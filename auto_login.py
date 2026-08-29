@@ -35,7 +35,6 @@ def fetch_request_code():
     auth_url = f"https://auth.flattrade.in/?app_key={api_key}"
     
     options = webdriver.ChromeOptions()
-    options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
@@ -55,13 +54,20 @@ def fetch_request_code():
     )
 
     print("[2/4] Typing User ID, Password, and TOTP...")
-    user_field = visible_inputs[0]
-    pwd_field = visible_inputs[1]
-    totp_field = visible_inputs[2]
-
+    
+    # Wait for the page to fully render
+    time.sleep(2)
+    
+    inputs = get_visible_inputs(driver)
+    if len(inputs) < 3:
+        raise Exception("Could not find all 3 login input fields!")
+        
+    # Re-fetch just in case DOM updated
+    user_field = get_visible_inputs(driver)[0]
     user_field.clear()
     user_field.send_keys(str(creds.USER_ID).strip())
 
+    pwd_field = get_visible_inputs(driver)[1]
     pwd_field.clear()
     pwd_field.send_keys(str(creds.PASSWORD).strip())
 
@@ -70,13 +76,19 @@ def fetch_request_code():
     totp_code = pyotp.TOTP(clean_key).now()
     print(f"      Generated TOTP Code: {totp_code}")
 
+    totp_field = get_visible_inputs(driver)[2]
     totp_field.clear()
     totp_field.send_keys(totp_code)
     
+    # Trigger Vue reactive events if necessary
+    totp_field.send_keys(Keys.TAB)
+    time.sleep(1)
+    
     submit_btn = wait.until(
-        EC.element_to_be_clickable((By.XPATH, "//button[.//span[contains(text(), 'Log In')]]"))
+        EC.presence_of_element_located((By.XPATH, "//button[.//span[contains(text(), 'Log In')]]"))
     )
-    submit_btn.click()
+    # Use JavaScript click to bypass any headless overlay issues
+    driver.execute_script("arguments[0].click();", submit_btn)
 
     print("[4/4] Extracting authorization code from redirect URL...")
     try:
