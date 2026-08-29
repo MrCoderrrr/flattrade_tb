@@ -81,6 +81,10 @@ def fetch_request_code():
     
     # Send ENTER directly to the TOTP field to submit the form robustly
     totp_field.send_keys(Keys.ENTER)
+    
+    # Wait a second for the UI to process the click/enter
+    time.sleep(2)
+    driver.save_screenshot("pre_wait.png")
 
     print("[4/4] Extracting authorization code from redirect URL...")
     try:
