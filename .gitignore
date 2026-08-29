@@ -1,5 +1,0 @@
-flat_venv/
-__pycache__/
-*.pyc
-creds.py
-.env
