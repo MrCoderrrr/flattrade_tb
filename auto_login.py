@@ -79,15 +79,8 @@ def fetch_request_code():
     totp_field.clear()
     totp_field.send_keys(totp_code)
     
-    # Trigger Vue reactive events if necessary
-    totp_field.send_keys(Keys.TAB)
-    time.sleep(1)
-    
-    submit_btn = wait.until(
-        EC.presence_of_element_located((By.XPATH, "//button[.//span[contains(text(), 'Log In')]]"))
-    )
-    # Use JavaScript click to bypass any headless overlay issues
-    driver.execute_script("arguments[0].click();", submit_btn)
+    # Send ENTER directly to the TOTP field to submit the form robustly
+    totp_field.send_keys(Keys.ENTER)
 
     print("[4/4] Extracting authorization code from redirect URL...")
     try:
