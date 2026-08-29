@@ -1,0 +1,618 @@
+<html lang="en"><head><meta charset="utf-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="icon" href="/favicon.ico"><title>Auth</title><link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:100,300,400,500,700,900"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@mdi/font@latest/css/materialdesignicons.min.css"><link href="/css/app.ed5059d6.css" rel="preload" as="style"><link href="/css/chunk-vendors.3a1bbf08.css" rel="preload" as="style"><link href="/js/app.38fb4d91.js" rel="preload" as="script"><link href="/js/chunk-vendors.e98b3c4a.js" rel="preload" as="script"><link href="/css/chunk-vendors.3a1bbf08.css" rel="stylesheet"><link href="/css/app.ed5059d6.css" rel="stylesheet"><style type="text/css" id="vuetify-theme-stylesheet">.v-application a { color: #1976d2; }
+.v-application .primary {
+  background-color: #1976d2 !important;
+  border-color: #1976d2 !important;
+}
+.v-application .primary--text {
+  color: #1976d2 !important;
+  caret-color: #1976d2 !important;
+}
+.v-application .primary.lighten-5 {
+  background-color: #c7fdff !important;
+  border-color: #c7fdff !important;
+}
+.v-application .primary--text.text--lighten-5 {
+  color: #c7fdff !important;
+  caret-color: #c7fdff !important;
+}
+.v-application .primary.lighten-4 {
+  background-color: #a8e0ff !important;
+  border-color: #a8e0ff !important;
+}
+.v-application .primary--text.text--lighten-4 {
+  color: #a8e0ff !important;
+  caret-color: #a8e0ff !important;
+}
+.v-application .primary.lighten-3 {
+  background-color: #8ac5ff !important;
+  border-color: #8ac5ff !important;
+}
+.v-application .primary--text.text--lighten-3 {
+  color: #8ac5ff !important;
+  caret-color: #8ac5ff !important;
+}
+.v-application .primary.lighten-2 {
+  background-color: #6aaaff !important;
+  border-color: #6aaaff !important;
+}
+.v-application .primary--text.text--lighten-2 {
+  color: #6aaaff !important;
+  caret-color: #6aaaff !important;
+}
+.v-application .primary.lighten-1 {
+  background-color: #488fef !important;
+  border-color: #488fef !important;
+}
+.v-application .primary--text.text--lighten-1 {
+  color: #488fef !important;
+  caret-color: #488fef !important;
+}
+.v-application .primary.darken-1 {
+  background-color: #005eb6 !important;
+  border-color: #005eb6 !important;
+}
+.v-application .primary--text.text--darken-1 {
+  color: #005eb6 !important;
+  caret-color: #005eb6 !important;
+}
+.v-application .primary.darken-2 {
+  background-color: #00479b !important;
+  border-color: #00479b !important;
+}
+.v-application .primary--text.text--darken-2 {
+  color: #00479b !important;
+  caret-color: #00479b !important;
+}
+.v-application .primary.darken-3 {
+  background-color: #003180 !important;
+  border-color: #003180 !important;
+}
+.v-application .primary--text.text--darken-3 {
+  color: #003180 !important;
+  caret-color: #003180 !important;
+}
+.v-application .primary.darken-4 {
+  background-color: #001e67 !important;
+  border-color: #001e67 !important;
+}
+.v-application .primary--text.text--darken-4 {
+  color: #001e67 !important;
+  caret-color: #001e67 !important;
+}
+.v-application .secondary {
+  background-color: #424242 !important;
+  border-color: #424242 !important;
+}
+.v-application .secondary--text {
+  color: #424242 !important;
+  caret-color: #424242 !important;
+}
+.v-application .secondary.lighten-5 {
+  background-color: #c1c1c1 !important;
+  border-color: #c1c1c1 !important;
+}
+.v-application .secondary--text.text--lighten-5 {
+  color: #c1c1c1 !important;
+  caret-color: #c1c1c1 !important;
+}
+.v-application .secondary.lighten-4 {
+  background-color: #a6a6a6 !important;
+  border-color: #a6a6a6 !important;
+}
+.v-application .secondary--text.text--lighten-4 {
+  color: #a6a6a6 !important;
+  caret-color: #a6a6a6 !important;
+}
+.v-application .secondary.lighten-3 {
+  background-color: #8b8b8b !important;
+  border-color: #8b8b8b !important;
+}
+.v-application .secondary--text.text--lighten-3 {
+  color: #8b8b8b !important;
+  caret-color: #8b8b8b !important;
+}
+.v-application .secondary.lighten-2 {
+  background-color: #727272 !important;
+  border-color: #727272 !important;
+}
+.v-application .secondary--text.text--lighten-2 {
+  color: #727272 !important;
+  caret-color: #727272 !important;
+}
+.v-application .secondary.lighten-1 {
+  background-color: #595959 !important;
+  border-color: #595959 !important;
+}
+.v-application .secondary--text.text--lighten-1 {
+  color: #595959 !important;
+  caret-color: #595959 !important;
+}
+.v-application .secondary.darken-1 {
+  background-color: #2c2c2c !important;
+  border-color: #2c2c2c !important;
+}
+.v-application .secondary--text.text--darken-1 {
+  color: #2c2c2c !important;
+  caret-color: #2c2c2c !important;
+}
+.v-application .secondary.darken-2 {
+  background-color: #171717 !important;
+  border-color: #171717 !important;
+}
+.v-application .secondary--text.text--darken-2 {
+  color: #171717 !important;
+  caret-color: #171717 !important;
+}
+.v-application .secondary.darken-3 {
+  background-color: #000000 !important;
+  border-color: #000000 !important;
+}
+.v-application .secondary--text.text--darken-3 {
+  color: #000000 !important;
+  caret-color: #000000 !important;
+}
+.v-application .secondary.darken-4 {
+  background-color: #000000 !important;
+  border-color: #000000 !important;
+}
+.v-application .secondary--text.text--darken-4 {
+  color: #000000 !important;
+  caret-color: #000000 !important;
+}
+.v-application .accent {
+  background-color: #82b1ff !important;
+  border-color: #82b1ff !important;
+}
+.v-application .accent--text {
+  color: #82b1ff !important;
+  caret-color: #82b1ff !important;
+}
+.v-application .accent.lighten-5 {
+  background-color: #ffffff !important;
+  border-color: #ffffff !important;
+}
+.v-application .accent--text.text--lighten-5 {
+  color: #ffffff !important;
+  caret-color: #ffffff !important;
+}
+.v-application .accent.lighten-4 {
+  background-color: #f8ffff !important;
+  border-color: #f8ffff !important;
+}
+.v-application .accent--text.text--lighten-4 {
+  color: #f8ffff !important;
+  caret-color: #f8ffff !important;
+}
+.v-application .accent.lighten-3 {
+  background-color: #daffff !important;
+  border-color: #daffff !important;
+}
+.v-application .accent--text.text--lighten-3 {
+  color: #daffff !important;
+  caret-color: #daffff !important;
+}
+.v-application .accent.lighten-2 {
+  background-color: #bce8ff !important;
+  border-color: #bce8ff !important;
+}
+.v-application .accent--text.text--lighten-2 {
+  color: #bce8ff !important;
+  caret-color: #bce8ff !important;
+}
+.v-application .accent.lighten-1 {
+  background-color: #9fccff !important;
+  border-color: #9fccff !important;
+}
+.v-application .accent--text.text--lighten-1 {
+  color: #9fccff !important;
+  caret-color: #9fccff !important;
+}
+.v-application .accent.darken-1 {
+  background-color: #6596e2 !important;
+  border-color: #6596e2 !important;
+}
+.v-application .accent--text.text--darken-1 {
+  color: #6596e2 !important;
+  caret-color: #6596e2 !important;
+}
+.v-application .accent.darken-2 {
+  background-color: #467dc6 !important;
+  border-color: #467dc6 !important;
+}
+.v-application .accent--text.text--darken-2 {
+  color: #467dc6 !important;
+  caret-color: #467dc6 !important;
+}
+.v-application .accent.darken-3 {
+  background-color: #2364aa !important;
+  border-color: #2364aa !important;
+}
+.v-application .accent--text.text--darken-3 {
+  color: #2364aa !important;
+  caret-color: #2364aa !important;
+}
+.v-application .accent.darken-4 {
+  background-color: #004c90 !important;
+  border-color: #004c90 !important;
+}
+.v-application .accent--text.text--darken-4 {
+  color: #004c90 !important;
+  caret-color: #004c90 !important;
+}
+.v-application .error {
+  background-color: #ff5252 !important;
+  border-color: #ff5252 !important;
+}
+.v-application .error--text {
+  color: #ff5252 !important;
+  caret-color: #ff5252 !important;
+}
+.v-application .error.lighten-5 {
+  background-color: #ffe4d5 !important;
+  border-color: #ffe4d5 !important;
+}
+.v-application .error--text.text--lighten-5 {
+  color: #ffe4d5 !important;
+  caret-color: #ffe4d5 !important;
+}
+.v-application .error.lighten-4 {
+  background-color: #ffc6b9 !important;
+  border-color: #ffc6b9 !important;
+}
+.v-application .error--text.text--lighten-4 {
+  color: #ffc6b9 !important;
+  caret-color: #ffc6b9 !important;
+}
+.v-application .error.lighten-3 {
+  background-color: #ffa99e !important;
+  border-color: #ffa99e !important;
+}
+.v-application .error--text.text--lighten-3 {
+  color: #ffa99e !important;
+  caret-color: #ffa99e !important;
+}
+.v-application .error.lighten-2 {
+  background-color: #ff8c84 !important;
+  border-color: #ff8c84 !important;
+}
+.v-application .error--text.text--lighten-2 {
+  color: #ff8c84 !important;
+  caret-color: #ff8c84 !important;
+}
+.v-application .error.lighten-1 {
+  background-color: #ff6f6a !important;
+  border-color: #ff6f6a !important;
+}
+.v-application .error--text.text--lighten-1 {
+  color: #ff6f6a !important;
+  caret-color: #ff6f6a !important;
+}
+.v-application .error.darken-1 {
+  background-color: #df323b !important;
+  border-color: #df323b !important;
+}
+.v-application .error--text.text--darken-1 {
+  color: #df323b !important;
+  caret-color: #df323b !important;
+}
+.v-application .error.darken-2 {
+  background-color: #bf0025 !important;
+  border-color: #bf0025 !important;
+}
+.v-application .error--text.text--darken-2 {
+  color: #bf0025 !important;
+  caret-color: #bf0025 !important;
+}
+.v-application .error.darken-3 {
+  background-color: #9f0010 !important;
+  border-color: #9f0010 !important;
+}
+.v-application .error--text.text--darken-3 {
+  color: #9f0010 !important;
+  caret-color: #9f0010 !important;
+}
+.v-application .error.darken-4 {
+  background-color: #800000 !important;
+  border-color: #800000 !important;
+}
+.v-application .error--text.text--darken-4 {
+  color: #800000 !important;
+  caret-color: #800000 !important;
+}
+.v-application .info {
+  background-color: #2196f3 !important;
+  border-color: #2196f3 !important;
+}
+.v-application .info--text {
+  color: #2196f3 !important;
+  caret-color: #2196f3 !important;
+}
+.v-application .info.lighten-5 {
+  background-color: #d4ffff !important;
+  border-color: #d4ffff !important;
+}
+.v-application .info--text.text--lighten-5 {
+  color: #d4ffff !important;
+  caret-color: #d4ffff !important;
+}
+.v-application .info.lighten-4 {
+  background-color: #b5ffff !important;
+  border-color: #b5ffff !important;
+}
+.v-application .info--text.text--lighten-4 {
+  color: #b5ffff !important;
+  caret-color: #b5ffff !important;
+}
+.v-application .info.lighten-3 {
+  background-color: #95e8ff !important;
+  border-color: #95e8ff !important;
+}
+.v-application .info--text.text--lighten-3 {
+  color: #95e8ff !important;
+  caret-color: #95e8ff !important;
+}
+.v-application .info.lighten-2 {
+  background-color: #75ccff !important;
+  border-color: #75ccff !important;
+}
+.v-application .info--text.text--lighten-2 {
+  color: #75ccff !important;
+  caret-color: #75ccff !important;
+}
+.v-application .info.lighten-1 {
+  background-color: #51b0ff !important;
+  border-color: #51b0ff !important;
+}
+.v-application .info--text.text--lighten-1 {
+  color: #51b0ff !important;
+  caret-color: #51b0ff !important;
+}
+.v-application .info.darken-1 {
+  background-color: #007cd6 !important;
+  border-color: #007cd6 !important;
+}
+.v-application .info--text.text--darken-1 {
+  color: #007cd6 !important;
+  caret-color: #007cd6 !important;
+}
+.v-application .info.darken-2 {
+  background-color: #0064ba !important;
+  border-color: #0064ba !important;
+}
+.v-application .info--text.text--darken-2 {
+  color: #0064ba !important;
+  caret-color: #0064ba !important;
+}
+.v-application .info.darken-3 {
+  background-color: #004d9f !important;
+  border-color: #004d9f !important;
+}
+.v-application .info--text.text--darken-3 {
+  color: #004d9f !important;
+  caret-color: #004d9f !important;
+}
+.v-application .info.darken-4 {
+  background-color: #003784 !important;
+  border-color: #003784 !important;
+}
+.v-application .info--text.text--darken-4 {
+  color: #003784 !important;
+  caret-color: #003784 !important;
+}
+.v-application .success {
+  background-color: #4caf50 !important;
+  border-color: #4caf50 !important;
+}
+.v-application .success--text {
+  color: #4caf50 !important;
+  caret-color: #4caf50 !important;
+}
+.v-application .success.lighten-5 {
+  background-color: #dcffd6 !important;
+  border-color: #dcffd6 !important;
+}
+.v-application .success--text.text--lighten-5 {
+  color: #dcffd6 !important;
+  caret-color: #dcffd6 !important;
+}
+.v-application .success.lighten-4 {
+  background-color: #beffba !important;
+  border-color: #beffba !important;
+}
+.v-application .success--text.text--lighten-4 {
+  color: #beffba !important;
+  caret-color: #beffba !important;
+}
+.v-application .success.lighten-3 {
+  background-color: #a2ff9e !important;
+  border-color: #a2ff9e !important;
+}
+.v-application .success--text.text--lighten-3 {
+  color: #a2ff9e !important;
+  caret-color: #a2ff9e !important;
+}
+.v-application .success.lighten-2 {
+  background-color: #85e783 !important;
+  border-color: #85e783 !important;
+}
+.v-application .success--text.text--lighten-2 {
+  color: #85e783 !important;
+  caret-color: #85e783 !important;
+}
+.v-application .success.lighten-1 {
+  background-color: #69cb69 !important;
+  border-color: #69cb69 !important;
+}
+.v-application .success--text.text--lighten-1 {
+  color: #69cb69 !important;
+  caret-color: #69cb69 !important;
+}
+.v-application .success.darken-1 {
+  background-color: #2d9437 !important;
+  border-color: #2d9437 !important;
+}
+.v-application .success--text.text--darken-1 {
+  color: #2d9437 !important;
+  caret-color: #2d9437 !important;
+}
+.v-application .success.darken-2 {
+  background-color: #00791e !important;
+  border-color: #00791e !important;
+}
+.v-application .success--text.text--darken-2 {
+  color: #00791e !important;
+  caret-color: #00791e !important;
+}
+.v-application .success.darken-3 {
+  background-color: #006000 !important;
+  border-color: #006000 !important;
+}
+.v-application .success--text.text--darken-3 {
+  color: #006000 !important;
+  caret-color: #006000 !important;
+}
+.v-application .success.darken-4 {
+  background-color: #004700 !important;
+  border-color: #004700 !important;
+}
+.v-application .success--text.text--darken-4 {
+  color: #004700 !important;
+  caret-color: #004700 !important;
+}
+.v-application .warning {
+  background-color: #fb8c00 !important;
+  border-color: #fb8c00 !important;
+}
+.v-application .warning--text {
+  color: #fb8c00 !important;
+  caret-color: #fb8c00 !important;
+}
+.v-application .warning.lighten-5 {
+  background-color: #ffff9e !important;
+  border-color: #ffff9e !important;
+}
+.v-application .warning--text.text--lighten-5 {
+  color: #ffff9e !important;
+  caret-color: #ffff9e !important;
+}
+.v-application .warning.lighten-4 {
+  background-color: #fffb82 !important;
+  border-color: #fffb82 !important;
+}
+.v-application .warning--text.text--lighten-4 {
+  color: #fffb82 !important;
+  caret-color: #fffb82 !important;
+}
+.v-application .warning.lighten-3 {
+  background-color: #ffdf67 !important;
+  border-color: #ffdf67 !important;
+}
+.v-application .warning--text.text--lighten-3 {
+  color: #ffdf67 !important;
+  caret-color: #ffdf67 !important;
+}
+.v-application .warning.lighten-2 {
+  background-color: #ffc24b !important;
+  border-color: #ffc24b !important;
+}
+.v-application .warning--text.text--lighten-2 {
+  color: #ffc24b !important;
+  caret-color: #ffc24b !important;
+}
+.v-application .warning.lighten-1 {
+  background-color: #ffa72d !important;
+  border-color: #ffa72d !important;
+}
+.v-application .warning--text.text--lighten-1 {
+  color: #ffa72d !important;
+  caret-color: #ffa72d !important;
+}
+.v-application .warning.darken-1 {
+  background-color: #db7200 !important;
+  border-color: #db7200 !important;
+}
+.v-application .warning--text.text--darken-1 {
+  color: #db7200 !important;
+  caret-color: #db7200 !important;
+}
+.v-application .warning.darken-2 {
+  background-color: #bb5900 !important;
+  border-color: #bb5900 !important;
+}
+.v-application .warning--text.text--darken-2 {
+  color: #bb5900 !important;
+  caret-color: #bb5900 !important;
+}
+.v-application .warning.darken-3 {
+  background-color: #9d4000 !important;
+  border-color: #9d4000 !important;
+}
+.v-application .warning--text.text--darken-3 {
+  color: #9d4000 !important;
+  caret-color: #9d4000 !important;
+}
+.v-application .warning.darken-4 {
+  background-color: #802700 !important;
+  border-color: #802700 !important;
+}
+.v-application .warning--text.text--darken-4 {
+  color: #802700 !important;
+  caret-color: #802700 !important;
+}</style></head><body><noscript><strong>We're sorry but ftauth doesn't work properly without JavaScript enabled. Please enable it to continue.</strong></noscript><div data-app="true" class="v-application v-application--is-ltr theme--light" id="app"><div class="v-application--wrap"><main class="v-main" data-booted="true" style="padding: 0px;"><div class="v-main__wrap"><div data-app="true" class="v-application v-application--is-ltr theme--light" id="app" style="background-color: rgb(250, 250, 250);"><div class="v-application--wrap"><div class="container mx-auto my-1 container--fluid"><div class="v-snack v-snack--has-background v-snack--top" style="padding-bottom: 0px; padding-top: 0px;"><div class="v-snack__wrapper v-sheet theme--dark" style="background-color: rgb(9, 101, 218); border-color: rgb(9, 101, 218); display: none;"><div role="status" aria-live="polite" class="v-snack__content"><p></p></div><div class="v-snack__action "><button type="button" class="v-btn v-btn--text theme--dark v-size--default v-snack__btn"><span class="v-btn__content"> Close </span></button></div></div></div><div class="row align-center justify-center"><div align="center" class="col"><div role="dialog" class="v-dialog__container" username=""><!----></div><div data-v-5b8398cd="" class="container fill-height justify-center login-container pa-0 container--fluid" style="height: 96vh; overflow: hidden; background: none;"><div data-v-5b8398cd="" class="login-content-wrapper d-flex flex-column align-center" style="width: 100%; max-width: 900px; transition: 0.3s; padding: 24px;"><div data-v-5b8398cd="" class="login-card overflow-hidden v-card v-sheet theme--light elevation-10 rounded-xl mb-2" style="width: 100%;"><div data-v-5b8398cd="" class="row no-gutters" style="height: 100%;"><div data-v-5b8398cd="" class="pa-0 carousel-col custom-carousel-visibility col-md-6 col-12" style="position: relative;"><div data-v-5b8398cd="" class="v-window login-carousel fill-height carousel-pos-absolute v-item-group theme--dark v-carousel" style="height: 100%;"><div class="v-window__container" style="height: 100%;"><div data-v-5b8398cd="" class="v-window-item" style="display: none;"><div class="v-image v-responsive v-carousel__item theme--light" style="height: 100%;"><div class="v-responsive__content"><div data-v-5b8398cd="" class="v-image v-responsive fill-height theme--light" cover="" style="height: 100%;"><div class="v-responsive__sizer" style="padding-bottom: 164.238%;"></div><div class="v-image__image v-image__image--cover" style="background-image: url(&quot;https://flattrade.s3.ap-south-1.amazonaws.com/ftauth/ftauthbanner_1771238751&quot;); background-position: center center;"></div><div class="v-responsive__content" style="width: 755px;"></div></div></div></div></div><div data-v-5b8398cd="" class="v-window-item" style="display: none;"><div class="v-image v-responsive v-carousel__item theme--light" style="height: 100%;"><div class="v-responsive__content"><div data-v-5b8398cd="" class="v-image v-responsive fill-height theme--light" cover="" style="height: 100%;"><div class="v-responsive__sizer" style="padding-bottom: 164.238%;"></div><div class="v-image__image v-image__image--cover" style="background-image: url(&quot;https://flattrade.s3.ap-south-1.amazonaws.com/ftauth/ftauthbanner_1771335700&quot;); background-position: center center;"></div><div class="v-responsive__content" style="width: 755px;"></div></div></div></div></div><div data-v-5b8398cd="" class="v-window-item" style=""><div class="v-image v-responsive v-carousel__item theme--light" style="height: 100%;"><div class="v-responsive__content"><div data-v-5b8398cd="" class="v-image v-responsive fill-height theme--light" cover="" style="height: 100%;"><div class="v-responsive__sizer" style="padding-bottom: 164.238%;"></div><div class="v-image__image v-image__image--cover" style="background-image: url(&quot;https://flattrade.s3.ap-south-1.amazonaws.com/ftauth/ftauthbanner_1780133374&quot;); background-position: center center;"></div><div class="v-responsive__content" style="width: 755px;"></div></div></div></div></div></div></div><div data-v-5b8398cd="" class="custom-delimiters-container"><div data-v-5b8398cd="" class="d-flex justify-center align-center"><div data-v-5b8398cd="" class="custom-dot mx-1"></div><div data-v-5b8398cd="" class="custom-dot mx-1"></div><div data-v-5b8398cd="" class="custom-dot mx-1 active"></div></div></div></div><div data-v-5b8398cd="" class="pa-6 d-flex flex-column white col-md-6 col-12" style="flex: 0 0 50%; max-width: 50%; justify-content: center; height: 100%; align-items: center;"><div data-v-5b8398cd="" class="d-flex flex-column" style="width: 100%;"><div data-v-5b8398cd="" class="d-flex justify-center mb-4"><div data-v-5b8398cd="" class="v-image v-responsive theme--light" style="max-height: 24px; max-width: 150px;"><div class="v-image__image v-image__image--preload v-image__image--contain" style="background-position: center center;"></div><div class="v-responsive__content"></div></div></div><h2 data-v-5b8398cd="" class="text-h5 font-weight-bold mb-2 black--text text-left"> Log In </h2><form data-v-5b8398cd="" novalidate="novalidate" class="v-form"><label data-v-5b8398cd="" class="
+                  text-subtitle-2
+                  ml-1
+                  font-weight-medium
+                  d-block
+                  black--text
+                  text-left
+                ">User ID</label><div data-v-5b8398cd="" class="v-input login-input-custom mb-0 v-input--is-label-active v-input--is-dirty v-input--dense theme--light v-text-field v-text-field--single-line v-text-field--solo-flat v-text-field--filled v-text-field--is-booted v-text-field--enclosed v-text-field--placeholder v-text-field--rounded"><div class="v-input__control"><div class="v-input__slot" style="background-color: rgb(245, 245, 245); border-color: rgb(245, 245, 245);"><div class="v-text-field__slot"><input required="required" autofocus="autofocus" id="input-20" placeholder="User ID" type="text"></div></div><div class="v-text-field__details"><div class="v-messages theme--light"><div class="v-messages__wrapper"></div></div></div></div></div><label data-v-5b8398cd="" class="
+                  text-subtitle-2
+                  ml-1
+                  font-weight-medium
+                  d-block
+                  black--text
+                  text-left
+                ">Password</label><div data-v-5b8398cd="" class="v-input login-input-custom mb-0 v-input--is-label-active v-input--is-dirty v-input--dense theme--light v-text-field v-text-field--single-line v-text-field--solo-flat v-text-field--filled v-text-field--is-booted v-text-field--enclosed v-text-field--placeholder v-text-field--rounded"><div class="v-input__control"><div class="v-input__slot" style="background-color: rgb(245, 245, 245); border-color: rgb(245, 245, 245);"><div class="v-text-field__slot"><input required="required" id="input-23" placeholder="Password" type="password"></div><div class="v-input__append-inner"><div class="v-input__icon v-input__icon--append"><button type="button" aria-label="append icon" class="v-icon notranslate v-icon--link mdi mdi-eye-off-outline theme--light"></button></div></div></div><div class="v-text-field__details"><div class="v-messages theme--light"><div class="v-messages__wrapper"></div></div></div></div></div><div data-v-5b8398cd="" class="d-flex justify-end mb-1"><a data-v-5b8398cd="" class="
+                    text-caption
+                    blue--text
+                    text--darken-2
+                    font-weight-medium
+                  ">Forgot Password?</a></div><label data-v-5b8398cd="" class="
+                  text-subtitle-2
+                  ml-1
+                  font-weight-medium
+                  d-block
+                  black--text
+                  text-left
+                ">OTP / TOTP</label><div data-v-5b8398cd="" class="v-input login-input-custom mb-0 v-input--is-label-active v-input--is-dirty v-input--dense theme--light v-text-field v-text-field--single-line v-text-field--solo-flat v-text-field--filled v-text-field--is-booted v-text-field--enclosed v-text-field--placeholder v-text-field--rounded"><div class="v-input__control"><div class="v-input__slot" style="background-color: rgb(245, 245, 245); border-color: rgb(245, 245, 245);"><div class="v-text-field__slot"><input required="required" id="input-27" placeholder="OTP / TOTP" type="password"></div><div class="v-input__append-inner"><div class="v-input__icon v-input__icon--append"><button type="button" aria-label="append icon" class="v-icon notranslate v-icon--link mdi mdi-eye-off-outline theme--light"></button></div></div></div><div class="v-text-field__details"><div class="v-messages theme--light"><div class="v-messages__wrapper"></div></div></div></div></div><div data-v-5b8398cd="" class="flex-column"><div data-v-5b8398cd="" class="d-flex justify-end mb-4"><a data-v-5b8398cd="" class="
+                      text-caption
+                      blue--text
+                      text--darken-2 text-decoration-none
+                      font-weight-medium
+                    ">Get OTP</a></div><div data-v-5b8398cd="" class="d-flex justify-center mb-4"><button data-v-5b8398cd="" type="button" class="
+                      white--text
+                      text-capitalize
+                      rounded-lg
+                      text-body-1
+                      font-weight-bold
+                      shine-button
+                     v-btn v-btn--has-bg theme--light v-size--large" style="background-color: rgb(21, 101, 192); border-color: rgb(21, 101, 192); width: 60%; height: 44px; display: none;"><span class="v-btn__content"> Log In </span></button></div></div><div data-v-5b8398cd="" role="progressbar" aria-valuemin="0" aria-valuemax="100" class="v-progress-linear rounded mt-4 v-progress-linear--visible theme--light" style="height: 6px;"><div class="v-progress-linear__background blue" style="opacity: 0.3; left: 0%; width: 100%;"></div><div class="v-progress-linear__buffer"></div><div class="v-progress-linear__indeterminate v-progress-linear__indeterminate--active"><div class="v-progress-linear__indeterminate long blue"></div><div class="v-progress-linear__indeterminate short blue"></div></div></div><div data-v-5b8398cd="" class="
+                  text-center
+                  mb-4
+                  text-caption
+                  grey--text
+                  text--darken-1
+                "> Don't have an account? <a data-v-5b8398cd="" href="https://instakyc.flattrade.in/Signup" target="_blank" rel="noopener noreferrer" class="black--text font-weight-medium text-decoration-none" style="cursor: pointer;">Open Account!</a></div><div data-v-5b8398cd="" class="rounded-lg pa-4 text-center mx-auto v-sheet theme--light" style="width: 100%; background-color: rgb(238, 245, 253); border-color: rgb(238, 245, 253);"><div data-v-5b8398cd="" class="
+                    text-body-2
+                    font-weight-bold
+                    grey--text
+                    text--darken-3
+                    mb-1
+                  "> 09:37 </div><div data-v-5b8398cd="" class="grey--text text--darken-2" style="font-size: 11px; line-height: 1.4;"> Please log in within 600 sec to finish your transaction at once.<br data-v-5b8398cd=""> We'd hate for your session to time out! </div></div><!----><!----><div data-v-5b8398cd="" class="
+                  login-footer
+                  mt-1
+                  text-center
+                  grey--text
+                  text--lighten-1 text-caption
+                " style="text-align: center; width: 100%; margin-top: auto;"><div data-v-5b8398cd="" class="mb-1">Fortune 1.0.8</div><div data-v-5b8398cd="" class=" mb-2"><span data-v-5b8398cd="" class="text--darken-5 font-weight-bold mx-1">NSE</span> | <span data-v-5b8398cd="" class="text--darken-5 font-weight-bold mx-1">BSE</span> | <span data-v-5b8398cd="" class="text--darken-5 font-weight-bold mx-1">MCX</span></div><div data-v-5b8398cd="" class="mx-auto-footer grey--text text--lighten-1" style="font-size: 10px; line-height: 1.4; max-width: 600px;"> SEBI Registration No. INZ000201438 Member Code for NSE: 14572 BSE 6524 MCX: 16765 and<br data-v-5b8398cd=""> SEBI Single Registration No: IN-DP-811-2025<br data-v-5b8398cd=""> FLATTRADE is an online brand of Flattrade Broking Pvt Ltd </div></div></form></div></div></div></div></div><div data-v-5b8398cd="" role="dialog" class="v-dialog__container"><!----></div><div data-v-0f359802="" data-v-5b8398cd="" class="text-center" errormsg=""><div data-v-0f359802="" role="dialog" class="v-dialog__container"><!----></div><div data-v-0f359802="" class="v-snack v-snack--has-background v-snack--right v-snack--top" style="padding-bottom: 0px; padding-top: 0px;"><div class="v-snack__wrapper v-sheet theme--dark success" style="display: none;"><div role="status" aria-live="polite" class="v-snack__content">  </div><div class="v-snack__action "></div></div></div></div></div></div></div></div><!----></div></div></div></main></div></div><script src="/js/chunk-vendors.e98b3c4a.js"></script><script src="/js/app.38fb4d91.js"></script><script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/v3d52b47920f24c319d37e2661827c42b1787588026925" integrity="sha512-d9sL6GJLXn6fInD1+TVXhTcQOsmxeHfmHAvwGDIxp5TO+uo1fiWW7mHomMj4MLRlCsJDTqXzWLHJFFlPCEIj/A==" data-cf-beacon="{&quot;version&quot;:&quot;2024.11.0&quot;,&quot;token&quot;:&quot;486d9ec9fd8340bf87f655e516c08b5b&quot;}" crossorigin="anonymous"></script>
+</body></html>
