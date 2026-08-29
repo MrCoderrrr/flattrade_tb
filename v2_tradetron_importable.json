@@ -13,10 +13,26 @@
   "description": "<p>ADX regime split, native KAMA slope for direction, Kaufman Efficiency-scaled dynamic spot stops, Find Strike premium-based legs.</p>",
   "tags": [],
   "variables": [
-    { "name": "spot_entry_chop_ce", "type": "Number", "initialValue": "0" },
-    { "name": "spot_entry_chop_pe", "type": "Number", "initialValue": "0" },
-    { "name": "spot_entry_bull", "type": "Number", "initialValue": "0" },
-    { "name": "spot_entry_bear", "type": "Number", "initialValue": "0" }
+    {
+      "name": "spot_entry_chop_ce",
+      "type": "Number",
+      "initialValue": "0"
+    },
+    {
+      "name": "spot_entry_chop_pe",
+      "type": "Number",
+      "initialValue": "0"
+    },
+    {
+      "name": "spot_entry_bull",
+      "type": "Number",
+      "initialValue": "0"
+    },
+    {
+      "name": "spot_entry_bear",
+      "type": "Number",
+      "initialValue": "0"
+    }
   ],
   "sets": [
     {
@@ -60,7 +76,7 @@
         {
           "type": "Exit",
           "conditionValue": "( tt_LTP ( 'NIFTY' ) >= ( tt_GetRuntimeNumber ( 'spot_entry_chop_ce' ) + ( tt_Number ( '90' ) - tt_MathOperation ( tt_Number ( '30' ), 'Multiply', tt_KaufmanEfficiency ( '10', '5min', 'NIFTY' ) ) ) ) )",
-          "conditionJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"LTP\",\"kid\":1042,\"params\":[{\"type\":\"value\",\"value\":\"NIFTY\"}]},{\"name\":\">=\",\"params\":[]},{\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"keyword\",\"name\":\"Get Runtime Number\",\"kid\":9998,\"params\":[{\"type\":\"value\",\"value\":\"spot_entry_chop_ce\"}]},{\"type\":\"value\",\"value\":\"Add\"},{\"type\":\"keyword\",\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"value\",\"value\":\"90\"},{\"type\":\"value\",\"value\":\"Subtract\"},{\"type\":\"keyword\",\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"value\",\"value\":\"30\"},{\"type\":\"value\",\"value\":\"Multiply\"},{\"type\":\"keyword\",\"name\":\"Kaufman Efficiency indicator\",\"kid\":7002,\"params\":[{\"type\":\"value\",\"value\":\"10\"},{\"type\":\"value\",\"value\":\"5min\"},{\"type\":\"value\",\"value\":\"NIFTY\"}]}]}]}]}]}]}",
+          "conditionJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"LTP\",\"kid\":1042,\"params\":[{\"type\":\"value\",\"value\":\"NIFTY\"}]},{\"name\":\">=\",\"params\":[]},{\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"keyword\",\"keyword\":{\"name\":\"Get Runtime Number\",\"kid\":9998,\"params\":[{\"type\":\"value\",\"value\":\"spot_entry_chop_ce\"}]}},{\"type\":\"value\",\"value\":\"Add\"},{\"type\":\"keyword\",\"keyword\":{\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"value\",\"value\":\"90\"},{\"type\":\"value\",\"value\":\"Subtract\"},{\"type\":\"keyword\",\"keyword\":{\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"value\",\"value\":\"30\"},{\"type\":\"value\",\"value\":\"Multiply\"},{\"type\":\"keyword\",\"keyword\":{\"name\":\"Kaufman Efficiency indicator\",\"kid\":7002,\"params\":[{\"type\":\"value\",\"value\":\"10\"},{\"type\":\"value\",\"value\":\"5min\"},{\"type\":\"value\",\"value\":\"NIFTY\"}]}}]}}]}}]}]}]}",
           "conditionDisplay": "( LTP ( 'NIFTY' ) >= ( GetRuntimeNumber ( 'spot_entry_chop_ce' ) + ( Number ( '90' ) - MathOperation ( Number ( '30' ), Multiply, KaufmanEfficiency ( '10', '5min', 'NIFTY' ) ) ) ) )",
           "subType": "None",
           "visible": 1
@@ -108,7 +124,7 @@
         {
           "type": "Exit",
           "conditionValue": "( tt_LTP ( 'NIFTY' ) <= ( tt_GetRuntimeNumber ( 'spot_entry_chop_pe' ) - ( tt_Number ( '90' ) - tt_MathOperation ( tt_Number ( '30' ), 'Multiply', tt_KaufmanEfficiency ( '10', '5min', 'NIFTY' ) ) ) ) )",
-          "conditionJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"LTP\",\"kid\":1042,\"params\":[{\"type\":\"value\",\"value\":\"NIFTY\"}]},{\"name\":\"<=\",\"params\":[]},{\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"keyword\",\"name\":\"Get Runtime Number\",\"kid\":9998,\"params\":[{\"type\":\"value\",\"value\":\"spot_entry_chop_pe\"}]},{\"type\":\"value\",\"value\":\"Subtract\"},{\"type\":\"keyword\",\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"value\",\"value\":\"90\"},{\"type\":\"value\",\"value\":\"Subtract\"},{\"type\":\"keyword\",\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"value\",\"value\":\"30\"},{\"type\":\"value\",\"value\":\"Multiply\"},{\"type\":\"keyword\",\"name\":\"Kaufman Efficiency indicator\",\"kid\":7002,\"params\":[{\"type\":\"value\",\"value\":\"10\"},{\"type\":\"value\",\"value\":\"5min\"},{\"type\":\"value\",\"value\":\"NIFTY\"}]}]}]}]}]}]}",
+          "conditionJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"LTP\",\"kid\":1042,\"params\":[{\"type\":\"value\",\"value\":\"NIFTY\"}]},{\"name\":\"<=\",\"params\":[]},{\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"keyword\",\"keyword\":{\"name\":\"Get Runtime Number\",\"kid\":9998,\"params\":[{\"type\":\"value\",\"value\":\"spot_entry_chop_pe\"}]}},{\"type\":\"value\",\"value\":\"Subtract\"},{\"type\":\"keyword\",\"keyword\":{\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"value\",\"value\":\"90\"},{\"type\":\"value\",\"value\":\"Subtract\"},{\"type\":\"keyword\",\"keyword\":{\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"value\",\"value\":\"30\"},{\"type\":\"value\",\"value\":\"Multiply\"},{\"type\":\"keyword\",\"keyword\":{\"name\":\"Kaufman Efficiency indicator\",\"kid\":7002,\"params\":[{\"type\":\"value\",\"value\":\"10\"},{\"type\":\"value\",\"value\":\"5min\"},{\"type\":\"value\",\"value\":\"NIFTY\"}]}}]}}]}}]}]}]}",
           "conditionDisplay": "( LTP ( 'NIFTY' ) <= ( GetRuntimeNumber ( 'spot_entry_chop_pe' ) - ( Number ( '90' ) - MathOperation ( Number ( '30' ), Multiply, KaufmanEfficiency ( '10', '5min', 'NIFTY' ) ) ) ) )",
           "subType": "None",
           "visible": 1
@@ -156,7 +172,7 @@
         {
           "type": "Exit",
           "conditionValue": "( tt_LTP ( 'NIFTY' ) <= ( tt_GetRuntimeNumber ( 'spot_entry_bull' ) - ( tt_Number ( '65' ) - tt_MathOperation ( tt_Number ( '30' ), 'Multiply', tt_KaufmanEfficiency ( '10', '5min', 'NIFTY' ) ) ) ) )",
-          "conditionJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"LTP\",\"kid\":1042,\"params\":[{\"type\":\"value\",\"value\":\"NIFTY\"}]},{\"name\":\"<=\",\"params\":[]},{\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"keyword\",\"name\":\"Get Runtime Number\",\"kid\":9998,\"params\":[{\"type\":\"value\",\"value\":\"spot_entry_bull\"}]},{\"type\":\"value\",\"value\":\"Subtract\"},{\"type\":\"keyword\",\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"value\",\"value\":\"65\"},{\"type\":\"value\",\"value\":\"Subtract\"},{\"type\":\"keyword\",\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"value\",\"value\":\"30\"},{\"type\":\"value\",\"value\":\"Multiply\"},{\"type\":\"keyword\",\"name\":\"Kaufman Efficiency indicator\",\"kid\":7002,\"params\":[{\"type\":\"value\",\"value\":\"10\"},{\"type\":\"value\",\"value\":\"5min\"},{\"type\":\"value\",\"value\":\"NIFTY\"}]}]}]}]}]}]}",
+          "conditionJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"LTP\",\"kid\":1042,\"params\":[{\"type\":\"value\",\"value\":\"NIFTY\"}]},{\"name\":\"<=\",\"params\":[]},{\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"keyword\",\"keyword\":{\"name\":\"Get Runtime Number\",\"kid\":9998,\"params\":[{\"type\":\"value\",\"value\":\"spot_entry_bull\"}]}},{\"type\":\"value\",\"value\":\"Subtract\"},{\"type\":\"keyword\",\"keyword\":{\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"value\",\"value\":\"65\"},{\"type\":\"value\",\"value\":\"Subtract\"},{\"type\":\"keyword\",\"keyword\":{\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"value\",\"value\":\"30\"},{\"type\":\"value\",\"value\":\"Multiply\"},{\"type\":\"keyword\",\"keyword\":{\"name\":\"Kaufman Efficiency indicator\",\"kid\":7002,\"params\":[{\"type\":\"value\",\"value\":\"10\"},{\"type\":\"value\",\"value\":\"5min\"},{\"type\":\"value\",\"value\":\"NIFTY\"}]}}]}}]}}]}]}]}",
           "conditionDisplay": "( LTP ( 'NIFTY' ) <= ( GetRuntimeNumber ( 'spot_entry_bull' ) - ( Number ( '65' ) - MathOperation ( Number ( '30' ), Multiply, KaufmanEfficiency ( '10', '5min', 'NIFTY' ) ) ) ) )",
           "subType": "None",
           "visible": 1
@@ -204,7 +220,7 @@
         {
           "type": "Exit",
           "conditionValue": "( tt_LTP ( 'NIFTY' ) >= ( tt_GetRuntimeNumber ( 'spot_entry_bear' ) + ( tt_Number ( '65' ) - tt_MathOperation ( tt_Number ( '30' ), 'Multiply', tt_KaufmanEfficiency ( '10', '5min', 'NIFTY' ) ) ) ) )",
-          "conditionJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"LTP\",\"kid\":1042,\"params\":[{\"type\":\"value\",\"value\":\"NIFTY\"}]},{\"name\":\">=\",\"params\":[]},{\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"keyword\",\"name\":\"Get Runtime Number\",\"kid\":9998,\"params\":[{\"type\":\"value\",\"value\":\"spot_entry_bear\"}]},{\"type\":\"value\",\"value\":\"Add\"},{\"type\":\"keyword\",\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"value\",\"value\":\"65\"},{\"type\":\"value\",\"value\":\"Subtract\"},{\"type\":\"keyword\",\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"value\",\"value\":\"30\"},{\"type\":\"value\",\"value\":\"Multiply\"},{\"type\":\"keyword\",\"name\":\"Kaufman Efficiency indicator\",\"kid\":7002,\"params\":[{\"type\":\"value\",\"value\":\"10\"},{\"type\":\"value\",\"value\":\"5min\"},{\"type\":\"value\",\"value\":\"NIFTY\"}]}]}]}]}]}]}",
+          "conditionJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"LTP\",\"kid\":1042,\"params\":[{\"type\":\"value\",\"value\":\"NIFTY\"}]},{\"name\":\">=\",\"params\":[]},{\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"keyword\",\"keyword\":{\"name\":\"Get Runtime Number\",\"kid\":9998,\"params\":[{\"type\":\"value\",\"value\":\"spot_entry_bear\"}]}},{\"type\":\"value\",\"value\":\"Add\"},{\"type\":\"keyword\",\"keyword\":{\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"value\",\"value\":\"65\"},{\"type\":\"value\",\"value\":\"Subtract\"},{\"type\":\"keyword\",\"keyword\":{\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"value\",\"value\":\"30\"},{\"type\":\"value\",\"value\":\"Multiply\"},{\"type\":\"keyword\",\"keyword\":{\"name\":\"Kaufman Efficiency indicator\",\"kid\":7002,\"params\":[{\"type\":\"value\",\"value\":\"10\"},{\"type\":\"value\",\"value\":\"5min\"},{\"type\":\"value\",\"value\":\"NIFTY\"}]}}]}}]}}]}]}]}",
           "conditionDisplay": "( LTP ( 'NIFTY' ) >= ( GetRuntimeNumber ( 'spot_entry_bear' ) + ( Number ( '65' ) - MathOperation ( Number ( '30' ), Multiply, KaufmanEfficiency ( '10', '5min', 'NIFTY' ) ) ) ) )",
           "subType": "None",
           "visible": 1
