@@ -34,14 +34,18 @@ def fetch_request_code():
     api_key = str(creds.API_KEY).strip()
     auth_url = f"https://auth.flattrade.in/?app_key={api_key}"
     
-    import undetected_chromedriver as uc
-    options = uc.ChromeOptions()
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1920,1080")
+    from selenium import webdriver
+    from selenium.webdriver.chrome.service import Service
+    from webdriver_manager.chrome import ChromeDriverManager
+    
+    options = webdriver.ChromeOptions()
+    # options.add_argument("--no-sandbox")
+    # options.add_argument("--disable-dev-shm-usage")
 
-    driver = uc.Chrome(options=options)
+    driver = webdriver.Chrome(
+        service=Service(ChromeDriverManager().install()),
+        options=options
+    )
     
     driver.get(auth_url)
     
