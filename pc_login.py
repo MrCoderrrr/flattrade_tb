@@ -79,14 +79,24 @@ def fetch_request_code():
     totp_code = pyotp.TOTP(clean_key).now()
     print(f"      Generated TOTP Code: {totp_code}")
 
-    totp_field = get_visible_inputs(driver)[2]
-    totp_field.clear()
-    totp_field.send_keys(totp_code)
+    # Trigger Vue reactive events if necessary
+    totp_field.send_keys(Keys.TAB)
+    time.sleep(1)
     
-    # Send ENTER directly to the TOTP field to submit the form robustly
-    totp_field.send_keys(Keys.ENTER)
+    submit_btn = wait.until(
+        EC.element_to_be_clickable((By.XPATH, "//button[.//span[contains(text(), 'Log In')]]"))
+    )
+    # Scroll to it just in case
+    driver.execute_script("arguments[0].scrollIntoView(true);", submit_btn)
+    time.sleep(0.5)
     
-    # Wait a second for the UI to process the click/enter
+    try:
+        submit_btn.click()
+    except:
+        # Fallback to JavaScript click if covered by another element
+        driver.execute_script("arguments[0].click();", submit_btn)
+    
+    # Wait a second for the UI to process the click
     time.sleep(2)
     driver.save_screenshot("pre_wait.png")
 
