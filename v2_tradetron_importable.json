@@ -3,22 +3,31 @@
   "_readme": {
     "about": "Tradetron strategy export. Edit and re-import via the ASB Import button.",
     "logic": "To change a condition's logic, edit its 'conditionJson' (the AST).",
-    "do_not": "Do not add '*_id' foreign keys back."
+    "do_not": "Do not add '*_id' foreign keys back.",
+    "patch_notes": "v4 architecture: 4 independent Sets (Chop-CE, Chop-PE, Bullish, Bearish), each with its own Entry + Exit (no Repair Once anywhere, per Tradetron's documented Repair-Once-counter-reset limitation). Direction filter uses native Kaufman Adaptive MA slope (offset 0 vs -1), not DMI. Stop distance is dynamically scaled by native Kaufman Efficiency indicator instead of a fixed point value: stop = wide_points - (ER * (wide_points - tight_points)). Strike selection uses Find Strike (Fx formula, searching by LTP/premium), not a 'Premium' dropdown - that field does not exist in Tradetron's Strike Selection Type list.",
+    "UNVERIFIED_1": "Kaufman Adaptive MA's exact input parameters in your Tradetron version are unconfirmed - it may take a single period, or the full 3-parameter ER-period/fast-SC/slow-SC set like the original KAMA(10,3,30). Check what fields appear when you select the keyword and adjust 'period' placeholders below accordingly.",
+    "UNVERIFIED_2": "The nested Math Operation formula used for the ER-scaled stop distance (wide - ER*(wide-tight)) is written here as a formula sketch. Tradetron's actual nested-Fx UI may require building this differently (e.g. via multiple chained Math Operation keywords). Rebuild this specific formula by hand in the Exit condition's Fx box rather than trusting this JSON's structure verbatim.",
+    "UNVERIFIED_3": "All 'kid' numeric IDs in conditionJson/strikeJson below (including for Kaufman Adaptive MA, Kaufman Efficiency indicator, Find Strike, Math Operation, Get Runtime Number) are placeholders, not confirmed values from a live Tradetron export. Rebuild every condition and Fx formula via the UI dropdowns before relying on this file - do not import and run as-is without checking each condition in the builder."
   },
-  "name": "V3 Adaptive DI-Gated Strangle",
-  "description": "<p>Premium Matching, DI+/- Gating, and Custom Variable Spot Trailing SL.</p>",
+  "name": "V4 KAMA-ER Adaptive Strangle",
+  "description": "<p>ADX regime split, native KAMA slope for direction, Kaufman Efficiency-scaled dynamic spot stops, Find Strike premium-based legs.</p>",
   "tags": [],
-  "variables": [],
+  "variables": [
+    { "name": "spot_entry_chop_ce", "type": "Number", "initialValue": "0" },
+    { "name": "spot_entry_chop_pe", "type": "Number", "initialValue": "0" },
+    { "name": "spot_entry_bull", "type": "Number", "initialValue": "0" },
+    { "name": "spot_entry_bear", "type": "Number", "initialValue": "0" }
+  ],
   "sets": [
     {
       "list": 0,
-      "name": "Set 1 - Chop Regime (ADX < 20)",
+      "name": "Set 1 - Chop CE",
       "conditions": [
         {
           "type": "Entry",
-          "conditionValue": "( tt_Time ( 'NSE' ) >= tt_Number ( '0918' ) ) and ( tt_ADX ( '14', '5min' ) < tt_Number ( '20' ) )",
-          "conditionJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"Time\",\"kid\":4051,\"params\":[{\"type\":\"value\",\"value\":\"NSE\"}]},{\"name\":\">=\",\"params\":[]},{\"name\":\"Number\",\"kid\":3336,\"params\":[{\"type\":\"value\",\"value\":\"0918\"}]}]},{\"type\":\"rule\",\"value\":\"builder-basic_rule_1\",\"elements\":[{\"name\":\"ADX\",\"kid\":1001,\"params\":[{\"type\":\"value\",\"value\":\"14\"},{\"type\":\"value\",\"value\":\"5min\"}]},{\"name\":\"<\",\"params\":[]},{\"name\":\"Number\",\"kid\":3336,\"params\":[{\"type\":\"value\",\"value\":\"20\"}]}]}]}",
-          "conditionDisplay": "( Time ( 'NSE' ) >= Number ( '0918' ) ) and ( ADX ( '14', '5min' ) < Number ( '20' ) )",
+          "conditionValue": "( tt_Time ( 'NSE' ) >= tt_Number ( '0918' ) ) and ( tt_ADX ( '14', '5min', 'NIFTY' ) < tt_Number ( '20' ) )",
+          "conditionJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"Time\",\"kid\":4051,\"params\":[{\"type\":\"value\",\"value\":\"NSE\"}]},{\"name\":\">=\",\"params\":[]},{\"name\":\"Number\",\"kid\":3336,\"params\":[{\"type\":\"value\",\"value\":\"0918\"}]}]},{\"type\":\"rule\",\"value\":\"builder-basic_rule_1\",\"elements\":[{\"name\":\"ADX\",\"kid\":1001,\"params\":[{\"type\":\"value\",\"value\":\"14\"},{\"type\":\"value\",\"value\":\"5min\"},{\"type\":\"value\",\"value\":\"NIFTY\"}]},{\"name\":\"<\",\"params\":[]},{\"name\":\"Number\",\"kid\":3336,\"params\":[{\"type\":\"value\",\"value\":\"20\"}]}]}]}",
+          "conditionDisplay": "( Time ( 'NSE' ) >= Number ( '0918' ) ) and ( ADX ( '14', '5min', 'NIFTY' ) < Number ( '20' ) )",
           "subType": "None",
           "visible": 1,
           "legs": [
@@ -27,23 +36,10 @@
               "list": 0,
               "optionType": "CE",
               "expiryType": "Current Week",
-              "strikeType": "Premium",
-              "strike": "tt_Number('40')",
-              "strikeJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"Number\",\"kid\":3336,\"params\":[{\"type\":\"value\",\"value\":\"40\"}]}]}]}",
+              "strikeType": "Fx",
+              "strike": "( tt_FindStrike ( 'NIFTY', 'CurrentWeekExpiry', 'CE', 'LTP', tt_Number('40'), 'ANY' ) )",
+              "strikeJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"Find Strike\",\"kid\":7001,\"params\":[{\"type\":\"value\",\"value\":\"NIFTY\"},{\"type\":\"value\",\"value\":\"CurrentWeekExpiry\"},{\"type\":\"value\",\"value\":\"CE\"},{\"type\":\"value\",\"value\":\"LTP\"},{\"type\":\"value\",\"value\":\"40\"},{\"type\":\"value\",\"value\":\"ANY\"}]}]}]}",
               "qty": "tt_lots(1,'INSTRUMENT','CE')",
-              "buySell": "S",
-              "productType": "NRML",
-              "underlyingSymbol": "NIFTY"
-            },
-            {
-              "instrument": 1,
-              "list": 0,
-              "optionType": "PE",
-              "expiryType": "Current Week",
-              "strikeType": "Premium",
-              "strike": "tt_Number('40')",
-              "strikeJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"Number\",\"kid\":3336,\"params\":[{\"type\":\"value\",\"value\":\"40\"}]}]}]}",
-              "qty": "tt_lots(1,'INSTRUMENT','PE')",
               "buySell": "S",
               "productType": "NRML",
               "underlyingSymbol": "NIFTY"
@@ -53,7 +49,7 @@
             "name": null,
             "variables": [
               {
-                "variableName": "spot_entry",
+                "variableName": "spot_entry_chop_ce",
                 "value": "( tt_LTP ( 'NIFTY' ) )",
                 "display": "( LTP ( 'NIFTY' ) )",
                 "json": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"LTP\",\"kid\":1042,\"params\":[{\"type\":\"value\",\"value\":\"NIFTY\"}]}]}]}"
@@ -62,70 +58,24 @@
           }
         },
         {
-          "type": "Repair Once",
-          "conditionValue": "( tt_LTP ( 'NIFTY' ) >= ( tt_GetVar ( 'spot_entry' ) + tt_Number ( '75' ) ) )",
-          "conditionJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"LTP\",\"kid\":1042,\"params\":[{\"type\":\"value\",\"value\":\"NIFTY\"}]},{\"name\":\">=\",\"params\":[]},{\"name\":\"GetVar\",\"kid\":9999,\"params\":[{\"type\":\"value\",\"value\":\"spot_entry\"}]},{\"name\":\"+\",\"params\":[]},{\"name\":\"Number\",\"kid\":3336,\"params\":[{\"type\":\"value\",\"value\":\"75\"}]}]}]}",
-          "conditionDisplay": "( LTP ( 'NIFTY' ) >= ( GetVar ( 'spot_entry' ) + Number ( '75' ) ) )",
+          "type": "Exit",
+          "conditionValue": "( tt_LTP ( 'NIFTY' ) >= ( tt_GetRuntimeNumber ( 'spot_entry_chop_ce' ) + ( tt_Number ( '90' ) - tt_MathOperation ( tt_Number ( '30' ), 'Multiply', tt_KaufmanEfficiency ( '10', '5min', 'NIFTY' ) ) ) ) )",
+          "conditionJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"LTP\",\"kid\":1042,\"params\":[{\"type\":\"value\",\"value\":\"NIFTY\"}]},{\"name\":\">=\",\"params\":[]},{\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"keyword\",\"name\":\"Get Runtime Number\",\"kid\":9998,\"params\":[{\"type\":\"value\",\"value\":\"spot_entry_chop_ce\"}]},{\"type\":\"value\",\"value\":\"Add\"},{\"type\":\"keyword\",\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"value\",\"value\":\"90\"},{\"type\":\"value\",\"value\":\"Subtract\"},{\"type\":\"keyword\",\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"value\",\"value\":\"30\"},{\"type\":\"value\",\"value\":\"Multiply\"},{\"type\":\"keyword\",\"name\":\"Kaufman Efficiency indicator\",\"kid\":7002,\"params\":[{\"type\":\"value\",\"value\":\"10\"},{\"type\":\"value\",\"value\":\"5min\"},{\"type\":\"value\",\"value\":\"NIFTY\"}]}]}]}]}]}]}",
+          "conditionDisplay": "( LTP ( 'NIFTY' ) >= ( GetRuntimeNumber ( 'spot_entry_chop_ce' ) + ( Number ( '90' ) - MathOperation ( Number ( '30' ), Multiply, KaufmanEfficiency ( '10', '5min', 'NIFTY' ) ) ) ) )",
           "subType": "None",
-          "visible": 1,
-          "legs": [
-            {
-              "instrument": 1,
-              "list": 0,
-              "optionType": "CE",
-              "expiryType": "Current Week",
-              "strikeType": "Fx",
-              "strike": "( find_traded_instrument ( 'strategy_id', 'run_counter', 'Entry', 'strike', 'NIFTY', '1', '1', '1' ) )",
-              "strikeJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"Traded Instrument\",\"kid\":8713,\"params\":[{\"type\":\"value\",\"value\":\"Entry\"},{\"type\":\"value\",\"value\":\"strike\"},{\"type\":\"value\",\"value\":\"NIFTY\"},{\"type\":\"value\",\"value\":\"1\"},{\"type\":\"value\",\"value\":\"1\"},{\"type\":\"value\",\"value\":\"1\"}]}]}]}",
-              "qty": "tt_lots(1,'INSTRUMENT','CE')",
-              "buySell": "B",
-              "productType": "NRML",
-              "underlyingSymbol": "NIFTY"
-            }
-          ],
-          "extra": {
-            "name": null,
-            "variables": []
-          }
-        },
-        {
-          "type": "Repair Once",
-          "conditionValue": "( tt_LTP ( 'NIFTY' ) <= ( tt_GetVar ( 'spot_entry' ) - tt_Number ( '75' ) ) )",
-          "conditionJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"LTP\",\"kid\":1042,\"params\":[{\"type\":\"value\",\"value\":\"NIFTY\"}]},{\"name\":\"<=\",\"params\":[]},{\"name\":\"GetVar\",\"kid\":9999,\"params\":[{\"type\":\"value\",\"value\":\"spot_entry\"}]},{\"name\":\"-\",\"params\":[]},{\"name\":\"Number\",\"kid\":3336,\"params\":[{\"type\":\"value\",\"value\":\"75\"}]}]}]}",
-          "conditionDisplay": "( LTP ( 'NIFTY' ) <= ( GetVar ( 'spot_entry' ) - Number ( '75' ) ) )",
-          "subType": "None",
-          "visible": 1,
-          "legs": [
-            {
-              "instrument": 1,
-              "list": 0,
-              "optionType": "PE",
-              "expiryType": "Current Week",
-              "strikeType": "Fx",
-              "strike": "( find_traded_instrument ( 'strategy_id', 'run_counter', 'Entry', 'strike', 'NIFTY', '1', '1', '2' ) )",
-              "strikeJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"Traded Instrument\",\"kid\":8713,\"params\":[{\"type\":\"value\",\"value\":\"Entry\"},{\"type\":\"value\",\"value\":\"strike\"},{\"type\":\"value\",\"value\":\"NIFTY\"},{\"type\":\"value\",\"value\":\"1\"},{\"type\":\"value\",\"value\":\"1\"},{\"type\":\"value\",\"value\":\"2\"}]}]}]}",
-              "qty": "tt_lots(1,'INSTRUMENT','PE')",
-              "buySell": "B",
-              "productType": "NRML",
-              "underlyingSymbol": "NIFTY"
-            }
-          ],
-          "extra": {
-            "name": null,
-            "variables": []
-          }
+          "visible": 1
         }
       ]
     },
     {
       "list": 1,
-      "name": "Set 2 - Bullish Trend (ADX >= 20 & +DI > -DI)",
+      "name": "Set 2 - Chop PE",
       "conditions": [
         {
           "type": "Entry",
-          "conditionValue": "( tt_Time ( 'NSE' ) >= tt_Number ( '0918' ) ) and ( tt_ADX ( '14', '5min' ) >= tt_Number ( '20' ) ) and ( tt_Plus_DI ( '14', '5min' ) > tt_Minus_DI ( '14', '5min' ) )",
-          "conditionJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"Time\",\"kid\":4051,\"params\":[{\"type\":\"value\",\"value\":\"NSE\"}]},{\"name\":\">=\",\"params\":[]},{\"name\":\"Number\",\"kid\":3336,\"params\":[{\"type\":\"value\",\"value\":\"0918\"}]}]},{\"type\":\"rule\",\"value\":\"builder-basic_rule_1\",\"elements\":[{\"name\":\"ADX\",\"kid\":1001,\"params\":[{\"type\":\"value\",\"value\":\"14\"},{\"type\":\"value\",\"value\":\"5min\"}]},{\"name\":\">=\",\"params\":[]},{\"name\":\"Number\",\"kid\":3336,\"params\":[{\"type\":\"value\",\"value\":\"20\"}]}]},{\"type\":\"rule\",\"value\":\"builder-basic_rule_2\",\"elements\":[{\"name\":\"+DI\",\"kid\":1002,\"params\":[{\"type\":\"value\",\"value\":\"14\"},{\"type\":\"value\",\"value\":\"5min\"}]},{\"name\":\">\",\"params\":[]},{\"name\":\"-DI\",\"kid\":1003,\"params\":[{\"type\":\"value\",\"value\":\"14\"},{\"type\":\"value\",\"value\":\"5min\"}]}]}]}",
-          "conditionDisplay": "( Time ( 'NSE' ) >= Number ( '0918' ) ) and ( ADX ( '14', '5min' ) >= Number ( '20' ) ) and ( +DI ( '14', '5min' ) > -DI ( '14', '5min' ) )",
+          "conditionValue": "( tt_Time ( 'NSE' ) >= tt_Number ( '0918' ) ) and ( tt_ADX ( '14', '5min', 'NIFTY' ) < tt_Number ( '20' ) )",
+          "conditionJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"Time\",\"kid\":4051,\"params\":[{\"type\":\"value\",\"value\":\"NSE\"}]},{\"name\":\">=\",\"params\":[]},{\"name\":\"Number\",\"kid\":3336,\"params\":[{\"type\":\"value\",\"value\":\"0918\"}]}]},{\"type\":\"rule\",\"value\":\"builder-basic_rule_1\",\"elements\":[{\"name\":\"ADX\",\"kid\":1001,\"params\":[{\"type\":\"value\",\"value\":\"14\"},{\"type\":\"value\",\"value\":\"5min\"},{\"type\":\"value\",\"value\":\"NIFTY\"}]},{\"name\":\"<\",\"params\":[]},{\"name\":\"Number\",\"kid\":3336,\"params\":[{\"type\":\"value\",\"value\":\"20\"}]}]}]}",
+          "conditionDisplay": "( Time ( 'NSE' ) >= Number ( '0918' ) ) and ( ADX ( '14', '5min', 'NIFTY' ) < Number ( '20' ) )",
           "subType": "None",
           "visible": 1,
           "legs": [
@@ -134,9 +84,9 @@
               "list": 1,
               "optionType": "PE",
               "expiryType": "Current Week",
-              "strikeType": "Premium",
-              "strike": "tt_Number('75')",
-              "strikeJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"Number\",\"kid\":3336,\"params\":[{\"type\":\"value\",\"value\":\"75\"}]}]}]}",
+              "strikeType": "Fx",
+              "strike": "( tt_FindStrike ( 'NIFTY', 'CurrentWeekExpiry', 'PE', 'LTP', tt_Number('40'), 'ANY' ) )",
+              "strikeJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"Find Strike\",\"kid\":7001,\"params\":[{\"type\":\"value\",\"value\":\"NIFTY\"},{\"type\":\"value\",\"value\":\"CurrentWeekExpiry\"},{\"type\":\"value\",\"value\":\"PE\"},{\"type\":\"value\",\"value\":\"LTP\"},{\"type\":\"value\",\"value\":\"40\"},{\"type\":\"value\",\"value\":\"ANY\"}]}]}]}",
               "qty": "tt_lots(1,'INSTRUMENT','PE')",
               "buySell": "S",
               "productType": "NRML",
@@ -147,7 +97,7 @@
             "name": null,
             "variables": [
               {
-                "variableName": "spot_entry",
+                "variableName": "spot_entry_chop_pe",
                 "value": "( tt_LTP ( 'NIFTY' ) )",
                 "display": "( LTP ( 'NIFTY' ) )",
                 "json": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"LTP\",\"kid\":1042,\"params\":[{\"type\":\"value\",\"value\":\"NIFTY\"}]}]}]}"
@@ -156,54 +106,83 @@
           }
         },
         {
-          "type": "Repair Once",
-          "conditionValue": "( tt_LTP ( 'NIFTY' ) <= ( tt_GetVar ( 'spot_entry' ) - tt_Number ( '50' ) ) )",
-          "conditionJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"LTP\",\"kid\":1042,\"params\":[{\"type\":\"value\",\"value\":\"NIFTY\"}]},{\"name\":\"<=\",\"params\":[]},{\"name\":\"GetVar\",\"kid\":9999,\"params\":[{\"type\":\"value\",\"value\":\"spot_entry\"}]},{\"name\":\"-\",\"params\":[]},{\"name\":\"Number\",\"kid\":3336,\"params\":[{\"type\":\"value\",\"value\":\"50\"}]}]}]}",
-          "conditionDisplay": "( LTP ( 'NIFTY' ) <= ( GetVar ( 'spot_entry' ) - Number ( '50' ) ) )",
+          "type": "Exit",
+          "conditionValue": "( tt_LTP ( 'NIFTY' ) <= ( tt_GetRuntimeNumber ( 'spot_entry_chop_pe' ) - ( tt_Number ( '90' ) - tt_MathOperation ( tt_Number ( '30' ), 'Multiply', tt_KaufmanEfficiency ( '10', '5min', 'NIFTY' ) ) ) ) )",
+          "conditionJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"LTP\",\"kid\":1042,\"params\":[{\"type\":\"value\",\"value\":\"NIFTY\"}]},{\"name\":\"<=\",\"params\":[]},{\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"keyword\",\"name\":\"Get Runtime Number\",\"kid\":9998,\"params\":[{\"type\":\"value\",\"value\":\"spot_entry_chop_pe\"}]},{\"type\":\"value\",\"value\":\"Subtract\"},{\"type\":\"keyword\",\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"value\",\"value\":\"90\"},{\"type\":\"value\",\"value\":\"Subtract\"},{\"type\":\"keyword\",\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"value\",\"value\":\"30\"},{\"type\":\"value\",\"value\":\"Multiply\"},{\"type\":\"keyword\",\"name\":\"Kaufman Efficiency indicator\",\"kid\":7002,\"params\":[{\"type\":\"value\",\"value\":\"10\"},{\"type\":\"value\",\"value\":\"5min\"},{\"type\":\"value\",\"value\":\"NIFTY\"}]}]}]}]}]}]}",
+          "conditionDisplay": "( LTP ( 'NIFTY' ) <= ( GetRuntimeNumber ( 'spot_entry_chop_pe' ) - ( Number ( '90' ) - MathOperation ( Number ( '30' ), Multiply, KaufmanEfficiency ( '10', '5min', 'NIFTY' ) ) ) ) )",
           "subType": "None",
-          "visible": 1,
-          "legs": [
-            {
-              "instrument": 1,
-              "list": 1,
-              "optionType": "PE",
-              "expiryType": "Current Week",
-              "strikeType": "Fx",
-              "strike": "( find_traded_instrument ( 'strategy_id', 'run_counter', 'Entry', 'strike', 'NIFTY', '1', '1', '1' ) )",
-              "strikeJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"Traded Instrument\",\"kid\":8713,\"params\":[{\"type\":\"value\",\"value\":\"Entry\"},{\"type\":\"value\",\"value\":\"strike\"},{\"type\":\"value\",\"value\":\"NIFTY\"},{\"type\":\"value\",\"value\":\"1\"},{\"type\":\"value\",\"value\":\"1\"},{\"type\":\"value\",\"value\":\"1\"}]}]}]}",
-              "qty": "tt_lots(1,'INSTRUMENT','PE')",
-              "buySell": "B",
-              "productType": "NRML",
-              "underlyingSymbol": "NIFTY"
-            }
-          ],
-          "extra": {
-            "name": null,
-            "variables": []
-          }
+          "visible": 1
         }
       ]
     },
     {
       "list": 2,
-      "name": "Set 3 - Bearish Trend (ADX >= 20 & -DI > +DI)",
+      "name": "Set 3 - Bullish (KAMA rising)",
       "conditions": [
         {
           "type": "Entry",
-          "conditionValue": "( tt_Time ( 'NSE' ) >= tt_Number ( '0918' ) ) and ( tt_ADX ( '14', '5min' ) >= tt_Number ( '20' ) ) and ( tt_Minus_DI ( '14', '5min' ) > tt_Plus_DI ( '14', '5min' ) )",
-          "conditionJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"Time\",\"kid\":4051,\"params\":[{\"type\":\"value\",\"value\":\"NSE\"}]},{\"name\":\">=\",\"params\":[]},{\"name\":\"Number\",\"kid\":3336,\"params\":[{\"type\":\"value\",\"value\":\"0918\"}]}]},{\"type\":\"rule\",\"value\":\"builder-basic_rule_1\",\"elements\":[{\"name\":\"ADX\",\"kid\":1001,\"params\":[{\"type\":\"value\",\"value\":\"14\"},{\"type\":\"value\",\"value\":\"5min\"}]},{\"name\":\">=\",\"params\":[]},{\"name\":\"Number\",\"kid\":3336,\"params\":[{\"type\":\"value\",\"value\":\"20\"}]}]},{\"type\":\"rule\",\"value\":\"builder-basic_rule_2\",\"elements\":[{\"name\":\"-DI\",\"kid\":1003,\"params\":[{\"type\":\"value\",\"value\":\"14\"},{\"type\":\"value\",\"value\":\"5min\"}]},{\"name\":\">\",\"params\":[]},{\"name\":\"+DI\",\"kid\":1002,\"params\":[{\"type\":\"value\",\"value\":\"14\"},{\"type\":\"value\",\"value\":\"5min\"}]}]}]}",
-          "conditionDisplay": "( Time ( 'NSE' ) >= Number ( '0918' ) ) and ( ADX ( '14', '5min' ) >= Number ( '20' ) ) and ( -DI ( '14', '5min' ) > +DI ( '14', '5min' ) )",
+          "conditionValue": "( tt_Time ( 'NSE' ) >= tt_Number ( '0918' ) ) and ( tt_ADX ( '14', '5min', 'NIFTY' ) >= tt_Number ( '20' ) ) and ( tt_KaufmanAdaptiveMA ( '10', '0', '5min', 'NIFTY' ) > tt_KaufmanAdaptiveMA ( '10', '-1', '5min', 'NIFTY' ) )",
+          "conditionJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"Time\",\"kid\":4051,\"params\":[{\"type\":\"value\",\"value\":\"NSE\"}]},{\"name\":\">=\",\"params\":[]},{\"name\":\"Number\",\"kid\":3336,\"params\":[{\"type\":\"value\",\"value\":\"0918\"}]}]},{\"type\":\"rule\",\"value\":\"builder-basic_rule_1\",\"elements\":[{\"name\":\"ADX\",\"kid\":1001,\"params\":[{\"type\":\"value\",\"value\":\"14\"},{\"type\":\"value\",\"value\":\"5min\"},{\"type\":\"value\",\"value\":\"NIFTY\"}]},{\"name\":\">=\",\"params\":[]},{\"name\":\"Number\",\"kid\":3336,\"params\":[{\"type\":\"value\",\"value\":\"20\"}]}]},{\"type\":\"rule\",\"value\":\"builder-basic_rule_2\",\"elements\":[{\"name\":\"Kaufman Adaptive MA\",\"kid\":7003,\"params\":[{\"type\":\"value\",\"value\":\"10\"},{\"type\":\"value\",\"value\":\"0\"},{\"type\":\"value\",\"value\":\"5min\"},{\"type\":\"value\",\"value\":\"NIFTY\"}]},{\"name\":\">\",\"params\":[]},{\"name\":\"Kaufman Adaptive MA\",\"kid\":7003,\"params\":[{\"type\":\"value\",\"value\":\"10\"},{\"type\":\"value\",\"value\":\"-1\"},{\"type\":\"value\",\"value\":\"5min\"},{\"type\":\"value\",\"value\":\"NIFTY\"}]}]}]}",
+          "conditionDisplay": "( Time ( 'NSE' ) >= Number ( '0918' ) ) and ( ADX ( '14', '5min', 'NIFTY' ) >= Number ( '20' ) ) and ( KaufmanAdaptiveMA(10, offset 0) > KaufmanAdaptiveMA(10, offset -1) )",
           "subType": "None",
           "visible": 1,
           "legs": [
             {
               "instrument": 1,
               "list": 2,
+              "optionType": "PE",
+              "expiryType": "Current Week",
+              "strikeType": "Fx",
+              "strike": "( tt_FindStrike ( 'NIFTY', 'CurrentWeekExpiry', 'PE', 'LTP', tt_Number('75'), 'ANY' ) )",
+              "strikeJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"Find Strike\",\"kid\":7001,\"params\":[{\"type\":\"value\",\"value\":\"NIFTY\"},{\"type\":\"value\",\"value\":\"CurrentWeekExpiry\"},{\"type\":\"value\",\"value\":\"PE\"},{\"type\":\"value\",\"value\":\"LTP\"},{\"type\":\"value\",\"value\":\"75\"},{\"type\":\"value\",\"value\":\"ANY\"}]}]}]}",
+              "qty": "tt_lots(1,'INSTRUMENT','PE')",
+              "buySell": "S",
+              "productType": "NRML",
+              "underlyingSymbol": "NIFTY"
+            }
+          ],
+          "extra": {
+            "name": null,
+            "variables": [
+              {
+                "variableName": "spot_entry_bull",
+                "value": "( tt_LTP ( 'NIFTY' ) )",
+                "display": "( LTP ( 'NIFTY' ) )",
+                "json": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"LTP\",\"kid\":1042,\"params\":[{\"type\":\"value\",\"value\":\"NIFTY\"}]}]}]}"
+              }
+            ]
+          }
+        },
+        {
+          "type": "Exit",
+          "conditionValue": "( tt_LTP ( 'NIFTY' ) <= ( tt_GetRuntimeNumber ( 'spot_entry_bull' ) - ( tt_Number ( '65' ) - tt_MathOperation ( tt_Number ( '30' ), 'Multiply', tt_KaufmanEfficiency ( '10', '5min', 'NIFTY' ) ) ) ) )",
+          "conditionJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"LTP\",\"kid\":1042,\"params\":[{\"type\":\"value\",\"value\":\"NIFTY\"}]},{\"name\":\"<=\",\"params\":[]},{\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"keyword\",\"name\":\"Get Runtime Number\",\"kid\":9998,\"params\":[{\"type\":\"value\",\"value\":\"spot_entry_bull\"}]},{\"type\":\"value\",\"value\":\"Subtract\"},{\"type\":\"keyword\",\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"value\",\"value\":\"65\"},{\"type\":\"value\",\"value\":\"Subtract\"},{\"type\":\"keyword\",\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"value\",\"value\":\"30\"},{\"type\":\"value\",\"value\":\"Multiply\"},{\"type\":\"keyword\",\"name\":\"Kaufman Efficiency indicator\",\"kid\":7002,\"params\":[{\"type\":\"value\",\"value\":\"10\"},{\"type\":\"value\",\"value\":\"5min\"},{\"type\":\"value\",\"value\":\"NIFTY\"}]}]}]}]}]}]}",
+          "conditionDisplay": "( LTP ( 'NIFTY' ) <= ( GetRuntimeNumber ( 'spot_entry_bull' ) - ( Number ( '65' ) - MathOperation ( Number ( '30' ), Multiply, KaufmanEfficiency ( '10', '5min', 'NIFTY' ) ) ) ) )",
+          "subType": "None",
+          "visible": 1
+        }
+      ]
+    },
+    {
+      "list": 3,
+      "name": "Set 4 - Bearish (KAMA falling)",
+      "conditions": [
+        {
+          "type": "Entry",
+          "conditionValue": "( tt_Time ( 'NSE' ) >= tt_Number ( '0918' ) ) and ( tt_ADX ( '14', '5min', 'NIFTY' ) >= tt_Number ( '20' ) ) and ( tt_KaufmanAdaptiveMA ( '10', '0', '5min', 'NIFTY' ) < tt_KaufmanAdaptiveMA ( '10', '-1', '5min', 'NIFTY' ) )",
+          "conditionJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"Time\",\"kid\":4051,\"params\":[{\"type\":\"value\",\"value\":\"NSE\"}]},{\"name\":\">=\",\"params\":[]},{\"name\":\"Number\",\"kid\":3336,\"params\":[{\"type\":\"value\",\"value\":\"0918\"}]}]},{\"type\":\"rule\",\"value\":\"builder-basic_rule_1\",\"elements\":[{\"name\":\"ADX\",\"kid\":1001,\"params\":[{\"type\":\"value\",\"value\":\"14\"},{\"type\":\"value\",\"value\":\"5min\"},{\"type\":\"value\",\"value\":\"NIFTY\"}]},{\"name\":\">=\",\"params\":[]},{\"name\":\"Number\",\"kid\":3336,\"params\":[{\"type\":\"value\",\"value\":\"20\"}]}]},{\"type\":\"rule\",\"value\":\"builder-basic_rule_2\",\"elements\":[{\"name\":\"Kaufman Adaptive MA\",\"kid\":7003,\"params\":[{\"type\":\"value\",\"value\":\"10\"},{\"type\":\"value\",\"value\":\"0\"},{\"type\":\"value\",\"value\":\"5min\"},{\"type\":\"value\",\"value\":\"NIFTY\"}]},{\"name\":\"<\",\"params\":[]},{\"name\":\"Kaufman Adaptive MA\",\"kid\":7003,\"params\":[{\"type\":\"value\",\"value\":\"10\"},{\"type\":\"value\",\"value\":\"-1\"},{\"type\":\"value\",\"value\":\"5min\"},{\"type\":\"value\",\"value\":\"NIFTY\"}]}]}]}",
+          "conditionDisplay": "( Time ( 'NSE' ) >= Number ( '0918' ) ) and ( ADX ( '14', '5min', 'NIFTY' ) >= Number ( '20' ) ) and ( KaufmanAdaptiveMA(10, offset 0) < KaufmanAdaptiveMA(10, offset -1) )",
+          "subType": "None",
+          "visible": 1,
+          "legs": [
+            {
+              "instrument": 1,
+              "list": 3,
               "optionType": "CE",
               "expiryType": "Current Week",
-              "strikeType": "Premium",
-              "strike": "tt_Number('75')",
-              "strikeJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"Number\",\"kid\":3336,\"params\":[{\"type\":\"value\",\"value\":\"75\"}]}]}]}",
+              "strikeType": "Fx",
+              "strike": "( tt_FindStrike ( 'NIFTY', 'CurrentWeekExpiry', 'CE', 'LTP', tt_Number('75'), 'ANY' ) )",
+              "strikeJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"Find Strike\",\"kid\":7001,\"params\":[{\"type\":\"value\",\"value\":\"NIFTY\"},{\"type\":\"value\",\"value\":\"CurrentWeekExpiry\"},{\"type\":\"value\",\"value\":\"CE\"},{\"type\":\"value\",\"value\":\"LTP\"},{\"type\":\"value\",\"value\":\"75\"},{\"type\":\"value\",\"value\":\"ANY\"}]}]}]}",
               "qty": "tt_lots(1,'INSTRUMENT','CE')",
               "buySell": "S",
               "productType": "NRML",
@@ -214,7 +193,7 @@
             "name": null,
             "variables": [
               {
-                "variableName": "spot_entry",
+                "variableName": "spot_entry_bear",
                 "value": "( tt_LTP ( 'NIFTY' ) )",
                 "display": "( LTP ( 'NIFTY' ) )",
                 "json": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"LTP\",\"kid\":1042,\"params\":[{\"type\":\"value\",\"value\":\"NIFTY\"}]}]}]}"
@@ -223,31 +202,12 @@
           }
         },
         {
-          "type": "Repair Once",
-          "conditionValue": "( tt_LTP ( 'NIFTY' ) >= ( tt_GetVar ( 'spot_entry' ) + tt_Number ( '50' ) ) )",
-          "conditionJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"LTP\",\"kid\":1042,\"params\":[{\"type\":\"value\",\"value\":\"NIFTY\"}]},{\"name\":\">=\",\"params\":[]},{\"name\":\"GetVar\",\"kid\":9999,\"params\":[{\"type\":\"value\",\"value\":\"spot_entry\"}]},{\"name\":\"+\",\"params\":[]},{\"name\":\"Number\",\"kid\":3336,\"params\":[{\"type\":\"value\",\"value\":\"50\"}]}]}]}",
-          "conditionDisplay": "( LTP ( 'NIFTY' ) >= ( GetVar ( 'spot_entry' ) + Number ( '50' ) ) )",
+          "type": "Exit",
+          "conditionValue": "( tt_LTP ( 'NIFTY' ) >= ( tt_GetRuntimeNumber ( 'spot_entry_bear' ) + ( tt_Number ( '65' ) - tt_MathOperation ( tt_Number ( '30' ), 'Multiply', tt_KaufmanEfficiency ( '10', '5min', 'NIFTY' ) ) ) ) )",
+          "conditionJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"LTP\",\"kid\":1042,\"params\":[{\"type\":\"value\",\"value\":\"NIFTY\"}]},{\"name\":\">=\",\"params\":[]},{\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"keyword\",\"name\":\"Get Runtime Number\",\"kid\":9998,\"params\":[{\"type\":\"value\",\"value\":\"spot_entry_bear\"}]},{\"type\":\"value\",\"value\":\"Add\"},{\"type\":\"keyword\",\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"value\",\"value\":\"65\"},{\"type\":\"value\",\"value\":\"Subtract\"},{\"type\":\"keyword\",\"name\":\"Math Operation\",\"kid\":7100,\"params\":[{\"type\":\"value\",\"value\":\"30\"},{\"type\":\"value\",\"value\":\"Multiply\"},{\"type\":\"keyword\",\"name\":\"Kaufman Efficiency indicator\",\"kid\":7002,\"params\":[{\"type\":\"value\",\"value\":\"10\"},{\"type\":\"value\",\"value\":\"5min\"},{\"type\":\"value\",\"value\":\"NIFTY\"}]}]}]}]}]}]}",
+          "conditionDisplay": "( LTP ( 'NIFTY' ) >= ( GetRuntimeNumber ( 'spot_entry_bear' ) + ( Number ( '65' ) - MathOperation ( Number ( '30' ), Multiply, KaufmanEfficiency ( '10', '5min', 'NIFTY' ) ) ) ) )",
           "subType": "None",
-          "visible": 1,
-          "legs": [
-            {
-              "instrument": 1,
-              "list": 2,
-              "optionType": "CE",
-              "expiryType": "Current Week",
-              "strikeType": "Fx",
-              "strike": "( find_traded_instrument ( 'strategy_id', 'run_counter', 'Entry', 'strike', 'NIFTY', '1', '1', '1' ) )",
-              "strikeJson": "{\"operator\":\"and\",\"operands\":[{\"type\":\"rule\",\"value\":\"builder-basic_rule_0\",\"elements\":[{\"name\":\"Traded Instrument\",\"kid\":8713,\"params\":[{\"type\":\"value\",\"value\":\"Entry\"},{\"type\":\"value\",\"value\":\"strike\"},{\"type\":\"value\",\"value\":\"NIFTY\"},{\"type\":\"value\",\"value\":\"1\"},{\"type\":\"value\",\"value\":\"1\"},{\"type\":\"value\",\"value\":\"1\"}]}]}]}",
-              "qty": "tt_lots(1,'INSTRUMENT','CE')",
-              "buySell": "B",
-              "productType": "NRML",
-              "underlyingSymbol": "NIFTY"
-            }
-          ],
-          "extra": {
-            "name": null,
-            "variables": []
-          }
+          "visible": 1
         }
       ]
     }
