@@ -79,6 +79,10 @@ def fetch_request_code():
     totp_code = pyotp.TOTP(clean_key).now()
     print(f"      Generated TOTP Code: {totp_code}")
 
+    totp_field = get_visible_inputs(driver)[2]
+    totp_field.clear()
+    totp_field.send_keys(totp_code)
+    
     # Trigger Vue reactive events if necessary
     totp_field.send_keys(Keys.TAB)
     time.sleep(1)
