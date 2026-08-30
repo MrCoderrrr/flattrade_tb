@@ -1,0 +1,6 @@
+requests
+websocket_client
+./dist/norenrestapi-0.0.30-py3-none-any.whl
+pandas
+pyyaml
+undetected-chromedriver
