@@ -149,7 +149,7 @@ def get_safe_strikes(spot, atr=35.0, min_width=0, max_width=0, atr_multiplier=1.
 def find_option_symbol(api_instance, strike, option_type, expiry_prefix="NIFTY"):
     """
     Searches Flattrade for the exact option trading symbol for a given strike.
-    Option type: 'CE' or 'PE'
+    Returns a dictionary with 'tsym' and 'ls' (Lot Size), or None.
     """
     search_text = f"{expiry_prefix} {strike} {option_type}"
     print(f"Searching symbol for: {search_text}")
@@ -159,15 +159,25 @@ def find_option_symbol(api_instance, strike, option_type, expiry_prefix="NIFTY")
         opt_char = option_type[0] # 'C' or 'P'
         expected_suffix = f"{opt_char}{strike}"
         
-        # Try to find an exact suffix match (e.g., ends with C24050)
-        # and prefer weekly options (usually shorter symbol length than monthly if different format, 
-        # or just take the first exact match as Flattrade sorts nearest expiry first).
+        valid_candidates = []
         for item in res['values']:
-            if item['tsym'].endswith(expected_suffix):
-                return item['tsym']
-                
-        # Fallback if no exact suffix match
-        return res['values'][0]['tsym']
+            if item['tsym'].endswith(expected_suffix) and 'exd' in item:
+                # Parse date to sort safely
+                try:
+                    dt = datetime.strptime(item['exd'], "%d-%b-%Y")
+                    valid_candidates.append({'item': item, 'dt': dt})
+                except ValueError:
+                    continue
+                    
+        if valid_candidates:
+            # Sort by nearest expiry date
+            valid_candidates.sort(key=lambda x: x['dt'])
+            best_match = valid_candidates[0]['item']
+            print(f"  -> Selected Nearest Expiry: {best_match['tsym']} (Lot Size: {best_match['ls']})")
+            return {'tsym': best_match['tsym'], 'ls': int(best_match['ls'])}
+            
+        print(f"  -> No valid candidates ended with {expected_suffix} and had 'exd'.")
+        return None
     else:
         print(f"Could not find symbol for {search_text}: {res}")
         return None
@@ -296,25 +306,24 @@ def run_v2_iron_condor():
     # 4. Resolve exact trading symbols from Flattrade
     search_prefix = "NIFTY" 
     
-    long_pe_sym = find_option_symbol(api, long_pe_strike, 'PE', search_prefix)
-    long_ce_sym = find_option_symbol(api, long_ce_strike, 'CE', search_prefix)
-    short_pe_sym = find_option_symbol(api, short_pe_strike, 'PE', search_prefix)
-    short_ce_sym = find_option_symbol(api, short_ce_strike, 'CE', search_prefix)
+    long_pe_data = find_option_symbol(api, long_pe_strike, 'PE', search_prefix)
+    long_ce_data = find_option_symbol(api, long_ce_strike, 'CE', search_prefix)
+    short_pe_data = find_option_symbol(api, short_pe_strike, 'PE', search_prefix)
+    short_ce_data = find_option_symbol(api, short_ce_strike, 'CE', search_prefix)
     
-    if not all([long_pe_sym, long_ce_sym, short_pe_sym, short_ce_sym]):
-        print("Aborting: Failed to resolve all option symbols.")
+    if not all([long_pe_data, long_ce_data, short_pe_data, short_ce_data]):
+        print("Aborting: Failed to resolve all option symbols and lot sizes.")
         return
         
     # 5. Define Iron Condor Legs
     # Sequence: Buy Hedges first to reduce margin, then Sell Shorts
-    qty = 75 # Lot size
     product = "M" # NRML
     
     iron_condor_legs = [
-        {'symbol': long_pe_sym,  'action': 'B', 'qty': qty, 'product': product},
-        {'symbol': long_ce_sym,  'action': 'B', 'qty': qty, 'product': product},
-        {'symbol': short_pe_sym, 'action': 'S', 'qty': qty, 'product': product},
-        {'symbol': short_ce_sym, 'action': 'S', 'qty': qty, 'product': product},
+        {'symbol': long_pe_data['tsym'],  'action': 'B', 'qty': long_pe_data['ls'], 'product': product},
+        {'symbol': long_ce_data['tsym'],  'action': 'B', 'qty': long_ce_data['ls'], 'product': product},
+        {'symbol': short_pe_data['tsym'], 'action': 'S', 'qty': short_pe_data['ls'], 'product': product},
+        {'symbol': short_ce_data['tsym'], 'action': 'S', 'qty': short_ce_data['ls'], 'product': product},
     ]
     
     # 6. Execute Trades
