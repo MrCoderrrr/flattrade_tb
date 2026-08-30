@@ -14,19 +14,19 @@ def place_leg(api_instance, symbol, buy_or_sell, quantity, product_type="M", pri
     """
     try:
         res = api_instance.place_order(
-            buy_or_sell=buy_or_sell,       # 'B' or 'S'
-            product_type=product_type,     # 'M' for NRML, 'I' for MIS
-            exchange=exchange,             # 'NFO' for options/futures
-            tradingsymbol=symbol,          # e.g., 'NIFTY28MAR24C22000'
-            quantity=quantity,
-            discloseqty=0,
-            price_type=price_type,         # 'MKT' or 'LMT'
-            price=price,
-            trigger_price=0,
+            buy_or_sell=str(buy_or_sell),       # 'B' or 'S'
+            product_type=str(product_type),     # 'M' for NRML, 'I' for MIS
+            exchange=str(exchange),             # 'NFO' for options/futures
+            tradingsymbol=str(symbol),          # e.g., 'NIFTY28MAR24C22000'
+            quantity=str(quantity),
+            discloseqty="0",
+            price_type=str(price_type),         # 'MKT' or 'LMT'
+            price=str(price),
+            trigger_price="0",
             retention='DAY',
             remarks='API_Strategy_Leg'
         )
-        if res and res.get('stat') == 'Ok':
+        if res and isinstance(res, dict) and res.get('stat') == 'Ok':
             print(f"[SUCCESS] {buy_or_sell} {quantity} x {symbol} | Order No: {res.get('norenordno')}")
             return res
         else:
