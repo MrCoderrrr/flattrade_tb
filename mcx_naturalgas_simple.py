@@ -17,7 +17,7 @@ except Exception:
 
 TOKEN_FILE = "token.txt"
 STRIKE_STEP = 1.0
-ENTRY_TIME = "09:15"
+ENTRY_TIME = "18:00"
 EXIT_TIME = "11:24"
 
 
@@ -269,8 +269,8 @@ class NaturalGasBot:
                     self._close_all("SESSION_END")
                     break
 
-                # Pre-market wait until 9:15 AM
-                if now.hour < 9 or (now.hour == 9 and now.minute < 15):
+                # Pre-market wait until 6:00 PM
+                if now.hour < 18:
                     time.sleep(30)
                     continue
 
@@ -291,7 +291,7 @@ class NaturalGasBot:
 
                 # If we have no positions, open 1 leg based on the KAMA trend
                 if not self.positions:
-                    if now.hour > 9 or (now.hour == 9 and now.minute >= 15):
+                    if now.hour >= 18:
                         atm = self.find_atm_strike(spot)
                         
                         # Directional Entry (Capital only allows 1 leg)
