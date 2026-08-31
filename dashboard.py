@@ -278,6 +278,9 @@ def main():
                     for leg, p in snap.get('positions', {}).items():
                         sl_line = (p.get('spot_sl_state') or {}).get('current_sl', '-')
                         print(f" {leg:<10} Strike {p.get('strike'):<6} Entry ₹{p.get('entry_price'):<6.2f} LTP ₹{p.get('live_ltp'):<6.2f} PnL ₹{p.get('live_pnl',0):<8.2f} SL {sl_line}")
+                else:
+                    print("=== V2 PRO DASHBOARD ===")
+                    print("Waiting for bot data... (Checking data/state/live_snapshot_v2.json)")
                 time.sleep(3.0)
         except KeyboardInterrupt:
             pass
