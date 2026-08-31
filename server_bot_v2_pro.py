@@ -1099,10 +1099,7 @@ class ExecutionEngine:
 
                 if self.mode == "WAIT_DATA":
                     if now.hour > MARKET_START_HOUR or (now.hour == MARKET_START_HOUR and now.minute >= MARKET_START_MINUTE):
-                        # After a whipsaw exit, pause 5 minutes before entering a new strangle
-                        if time.time() - self._last_whipsaw_time < 300.0:
-                            pass
-                        elif regime == "TRANSITION":
+                        if regime == "TRANSITION":
                             log_info(f"09:18 AM reached but ADX {adx:.1f} is in the TRANSITION band — holding entry.")
                         else:
                             log_info(f"Market Ready. Entering Strangle (Regime: {regime}, KAMA 1m Trend: {trend})...")
@@ -1117,6 +1114,11 @@ class ExecutionEngine:
 
                 elif self.mode in ("RUNNING", "CHOP_MODE"):
                     if not self.positions:
+                        self.mode = "WAIT_DATA"
+                        continue
+                    
+                    if "CE" not in self.positions and "PE" not in self.positions:
+                        log_info("Core short legs (CE/PE) are missing. Reverting to WAIT_DATA to re-enter strangle.")
                         self.mode = "WAIT_DATA"
                         continue
 
