@@ -118,7 +118,7 @@ MARGIN_IRON_CONDOR      = 95_000
 PORTFOLIO_CIRCUIT_PCT   = 1.8         
 
 KAMA_PERIOD             = 13          
-KAMA_FAST_EMA           = 2           
+KAMA_FAST_EMA           = 3           
 KAMA_SLOW_EMA           = 30          
 KAMA_MIN_SLOPE          = 1.0         
 
@@ -293,6 +293,13 @@ class MarketData:
         if not self.bars_5m: return pd.DataFrame(columns=['open', 'high', 'low', 'close'])
         return pd.DataFrame(self.bars_5m)
 
+    def get_1m_dataframe(self) -> pd.DataFrame:
+        if not self.bars_1m: return pd.DataFrame(columns=['open', 'high', 'low', 'close'])
+        df = pd.DataFrame(self.bars_1m)
+        df.set_index('timestamp', inplace=True)
+        df_1m = df['spot'].resample('1min', label='left', closed='left').ohlc().dropna()
+        return df_1m
+
 
 # ==============================================================================
 # MODULE 2: INDICATORS & REGIME DETECTION
@@ -386,15 +393,23 @@ class Indicators:
         return current_adx, float(plus_di[-1]), float(minus_di[-1])
 
     @classmethod
-    def evaluate_all(cls, df_5m: pd.DataFrame):
+    def evaluate_all(cls, df_1m: pd.DataFrame, df_5m: pd.DataFrame):
         if df_5m.empty or len(df_5m) < 5:
             return {'kama': None, 'prev_kama': None, 'trend': 0, 'atr': DEFAULT_ATR_5M, 'adx': 18.0, 'plus_di': 20.0, 'minus_di': 20.0, 'regime': 'CHOP'}
+            
         highs = df_5m['high'].to_numpy(dtype=float)
         lows = df_5m['low'].to_numpy(dtype=float)
         closes = df_5m['close'].to_numpy(dtype=float)
-        kama, prev_kama, trend = cls.calculate_kama(closes)
+        
         atr = cls.calculate_atr(highs, lows, closes)
         adx, p_di, m_di = cls.calculate_adx(highs, lows, closes)
+        
+        # Calculate KAMA on 1-minute chart as requested
+        if df_1m.empty or len(df_1m) < KAMA_PERIOD:
+            kama, prev_kama, trend = None, None, 0
+        else:
+            closes_1m = df_1m['close'].to_numpy(dtype=float)
+            kama, prev_kama, trend = cls.calculate_kama(closes_1m)
         
         if adx < ADX_CHOP_THRESHOLD: regime = "CHOP"
         elif adx >= ADX_TREND_THRESHOLD: regime = "TREND"
@@ -517,8 +532,9 @@ class ExecutionEngine:
             'PE': {'stopped_time': 0.0, 'stopped_spot': 0.0, 'active': False}
         }
         
+        df_1m = self.market_data.get_1m_dataframe()
         df_5m = self.market_data.get_5m_dataframe()
-        self.current_indicators = Indicators.evaluate_all(df_5m) if not df_5m.empty else {'atr': 35.0, 'regime': 'CHOP', 'trend': 0, 'adx': 18.0}
+        self.current_indicators = Indicators.evaluate_all(df_1m, df_5m) if not df_5m.empty else {'atr': 35.0, 'regime': 'CHOP', 'trend': 0, 'adx': 18.0}
         
         self._ltp_cache: Dict[str, float] = {}
         self._load_state()
@@ -666,8 +682,9 @@ class ExecutionEngine:
                     break
 
                 spot, atm, is_new_1m_bar = self.market_data.fetch_live_tick()
+                df_1m = self.market_data.get_1m_dataframe()
                 df_5m = self.market_data.get_5m_dataframe()
-                self.current_indicators = Indicators.evaluate_all(df_5m)
+                self.current_indicators = Indicators.evaluate_all(df_1m, df_5m)
                 
                 atr = self.current_indicators.get('atr', DEFAULT_ATR_5M)
                 regime = self.current_indicators.get('regime', 'CHOP')
