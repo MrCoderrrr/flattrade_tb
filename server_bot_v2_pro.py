@@ -607,20 +607,15 @@ class RiskManager:
             is_breaching = (current_spot <= sl_state["current_sl"])
             hard_breach = (current_spot <= (sl_state["current_sl"] - 1.5 * safe_atr))
 
-        if is_new_1m_bar:
-            if is_breaching:
-                breach_count += 1
-                sl_state["breach_count"] = breach_count
-            else:
-                sl_state["breach_count"] = 0
+        if is_breaching:
+            breach_count += 1
+            sl_state["breach_count"] = breach_count
+        else:
+            sl_state["breach_count"] = 0
 
-        # Hard breach triggers immediate exit without waiting for 1m bar close
-        if hard_breach:
-            return True, f"⛔ Hard Emergency Spot SL Triggered for {leg} | Spot: {current_spot:.2f} violently crossed SL: {sl_state['current_sl']:.2f}"
-
-        # Standard debounce exit requires confirmed 1-min close past SL
-        if sl_state["breach_count"] >= SPOT_SL_DEBOUNCE_BARS:
-            return True, f"⛔ Spot SL Triggered for {leg} | Spot: {current_spot:.2f} breached SL: {sl_state['current_sl']:.2f} on {SPOT_SL_DEBOUNCE_BARS} 1m close"
+        # Fast live-tick SL trigger: Exits when Spot breaches SL for 2 consecutive ticks (or immediate hard breach)
+        if breach_count >= 2 or hard_breach:
+            return True, f"⛔ Spot SL Triggered for {leg} | Spot: {current_spot:.2f} crossed SL: {sl_state['current_sl']:.2f} (Confirmed over {breach_count} ticks)"
         return False, ""
 
     def check_portfolio_circuit_breaker(self, realized_pnl: float, unrealized_pnl: float):
@@ -1111,10 +1106,20 @@ class ExecutionEngine:
                         self.mode = "WAIT_DATA"
                         continue
 
-                    # Spot-Based SL Check
+                    # Real-time Spot-Based SL & Premium Protection Check
                     for leg in ("CE", "PE"):
                         if leg in self.positions and self.positions[leg]["side"] == "SELL":
-                            is_stopped, reason = self.risk_manager.update_spot_sl_and_check(leg, self.positions[leg], spot, is_new_1m_bar)
+                            pos = self.positions[leg]
+                            is_stopped, reason = self.risk_manager.update_spot_sl_and_check(leg, pos, spot, is_new_1m_bar)
+                            
+                            # Premium Protection: Safety guard if option spikes to 2.5x entry
+                            if not is_stopped:
+                                ltp = self._get_ltp(pos["strike"], pos["base"])
+                                entry_prc = float(pos.get("entry_price", 0.0))
+                                if entry_prc > 0 and ltp >= (entry_prc * 2.5):
+                                    is_stopped = True
+                                    reason = f"⛔ Premium SL Triggered for {leg} | LTP: ₹{ltp:.2f} hit 2.5x Entry Price (₹{entry_prc:.2f})"
+
                             if is_stopped:
                                 log_alert(reason)
                                 self._exit_leg(leg, reason="SPOT_TSL_HIT")
