@@ -230,13 +230,15 @@ EXPIRY_WIDTH_LOOKAHEAD_DAYS = 8.0
 EXPIRY_NEAR_DAYS            = 2.0     
 EXPIRY_NEAR_BONUS           = 0.42    
 
-# Spot-Based Trailing Stop Loss (User tuned: 50% Trail, 1 Debounce)
-SPOT_SL_ATR_MULT        = 1.20        # Initial Spot SL distance = 1.2 * ATR (~42 pts from entry spot)
-SPOT_SL_TRAIL_RATIO     = 0.50        # 50% Trailing Stop Loss on favorable spot movement
-SPOT_SL_TRAIL_RATIO_STRONG = 0.65     # Stronger trail once trade is in deep profit
-SPOT_SL_TRAIL_RATIO_DEEP   = 0.80     
-SPOT_SL_BREAKEVEN_LOCK_ATR = 1.30     
-SPOT_SL_DEBOUNCE_BARS   = 1           # 1-bar debounce confirmation for quick protection
+# Spot-Based Trailing Stop Loss (15-Second Micro-Candle Debounced)
+MICRO_CANDLE_SECONDS            = 15          # Size of the TSL debounce candle in seconds (tunable: 10s, 15s, 20s)
+SPOT_SL_ATR_MULT                = 1.20        # Initial Spot SL distance = 1.2 * ATR (~42 pts from entry spot)
+SPOT_SL_MIN_BREACH_DISTANCE_PTS = 4.0         # Price must close at least this far past the SL line, not just barely past it
+SPOT_SL_TRAIL_RATIO             = 0.50        # 50% Trailing Stop Loss on favorable spot movement
+SPOT_SL_TRAIL_RATIO_STRONG      = 0.65        # Stronger trail once trade is in deep profit
+SPOT_SL_TRAIL_RATIO_DEEP        = 0.80     
+SPOT_SL_BREAKEVEN_LOCK_ATR      = 1.30     
+SPOT_SL_DEBOUNCE_BARS           = 2           # Require 2 consecutive closed 15s micro-candles (= 30s sustained breach)
 
 # Anti-Whipsaw Consecutive Tick Engine
 CONSECUTIVE_TICKS_REQUIRED = 10       # Require 10 consecutive favorable ticks (~10s) to re-enter
@@ -271,10 +273,76 @@ def round_to_strike(price: float, strike_step: int = 50) -> int: return int(roun
 # MODULE 1: MARKET DATA INGESTION & TIME-PRICE SERIES
 # ==============================================================================
 
+class MicroCandleBuilder:
+    """
+    Maintains a rolling 15-second OHLC micro-candle built from raw spot ticks.
+    Filters micro-noise without adding full 1-minute lag.
+    """
+    def __init__(self, candle_seconds: int = MICRO_CANDLE_SECONDS):
+        self.candle_seconds = candle_seconds
+        self.current_window_start: Optional[int] = None
+        self.current_open: float = 0.0
+        self.current_high: float = 0.0
+        self.current_low: float = 0.0
+        self.current_close: float = 0.0
+        self.last_closed_candle: Dict[str, float] = {}
+
+    def update(self, spot: float, timestamp: float) -> Tuple[float, bool]:
+        """
+        Updates the current micro-candle.
+        Returns: (current_close_price, is_new_candle_closed)
+        is_new_candle_closed is True only on the tick that closes out a 15-second window.
+        """
+        ts_int = int(timestamp)
+        window_start = (ts_int // self.candle_seconds) * self.candle_seconds
+        is_new_closed = False
+
+        if self.current_window_start is None:
+            self.current_window_start = window_start
+            self.current_open = spot
+            self.current_high = spot
+            self.current_low = spot
+            self.current_close = spot
+            return spot, False
+
+        if window_start != self.current_window_start:
+            # Previous window has just closed!
+            self.last_closed_candle = {
+                'open': self.current_open,
+                'high': self.current_high,
+                'low': self.current_low,
+                'close': self.current_close,
+                'window_start': self.current_window_start
+            }
+            is_new_closed = True
+            closed_close = self.current_close
+
+            # Start new candle
+            self.current_window_start = window_start
+            self.current_open = spot
+            self.current_high = spot
+            self.current_low = spot
+            self.current_close = spot
+            return closed_close, is_new_closed
+        else:
+            # Intra-candle update
+            self.current_high = max(self.current_high, spot)
+            self.current_low = min(self.current_low, spot)
+            self.current_close = spot
+            return self.current_close, False
+
+    def get_display_str(self) -> str:
+        """Returns format O: 24050.2 / C: 24052.1 for dashboard display."""
+        if self.current_open == 0.0:
+            return "—"
+        return f"O:{self.current_open:.1f} C:{self.current_close:.1f}"
+
+
 class MarketData:
     def __init__(self, cache_file: str):
         self.cache_file = cache_file
         self.streamer = NSEATMStreamer()
+        self.micro_candle_builder = MicroCandleBuilder(candle_seconds=MICRO_CANDLE_SECONDS)
         self.bars_1m: List[Dict[str, Any]] = []
         self.logged_1m_keys: set = set()
         self.bars_5m: List[Dict[str, Any]] = []
@@ -568,7 +636,7 @@ class RiskManager:
             "best_spot": round(entry_spot, 2), "trail_amount": 0.0, "breach_count": 0
         }
 
-    def update_spot_sl_and_check(self, leg: str, pos_data: Dict[str, Any], current_spot: float, is_new_1m_bar: bool):
+    def update_spot_sl_and_check(self, leg: str, pos_data: Dict[str, Any], current_spot: float, is_new_micro_candle: bool):
         sl_state = pos_data.get("spot_sl_state")
         if not sl_state: return False, ""
         entry_spot = float(sl_state["entry_spot"])
@@ -591,7 +659,8 @@ class RiskManager:
                 candidate_sl = sl_state["initial_sl"] - trail_amount
                 sl_state["current_sl"] = min(current_sl, round(candidate_sl, 2))
                 sl_state["trail_amount"] = round(trail_amount, 2)
-            is_breaching = (current_spot >= sl_state["current_sl"])
+            # Minimum breach distance requirement in losing direction (Upward past SL + 4.0 pts)
+            is_breaching = (current_spot >= (sl_state["current_sl"] + SPOT_SL_MIN_BREACH_DISTANCE_PTS))
             hard_breach = (current_spot >= (sl_state["current_sl"] + 1.5 * safe_atr))
         else:
             if current_spot > best_spot:
@@ -604,18 +673,28 @@ class RiskManager:
                 candidate_sl = sl_state["initial_sl"] + trail_amount
                 sl_state["current_sl"] = max(current_sl, round(candidate_sl, 2))
                 sl_state["trail_amount"] = round(trail_amount, 2)
-            is_breaching = (current_spot <= sl_state["current_sl"])
+            # Minimum breach distance requirement in losing direction (Downward past SL - 4.0 pts)
+            is_breaching = (current_spot <= (sl_state["current_sl"] - SPOT_SL_MIN_BREACH_DISTANCE_PTS))
             hard_breach = (current_spot <= (sl_state["current_sl"] - 1.5 * safe_atr))
 
-        if is_breaching:
-            breach_count += 1
-            sl_state["breach_count"] = breach_count
-        else:
-            sl_state["breach_count"] = 0
+        # Breach counter increments/resets strictly on a closed 15s micro-candle
+        if is_new_micro_candle:
+            if is_breaching:
+                breach_count += 1
+                sl_state["breach_count"] = breach_count
+                log_info(f"[{leg} TSL Micro-Candle Closed] Breach active: Spot={current_spot:.2f}, SL={sl_state['current_sl']:.2f}, Breach Count={breach_count}/{SPOT_SL_DEBOUNCE_BARS}")
+            else:
+                if breach_count > 0:
+                    log_info(f"[{leg} TSL Micro-Candle Closed] Breach cleared: Spot={current_spot:.2f}, SL={sl_state['current_sl']:.2f}, Breach Count reset to 0")
+                sl_state["breach_count"] = 0
 
-        # Fast live-tick SL trigger: Exits when Spot breaches SL for 2 consecutive ticks (or immediate hard breach)
-        if breach_count >= 2 or hard_breach:
-            return True, f"⛔ Spot SL Triggered for {leg} | Spot: {current_spot:.2f} crossed SL: {sl_state['current_sl']:.2f} (Confirmed over {breach_count} ticks)"
+        # Hard emergency breach triggers immediately without waiting for micro-candle close
+        if hard_breach:
+            return True, f"⛔ Hard Emergency Spot SL Triggered for {leg} | Spot: {current_spot:.2f} violently crossed SL: {sl_state['current_sl']:.2f}"
+
+        # Standard debounce exit requires confirmed consecutive closed micro-candles (e.g. 2 x 15s = 30s sustained breach)
+        if sl_state["breach_count"] >= SPOT_SL_DEBOUNCE_BARS:
+            return True, f"⛔ Spot SL Triggered for {leg} | Spot: {current_spot:.2f} breached SL: {sl_state['current_sl']:.2f} over {sl_state['breach_count']} closed {MICRO_CANDLE_SECONDS}s micro-candles"
         return False, ""
 
     def check_portfolio_circuit_breaker(self, realized_pnl: float, unrealized_pnl: float):
@@ -686,20 +765,22 @@ class Dashboard:
         pos_table.add_column("LTP ₹")
         pos_table.add_column("P&L ₹")
         pos_table.add_column("SL Line")
-        pos_table.add_column("Breaches")
+        pos_table.add_column("Breach Cnt")
+        pos_table.add_column("Micro Candle (15s)")
 
+        micro_c_str = snap.get("micro_candle", "—")
         for leg, pos in snap.get("positions", {}).items():
             pnl = pos.get("live_pnl", 0.0)
             pnl_str = f"[green]{pnl:,.2f}[/green]" if pnl >= 0 else f"[red]{pnl:,.2f}[/red]"
             sl_state = pos.get("spot_sl_state") or {}
             sl_line = f"{sl_state.get('current_sl', '-')}" if sl_state else "-"
-            breach = f"{sl_state.get('breach_count', 0)}" if sl_state else "-"
+            breach = f"{sl_state.get('breach_count', 0)}/2" if sl_state else "-"
             pos_table.add_row(leg, str(pos.get("strike", "-")), pos.get("side", "-"),
                                f"{pos.get('entry_price', 0):.2f}", f"{pos.get('live_ltp', 0):.2f}",
-                               pnl_str, sl_line, breach)
+                               pnl_str, sl_line, breach, micro_c_str)
 
         if not snap.get("positions"):
-            pos_table.add_row("-", "-", "-", "-", "-", "-", "-", "-")
+            pos_table.add_row("-", "-", "-", "-", "-", "-", "-", "-", "-")
 
         cd_table = Table(title="Cooldowns", expand=True, show_lines=False)
         cd_table.add_column("Leg")
@@ -1035,6 +1116,7 @@ class ExecutionEngine:
             "mode": self.mode,
             "paper_mode": self.broker.paper_trading,
             "spot": spot, "atm": atm,
+            "micro_candle": self.market_data.micro_candle_builder.get_display_str(),
             "adx": self.current_indicators.get("adx", 18.0),
             "kama": self.current_indicators.get("kama"),
             "prev_kama": self.current_indicators.get("prev_kama"),
@@ -1085,6 +1167,7 @@ class ExecutionEngine:
                     continue
                     
                 spot, atm, is_new_1m_bar = self.market_data.fetch_live_tick()
+                micro_close, is_new_micro_candle = self.market_data.micro_candle_builder.update(spot, time.time())
                 df_1m = self.market_data.get_1m_dataframe()
                 df_5m = self.market_data.get_5m_dataframe()
                 self.current_indicators = Indicators.evaluate_all(df_1m, df_5m)
@@ -1123,11 +1206,11 @@ class ExecutionEngine:
                         self.mode = "WAIT_DATA"
                         continue
 
-                    # Real-time Spot-Based SL & Premium Protection Check
+                    # Real-time Spot-Based SL & Premium Protection Check (Debounced via 15s Micro-Candles)
                     for leg in ("CE", "PE"):
                         if leg in self.positions and self.positions[leg]["side"] == "SELL":
                             pos = self.positions[leg]
-                            is_stopped, reason = self.risk_manager.update_spot_sl_and_check(leg, pos, spot, is_new_1m_bar)
+                            is_stopped, reason = self.risk_manager.update_spot_sl_and_check(leg, pos, spot, is_new_micro_candle)
                             
                             # Premium Protection: Safety guard if option spikes to 2.5x entry
                             if not is_stopped:

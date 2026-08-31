@@ -191,7 +191,7 @@ def render_rich(snap):
         f"[bold]Total MTM:[/bold] {tot_str}",
     )
 
-    pos_table = Table(title="Open Positions (with Spot TSL)", expand=True, show_lines=True)
+    pos_table = Table(title="Open Positions (with 15s Micro-Candle Spot TSL)", expand=True, show_lines=True)
     pos_table.add_column("Leg", style="bold")
     pos_table.add_column("Strike")
     pos_table.add_column("Side")
@@ -200,16 +200,18 @@ def render_rich(snap):
     pos_table.add_column("LTP ₹")
     pos_table.add_column("P&L ₹")
     pos_table.add_column("Spot SL Line")
-    pos_table.add_column("Breaches")
+    pos_table.add_column("Breach Cnt")
+    pos_table.add_column("Micro Candle (15s)")
 
     positions = snap.get("positions", {})
+    micro_c_str = snap.get("micro_candle", "—")
     if positions:
         for leg, pos in positions.items():
             pnl = pos.get("live_pnl", 0.0)
             pnl_str = f"[green]₹{pnl:,.2f}[/green]" if pnl >= 0 else f"[red]₹{pnl:,.2f}[/red]"
             sl_state = pos.get("spot_sl_state") or {}
             sl_line = f"{sl_state.get('current_sl', '-')}" if sl_state else "-"
-            breach = f"{sl_state.get('breach_count', 0)}" if sl_state else "-"
+            breach = f"{sl_state.get('breach_count', 0)}/2" if sl_state else "-"
             pos_table.add_row(
                 leg,
                 str(pos.get("strike", "-")),
@@ -219,10 +221,11 @@ def render_rich(snap):
                 f"{pos.get('live_ltp', 0):.2f}",
                 pnl_str,
                 str(sl_line),
-                str(breach)
+                str(breach),
+                micro_c_str
             )
     else:
-        pos_table.add_row("No Open Positions", "-", "-", "-", "-", "-", "-", "-", "-")
+        pos_table.add_row("No Open Positions", "-", "-", "-", "-", "-", "-", "-", "-", "-")
 
     cd_table = Table(title="Anti-Whipsaw Protection (Strict Re-entry Engine)", expand=True, show_lines=False)
     cd_table.add_column("Leg", style="bold")
