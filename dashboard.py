@@ -224,14 +224,18 @@ def render_rich(snap):
     else:
         pos_table.add_row("No Open Positions", "-", "-", "-", "-", "-", "-", "-", "-")
 
-    cd_table = Table(title="Cooldowns (Anti-Whipsaw)", expand=True, show_lines=False)
-    cd_table.add_column("Leg")
-    cd_table.add_column("Active")
-    cd_table.add_column("Elapsed (s)")
+    cd_table = Table(title="Anti-Whipsaw Protection (Consecutive Tick Engine)", expand=True, show_lines=False)
+    cd_table.add_column("Leg", style="bold")
+    cd_table.add_column("Status")
+    cd_table.add_column("Consecutive Safe Ticks")
+    cd_table.add_column("Stopped Spot")
     for leg, cd in snap.get("cooldown_tracker", {}).items():
         active = cd.get("active", False)
-        elapsed = (time.time() - cd["stopped_time"]) if active and cd.get("stopped_time") else 0
-        cd_table.add_row(leg, "[yellow]ACTIVE[/yellow]" if active else "inactive", f"{elapsed:.0f}s" if active else "-")
+        safe_t = cd.get("safe_ticks", 0)
+        status_txt = "[yellow]COOLING DOWN[/yellow]" if active else "[green]Active / Ready[/green]"
+        progress_txt = f"[bold cyan]{safe_t}/10 Ticks[/bold cyan]" if active else "—"
+        stopped_txt = f"₹{cd.get('stopped_spot', 0):.2f}" if active else "—"
+        cd_table.add_row(leg, status_txt, progress_txt, stopped_txt)
 
     footer = Text(f" [Updated at {snap.get('now_str')} | Auto-refresh 3s | Press Ctrl+C to close dashboard] ", style="dim")
 

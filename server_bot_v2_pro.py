@@ -238,9 +238,10 @@ SPOT_SL_TRAIL_RATIO_DEEP   = 0.80
 SPOT_SL_BREAKEVEN_LOCK_ATR = 1.30     
 SPOT_SL_DEBOUNCE_BARS   = 1           # 1-bar debounce confirmation for quick protection
 
-# Anti-Whipsaw Cooldown
-COOLDOWN_MINUTES        = 3           # Fallback cooldown timer
-COOLDOWN_SPOT_PCT       = 0.0020      # 0.10% spot movement (~24 pts) resets cooldown early
+# Anti-Whipsaw Consecutive Tick Engine
+CONSECUTIVE_TICKS_REQUIRED = 10       # Require 10 consecutive favorable ticks (~10s) to re-enter
+COOLDOWN_MINUTES        = 3           # Max fallback ceiling
+COOLDOWN_SPOT_PCT       = 0.0020
 
 # Session Timing
 MARKET_START_HOUR       = 9
@@ -711,8 +712,9 @@ class Dashboard:
         cd_table.add_column("Elapsed (s)")
         for leg, cd in snap.get("cooldown_tracker", {}).items():
             active = cd.get("active", False)
-            elapsed = (time.time() - cd["stopped_time"]) if active and cd.get("stopped_time") else 0
-            cd_table.add_row(leg, "[yellow]YES[/yellow]" if active else "no", f"{elapsed:.0f}" if active else "-")
+            safe_t = cd.get("safe_ticks", 0)
+            status_txt = f"[yellow]ACTIVE ({safe_t}/10 ticks)[/yellow]" if active else "[green]Ready[/green]"
+            cd_table.add_row(leg, status_txt, f"Stopped @ {cd.get('stopped_spot', 0):.2f}" if active else "-")
 
         footer = Text(f" Last event: {snap.get('last_event', '-')} ", style="dim")
 
@@ -780,8 +782,8 @@ class ExecutionEngine:
         log_info(f"Loaded Lot Multiplier: {lots_multiplier}x (Total Qty per leg: {self.qty})")
         
         self.cooldown_tracker: Dict[str, Dict[str, Any]] = {
-            'CE': {'stopped_time': 0.0, 'stopped_spot': 0.0, 'active': False},
-            'PE': {'stopped_time': 0.0, 'stopped_spot': 0.0, 'active': False}
+            'CE': {'stopped_time': 0.0, 'stopped_spot': 0.0, 'active': False, 'safe_ticks': 0},
+            'PE': {'stopped_time': 0.0, 'stopped_spot': 0.0, 'active': False, 'safe_ticks': 0}
         }
         
         df_1m = self.market_data.get_1m_dataframe()
@@ -952,57 +954,61 @@ class ExecutionEngine:
         for leg in list(self.positions.keys()): self._exit_leg(leg, reason=reason)
 
     def _trigger_leg_cooldown(self, stopped_leg: str, current_spot: float):
-        self.cooldown_tracker[stopped_leg] = {'stopped_time': time.time(), 'stopped_spot': current_spot, 'active': True}
-        log_alert(f"⏳ {stopped_leg} entered Adaptive COOLDOWN.")
+        self.cooldown_tracker[stopped_leg] = {
+            'stopped_time': time.time(),
+            'stopped_spot': current_spot,
+            'active': True,
+            'safe_ticks': 0
+        }
+        log_alert(f"⏳ {stopped_leg} entered Consecutive-Tick Cooldown (Monitoring for {CONSECUTIVE_TICKS_REQUIRED} consecutive stable ticks to re-enter).")
         self.mode = "COOLDOWN"
         self._save_state()
 
-    def _check_cooldown_and_reenter(self, spot: float, atm: int, atr: float, regime: str, trend: int, is_new_1m_bar: bool, dte_days: float = 2.0):
-        # Only evaluate structural re-entry on confirmed 1-minute candle closes
-        if not is_new_1m_bar:
-            return
-
+    def _check_cooldown_and_reenter(self, spot: float, atm: int, atr: float, regime: str, trend: int, dte_days: float = 2.0):
+        """
+        Evaluates active cooldowns on every 1-second live tick.
+        Re-enters ONLY when CONSECUTIVE_TICKS_REQUIRED safe/favorable ticks are achieved consecutively.
+        Any adverse tick (adverse momentum or push against stop) immediately resets counter to 0!
+        """
         for leg in ("CE", "PE"):
             cd = self.cooldown_tracker.get(leg)
             if not cd or not cd.get("active", False): continue
-            elapsed_sec = time.time() - cd["stopped_time"]
-            spot_displacement = abs(spot - cd["stopped_spot"]) / max(0.1, cd["stopped_spot"])
             
-            indicator_cleared = False
-            clear_reason = ""
-
-            # Require minimum 2 minutes elapsed or significant spot displacement to avoid immediate re-whipsaw
-            if elapsed_sec >= 120.0:
-                if leg == "CE" and trend == -1:
-                    indicator_cleared = True
-                    clear_reason = "KAMA trend reversed DOWN (-1)"
-                elif leg == "PE" and trend == 1:
-                    indicator_cleared = True
-                    clear_reason = "KAMA trend reversed UP (+1)"
-                elif regime == "CHOP" and elapsed_sec >= 180.0:
-                    indicator_cleared = True
-                    clear_reason = "Chop regime stabilized over 3m"
+            stopped_spot = cd.get("stopped_spot", spot)
+            safe_ticks = cd.get("safe_ticks", 0)
             
-            if spot_displacement >= COOLDOWN_SPOT_PCT and elapsed_sec >= 60.0:
-                indicator_cleared = True
-                clear_reason = f"Spot displaced {spot_displacement*100:.2f}% away from stop level"
-
-            if elapsed_sec >= COOLDOWN_MINUTES * 60:
-                indicator_cleared = True
-                clear_reason = "Full cooldown timer elapsed"
+            # ── 1. Evaluate Condition for Current Tick ──
+            is_favorable_tick = False
             
-            if indicator_cleared:
-                trend_safe = True
-                if leg == "CE" and regime == "TREND" and trend == 1: trend_safe = False
-                elif leg == "PE" and regime == "TREND" and trend == -1: trend_safe = False
-                if trend_safe:
-                    log_info(f"✅ Cooldown Cleared for {leg} ({clear_reason}) -> Re-entering short strike...")
-                    ce_strike, pe_strike = self.calculate_strangle_strikes(atm, atr, regime, dte_days=dte_days)
-                    if leg not in self.positions: self._enter_leg(leg, ce_strike if leg == "CE" else pe_strike, "SELL", spot, atr)
-                    cd["active"] = False
-                    self._save_state()
-                    if not any(v.get("active", False) for v in self.cooldown_tracker.values()):
-                        self.mode = "CHOP_MODE" if regime == "CHOP" else "RUNNING"
+            if leg == "CE":
+                # CE is safe when spot is NOT aggressively making higher highs and KAMA trend is not Bullish (+1)
+                if spot <= (stopped_spot + 3.0) and trend <= 0:
+                    is_favorable_tick = True
+            else:  # PE
+                # PE is safe when spot is NOT aggressively making lower lows and KAMA trend is not Bearish (-1)
+                if spot >= (stopped_spot - 3.0) and trend >= 0:
+                    is_favorable_tick = True
+            
+            # ── 2. Increment or Reset Tick Counter ──
+            if is_favorable_tick:
+                safe_ticks += 1
+                cd["safe_ticks"] = safe_ticks
+            else:
+                if safe_ticks > 0:
+                    cd["safe_ticks"] = 0
+            
+            # ── 3. Check if Consecutive Requirement Met ──
+            if safe_ticks >= CONSECUTIVE_TICKS_REQUIRED:
+                log_info(f"✅ Consecutive Tick Condition Cleared for {leg} ({safe_ticks}/{CONSECUTIVE_TICKS_REQUIRED} stable ticks confirmed) -> Re-entering short strike...")
+                ce_strike, pe_strike = self.calculate_strangle_strikes(atm, atr, regime, dte_days=dte_days)
+                target_strike = ce_strike if leg == "CE" else pe_strike
+                if leg not in self.positions:
+                    self._enter_leg(leg, target_strike, "SELL", spot, atr)
+                cd["active"] = False
+                cd["safe_ticks"] = 0
+                self._save_state()
+                if not any(v.get("active", False) for v in self.cooldown_tracker.values()):
+                    self.mode = "CHOP_MODE" if regime == "CHOP" else "RUNNING"
 
     def _build_dashboard_snapshot(self, spot: float, atm: int, atr: float, regime: str, trend: int,
                                    dte_days: float, unrealized: float) -> Dict[str, Any]:
@@ -1115,7 +1121,7 @@ class ExecutionEngine:
                                 self._trigger_leg_cooldown(leg, spot)
 
                     # Handle disciplined re-entry after cooldown only on confirmed 1-min closes
-                    self._check_cooldown_and_reenter(spot, atm, atr, regime, trend, is_new_1m_bar, dte_days=dte_days)
+                    self._check_cooldown_and_reenter(spot, atm, atr, regime, trend, dte_days=dte_days)
 
                 snap = self._build_dashboard_snapshot(spot, atm, atr, regime, trend, dte_days, unrealized)
                 self.dashboard.update(snap)
