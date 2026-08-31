@@ -12,11 +12,22 @@ from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
 import pandas as pd
 
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.layout import Layout
+    from rich.text import Text
+    HAS_RICH = True
+except ImportError:
+    HAS_RICH = False
+
 urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
-# Setup IST Timezone
+# Setup IST Timezone (Ensures proper operation on UTC / Greenwich servers)
 IST = timezone(timedelta(hours=5, minutes=30))
 def get_ist_now() -> datetime: return datetime.now(IST)
 
@@ -31,9 +42,19 @@ global_api = NorenApiPy()
 if os.path.exists("token.txt"):
     with open("token.txt", "r") as f:
         access_token = f.read().strip()
-        global_api.set_session(userid=str(USER_ID).strip(), password='', usertoken=access_token)
+    session_res = global_api.set_session(userid=str(USER_ID).strip(), password='', usertoken=access_token)
+    try:
+        limits_check = global_api.get_limits()
+    except Exception as e:
+        print(f"[FATAL] Exception verifying session via get_limits(): {e}", flush=True)
+        sys.exit(1)
+    if not limits_check or not isinstance(limits_check, dict) or limits_check.get('stat') != 'Ok':
+        print(f"[FATAL] token.txt is present but the session is INVALID or EXPIRED. "
+              f"get_limits() returned: {limits_check}. Run login.py to refresh the token.", flush=True)
+        sys.exit(1)
+    print(f"[BOOT] Flattrade session verified OK for user {USER_ID}.", flush=True)
 else:
-    print("[FATAL] token.txt not found. Please run login.py first.")
+    print("[FATAL] token.txt not found. Please run login.py first.", flush=True)
     sys.exit(1)
 
 class NSEATMStreamer:
@@ -47,7 +68,7 @@ class NSEATMStreamer:
                 spot = float(res.get('lp', res.get('ltp', 24000.0)))
                 return spot, int(round(spot / 50.0) * 50)
         except Exception as e:
-            print(f"Error fetching spot: {e}")
+            print(f"Error fetching spot: {e}", flush=True)
         return 24000.0, 24000
 
     def get_live_quote(self, strike: int, option_type: str) -> Dict[str, Any]:
@@ -66,10 +87,15 @@ class NSEATMStreamer:
                 valid.sort(key=lambda x: x['dt'])
                 match = valid[0]['item']
                 tsym = match['tsym']
-                quote = self.api.get_quotes(exchange='NFO', token=match['token'])
+                try:
+                    quote = self.api.get_quotes(exchange='NFO', token=match['token'])
+                except Exception as e:
+                    log_alert(f"get_quotes failed for {tsym}: {e}")
+                    quote = None
                 lp = float(quote.get('lp', quote.get('ltp', 0.0))) if quote else 0.0
-                return {"lp": lp, "tsym": tsym, "ls": int(match['ls'])}
-        return {"lp": 0.0, "tsym": f"NIFTY_{strike}_{option_type}", "ls": 65}
+                return {"lp": lp, "tsym": tsym, "ls": int(match['ls']), "valid": True}
+        log_alert(f"[SYMBOL LOOKUP FAILED] No valid instrument found for NIFTY {strike} {option_type}. searchscrip result: {res}")
+        return {"lp": 0.0, "tsym": None, "ls": LOT_SIZE, "valid": False}
         
     def get_near_expiry_dte(self):
         return None, 2.0
@@ -77,23 +103,48 @@ class NSEATMStreamer:
 class FlattradeBroker:
     def __init__(self, paper_trading=False):
         self.api = global_api
-        
-    def place_option_order(self, symbol, transaction_type, quantity, price):
-        action = transaction_type[0] # 'B' or 'S'
-        res = self.api.place_order(
-            buy_or_sell=str(action),
-            product_type="M",
-            exchange="NFO",
-            tradingsymbol=str(symbol),
-            quantity=str(quantity),
-            discloseqty="0",
-            price_type="MKT",
-            price="0",
-            trigger_price="0",
-            retention="DAY"
-        )
-        log_info(f"Order API Response: {res}")
-        return res
+        self.paper_trading = paper_trading
+        if self.paper_trading:
+            log_warn("FlattradeBroker running in PAPER TRADING mode. NO REAL ORDERS WILL BE PLACED.")
+
+    def place_option_order(self, symbol, transaction_type, quantity, price) -> Dict[str, Any]:
+        action = transaction_type[0]  # 'B' or 'S'
+
+        if self.paper_trading:
+            fake_order_no = f"PAPER-{int(time.time()*1000)}"
+            log_info(f"[PAPER] {action} {quantity} x {symbol} @ ~₹{price:.2f} (simulated, no real order sent)")
+            return {"ok": True, "order_no": fake_order_no, "msg": "Simulated fill (paper trading)", "raw": None}
+
+        try:
+            res = self.api.place_order(
+                buy_or_sell=str(action),
+                product_type="M",
+                exchange="NFO",
+                tradingsymbol=str(symbol),
+                quantity=str(quantity),
+                discloseqty="0",
+                price_type="MKT",
+                price="0",
+                trigger_price="0",
+                retention="DAY"
+            )
+        except Exception as e:
+            log_alert(f"[ORDER EXCEPTION] {action} {symbol}: {e}")
+            traceback.print_exc()
+            return {"ok": False, "order_no": None, "msg": f"Exception: {e}", "raw": None}
+
+        if res is None:
+            log_alert(f"[ORDER FAILED] {action} {symbol}: API returned None (no response / network issue).")
+            return {"ok": False, "order_no": None, "msg": "No response from API", "raw": None}
+
+        if isinstance(res, dict) and res.get("stat") == "Ok":
+            order_no = res.get("norenordno")
+            log_trade(f"[ORDER OK] {action} {quantity} x {symbol} | Order No: {order_no}")
+            return {"ok": True, "order_no": order_no, "msg": "Order placed", "raw": res}
+
+        err_msg = res.get("emsg", "Unknown error") if isinstance(res, dict) else str(res)
+        log_alert(f"[ORDER REJECTED] {action} {symbol}: {err_msg}")
+        return {"ok": False, "order_no": None, "msg": err_msg, "raw": res}
 
 class VolatilityEngine:
     @staticmethod
@@ -162,11 +213,19 @@ AUTO_SQUAREOFF_MINUTE   = 28
 REFRESH_INTERVAL_SEC    = 1          
 
 
+_LAST_EVENT: Dict[str, str] = {"msg": "Engine starting..."}
+
 def _now_str() -> str: return get_ist_now().strftime("%H:%M:%S")
 def log_info(msg: str): print(f"[{_now_str()} INFO]  {msg}", flush=True)
-def log_warn(msg: str): print(f"[{_now_str()} WARNING]  {msg}", flush=True)
-def log_alert(msg: str): print(f"[{_now_str()} ALERT]  {msg}", flush=True)
-def log_trade(msg: str): print(f"[{_now_str()} TRADE]  {msg}", flush=True)
+def log_warn(msg: str):
+    print(f"[{_now_str()} WARNING]  {msg}", flush=True)
+    _LAST_EVENT["msg"] = f"WARN: {msg}"
+def log_alert(msg: str):
+    print(f"[{_now_str()} ALERT]  {msg}", flush=True)
+    _LAST_EVENT["msg"] = f"ALERT: {msg}"
+def log_trade(msg: str):
+    print(f"[{_now_str()} TRADE]  {msg}", flush=True)
+    _LAST_EVENT["msg"] = f"TRADE: {msg}"
 def round_to_strike(price: float, strike_step: int = 50) -> int: return int(round(price / float(strike_step)) * strike_step)
 
 
@@ -235,7 +294,6 @@ class MarketData:
                 seeded_5m = []
                 for row in res:
                     try:
-                        # Flattrade returns: 'time', 'into' (open), 'inth' (high), 'intl' (low), 'intc' (close)
                         ts = datetime.strptime(row['time'], "%d-%m-%Y %H:%M:%S")
                         seeded_5m.append({
                             'timestamp': ts,
@@ -248,7 +306,6 @@ class MarketData:
                         continue
                         
                 if seeded_5m:
-                    # Sort chronologically just in case
                     seeded_5m.sort(key=lambda x: x['timestamp'])
                     today = get_ist_now().date()
                     prior_bars = [b for b in seeded_5m if b['timestamp'].date() < today][-50:]
@@ -406,7 +463,6 @@ class Indicators:
         atr = cls.calculate_atr(highs, lows, closes)
         adx, p_di, m_di = cls.calculate_adx(highs, lows, closes)
         
-        # Calculate KAMA on 1-minute chart as requested
         if df_1m.empty or len(df_1m) < KAMA_PERIOD:
             kama, prev_kama, trend = None, None, 0
         else:
@@ -505,6 +561,111 @@ class RiskManager:
 
 
 # ==============================================================================
+# MODULE 3B: LIVE PER-SECOND DASHBOARD
+# ==============================================================================
+
+class Dashboard:
+    def __init__(self):
+        self.has_rich = HAS_RICH and sys.stdout.isatty()
+        if self.has_rich:
+            self.console = Console()
+            self.live = Live(self._render({}), console=self.console, refresh_per_second=2, screen=False)
+            self._started = False
+        else:
+            self._started = False
+
+    def start(self):
+        if self.has_rich and not self._started:
+            try:
+                self.live.start()
+                self._started = True
+            except Exception:
+                self.has_rich = False
+
+    def stop(self):
+        if self.has_rich and self._started:
+            try:
+                self.live.stop()
+            except Exception:
+                pass
+            self._started = False
+
+    def _render(self, snap: Dict[str, Any]):
+        if not HAS_RICH: return ""
+        header = Text(f" V2 PRO ALGO — {snap.get('now_str', '')}  |  Mode: {snap.get('mode', '-')}  |  "
+                       f"{'LIVE' if not snap.get('paper_mode', False) else 'PAPER'} TRADING ", style="bold white on blue")
+
+        top = Table.grid(expand=True)
+        top.add_column(justify="left")
+        top.add_column(justify="left")
+        top.add_column(justify="left")
+        top.add_column(justify="left")
+        top.add_row(
+            f"[bold]Spot:[/bold] {snap.get('spot', 0):.2f}",
+            f"[bold]ATM:[/bold] {snap.get('atm', 0)}",
+            f"[bold]ADX:[/bold] {snap.get('adx', 0):.1f} ({snap.get('regime', '-')})",
+            f"[bold]KAMA Trend:[/bold] {snap.get('trend', 0)}",
+        )
+        top.add_row(
+            f"[bold]ATR(5m):[/bold] {snap.get('atr', 0):.2f}",
+            f"[bold]DTE:[/bold] {snap.get('dte', 0):.2f}d",
+            f"[bold]Realized P&L:[/bold] " + (f"[green]₹{snap.get('realized_pnl', 0):,.2f}[/green]" if snap.get('realized_pnl', 0) >= 0 else f"[red]₹{snap.get('realized_pnl', 0):,.2f}[/red]"),
+            f"[bold]Unrealized P&L:[/bold] " + (f"[green]₹{snap.get('unrealized_pnl', 0):,.2f}[/green]" if snap.get('unrealized_pnl', 0) >= 0 else f"[red]₹{snap.get('unrealized_pnl', 0):,.2f}[/red]"),
+        )
+
+        pos_table = Table(title="Open Positions", expand=True, show_lines=False)
+        pos_table.add_column("Leg")
+        pos_table.add_column("Strike")
+        pos_table.add_column("Side")
+        pos_table.add_column("Entry ₹")
+        pos_table.add_column("LTP ₹")
+        pos_table.add_column("P&L ₹")
+        pos_table.add_column("SL Line")
+        pos_table.add_column("Breach Cnt")
+
+        for leg, pos in snap.get("positions", {}).items():
+            pnl = pos.get("live_pnl", 0.0)
+            pnl_str = f"[green]{pnl:,.2f}[/green]" if pnl >= 0 else f"[red]{pnl:,.2f}[/red]"
+            sl_state = pos.get("spot_sl_state") or {}
+            sl_line = f"{sl_state.get('current_sl', '-')}" if sl_state else "-"
+            breach = f"{sl_state.get('breach_count', 0)}" if sl_state else "-"
+            pos_table.add_row(leg, str(pos.get("strike", "-")), pos.get("side", "-"),
+                               f"{pos.get('entry_price', 0):.2f}", f"{pos.get('live_ltp', 0):.2f}",
+                               pnl_str, sl_line, breach)
+
+        if not snap.get("positions"):
+            pos_table.add_row("-", "-", "-", "-", "-", "-", "-", "-")
+
+        cd_table = Table(title="Cooldowns", expand=True, show_lines=False)
+        cd_table.add_column("Leg")
+        cd_table.add_column("Active")
+        cd_table.add_column("Elapsed (s)")
+        for leg, cd in snap.get("cooldown_tracker", {}).items():
+            active = cd.get("active", False)
+            elapsed = (time.time() - cd["stopped_time"]) if active and cd.get("stopped_time") else 0
+            cd_table.add_row(leg, "[yellow]YES[/yellow]" if active else "no", f"{elapsed:.0f}" if active else "-")
+
+        footer = Text(f" Last event: {snap.get('last_event', '-')} ", style="dim")
+
+        layout = Table.grid(expand=True)
+        layout.add_row(Panel(header, style="on blue"))
+        layout.add_row(Panel(top, title="Market State"))
+        layout.add_row(pos_table)
+        layout.add_row(cd_table)
+        layout.add_row(footer)
+        return layout
+
+    def update(self, snap: Dict[str, Any]):
+        if self.has_rich and self._started:
+            try:
+                self.live.update(self._render(snap))
+            except Exception as e:
+                log_warn(f"Dashboard render error (non-fatal): {e}")
+        else:
+            print(f"[{snap.get('now_str', _now_str())}] Spot: {snap.get('spot', 0):.2f} | ADX: {snap.get('adx', 0):.1f} ({snap.get('regime', '-')}) | KAMA Trend: {snap.get('trend', 0)} | Mode: {snap.get('mode', '-')}", flush=True)
+
+
+# ==============================================================================
 # MODULE 4: EXECUTION STATE MACHINE & STRATEGY ENGINE
 # ==============================================================================
 
@@ -519,7 +680,17 @@ class ExecutionEngine:
 
         self.market_data = MarketData(self.cache_file)
         self.risk_manager = RiskManager(capital=CAPITAL)
-        self.broker = FlattradeBroker(paper_trading=True)
+        
+        paper_mode = os.environ.get("PAPER_TRADING", "").strip().lower() in ("1", "true", "yes")
+        if not paper_mode and os.path.exists("paper_mode.txt"):
+            try:
+                with open("paper_mode.txt", "r") as f:
+                    paper_mode = f.read().strip().lower() in ("1", "true", "yes")
+            except Exception:
+                pass
+        self.broker = FlattradeBroker(paper_trading=paper_mode)
+        if not paper_mode:
+            log_warn("LIVE TRADING MODE ACTIVE — real orders will be placed with real money.")
         
         self.mode = "WAIT_DATA"
         self.session_em_1sd = 0.0
@@ -548,6 +719,8 @@ class ExecutionEngine:
         self.current_indicators = Indicators.evaluate_all(df_1m, df_5m) if not df_5m.empty else {'atr': 35.0, 'regime': 'CHOP', 'trend': 0, 'adx': 18.0}
         
         self._ltp_cache: Dict[str, float] = {}
+        self.last_event: str = "Engine started"
+        self.dashboard = Dashboard()
         self._load_state()
 
     def _expiry_width_multiplier(self, dte_days: float) -> float:
@@ -583,28 +756,60 @@ class ExecutionEngine:
     def _save_state(self):
         try:
             state = {"date": str(get_ist_now().date()), "mode": self.mode, "realized_pnl": self.realized_pnl, "positions": self.positions, "cooldown_tracker": self.cooldown_tracker}
-            with open(self.state_file, "w") as f: json.dump(state, f, indent=4)
-        except: pass
+            tmp_path = self.state_file + ".tmp"
+            with open(tmp_path, "w") as f:
+                json.dump(state, f, indent=4)
+            os.replace(tmp_path, self.state_file)
+        except Exception as e:
+            log_alert(f"[STATE SAVE FAILED] Could not persist state: {e}")
+
+    _KNOWN_MODES = {"WAIT_DATA", "RUNNING", "CHOP_MODE", "COOLDOWN", "SESSION_DONE", "SESSION_DONE_FLAT"}
 
     def _load_state(self):
-        if not os.path.exists(self.state_file): return
+        if not os.path.exists(self.state_file):
+            log_info("No prior state file found. Starting fresh in WAIT_DATA.")
+            return
         try:
-            with open(self.state_file, "r") as f: state = json.load(f)
-            if state.get("date") == str(get_ist_now().date()):
-                self.realized_pnl = float(state.get("realized_pnl", 0.0))
-                self.positions = state.get("positions", {})
-                self.cooldown_tracker = state.get("cooldown_tracker", self.cooldown_tracker)
-                saved_mode = state.get("mode", "WAIT_DATA")
+            with open(self.state_file, "r") as f:
+                state = json.load(f)
+        except Exception as e:
+            log_alert(f"[STATE LOAD FAILED] Could not parse {self.state_file}: {e}. Starting fresh in WAIT_DATA.")
+            traceback.print_exc()
+            return
+
+        try:
+            if state.get("date") != str(get_ist_now().date()):
+                log_info("State file is from a previous day. Starting fresh in WAIT_DATA.")
+                return
+
+            self.realized_pnl = float(state.get("realized_pnl", 0.0))
+            self.positions = state.get("positions", {})
+            self.cooldown_tracker = state.get("cooldown_tracker", self.cooldown_tracker)
+            saved_mode = state.get("mode", "WAIT_DATA")
+
+            if saved_mode not in self._KNOWN_MODES:
+                log_alert(f"[STATE CORRUPT] Unrecognized saved mode '{saved_mode}'. "
+                          f"Resetting to WAIT_DATA to avoid a silent stuck state.")
+                self.mode = "RUNNING" if self.positions else "WAIT_DATA"
+            else:
                 now = get_ist_now()
                 market_closed = (now.hour > AUTO_SQUAREOFF_HOUR or (now.hour == AUTO_SQUAREOFF_HOUR and now.minute >= AUTO_SQUAREOFF_MINUTE))
                 if saved_mode in ("SESSION_DONE", "SESSION_DONE_FLAT") and not market_closed:
                     self.mode = "RUNNING" if self.positions else "WAIT_DATA"
-                else: self.mode = saved_mode
-                for leg, pos in self.positions.items():
-                    if pos.get("side") == "SELL" and leg in ("CE", "PE"):
-                        if "spot_sl_state" not in pos or not pos["spot_sl_state"]:
-                            pos["spot_sl_state"] = self.risk_manager.init_spot_sl(leg, float(pos.get("entry_spot", self.market_data.latest_spot)), float(self.current_indicators.get("atr", DEFAULT_ATR_5M)))
-        except: pass
+                else:
+                    self.mode = saved_mode
+
+            log_info(f"Restored state: mode={self.mode}, positions={list(self.positions.keys())}, realized_pnl={self.realized_pnl:.2f}")
+
+            for leg, pos in self.positions.items():
+                if pos.get("side") == "SELL" and leg in ("CE", "PE"):
+                    if "spot_sl_state" not in pos or not pos["spot_sl_state"]:
+                        pos["spot_sl_state"] = self.risk_manager.init_spot_sl(leg, float(pos.get("entry_spot", self.market_data.latest_spot)), float(self.current_indicators.get("atr", DEFAULT_ATR_5M)))
+        except Exception as e:
+            log_alert(f"[STATE LOAD ERROR] Unexpected error applying loaded state: {e}. Resetting to WAIT_DATA.")
+            traceback.print_exc()
+            self.mode = "WAIT_DATA"
+            self.positions = {}
 
     def _get_ltp(self, strike: int, option_type: str) -> float:
         key = f"{strike}_{option_type}"
@@ -613,19 +818,38 @@ class ExecutionEngine:
             self._ltp_cache[key] = float(q.get("lp", 0.0))
         return self._ltp_cache[key]
 
-    def _enter_leg(self, leg: str, strike: int, side: str, spot: float, atr: float):
+    def _enter_leg(self, leg: str, strike: int, side: str, spot: float, atr: float) -> bool:
         base = leg.split("_")[0]
         q = self.market_data.streamer.get_live_quote(strike, base)
-        tsym = q.get("tsym", f"NIFTY_{strike}_{base}")
+
+        if not q.get("valid", True) or not q.get("tsym"):
+            log_alert(f"[ENTRY ABORTED] {leg} strike {strike}: could not resolve a valid tradable symbol. Skipping this leg.")
+            return False
+
+        tsym = q["tsym"]
         self._ltp_cache[f"{strike}_{base}"] = q.get("lp", 0.0)
         ltp = self._get_ltp(strike, base)
-        
-        self.broker.place_option_order(symbol=tsym, transaction_type=side, quantity=self.qty, price=ltp)
-        pos_info = {"strike": strike, "tsym": tsym, "base": base, "side": side, "qty": self.qty, "entry_price": ltp, "entry_time": time.time(), "entry_spot": spot}
-        if side == "SELL": pos_info["spot_sl_state"] = self.risk_manager.init_spot_sl(leg, spot, atr)
+
+        if ltp <= 0.0:
+            log_alert(f"[ENTRY ABORTED] {leg} {tsym}: last traded price is {ltp}, refusing to enter on a zero/invalid quote.")
+            return False
+
+        order_result = self.broker.place_option_order(symbol=tsym, transaction_type=side, quantity=self.qty, price=ltp)
+        if not order_result.get("ok"):
+            log_alert(f"[ENTRY FAILED] {side} {leg} {tsym}: {order_result.get('msg')}. Position NOT recorded.")
+            return False
+
+        pos_info = {
+            "strike": strike, "tsym": tsym, "base": base, "side": side, "qty": self.qty,
+            "entry_price": ltp, "entry_time": time.time(), "entry_spot": spot,
+            "order_no": order_result.get("order_no"),
+        }
+        if side == "SELL":
+            pos_info["spot_sl_state"] = self.risk_manager.init_spot_sl(leg, spot, atr)
         self.positions[leg] = pos_info
-        log_trade(f"{side} {leg:10s} Strike: {strike} @ ₹{ltp:.2f} (Spot: {spot:.2f})")
+        log_trade(f"{side} {leg:10s} Strike: {strike} @ ₹{ltp:.2f} (Spot: {spot:.2f}) | Order: {order_result.get('order_no')}")
         self._save_state()
+        return True
 
     def _exit_leg(self, leg: str, reason: str = "MANUAL") -> float:
         if leg not in self.positions: return 0.0
@@ -633,10 +857,16 @@ class ExecutionEngine:
         base = pos["base"]
         ltp = self._get_ltp(pos["strike"], base)
         close_side = "BUY" if pos["side"] == "SELL" else "SELL"
-        self.broker.place_option_order(symbol=pos["tsym"], transaction_type=close_side, quantity=pos["qty"], price=ltp)
+        order_result = self.broker.place_option_order(symbol=pos["tsym"], transaction_type=close_side, quantity=pos["qty"], price=ltp)
+
+        if not order_result.get("ok"):
+            log_alert(f"[EXIT FAILED] {leg} {pos['tsym']}: {order_result.get('msg')}. "
+                      f"Position REMAINS OPEN and will be retried. Reason was: {reason}")
+            return 0.0
+
         pnl = (pos["entry_price"] - ltp) * pos["qty"] if pos["side"] == "SELL" else (ltp - pos["entry_price"]) * pos["qty"]
         self.realized_pnl += pnl
-        log_trade(f"EXITED {leg:10s} Strike: {pos['strike']} @ ₹{ltp:.2f} | P&L: ₹{pnl:,.2f} (Reason: {reason})")
+        log_trade(f"EXITED {leg:10s} Strike: {pos['strike']} @ ₹{ltp:.2f} | P&L: ₹{pnl:,.2f} (Reason: {reason}) | Order: {order_result.get('order_no')}")
         del self.positions[leg]
         self._save_state()
         return pnl
@@ -677,8 +907,35 @@ class ExecutionEngine:
                     if not any(v.get("active", False) for v in self.cooldown_tracker.values()):
                         self.mode = "CHOP_MODE" if regime == "CHOP" else "RUNNING"
 
+    def _build_dashboard_snapshot(self, spot: float, atm: int, atr: float, regime: str, trend: int,
+                                   dte_days: float, unrealized: float) -> Dict[str, Any]:
+        positions_view = {}
+        for leg, pos in self.positions.items():
+            ltp = self._get_ltp(pos["strike"], pos["base"])
+            live_pnl = (pos["entry_price"] - ltp) * pos["qty"] if pos["side"] == "SELL" else (ltp - pos["entry_price"]) * pos["qty"]
+            positions_view[leg] = {**pos, "live_ltp": ltp, "live_pnl": live_pnl}
+
+        return {
+            "now_str": _now_str(),
+            "mode": self.mode,
+            "paper_mode": self.broker.paper_trading,
+            "spot": spot, "atm": atm, "adx": self.current_indicators.get("adx", 18.0),
+            "regime": regime, "trend": trend, "atr": atr, "dte": dte_days,
+            "realized_pnl": self.realized_pnl, "unrealized_pnl": unrealized,
+            "positions": positions_view,
+            "cooldown_tracker": self.cooldown_tracker,
+            "last_event": _LAST_EVENT["msg"],
+        }
+
     def run(self):
         log_info("Starting V2 Pro Algorithmic State Machine...")
+        self.dashboard.start()
+        try:
+            self._run_loop()
+        finally:
+            self.dashboard.stop()
+
+    def _run_loop(self):
         while True:
             try:
                 now = get_ist_now()
@@ -694,7 +951,10 @@ class ExecutionEngine:
 
                 # 1. Pre-Market Sleep Loop
                 if now.hour < 9 or (now.hour == 9 and now.minute < 15):
-                    print(f"[{_now_str()}] Pre-market. Sleeping until 09:15 AM to save API limits...", flush=True)
+                    _LAST_EVENT["msg"] = "Pre-market: sleeping until 09:15 to save API limits"
+                    self.dashboard.update({"now_str": _now_str(), "mode": "PRE_MARKET",
+                                            "paper_mode": self.broker.paper_trading,
+                                            "last_event": _LAST_EVENT["msg"]})
                     time.sleep(60.0)
                     continue
                     
@@ -719,13 +979,18 @@ class ExecutionEngine:
                     if now.hour > MARKET_START_HOUR or (now.hour == MARKET_START_HOUR and now.minute >= MARKET_START_MINUTE):
                         log_info(f"09:18 AM Reached. Entering Market (Regime: {regime})...")
                         hedge_width = 1000
-                        if "CE_HEDGE" not in self.positions: self._enter_leg("CE_HEDGE", atm + hedge_width, "BUY", spot, atr)
-                        if "PE_HEDGE" not in self.positions: self._enter_leg("PE_HEDGE", atm - hedge_width, "BUY", spot, atr)
-                        ce_strike, pe_strike = self.calculate_strangle_strikes(atm, atr, regime, dte_days=dte_days)
-                        if "CE" not in self.positions: self._enter_leg("CE", ce_strike, "SELL", spot, atr)
-                        if "PE" not in self.positions: self._enter_leg("PE", pe_strike, "SELL", spot, atr)
-                        self.mode = "CHOP_MODE" if regime == "CHOP" else "RUNNING"
-                        self._save_state()
+                        ce_hedge_ok = "CE_HEDGE" in self.positions or self._enter_leg("CE_HEDGE", atm + hedge_width, "BUY", spot, atr)
+                        pe_hedge_ok = "PE_HEDGE" in self.positions or self._enter_leg("PE_HEDGE", atm - hedge_width, "BUY", spot, atr)
+
+                        if not (ce_hedge_ok and pe_hedge_ok):
+                            log_alert("[ENTRY ABORTED] One or both hedge legs failed to fill. Refusing to sell naked shorts. Will retry next tick.")
+                        else:
+                            ce_strike, pe_strike = self.calculate_strangle_strikes(atm, atr, regime, dte_days=dte_days)
+                            if "CE" not in self.positions: self._enter_leg("CE", ce_strike, "SELL", spot, atr)
+                            if "PE" not in self.positions: self._enter_leg("PE", pe_strike, "SELL", spot, atr)
+                            if "CE" in self.positions and "PE" in self.positions:
+                                self.mode = "CHOP_MODE" if regime == "CHOP" else "RUNNING"
+                                self._save_state()
 
                 elif self.mode in ("RUNNING", "CHOP_MODE", "COOLDOWN"):
                     if not self.positions:
@@ -754,9 +1019,9 @@ class ExecutionEngine:
                             self._exit_leg("PE", reason="CHOP_ROLL_OUT")
                             self._enter_leg("PE", chop_pe, "SELL", spot, atr)
 
-                # CLI Print
-                print(f"[{_now_str()}] Spot: {spot:.2f} | ADX: {self.current_indicators.get('adx', 18):.1f} ({regime}) | KAMA Trend: {trend} | Mode: {self.mode}", flush=True)
-                
+                snap = self._build_dashboard_snapshot(spot, atm, atr, regime, trend, dte_days, unrealized)
+                self.dashboard.update(snap)
+
                 # Sleep for 1 second for ultra-fast, real-time tick evaluation
                 time.sleep(1.0)
 
