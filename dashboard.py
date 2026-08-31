@@ -430,17 +430,17 @@ def render_rich(snap: Optional[Dict]):
     pos_table.add_column("Entry ₹")
     pos_table.add_column("LTP ₹")
     pos_table.add_column("P&L ₹")
-    pos_table.add_column("Spot SL Line")
-    pos_table.add_column("Breach Cnt")
+    pos_table.add_column("Best Low ₹")
+    pos_table.add_column("Premium TSL ₹")
 
     positions = snap.get("positions", {})
     if positions:
         for leg, pos in positions.items():
             pnl = pos.get("live_pnl", 0.0)
             pnl_str = f"[green]₹{pnl:,.2f}[/green]" if pnl >= 0 else f"[red]₹{pnl:,.2f}[/red]"
-            sl_state = pos.get("spot_sl_state") or {}
+            sl_state = pos.get("premium_sl_state") or {}
+            low_val  = f"{sl_state.get('lowest_ltp', '—')}" if sl_state else "—"
             sl_line  = f"{sl_state.get('current_sl', '—')}" if sl_state else "—"
-            breach   = f"{sl_state.get('breach_count', 0)}/2" if sl_state else "—"
             side_str = f"[red]{pos.get('side','—')}[/red]" if pos.get('side') == 'SELL' else f"[green]{pos.get('side','—')}[/green]"
             pos_table.add_row(
                 leg,
@@ -450,25 +450,21 @@ def render_rich(snap: Optional[Dict]):
                 f"{pos.get('entry_price', 0):.2f}",
                 f"{pos.get('live_ltp', 0):.2f}",
                 pnl_str,
+                str(low_val),
                 str(sl_line),
-                str(breach),
             )
     else:
         pos_table.add_row("No Open Positions", "—", "—", "—", "—", "—", "—", "—", "—")
 
-    # Cooldown Table
-    cd_table = Table(title="⚡ Anti-Whipsaw Cooldown Engine", expand=True, show_lines=False)
-    cd_table.add_column("Leg", style="bold")
+    # Anti-Whipsaw Dual-Leg Status Table
+    cd_table = Table(title="⚡ Anti-Whipsaw Protection System", expand=True, show_lines=False)
+    cd_table.add_column("Feature", style="bold")
     cd_table.add_column("Status")
-    cd_table.add_column("Elapsed")
-    cd_table.add_column("Stopped At Spot")
-    for leg, cd in snap.get("cooldown_tracker", {}).items():
-        active = cd.get("active", False)
-        elapsed = time.time() - cd.get("stopped_time", time.time()) if active else 0
-        status_txt  = "[yellow]⏳ COOLING DOWN[/yellow]" if active else "[green]✅ Ready[/green]"
-        elapsed_txt = f"{elapsed:.0f}s" if active else "—"
-        stopped_txt = f"₹{cd.get('stopped_spot', 0):.2f}" if active else "—"
-        cd_table.add_row(leg, status_txt, elapsed_txt, stopped_txt)
+    cd_table.add_column("Config")
+    cd_table.add_row("Premium Trailing SL", "[green]✅ ACTIVE (Per-Second Live Ticks)[/green]", "5% trail (CHOP) / 7% trail (TREND)")
+    cd_table.add_row("Dual-Leg Exit", "[green]✅ ENABLED[/green]", "Instantly closes BOTH short legs on any SL hit")
+    cd_table.add_row("KAMA 1m Engine", "[green]✅ ENABLED[/green]", "KAMA(13,3,30) calculated on 1-min closes")
+    cd_table.add_row("Regime Gateway", "[green]✅ ENABLED[/green]", "ADX(9) + ATR(14) calculated on 5-min bars")
 
     footer = Text(
         f" [{source_color}]Data: {source}[/{source_color}]  |  Updated: {snap.get('now_str')}  |  Refresh: 3s  |  Press Ctrl+C to close ",

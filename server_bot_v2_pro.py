@@ -491,34 +491,40 @@ class Indicators:
 
     @classmethod
     def evaluate_all(cls, df_1m: pd.DataFrame, df_5m: pd.DataFrame):
+        # 1. KAMA on 1-Minute Close Data (13, 3, 30)
+        kama, prev_kama, trend = None, None, 0
+        kama_slope = 0.0
+        if not df_1m.empty and len(df_1m) >= KAMA_PERIOD + 1:
+            closes_1m = df_1m['close'].to_numpy(dtype=float)
+            kama, prev_kama, trend = cls.calculate_kama(closes_1m, period=KAMA_PERIOD, fast=KAMA_FAST_EMA, slow=KAMA_SLOW_EMA)
+            kama_slope = (kama - prev_kama) if (kama is not None and prev_kama is not None) else 0.0
+
+        # 2. ADX (9) and ATR (14) on 5-Minute Data
         if df_5m.empty or len(df_5m) < 5:
-            return {'kama': None, 'prev_kama': None, 'trend': 0, 'atr': DEFAULT_ATR_5M, 'adx': 18.0, 'plus_di': 20.0, 'minus_di': 20.0, 'regime': 'CHOP'}
+            return {
+                'kama': kama, 'prev_kama': prev_kama, 'trend': trend, 'kama_slope': kama_slope,
+                'atr': DEFAULT_ATR_5M, 'adx': 18.0, 'plus_di': 20.0, 'minus_di': 20.0, 'regime': 'CHOP'
+            }
             
-        highs = df_5m['high'].to_numpy(dtype=float)
-        lows = df_5m['low'].to_numpy(dtype=float)
-        closes = df_5m['close'].to_numpy(dtype=float)
+        highs_5m = df_5m['high'].to_numpy(dtype=float)
+        lows_5m = df_5m['low'].to_numpy(dtype=float)
+        closes_5m = df_5m['close'].to_numpy(dtype=float)
         
-        atr = cls.calculate_atr(highs, lows, closes)
-        adx, p_di, m_di = cls.calculate_adx(highs, lows, closes)
+        atr = cls.calculate_atr(highs_5m, lows_5m, closes_5m, period=ATR_PERIOD)
+        adx, p_di, m_di = cls.calculate_adx(highs_5m, lows_5m, closes_5m, period=ADX_PERIOD)
         
-        # KAMA now computed on the SAME 5m closes as ADX/ATR (was 1m before).
-        # It now actively skews live strike selection in TREND regime, so it
-        # needs to move on the same clock as the regime call, not a noisier one.
-        if len(closes) < KAMA_PERIOD + 1:
-            kama, prev_kama, trend = None, None, 0
-        else:
-            kama, prev_kama, trend = cls.calculate_kama(closes)
-        
-        # ADX_CHOP_THRESHOLD < ADX_TREND_THRESHOLD creates a real neutral band
-        # (previously both were 20.0, so this middle branch never fired).
         if adx < ADX_CHOP_THRESHOLD: regime = "CHOP"
         elif adx >= ADX_TREND_THRESHOLD: regime = "TREND"
         else: regime = "TRANSITION"
-        return {'kama': kama, 'prev_kama': prev_kama, 'trend': trend, 'atr': atr, 'adx': adx, 'plus_di': p_di, 'minus_di': m_di, 'regime': regime}
+        
+        return {
+            'kama': kama, 'prev_kama': prev_kama, 'trend': trend, 'kama_slope': kama_slope,
+            'atr': atr, 'adx': adx, 'plus_di': p_di, 'minus_di': m_di, 'regime': regime
+        }
 
 
 # ==============================================================================
-# MODULE 3: RISK MANAGER
+# MODULE 3: RISK MANAGER (DYNAMIC PREMIUM-BASED TSL)
 # ==============================================================================
 
 class RiskManager:
@@ -526,87 +532,82 @@ class RiskManager:
         self.capital = capital
         self.circuit_breaker_loss_limit = -1.0 * (capital * PORTFOLIO_CIRCUIT_PCT / 100.0)
 
-    def init_spot_sl(self, leg: str, entry_spot: float, atr: float):
-        initial_distance = max(12.0, SPOT_SL_ATR_MULT * atr)
-        base = "CE" if "CE" in leg else "PE"
-        if base == "CE":
-            initial_sl = entry_spot + initial_distance
-            best_spot = entry_spot 
-        else:
-            initial_sl = entry_spot - initial_distance
-            best_spot = entry_spot 
+    def init_premium_sl(self, entry_price: float, regime: str = "CHOP") -> Dict[str, Any]:
+        """
+        Initialize premium-based trailing stop loss state for a sold option.
+        - Initial Stop Loss: +30% in CHOP, +40% in TREND
+        - Trailing Buffer: 5% in CHOP (tighter), 7% in TREND (larger)
+        """
+        safe_entry = max(0.5, float(entry_price))
+        initial_sl_pct = 0.30 if regime == "CHOP" else 0.40
+        initial_sl_price = round(safe_entry * (1.0 + initial_sl_pct), 2)
+        
         return {
-            "entry_spot": round(entry_spot, 2), "atr_at_entry": round(atr, 2),
-            "initial_sl": round(initial_sl, 2), "current_sl": round(initial_sl, 2),
-            "best_spot": round(entry_spot, 2), "trail_amount": 0.0, "breach_count": 0
+            "entry_price": safe_entry,
+            "lowest_ltp": safe_entry,      # tracks best profit price reached (lower is better for short)
+            "initial_sl": initial_sl_price,
+            "current_sl": initial_sl_price,
+            "regime": regime,
+            "trail_pct": 0.05 if regime == "CHOP" else 0.07,  # 5% in CHOP, 7% in TREND
+            "profit_locked": False
         }
 
-    def update_spot_sl_and_check(self, leg: str, pos_data: Dict[str, Any], current_spot: float, is_new_1m_bar: bool):
-        sl_state = pos_data.get("spot_sl_state")
-        if not sl_state or not isinstance(sl_state, dict):
-            # Auto-initialize SL state if missing or corrupted
-            atr = float(pos_data.get("atr_at_entry", DEFAULT_ATR_5M))
-            sl_state = self.init_spot_sl(leg, current_spot, atr)
-            pos_data["spot_sl_state"] = sl_state
-
-        entry_spot = float(sl_state.get("entry_spot", current_spot))
-        if entry_spot <= 1000.0:
-            entry_spot = current_spot
-            sl_state["entry_spot"] = entry_spot
-            sl_dist = max(12.0, SPOT_SL_ATR_MULT * DEFAULT_ATR_5M)
-            sl_state["initial_sl"] = current_spot + sl_dist if ("CE" in leg) else current_spot - sl_dist
-            sl_state["current_sl"] = sl_state["initial_sl"]
-            sl_state["best_spot"] = entry_spot
-
-        atr_at_entry = float(sl_state.get("atr_at_entry", 0.0) or 0.0)
-        current_sl = float(sl_state["current_sl"])
-        best_spot = float(sl_state.get("best_spot", entry_spot))
-        safe_atr = max(5.0, atr_at_entry if atr_at_entry > 0 else DEFAULT_ATR_5M)
-        favorable_lock_at = safe_atr * SPOT_SL_BREAKEVEN_LOCK_ATR
-        deep_lock_at = favorable_lock_at * 1.6
+    def update_premium_tsl_and_check(self, leg: str, pos_data: Dict[str, Any], live_ltp: float, regime: str = "CHOP") -> Tuple[bool, str]:
+        """
+        Dynamic Premium-Based Trailing Stop Loss — runs every second on live tick data.
         
-        base = "CE" if "CE" in leg else "PE"
-        is_breaching = False
-
-        if base == "CE":
-            # For CE: favorable move is Spot going DOWN
-            if current_spot < best_spot:
-                best_spot = current_spot
-                sl_state["best_spot"] = round(best_spot, 2)
-            favorable_move = entry_spot - best_spot
-            if favorable_move > 0:
-                trail_ratio = SPOT_SL_TRAIL_RATIO_DEEP if favorable_move >= deep_lock_at else (SPOT_SL_TRAIL_RATIO_STRONG if favorable_move >= favorable_lock_at else SPOT_SL_TRAIL_RATIO)
-                trail_amount = favorable_move * trail_ratio
-                candidate_sl = sl_state["initial_sl"] - trail_amount
-                sl_state["current_sl"] = min(current_sl, round(candidate_sl, 2))
-                sl_state["trail_amount"] = round(trail_amount, 2)
-            # CE breached if Spot rises above Stop Loss line
-            is_breaching = (current_spot >= sl_state["current_sl"])
-        else:
-            # For PE: favorable move is Spot going UP
-            if current_spot > best_spot:
-                best_spot = current_spot
-                sl_state["best_spot"] = round(best_spot, 2)
-            favorable_move = best_spot - entry_spot
-            if favorable_move > 0:
-                trail_ratio = SPOT_SL_TRAIL_RATIO_DEEP if favorable_move >= deep_lock_at else (SPOT_SL_TRAIL_RATIO_STRONG if favorable_move >= favorable_lock_at else SPOT_SL_TRAIL_RATIO)
-                trail_amount = favorable_move * trail_ratio
-                candidate_sl = sl_state["initial_sl"] + trail_amount
-                sl_state["current_sl"] = max(current_sl, round(candidate_sl, 2))
-                sl_state["trail_amount"] = round(trail_amount, 2)
-            # PE breached if Spot falls below Stop Loss line
-            is_breaching = (current_spot <= sl_state["current_sl"])
-
-        # 1. Immediate Spot SL Trigger
-        if is_breaching:
-            return True, f"⛔ Spot SL Hit for {leg} | Spot: {current_spot:.2f} crossed SL: {sl_state['current_sl']:.2f} (Entry Spot: {entry_spot:.2f})"
-
-        # 2. Option Premium Stop Loss: 50% Max Loss on sold premium
+        For a short option:
+        - As live_ltp drops (e.g. 50 -> 40 -> 30), lowest_ltp is updated to the new low.
+        - Trailing SL ratchets down:
+            CHOP mode:  current_sl = min(current_sl, lowest_ltp + lowest_ltp * 5%)
+            TREND mode: current_sl = min(current_sl, lowest_ltp + lowest_ltp * 7%)
+        - If profit >= 15%, breakeven is locked so trade cannot become a loss.
+        - If live_ltp >= current_sl: triggers immediate stop loss!
+        """
         entry_price = float(pos_data.get("entry_price", 0.0))
-        live_ltp = float(pos_data.get("live_ltp", 0.0))
-        if entry_price > 0.0 and live_ltp > 0.0:
-            if (live_ltp - entry_price) >= (entry_price * 0.50):
-                return True, f"⛔ Option Premium 50% SL Hit for {leg} | Entry: ₹{entry_price:.2f}, LTP: ₹{live_ltp:.2f} (+50% loss)"
+        if entry_price <= 0.0:
+            return False, ""
+            
+        sl_state = pos_data.get("premium_sl_state")
+        if not sl_state or not isinstance(sl_state, dict):
+            sl_state = self.init_premium_sl(entry_price, regime)
+            pos_data["premium_sl_state"] = sl_state
+
+        if live_ltp <= 0.0:
+            return False, ""
+
+        lowest_ltp = float(sl_state.get("lowest_ltp", entry_price))
+        current_sl = float(sl_state.get("current_sl", sl_state.get("initial_sl", entry_price * 1.4)))
+        trail_pct = 0.05 if regime == "CHOP" else 0.07
+
+        # 1. If option price makes a new low (more profit for short seller), update lowest_ltp and ratchet SL tighter
+        if live_ltp < lowest_ltp:
+            lowest_ltp = live_ltp
+            sl_state["lowest_ltp"] = round(lowest_ltp, 2)
+            
+            # Dynamic trailing buffer: 5% in CHOP, 7% in TREND (min 1.0 pt buffer)
+            buffer = max(1.0, lowest_ltp * trail_pct)
+            candidate_sl = round(lowest_ltp + buffer, 2)
+            
+            # Trailing SL can only move down (never widen for a short option)
+            if candidate_sl < current_sl:
+                sl_state["current_sl"] = candidate_sl
+                current_sl = candidate_sl
+
+        # 2. Breakeven Lock: Once position is in profit >= 15%, ensure current_sl <= entry_price
+        if (entry_price - lowest_ltp) >= (entry_price * 0.15):
+            if current_sl > entry_price:
+                sl_state["current_sl"] = entry_price
+                current_sl = entry_price
+                sl_state["profit_locked"] = True
+
+        # 3. Trigger check: If live LTP breaches current_sl
+        if live_ltp >= current_sl:
+            return True, (
+                f"⛔ Premium TSL Hit for {leg} | Entry: ₹{entry_price:.2f}, "
+                f"Best Low: ₹{lowest_ltp:.2f}, TSL Line: ₹{current_sl:.2f}, Live LTP: ₹{live_ltp:.2f} "
+                f"(Regime: {regime}, Trail: {int(trail_pct*100)}%)"
+            )
 
         return False, ""
 
@@ -677,38 +678,39 @@ class ExecutionEngine:
         return float(np.clip(log_curve, 0.0, 1.0))
 
     def calculate_strangle_strikes(self, atm_spot: int, atr: float, regime: str, dte_days: float = 2.0, trend: int = 0, adx: float = 18.0) -> Tuple[int, int]:
-        skew = 0.0
+        """
+        Strike selection based on market choppiness / volatility:
+        - Very High Chop (Highs & Lows large, ATR >= 40 or ADX < 12):  OTM 3 (ATM ± 150)
+        - Medium Chop (ATR 28 - 40 or ADX 12 - 16):                    OTM 2 (ATM ± 100)
+        - Average Chop (ATR 18 - 28):                                  OTM 1 (ATM ± 50)
+        - Very Low / Tight Range (ATR < 18):                           ATM (ATM ± 0)
+        """
         if regime == "CHOP":
-            min_w, max_w, mult = CHOP_MIN_WIDTH_PTS, CHOP_MAX_WIDTH_PTS, CHOP_ATR_MULTIPLIER
-            # Continuous choppiness score: further below the CHOP threshold ADX
-            # sits, the choppier the tape, the wider we sell (was previously a
-            # flat multiplier that got zeroed out by the dead width config).
-            chop_score = float(np.clip((ADX_CHOP_THRESHOLD - adx) / max(1e-6, ADX_CHOP_THRESHOLD), 0.0, 1.0))
-            score_width = min_w + (max_w - min_w) * chop_score
-            calculated_width = max(min_w, min(max_w, max(score_width, mult * atr)))
-        else:
-            min_w, max_w, mult = BASE_MIN_WIDTH_PTS, BASE_MAX_WIDTH_PTS, BASE_ATR_MULTIPLIER
-            calculated_width = max(min_w, min(max_w, mult * atr))
-            if regime == "TREND" and trend != 0:
-                # KAMA-driven trend follow: shift the whole strangle center in
-                # the trend direction. The side price is pushing toward gets
-                # more room (protection); the side it's moving away from gets
-                # pulled in (more premium, since breach risk there is falling).
-                skew_score = float(np.clip(adx / TREND_SKEW_ADX_REF, 0.0, 1.0))
-                skew = trend * TREND_SKEW_MAX_PTS * skew_score
+            if atr >= 40.0 or adx < 12.0:
+                otm_pts = 150  # OTM 3 (High chop / wide candle ranges)
+            elif atr >= 28.0 or adx < 16.0:
+                otm_pts = 100  # OTM 2 (Medium chop)
+            elif atr >= 18.0:
+                otm_pts = 50   # OTM 1 (Average chop)
+            else:
+                otm_pts = 0    # ATM (Tight chop / low volatility)
+        elif regime == "TREND":
+            base_otm = 100 if atr >= 30.0 else 50
+            if trend == 1:    # Bullish: Call higher (+100/150), Put closer (+50)
+                ce_strike = atm_spot + base_otm + 50
+                pe_strike = max(atm_spot - base_otm, atm_spot - 50)
+                return ce_strike, pe_strike
+            elif trend == -1:  # Bearish: Put lower (-100/150), Call closer (-50)
+                ce_strike = min(atm_spot + base_otm, atm_spot + 50)
+                pe_strike = atm_spot - base_otm - 50
+                return ce_strike, pe_strike
+            else:
+                otm_pts = base_otm
+        else:  # TRANSITION
+            otm_pts = 100 if atr >= 28.0 else 50
 
-        if float(dte_days) <= 1.0: return atm_spot, atm_spot
-        expiry_curve = self._expiry_width_multiplier(dte_days)
-        expiry_floor = 50 if dte_days <= EXPIRY_NEAR_DAYS else min_w
-        compressed_width = max(expiry_floor, round(max(min_w, calculated_width) * (1.0 - 0.65 * expiry_curve) + min_w * (0.65 * expiry_curve)))
-        stride_50 = int(round(compressed_width / 50.0) * 50)
-        final_width = max(expiry_floor, min(max_w, stride_50))
-        skew_stride = int(round(skew / 50.0) * 50)
-
-        ce_strike = atm_spot + final_width + skew_stride
-        pe_strike = atm_spot - final_width + skew_stride
-        if ce_strike <= atm_spot or pe_strike >= atm_spot or ce_strike == pe_strike:
-            ce_strike, pe_strike = atm_spot + 50, atm_spot - 50
+        ce_strike = atm_spot + otm_pts
+        pe_strike = atm_spot - otm_pts
         return ce_strike, pe_strike
 
     def _save_state(self):
@@ -730,11 +732,12 @@ class ExecutionEngine:
                 market_closed = (now.hour > AUTO_SQUAREOFF_HOUR or (now.hour == AUTO_SQUAREOFF_HOUR and now.minute >= AUTO_SQUAREOFF_MINUTE))
                 if saved_mode in ("SESSION_DONE", "SESSION_DONE_FLAT") and not market_closed:
                     self.mode = "RUNNING" if self.positions else "WAIT_DATA"
-                else: self.mode = saved_mode
+                else:
+                    self.mode = saved_mode
                 for leg, pos in self.positions.items():
-                    if pos.get("side") == "SELL" and leg in ("CE", "PE"):
-                        if "spot_sl_state" not in pos or not pos["spot_sl_state"]:
-                            pos["spot_sl_state"] = self.risk_manager.init_spot_sl(leg, float(pos.get("entry_spot", self.market_data.latest_spot)), float(self.current_indicators.get("atr", DEFAULT_ATR_5M)))
+                    if pos.get("side") == "SELL":
+                        if "premium_sl_state" not in pos or not pos["premium_sl_state"]:
+                            pos["premium_sl_state"] = self.risk_manager.init_premium_sl(float(pos.get("entry_price", 0.0)), self.current_indicators.get("regime", "CHOP"))
         except: pass
 
     def _sync_positions_from_broker(self):
@@ -874,7 +877,7 @@ class ExecutionEngine:
                     "prd":        prd,
                 }
                 if side == "SELL":
-                    pos_info["spot_sl_state"] = self.risk_manager.init_spot_sl(base, spot, atr)
+                    pos_info["premium_sl_state"] = self.risk_manager.init_premium_sl(avgprc, self.current_indicators.get("regime", "CHOP"))
 
                 self.positions[leg] = pos_info
                 log_info(f"Imported: {leg} ({side} {qty}x {tsym} strike={strike} base={base} @ ₹{avgprc:.2f})")
@@ -927,7 +930,7 @@ class ExecutionEngine:
             self._ltp_cache[key] = float(q.get("lp", 0.0))
         return self._ltp_cache[key]
 
-    def _enter_leg(self, leg: str, strike: int, side: str, spot: float, atr: float, product_type: str = "M"):
+    def _enter_leg(self, leg: str, strike: int, side: str, spot: float, atr: float, product_type: str = "M", regime: str = "CHOP"):
         base = leg.split("_")[0]
         q = self.market_data.streamer.get_live_quote(strike, base)
         tsym = q.get("tsym", f"NIFTY_{strike}_{base}")
@@ -936,7 +939,8 @@ class ExecutionEngine:
         
         self.broker.place_option_order(symbol=tsym, transaction_type=side, quantity=self.qty, price=ltp, product_type=product_type)
         pos_info = {"strike": strike, "tsym": tsym, "base": base, "side": side, "qty": self.qty, "entry_price": ltp, "entry_time": time.time(), "entry_spot": spot, "prd": product_type}
-        if side == "SELL": pos_info["spot_sl_state"] = self.risk_manager.init_spot_sl(leg, spot, atr)
+        if side == "SELL":
+            pos_info["premium_sl_state"] = self.risk_manager.init_premium_sl(ltp, regime)
         self.positions[leg] = pos_info
         log_trade(f"{side} {leg:10s} Strike: {strike} @ ₹{ltp:.2f} (Spot: {spot:.2f})")
         self._save_state()
@@ -960,7 +964,6 @@ class ExecutionEngine:
         del self.positions[leg]
         self._save_state()
         return pnl
-
 
     def _exit_all_positions(self, reason: str = "GLOBAL_EXIT"):
         for leg in list(self.positions.keys()): self._exit_leg(leg, reason=reason)
@@ -1088,13 +1091,13 @@ class ExecutionEngine:
                         elif regime == "TRANSITION":
                             log_info(f"09:18 AM reached but ADX {adx:.1f} is in the TRANSITION band — holding entry.")
                         else:
-                            log_info(f"Market Ready. Entering Strangle (Regime: {regime})...")
+                            log_info(f"Market Ready. Entering Strangle (Regime: {regime}, KAMA 1m Trend: {trend})...")
                             hedge_width = HEDGE_WIDTH_PTS
-                            if "CE_HEDGE" not in self.positions: self._enter_leg("CE_HEDGE", atm + hedge_width, "BUY", spot, atr)
-                            if "PE_HEDGE" not in self.positions: self._enter_leg("PE_HEDGE", atm - hedge_width, "BUY", spot, atr)
+                            if "CE_HEDGE" not in self.positions: self._enter_leg("CE_HEDGE", atm + hedge_width, "BUY", spot, atr, regime=regime)
+                            if "PE_HEDGE" not in self.positions: self._enter_leg("PE_HEDGE", atm - hedge_width, "BUY", spot, atr, regime=regime)
                             ce_strike, pe_strike = self.calculate_strangle_strikes(atm, atr, regime, dte_days=dte_days, trend=trend, adx=adx)
-                            if "CE" not in self.positions: self._enter_leg("CE", ce_strike, "SELL", spot, atr)
-                            if "PE" not in self.positions: self._enter_leg("PE", pe_strike, "SELL", spot, atr)
+                            if "CE" not in self.positions: self._enter_leg("CE", ce_strike, "SELL", spot, atr, regime=regime)
+                            if "PE" not in self.positions: self._enter_leg("PE", pe_strike, "SELL", spot, atr, regime=regime)
                             self.mode = "RUNNING"
                             self._save_state()
 
@@ -1103,15 +1106,16 @@ class ExecutionEngine:
                         self.mode = "WAIT_DATA"
                         continue
 
-                    # Spot-Based SL Check: If ANY short leg breaches Stop Loss, close BOTH legs immediately (Whipsaw Exit)
+                    # Dynamic Premium-Based Trailing SL Check — evaluated every second on live tick data
                     whipsaw_triggered = False
                     whipsaw_leg = ""
                     whipsaw_reason = ""
                     for leg in list(self.positions.keys()):
                         pos = self.positions.get(leg)
                         if pos and pos.get("side") == "SELL":
-                            pos["live_ltp"] = self._get_ltp(pos.get("strike", 0), pos.get("base", "CE"), tsym=pos.get("tsym", ""))
-                            is_stopped, reason = self.risk_manager.update_spot_sl_and_check(leg, pos, spot, is_new_1m_bar)
+                            ltp = self._get_ltp(pos.get("strike", 0), pos.get("base", "CE"), tsym=pos.get("tsym", ""))
+                            pos["live_ltp"] = ltp
+                            is_stopped, reason = self.risk_manager.update_premium_tsl_and_check(leg, pos, ltp, regime=regime)
                             if is_stopped:
                                 whipsaw_triggered = True
                                 whipsaw_leg = leg
@@ -1120,7 +1124,7 @@ class ExecutionEngine:
 
                     if whipsaw_triggered:
                         log_alert(whipsaw_reason)
-                        log_alert(f"⚠️ WHIPSAW DETECTED on {whipsaw_leg} | Spot: {spot:.2f} — Closing BOTH short legs to protect capital!")
+                        log_alert(f"⚠️ WHIPSAW DETECTED on {whipsaw_leg} — Closing BOTH short legs to protect capital!")
                         self._exit_all_positions(reason="WHIPSAW_DUAL_LEG_EXIT")
                         self._last_whipsaw_time = time.time()
                         self.mode = "WAIT_DATA"
@@ -1130,7 +1134,7 @@ class ExecutionEngine:
                 self._write_snapshot(spot, atm, atr, regime, trend, adx, dte_days, unrealized)
 
                 # CLI Print
-                print(f"[{_now_str()}] Spot: {spot:.2f} | ADX: {adx:.1f} ({regime}) | KAMA Trend: {trend} | Mode: {self.mode} | P&L: ₹{self.realized_pnl:,.0f}", flush=True)
+                print(f"[{_now_str()}] Spot: {spot:.2f} | ADX: {adx:.1f} ({regime}) | KAMA 1m Trend: {trend} | Mode: {self.mode} | P&L: ₹{self.realized_pnl:,.0f}", flush=True)
                 
                 time.sleep(1.0)
 
