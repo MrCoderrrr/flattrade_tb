@@ -157,7 +157,7 @@ MARKET_START_HOUR       = 9
 MARKET_START_MINUTE     = 18          
 AUTO_SQUAREOFF_HOUR     = 15
 AUTO_SQUAREOFF_MINUTE   = 28          
-REFRESH_INTERVAL_SEC    = 60          
+REFRESH_INTERVAL_SEC    = 1          
 
 
 def _now_str() -> str: return datetime.now().strftime("%H:%M:%S")
@@ -723,8 +723,8 @@ class ExecutionEngine:
                 # CLI Print
                 print(f"[{_now_str()}] Spot: {spot:.2f} | ADX: {self.current_indicators.get('adx', 18):.1f} ({regime}) | KAMA Trend: {trend} | Mode: {self.mode}")
                 
-                # Sleep exactly until next 1-minute boundary or 30 seconds depending on data flow
-                time.sleep(30.0)
+                # Sleep for 1 second for ultra-fast, real-time tick evaluation
+                time.sleep(1.0)
 
             except KeyboardInterrupt:
                 log_alert(f"Algo manually stopped. Realized PnL: ₹{self.realized_pnl:,.2f}")
