@@ -100,14 +100,14 @@ class NaturalGasBot:
     def find_option_symbol(self, strike: float, option_type: str) -> Optional[Dict]:
         """Find a matching MCX NATGAS option contract for the strike."""
         try:
-            search_text = f"NATGAS {strike} {option_type}"
+            search_text = f"NATGAS {int(strike)} {option_type}"
             res = self.api.searchscrip(exchange="MCX", searchtext=search_text)
             if not res or not isinstance(res, dict) or not res.get("values"):
                 return None
 
             for item in res["values"]:
                 tsym = str(item.get("tsym", "")).upper()
-                if tsym.endswith(f"{option_type[0]}{int(round(strike))}"):
+                if str(int(strike)) in tsym and option_type in tsym:
                     q = self.api.get_quotes(exchange="MCX", token=item.get("token"))
                     lp = float(q.get("lp", q.get("ltp", 0.0))) if q else 0.0
                     return {"tsym": item.get("tsym"), "lp": lp, "ls": int(item.get("ls", 1)), "token": item.get("token")}
