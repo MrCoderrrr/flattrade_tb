@@ -283,23 +283,47 @@ def load_data() -> Optional[Dict]:
             positions_view = build_positions_from_flattrade(ft_positions)
             unrealized = sum(p["live_pnl"] for p in positions_view.values())
 
-            # Try to enrich with bot-side indicators (adx, kama, regime, trend)
+            # Try to enrich with bot-side indicators and premium TSL state
             bot_snap = {}
             if os.path.exists(SNAP_FILE):
                 try:
-                    if time.time() - os.path.getmtime(SNAP_FILE) < 15.0:
+                    if time.time() - os.path.getmtime(SNAP_FILE) < 30.0:
                         with open(SNAP_FILE, "r") as f:
                             bot_snap = json.load(f)
-                        # Merge bot SL state into broker positions
-                        for leg, pos in positions_view.items():
-                            base = pos["base"]
-                            if base in bot_snap.get("positions", {}):
-                                bot_pos = bot_snap["positions"][base]
-                                pos["spot_sl_state"] = bot_pos.get("spot_sl_state")
-                                if pos["strike"] == 0:
-                                    pos["strike"] = bot_pos.get("strike", 0)
                 except Exception:
                     pass
+            elif os.path.exists(STATE_FILE):
+                try:
+                    with open(STATE_FILE, "r") as f:
+                        bot_snap = json.load(f)
+                except Exception:
+                    pass
+
+            bot_positions = bot_snap.get("positions", {})
+            for leg, pos in positions_view.items():
+                base = pos["base"]
+                b_pos = bot_positions.get(leg) or bot_positions.get(base)
+                if b_pos:
+                    pos["premium_sl_state"] = b_pos.get("premium_sl_state")
+                    if pos["strike"] == 0:
+                        pos["strike"] = b_pos.get("strike", 0)
+
+                # Fallback TSL state if bot state is missing
+                if pos.get("side") == "SELL" and not pos.get("premium_sl_state"):
+                    entry_p = float(pos.get("entry_price", 0.0))
+                    live_p  = float(pos.get("live_ltp", entry_p))
+                    lowest_p = min(entry_p, live_p) if live_p > 0 else entry_p
+                    regime = bot_snap.get("regime", "CHOP")
+                    trail_pct = 0.05 if regime == "CHOP" else 0.07
+                    init_sl = round(entry_p * (1.30 if regime == "CHOP" else 1.40), 2)
+                    cur_sl  = min(init_sl, round(lowest_p + max(1.0, lowest_p * trail_pct), 2))
+                    pos["premium_sl_state"] = {
+                        "entry_price": entry_p,
+                        "lowest_ltp": lowest_p,
+                        "current_sl": cur_sl,
+                        "initial_sl": init_sl,
+                        "trail_pct": trail_pct,
+                    }
 
             return {
                 "now_str": now_str,
@@ -327,7 +351,7 @@ def load_data() -> Optional[Dict]:
     # --- Fallback: Bot snapshot JSON ---
     if os.path.exists(SNAP_FILE):
         try:
-            if time.time() - os.path.getmtime(SNAP_FILE) < 15.0:
+            if time.time() - os.path.getmtime(SNAP_FILE) < 30.0:
                 with open(SNAP_FILE, "r") as f:
                     data = json.load(f)
                 data["now_str"] = now_str
@@ -403,7 +427,7 @@ def render_rich(snap: Optional[Dict]):
         f"[bold]Spot:[/bold] {spot_str}",
         f"[bold]ATM:[/bold] {snap.get('atm', '—')}",
         f"[bold]ADX(9):[/bold] {adx_val:.1f} ({regime})",
-        f"[bold]KAMA Trend:[/bold] {trend_str}",
+        f"[bold]KAMA 1m Trend:[/bold] {trend_str}",
     )
 
     r_pnl = snap.get('realized_pnl', 0.0)
@@ -415,46 +439,61 @@ def render_rich(snap: Optional[Dict]):
     trades_today = snap.get('trade_count', '—')
 
     top.add_row(
-        f"[bold]KAMA:[/bold] {kama_str}",
+        f"[bold]KAMA(13,3,30):[/bold] {kama_str}",
         f"[bold]ATR(5m):[/bold] {snap.get('atr', 0):.2f}",
         f"[bold]Realized:[/bold] {r_str}   [bold]Unrealized:[/bold] {u_str}",
         f"[bold]Total MTM:[/bold] {tot_str}   [dim]({trades_today} trades today)[/dim]",
     )
 
     # Positions Table
-    pos_table = Table(title="📊 Open Positions (Live from Flattrade)", expand=True, show_lines=True)
+    pos_table = Table(title="📊 Open Positions & Dynamic TSL (Live Flattrade Stream)", expand=True, show_lines=True)
     pos_table.add_column("Leg", style="bold")
     pos_table.add_column("Symbol")
     pos_table.add_column("Side")
     pos_table.add_column("Qty")
-    pos_table.add_column("Entry ₹")
-    pos_table.add_column("LTP ₹")
-    pos_table.add_column("P&L ₹")
-    pos_table.add_column("Best Low ₹")
-    pos_table.add_column("Premium TSL ₹")
+    pos_table.add_column("Entry ₹", justify="right")
+    pos_table.add_column("Live LTP ₹", justify="right")
+    pos_table.add_column("Lowest ₹ (Best)", justify="right", style="bold cyan")
+    pos_table.add_column("Active TSL ₹", justify="right", style="bold yellow")
+    pos_table.add_column("Buffer to TSL", justify="right")
+    pos_table.add_column("P&L ₹", justify="right")
 
     positions = snap.get("positions", {})
     if positions:
         for leg, pos in positions.items():
             pnl = pos.get("live_pnl", 0.0)
             pnl_str = f"[green]₹{pnl:,.2f}[/green]" if pnl >= 0 else f"[red]₹{pnl:,.2f}[/red]"
+            entry_p = float(pos.get("entry_price", 0.0))
+            live_p  = float(pos.get("live_ltp", 0.0))
+            
             sl_state = pos.get("premium_sl_state") or {}
-            low_val  = f"{sl_state.get('lowest_ltp', '—')}" if sl_state else "—"
-            sl_line  = f"{sl_state.get('current_sl', '—')}" if sl_state else "—"
-            side_str = f"[red]{pos.get('side','—')}[/red]" if pos.get('side') == 'SELL' else f"[green]{pos.get('side','—')}[/green]"
+            if pos.get("side") == "SELL" and sl_state:
+                lowest_val = float(sl_state.get("lowest_ltp", live_p))
+                lowest_str = f"₹{lowest_val:.2f}"
+                tsl_val    = float(sl_state.get("current_sl", entry_p * 1.35))
+                tsl_str    = f"₹{tsl_val:.2f}"
+                diff       = tsl_val - live_p
+                diff_str   = f"[green]+₹{diff:.2f}[/green]" if diff > 0 else f"[bold red]⛔ BREACHED[/bold red]"
+            else:
+                lowest_str = "—"
+                tsl_str    = "[dim]Hedge (No TSL)[/dim]"
+                diff_str   = "—"
+
+            side_str = f"[bold red]{pos.get('side','—')}[/bold red]" if pos.get('side') == 'SELL' else f"[bold green]{pos.get('side','—')}[/bold green]"
             pos_table.add_row(
                 leg,
                 pos.get("tsym", "—"),
                 side_str,
                 str(pos.get("qty", "—")),
-                f"{pos.get('entry_price', 0):.2f}",
-                f"{pos.get('live_ltp', 0):.2f}",
+                f"₹{entry_p:.2f}",
+                f"₹{live_p:.2f}",
+                lowest_str,
+                tsl_str,
+                diff_str,
                 pnl_str,
-                str(low_val),
-                str(sl_line),
             )
     else:
-        pos_table.add_row("No Open Positions", "—", "—", "—", "—", "—", "—", "—", "—")
+        pos_table.add_row("No Open Positions", "—", "—", "—", "—", "—", "—", "—", "—", "—")
 
     # Anti-Whipsaw Dual-Leg Status Table
     cd_table = Table(title="⚡ Anti-Whipsaw Protection System", expand=True, show_lines=False)
