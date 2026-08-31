@@ -567,7 +567,7 @@ class ExecutionEngine:
 
         self.market_data = MarketData(self.cache_file)
         self.risk_manager = RiskManager(capital=CAPITAL)
-        self.broker = FlattradeBroker(paper_trading=True)
+        self.broker = FlattradeBroker(paper_trading=False)
         
         self.mode = "WAIT_DATA"
         self.session_em_1sd = 0.0
