@@ -1,12 +1,24 @@
 #!/usr/bin/env python3
+"""
+V2 PRO LIVE DASHBOARD
+On startup:
+  1. Fetches today's real executed trade history from Flattrade (order book + trade book)
+  2. Fetches live open positions from Flattrade positions API
+  3. Computes real realized P&L from closed trades
+  4. Layers on live LTP quotes for open positions (unrealized P&L)
+  5. Falls back to bot snapshot JSON if API is unavailable
+Refreshes every 3 seconds.
+"""
+
 import os
 import sys
 import time
 import json
 from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Any
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-SNAP_FILE = os.path.join(PROJECT_ROOT, "data", "state", "live_snapshot_v2.json")
+SNAP_FILE  = os.path.join(PROJECT_ROOT, "data", "state", "live_snapshot_v2.json")
 STATE_FILE = os.path.join(PROJECT_ROOT, "data", "state", "algo_state_v2.json")
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -17,13 +29,14 @@ try:
     from rich.table import Table
     from rich.live import Live
     from rich.panel import Panel
-    from rich.layout import Layout
     from rich.text import Text
     HAS_RICH = True
 except ImportError:
     HAS_RICH = False
 
-# Fallback Flattrade reader if standalone
+# ==============================================================================
+# FLATTRADE API CONNECTION
+# ==============================================================================
 api = None
 try:
     from api_helper import NorenApiPy
@@ -33,29 +46,16 @@ try:
             tok = f.read().strip()
         api = NorenApiPy()
         api.set_session(userid=str(USER_ID).strip(), password='', usertoken=tok)
-except Exception:
+        print(f"[DASHBOARD] Connected to Flattrade API as {USER_ID}", flush=True)
+except Exception as e:
+    print(f"[DASHBOARD] Flattrade API unavailable ({e}), will use snapshot file.", flush=True)
     api = None
 
-_quote_token_cache = {}
+_token_cache: Dict[str, str] = {}
 
-def get_quote_for_symbol(tsym: str) -> float:
-    if not api or not tsym: return 0.0
-    try:
-        if tsym not in _quote_token_cache:
-            res = api.searchscrip(exchange='NFO', searchtext=tsym)
-            if res and isinstance(res, dict) and res.get('values'):
-                for item in res['values']:
-                    if item.get('tsym') == tsym:
-                        _quote_token_cache[tsym] = item.get('token')
-                        break
-        tok = _quote_token_cache.get(tsym)
-        if tok:
-            q = api.get_quotes(exchange='NFO', token=tok)
-            if q and isinstance(q, dict):
-                return float(q.get('lp', q.get('ltp', 0.0)))
-    except Exception:
-        pass
-    return 0.0
+# ==============================================================================
+# FLATTRADE DATA FETCHERS
+# ==============================================================================
 
 def get_spot() -> float:
     if not api: return 0.0
@@ -67,133 +67,345 @@ def get_spot() -> float:
         pass
     return 0.0
 
-def load_data():
-    now_str = get_ist_now().strftime("%H:%M:%S")
+def get_ltp_for_tsym(tsym: str) -> float:
+    """Fetch live LTP for an NFO symbol (with token caching)."""
+    if not api or not tsym: return 0.0
+    try:
+        if tsym not in _token_cache:
+            res = api.searchscrip(exchange='NFO', searchtext=tsym)
+            if res and isinstance(res, dict) and res.get('values'):
+                for item in res['values']:
+                    if item.get('tsym') == tsym:
+                        _token_cache[tsym] = item.get('token', '')
+                        break
+        token = _token_cache.get(tsym, '')
+        if token:
+            q = api.get_quotes(exchange='NFO', token=token)
+            if q and isinstance(q, dict):
+                return float(q.get('lp', q.get('ltp', 0.0)))
+    except Exception:
+        pass
+    return 0.0
 
-    # 1. First priority: Live Snapshot from Bot
+def fetch_flattrade_order_book() -> List[Dict]:
+    """
+    Fetch today's completed orders from Flattrade order book.
+    Returns a list of filled orders for NFO exchange.
+    """
+    if not api: return []
+    try:
+        res = api.get_order_book()
+        if res and isinstance(res, list):
+            today = get_ist_now().date()
+            filled = []
+            for o in res:
+                # Only count filled NFO orders from today
+                if o.get('exchange') != 'NFO': continue
+                if o.get('status', '').upper() not in ('COMPLETE', 'FILLED', 'FIL'): continue
+                # Flattrade order time format: "HH:MM:SS DD-MM-YYYY"
+                try:
+                    norentm = o.get('norentm', o.get('exch_tm', ''))
+                    if norentm:
+                        # Try both formats
+                        for fmt in ("%H:%M:%S %d-%m-%Y", "%d-%m-%Y %H:%M:%S"):
+                            try:
+                                odate = datetime.strptime(norentm, fmt).date()
+                                if odate == today:
+                                    filled.append(o)
+                                break
+                            except ValueError:
+                                continue
+                    else:
+                        filled.append(o)  # include if no timestamp available
+                except Exception:
+                    filled.append(o)
+            return filled
+    except Exception as e:
+        print(f"[DASHBOARD] Order book fetch error: {e}", flush=True)
+    return []
+
+def fetch_flattrade_trade_book() -> List[Dict]:
+    """
+    Fetch today's executed trade confirmations from Flattrade trade book.
+    Trade book shows actual fill price and qty for each execution.
+    """
+    if not api: return []
+    try:
+        res = api.get_trade_book()
+        if res and isinstance(res, list):
+            return [t for t in res if t.get('exchange') == 'NFO']
+    except Exception as e:
+        print(f"[DASHBOARD] Trade book fetch error: {e}", flush=True)
+    return []
+
+def fetch_flattrade_positions() -> List[Dict]:
+    """
+    Fetch live open positions from Flattrade positions API.
+    Returns NFO positions with net qty, avg price, live LTP, live P&L.
+    """
+    if not api: return []
+    try:
+        res = api.get_positions()
+        if res and isinstance(res, list):
+            return [p for p in res if p.get('exchange') == 'NFO' and int(p.get('netqty', 0)) != 0]
+    except Exception as e:
+        print(f"[DASHBOARD] Positions fetch error: {e}", flush=True)
+    return []
+
+def compute_realized_pnl_from_trades(trade_book: List[Dict]) -> float:
+    """
+    Compute realized P&L from trade book by matching BUY vs SELL fills
+    on the same symbol. Net position = 0 means fully closed and realized.
+    """
+    # Build net qty and avg cost per symbol
+    symbol_fills: Dict[str, Dict] = {}
+    for t in trade_book:
+        tsym = t.get('tsym', '')
+        qty = int(t.get('qty', t.get('fillshares', 0)) or 0)
+        price = float(t.get('avgprc', t.get('flprc', 0.0)) or 0.0)
+        side = t.get('trantype', t.get('buy_or_sell', 'B')).upper()
+        if tsym not in symbol_fills:
+            symbol_fills[tsym] = {'net_qty': 0, 'buy_cost': 0.0, 'sell_proceeds': 0.0}
+        if side == 'B':
+            symbol_fills[tsym]['buy_cost'] += qty * price
+            symbol_fills[tsym]['net_qty'] += qty
+        else:
+            symbol_fills[tsym]['sell_proceeds'] += qty * price
+            symbol_fills[tsym]['net_qty'] -= qty
+
+    realized = 0.0
+    for sym, fills in symbol_fills.items():
+        # Short strangle: we sell first then buy back
+        # Realized when net_qty == 0 (fully closed)
+        realized += fills['sell_proceeds'] - fills['buy_cost']
+    return realized
+
+def build_positions_from_flattrade(ft_positions: List[Dict]) -> Dict[str, Dict]:
+    """
+    Build a positions dict from Flattrade's live positions API response.
+    Enriches with live LTP and P&L.
+    """
+    positions_view = {}
+    for i, p in enumerate(ft_positions):
+        tsym = p.get('tsym', '')
+        netqty = int(p.get('netqty', 0))
+        if netqty == 0: continue
+
+        # Flattrade gives daypnl, urmtom directly
+        day_pnl = float(p.get('daypnl', 0.0) or 0.0)
+        urmtom   = float(p.get('urmtom', 0.0) or 0.0)
+        avg_price = float(p.get('netavgprc', p.get('avgprc', 0.0)) or 0.0)
+
+        # Net negative qty = net short (sold more than bought)
+        side = "SELL" if netqty < 0 else "BUY"
+        qty_abs = abs(netqty)
+
+        # Live LTP
+        ltp = float(p.get('lp', p.get('ltp', 0.0)) or 0.0)
+        if ltp <= 0.0:
+            ltp = get_ltp_for_tsym(tsym)
+
+        # Compute live P&L if broker didn't give it
+        if urmtom != 0.0:
+            live_pnl = urmtom
+        elif side == "SELL":
+            live_pnl = (avg_price - ltp) * qty_abs
+        else:
+            live_pnl = (ltp - avg_price) * qty_abs
+
+        # Guess leg name from symbol
+        leg_name = tsym
+        if 'CE' in tsym: leg_name = f"CE_{i}"
+        elif 'PE' in tsym: leg_name = f"PE_{i}"
+
+        positions_view[leg_name] = {
+            "strike": int(p.get('strike', 0) or 0),
+            "tsym": tsym,
+            "base": "CE" if "CE" in tsym else ("PE" if "PE" in tsym else "?"),
+            "side": side,
+            "qty": qty_abs,
+            "entry_price": avg_price,
+            "live_ltp": ltp,
+            "live_pnl": live_pnl,
+            "spot_sl_state": None,
+        }
+    return positions_view
+
+
+# ==============================================================================
+# MAIN DATA LOADER — Priority:
+# 1. Flattrade live API (positions + trade book + spot)
+# 2. Bot snapshot JSON (if API down or positions empty)
+# 3. State file fallback
+# ==============================================================================
+
+_ft_realized_pnl: float = 0.0   # cached from trade book (expensive call)
+_ft_last_tradebook_fetch: float = 0.0
+_ft_trade_book_cache: List[Dict] = []
+
+def load_data() -> Optional[Dict]:
+    global _ft_realized_pnl, _ft_last_tradebook_fetch, _ft_trade_book_cache
+
+    now_str = get_ist_now().strftime("%H:%M:%S")
+    spot = get_spot() if api else 0.0
+    atm = int(round(spot / 50.0) * 50) if spot > 0 else 0
+
+    # --- Try Flattrade live positions ---
+    if api:
+        try:
+            ft_positions = fetch_flattrade_positions()
+
+            # Re-fetch trade book every 30 seconds to compute realized P&L
+            if time.time() - _ft_last_tradebook_fetch > 30.0:
+                _ft_trade_book_cache = fetch_flattrade_trade_book()
+                _ft_realized_pnl = compute_realized_pnl_from_trades(_ft_trade_book_cache)
+                _ft_last_tradebook_fetch = time.time()
+
+            positions_view = build_positions_from_flattrade(ft_positions)
+            unrealized = sum(p["live_pnl"] for p in positions_view.values())
+
+            # Try to enrich with bot-side indicators (adx, kama, regime, trend)
+            bot_snap = {}
+            if os.path.exists(SNAP_FILE):
+                try:
+                    if time.time() - os.path.getmtime(SNAP_FILE) < 15.0:
+                        with open(SNAP_FILE, "r") as f:
+                            bot_snap = json.load(f)
+                        # Merge bot SL state into broker positions
+                        for leg, pos in positions_view.items():
+                            base = pos["base"]
+                            if base in bot_snap.get("positions", {}):
+                                bot_pos = bot_snap["positions"][base]
+                                pos["spot_sl_state"] = bot_pos.get("spot_sl_state")
+                                if pos["strike"] == 0:
+                                    pos["strike"] = bot_pos.get("strike", 0)
+                except Exception:
+                    pass
+
+            return {
+                "now_str": now_str,
+                "mode": bot_snap.get("mode", "LIVE"),
+                "paper_mode": False,
+                "spot": spot,
+                "atm": atm,
+                "adx": bot_snap.get("adx", 0.0),
+                "kama": bot_snap.get("kama"),
+                "regime": bot_snap.get("regime", "LIVE"),
+                "trend": bot_snap.get("trend", 0),
+                "atr": bot_snap.get("atr", 0.0),
+                "dte": bot_snap.get("dte", 0.0),
+                "realized_pnl": _ft_realized_pnl,
+                "unrealized_pnl": unrealized,
+                "positions": positions_view,
+                "cooldown_tracker": bot_snap.get("cooldown_tracker", {}),
+                "trade_count": len(_ft_trade_book_cache),
+                "last_event": f"Flattrade live data | {len(ft_positions)} open positions | {len(_ft_trade_book_cache)} trades today",
+                "data_source": "FLATTRADE_LIVE",
+            }
+        except Exception as e:
+            print(f"[DASHBOARD] Flattrade live fetch error: {e}", flush=True)
+
+    # --- Fallback: Bot snapshot JSON ---
     if os.path.exists(SNAP_FILE):
         try:
-            mtime = os.path.getmtime(SNAP_FILE)
-            if time.time() - mtime < 10.0:
+            if time.time() - os.path.getmtime(SNAP_FILE) < 15.0:
                 with open(SNAP_FILE, "r") as f:
                     data = json.load(f)
-                    data["now_str"] = now_str
-                    return data
+                data["now_str"] = now_str
+                data["data_source"] = "BOT_SNAPSHOT"
+                return data
         except Exception:
             pass
 
-    # 2. Second priority: Read state file and query broker directly
+    # --- Fallback: State file ---
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r") as f:
                 st = json.load(f)
-            
-            raw_positions = st.get("positions", {})
             positions_view = {}
             unrealized = 0.0
-            spot_val = get_spot()
-
-            for leg, pos in raw_positions.items():
-                tsym = pos.get("tsym")
-                entry_prc = float(pos.get("entry_price", 0.0))
-                qty = int(pos.get("qty", 65))
+            for leg, pos in st.get("positions", {}).items():
+                ltp = get_ltp_for_tsym(pos.get("tsym", "")) if api else float(pos.get("entry_price", 0.0))
+                if ltp <= 0.0: ltp = float(pos.get("entry_price", 0.0))
                 side = pos.get("side", "SELL")
-                
-                ltp = get_quote_for_symbol(tsym)
-                if ltp <= 0.0:
-                    ltp = entry_prc
-
-                if side == "SELL":
-                    leg_pnl = (entry_prc - ltp) * qty
-                else:
-                    leg_pnl = (ltp - entry_prc) * qty
-
-                unrealized += leg_pnl
-                positions_view[leg] = {
-                    **pos,
-                    "live_ltp": ltp,
-                    "live_pnl": leg_pnl
-                }
-
-            atm_val = int(round(spot_val / 50.0) * 50) if spot_val > 0 else 0
-
+                qty = int(pos.get("qty", 65))
+                entry = float(pos.get("entry_price", 0.0))
+                pnl = (entry - ltp) * qty if side == "SELL" else (ltp - entry) * qty
+                unrealized += pnl
+                positions_view[leg] = {**pos, "live_ltp": ltp, "live_pnl": pnl}
             return {
-                "now_str": now_str,
-                "mode": st.get("mode", "ACTIVE"),
-                "paper_mode": False,
-                "spot": spot_val,
-                "atm": atm_val,
-                "adx": 22.0,
-                "kama": spot_val,
-                "regime": "LIVE",
-                "trend": 0,
-                "atr": 35.0,
-                "dte": 2.0,
+                "now_str": now_str, "mode": st.get("mode", "ACTIVE"),
+                "paper_mode": False, "spot": spot, "atm": atm,
+                "adx": 0.0, "kama": None, "regime": "—", "trend": 0, "atr": 0.0, "dte": 0.0,
                 "realized_pnl": float(st.get("realized_pnl", 0.0)),
-                "unrealized_pnl": unrealized,
-                "positions": positions_view,
+                "unrealized_pnl": unrealized, "positions": positions_view,
                 "cooldown_tracker": st.get("cooldown_tracker", {}),
-                "last_event": "Direct broker stream active"
+                "last_event": "State file fallback (bot may be offline)",
+                "data_source": "STATE_FILE",
             }
         except Exception:
             pass
 
     return None
 
-def render_rich(snap):
+
+# ==============================================================================
+# RICH RENDERER
+# ==============================================================================
+
+def render_rich(snap: Optional[Dict]):
     if not snap:
-        return Panel(Text("Waiting for bot data... (Checking data/state/live_snapshot_v2.json)", style="bold yellow"), title="V2 PRO LIVE DASHBOARD")
+        return Panel(
+            Text("⏳ Waiting for data...\n\nChecking:\n  • Flattrade API\n  • data/state/live_snapshot_v2.json\n  • data/state/algo_state_v2.json", style="bold yellow"),
+            title="V2 PRO LIVE DASHBOARD"
+        )
+
+    source = snap.get("data_source", "?")
+    source_color = "green" if source == "FLATTRADE_LIVE" else ("yellow" if source == "BOT_SNAPSHOT" else "red")
 
     header = Text(
         f" V2 PRO ALGO — {snap.get('now_str', '')}  |  Mode: {snap.get('mode', '-')}  |  "
-        f"{'LIVE' if not snap.get('paper_mode', False) else 'PAPER'} TRADING ",
+        f"{'LIVE' if not snap.get('paper_mode') else 'PAPER'} TRADING  |  Source: {source} ",
         style="bold white on blue"
     )
 
     top = Table.grid(expand=True)
-    top.add_column(justify="left")
-    top.add_column(justify="left")
-    top.add_column(justify="left")
-    top.add_column(justify="left")
-    
-    spot_str = f"{snap.get('spot', 0):.2f}" if snap.get('spot', 0) > 0 else "Fetching..."
-    atm_str = str(snap.get('atm', 0)) if snap.get('atm', 0) > 0 else "Fetching..."
-    
-    trend_val = snap.get('trend', 0)
-    if trend_val == 1:
-        trend_str = "[bold green]BULLISH (+1)[/bold green]"
-    elif trend_val == -1:
-        trend_str = "[bold red]BEARISH (-1)[/bold red]"
-    else:
-        trend_str = "[yellow]FLAT (0)[/yellow]"
+    for _ in range(4): top.add_column(justify="left")
 
+    spot_str = f"{snap.get('spot', 0):.2f}" if snap.get('spot', 0) > 0 else "[yellow]Fetching...[/yellow]"
+    trend_val = snap.get('trend', 0)
+    trend_str = "[bold green]▲ BULLISH[/bold green]" if trend_val == 1 else ("[bold red]▼ BEARISH[/bold red]" if trend_val == -1 else "[yellow]— FLAT[/yellow]")
     kama_val = snap.get('kama')
-    kama_str = f"₹{kama_val:.2f}" if (kama_val and kama_val > 0) else "Calculating..."
+    kama_str = f"₹{kama_val:.2f}" if (kama_val and kama_val > 0) else "[dim]Calculating...[/dim]"
+    adx_val = snap.get('adx', 0.0)
+    regime = snap.get('regime', '—')
 
     top.add_row(
         f"[bold]Spot:[/bold] {spot_str}",
-        f"[bold]ATM:[/bold] {atm_str}",
-        f"[bold]ADX(9):[/bold] {snap.get('adx', 0):.1f} ({snap.get('regime', '-')})",
+        f"[bold]ATM:[/bold] {snap.get('atm', '—')}",
+        f"[bold]ADX(9):[/bold] {adx_val:.1f} ({regime})",
         f"[bold]KAMA Trend:[/bold] {trend_str}",
     )
-    
+
     r_pnl = snap.get('realized_pnl', 0.0)
     u_pnl = snap.get('unrealized_pnl', 0.0)
-    r_str = f"[green]₹{r_pnl:,.2f}[/green]" if r_pnl >= 0 else f"[red]₹{r_pnl:,.2f}[/red]"
-    u_str = f"[green]₹{u_pnl:,.2f}[/green]" if u_pnl >= 0 else f"[red]₹{u_pnl:,.2f}[/red]"
     tot_pnl = r_pnl + u_pnl
+    r_str   = f"[green]₹{r_pnl:,.2f}[/green]"   if r_pnl >= 0  else f"[red]₹{r_pnl:,.2f}[/red]"
+    u_str   = f"[green]₹{u_pnl:,.2f}[/green]"   if u_pnl >= 0  else f"[red]₹{u_pnl:,.2f}[/red]"
     tot_str = f"[bold green]₹{tot_pnl:,.2f}[/bold green]" if tot_pnl >= 0 else f"[bold red]₹{tot_pnl:,.2f}[/bold red]"
+    trades_today = snap.get('trade_count', '—')
 
     top.add_row(
-        f"[bold]KAMA(1m):[/bold] {kama_str}",
+        f"[bold]KAMA:[/bold] {kama_str}",
         f"[bold]ATR(5m):[/bold] {snap.get('atr', 0):.2f}",
-        f"[bold]Realized P&L:[/bold] {r_str}",
-        f"[bold]Total MTM:[/bold] {tot_str}",
+        f"[bold]Realized:[/bold] {r_str}   [bold]Unrealized:[/bold] {u_str}",
+        f"[bold]Total MTM:[/bold] {tot_str}   [dim]({trades_today} trades today)[/dim]",
     )
 
-    pos_table = Table(title="Open Positions (with 15s Micro-Candle Spot TSL)", expand=True, show_lines=True)
+    # Positions Table
+    pos_table = Table(title="📊 Open Positions (Live from Flattrade)", expand=True, show_lines=True)
     pos_table.add_column("Leg", style="bold")
-    pos_table.add_column("Strike")
+    pos_table.add_column("Symbol")
     pos_table.add_column("Side")
     pos_table.add_column("Qty")
     pos_table.add_column("Entry ₹")
@@ -201,67 +413,83 @@ def render_rich(snap):
     pos_table.add_column("P&L ₹")
     pos_table.add_column("Spot SL Line")
     pos_table.add_column("Breach Cnt")
-    pos_table.add_column("Micro Candle (15s)")
 
     positions = snap.get("positions", {})
-    micro_c_str = snap.get("micro_candle", "—")
     if positions:
         for leg, pos in positions.items():
             pnl = pos.get("live_pnl", 0.0)
             pnl_str = f"[green]₹{pnl:,.2f}[/green]" if pnl >= 0 else f"[red]₹{pnl:,.2f}[/red]"
             sl_state = pos.get("spot_sl_state") or {}
-            sl_line = f"{sl_state.get('current_sl', '-')}" if sl_state else "-"
-            breach = f"{sl_state.get('breach_count', 0)}/2" if sl_state else "-"
+            sl_line  = f"{sl_state.get('current_sl', '—')}" if sl_state else "—"
+            breach   = f"{sl_state.get('breach_count', 0)}/2" if sl_state else "—"
+            side_str = f"[red]{pos.get('side','—')}[/red]" if pos.get('side') == 'SELL' else f"[green]{pos.get('side','—')}[/green]"
             pos_table.add_row(
                 leg,
-                str(pos.get("strike", "-")),
-                pos.get("side", "-"),
-                str(pos.get("qty", "-")),
+                pos.get("tsym", "—"),
+                side_str,
+                str(pos.get("qty", "—")),
                 f"{pos.get('entry_price', 0):.2f}",
                 f"{pos.get('live_ltp', 0):.2f}",
                 pnl_str,
                 str(sl_line),
                 str(breach),
-                micro_c_str
             )
     else:
-        pos_table.add_row("No Open Positions", "-", "-", "-", "-", "-", "-", "-", "-", "-")
+        pos_table.add_row("No Open Positions", "—", "—", "—", "—", "—", "—", "—", "—")
 
-    cd_table = Table(title="Anti-Whipsaw Protection (Strict Re-entry Engine)", expand=True, show_lines=False)
+    # Cooldown Table
+    cd_table = Table(title="⚡ Anti-Whipsaw Cooldown Engine", expand=True, show_lines=False)
     cd_table.add_column("Leg", style="bold")
     cd_table.add_column("Status")
-    cd_table.add_column("Progress (Consecutive Safe Ticks)")
-    cd_table.add_column("Reversal Type")
-    cd_table.add_column("Stopped Spot")
+    cd_table.add_column("Elapsed")
+    cd_table.add_column("Stopped At Spot")
     for leg, cd in snap.get("cooldown_tracker", {}).items():
         active = cd.get("active", False)
-        safe_t = cd.get("safe_ticks", 0)
-        target_t = cd.get("target_ticks", 45)
-        is_sharp = cd.get("is_sharp", False)
-        status_txt = "[yellow]COOLING DOWN[/yellow]" if active else "[green]Active / Ready[/green]"
-        progress_txt = f"[bold cyan]{safe_t}/{target_t} Ticks[/bold cyan]" if active else "—"
-        mode_txt = "[bold magenta]Sharp Reversal (75+ pts)[/bold magenta]" if is_sharp else ("Long Consolidation (3m+)" if active else "—")
+        elapsed = time.time() - cd.get("stopped_time", time.time()) if active else 0
+        status_txt  = "[yellow]⏳ COOLING DOWN[/yellow]" if active else "[green]✅ Ready[/green]"
+        elapsed_txt = f"{elapsed:.0f}s" if active else "—"
         stopped_txt = f"₹{cd.get('stopped_spot', 0):.2f}" if active else "—"
-        cd_table.add_row(leg, status_txt, progress_txt, mode_txt, stopped_txt)
+        cd_table.add_row(leg, status_txt, elapsed_txt, stopped_txt)
 
-    footer = Text(f" [Updated at {snap.get('now_str')} | Auto-refresh 3s | Press Ctrl+C to close dashboard] ", style="dim")
+    footer = Text(
+        f" [{source_color}]Data: {source}[/{source_color}]  |  Updated: {snap.get('now_str')}  |  Refresh: 3s  |  Press Ctrl+C to close ",
+        style="dim"
+    )
 
     layout = Table.grid(expand=True)
     layout.add_row(Panel(header, style="on blue"))
-    layout.add_row(Panel(top, title="Market State & Indicators"))
+    layout.add_row(Panel(top, title="Market State & P&L"))
     layout.add_row(pos_table)
     layout.add_row(cd_table)
+    layout.add_row(Panel(Text(snap.get("last_event", "—"), style="dim"), title="Last Event"))
     layout.add_row(footer)
     return layout
 
+
+# ==============================================================================
+# MAIN
+# ==============================================================================
+
 def main():
+    print("[DASHBOARD] Starting — fetching Flattrade trade history on boot...", flush=True)
+
+    # Warm up: fetch trade book once on startup so realized P&L is ready immediately
+    global _ft_realized_pnl, _ft_last_tradebook_fetch, _ft_trade_book_cache
+    if api:
+        try:
+            _ft_trade_book_cache = fetch_flattrade_trade_book()
+            _ft_realized_pnl = compute_realized_pnl_from_trades(_ft_trade_book_cache)
+            _ft_last_tradebook_fetch = time.time()
+            print(f"[DASHBOARD] Loaded {len(_ft_trade_book_cache)} trades today | Realized P&L: ₹{_ft_realized_pnl:,.2f}", flush=True)
+        except Exception as e:
+            print(f"[DASHBOARD] Trade book warmup failed: {e}", flush=True)
+
     if HAS_RICH:
         console = Console()
         with Live(render_rich(load_data()), console=console, refresh_per_second=1, screen=True) as live:
             try:
                 while True:
-                    data = load_data()
-                    live.update(render_rich(data))
+                    live.update(render_rich(load_data()))
                     time.sleep(3.0)
             except KeyboardInterrupt:
                 pass
@@ -271,16 +499,18 @@ def main():
                 os.system('clear' if os.name == 'posix' else 'cls')
                 snap = load_data()
                 if snap:
-                    print(f"=== V2 PRO DASHBOARD [{snap.get('now_str')}] ===")
-                    print(f"Spot: {snap.get('spot')} | KAMA: {snap.get('kama')} | ADX: {snap.get('adx')} | Trend: {snap.get('trend')}")
-                    print(f"Realized: ₹{snap.get('realized_pnl',0):,.2f} | Unrealized: ₹{snap.get('unrealized_pnl',0):,.2f}")
-                    print("-" * 65)
+                    src = snap.get("data_source", "?")
+                    print(f"=== V2 PRO DASHBOARD [{snap.get('now_str')}] | Source: {src} ===")
+                    print(f"Spot: {snap.get('spot',0):.2f} | ADX: {snap.get('adx',0):.1f} ({snap.get('regime','—')}) | Trend: {snap.get('trend',0)}")
+                    print(f"Realized: ₹{snap.get('realized_pnl',0):,.2f} | Unrealized: ₹{snap.get('unrealized_pnl',0):,.2f} | Total MTM: ₹{snap.get('realized_pnl',0)+snap.get('unrealized_pnl',0):,.2f}")
+                    print("-" * 75)
                     for leg, p in snap.get('positions', {}).items():
-                        sl_line = (p.get('spot_sl_state') or {}).get('current_sl', '-')
-                        print(f" {leg:<10} Strike {p.get('strike'):<6} Entry ₹{p.get('entry_price'):<6.2f} LTP ₹{p.get('live_ltp'):<6.2f} PnL ₹{p.get('live_pnl',0):<8.2f} SL {sl_line}")
+                        sl = (p.get('spot_sl_state') or {}).get('current_sl', '—')
+                        print(f" {leg:<12} {p.get('tsym','—'):<25} {p.get('side','—'):<5} Entry ₹{p.get('entry_price',0):<7.2f} LTP ₹{p.get('live_ltp',0):<7.2f} PnL ₹{p.get('live_pnl',0):<10.2f} SL: {sl}")
+                    print(f"\n{snap.get('last_event','—')}")
                 else:
                     print("=== V2 PRO DASHBOARD ===")
-                    print("Waiting for bot data... (Checking data/state/live_snapshot_v2.json)")
+                    print("Waiting for bot data or Flattrade API connection...")
                 time.sleep(3.0)
         except KeyboardInterrupt:
             pass
