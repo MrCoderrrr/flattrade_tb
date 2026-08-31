@@ -211,6 +211,14 @@ AUTO_SQUAREOFF_HOUR     = 15
 AUTO_SQUAREOFF_MINUTE   = 28          
 REFRESH_INTERVAL_SEC    = 1          
 
+# Trend rolls: only roll if the new ideal strike is at least this many ATRs
+# away from the current strike. Prevents micro-roll churn on every 1m bar.
+TREND_ROLL_MIN_ATR_MULT = 0.5         # e.g. 0.5 * 35 ATR = 17.5pts minimum drift before rolling
+
+# CHOP rolls: only re-evaluate strike width once per N minutes, not every tick.
+CHOP_ROLL_DEBOUNCE_MIN  = 5           # re-check chop strike every 5 minutes max
+
+
 
 def _now_str() -> str: return get_ist_now().strftime("%H:%M:%S")
 def log_info(msg: str): print(f"[{_now_str()} INFO]  {msg}", flush=True)
@@ -602,6 +610,9 @@ class ExecutionEngine:
         self.current_indicators = Indicators.evaluate_all(df_1m, df_5m) if not df_5m.empty else {'atr': 35.0, 'regime': 'CHOP', 'trend': 0, 'adx': 18.0}
         
         self._ltp_cache: Dict[str, float] = {}
+        self._last_chop_roll_time: float = 0.0       # timestamp of last CHOP roll check
+        self._last_trend_roll_bar: Optional[str] = None  # 1m key of last TREND roll
+        self._processed_1m_bar: Optional[str] = None    # ensures is_new_1m_bar is one-shot per bar
         self._load_state()
 
     def _expiry_width_multiplier(self, dte_days: float) -> float:
@@ -768,6 +779,15 @@ class ExecutionEngine:
                     continue
                     
                 spot, atm, is_new_1m_bar = self.market_data.fetch_live_tick()
+
+                # One-shot guard: treat is_new_1m_bar as True only ONCE per bar,
+                # not on every 1s tick within the same minute window.
+                current_bar_key = self.market_data.last_completed_1m_key
+                if is_new_1m_bar and current_bar_key == self._processed_1m_bar:
+                    is_new_1m_bar = False
+                elif is_new_1m_bar:
+                    self._processed_1m_bar = current_bar_key
+
                 df_1m = self.market_data.get_1m_dataframe()
                 df_5m = self.market_data.get_5m_dataframe()
                 self.current_indicators = Indicators.evaluate_all(df_1m, df_5m)
@@ -788,8 +808,6 @@ class ExecutionEngine:
                 if self.mode == "WAIT_DATA":
                     if now.hour > MARKET_START_HOUR or (now.hour == MARKET_START_HOUR and now.minute >= MARKET_START_MINUTE):
                         if regime == "TRANSITION":
-                            # Neutral zone at open: don't commit capital while the
-                            # regime read is ambiguous, wait for it to resolve.
                             log_info(f"09:18 AM reached but ADX {adx:.1f} is in the TRANSITION band — holding entry.")
                         else:
                             log_info(f"09:18 AM Reached. Entering Market (Regime: {regime})...")
@@ -817,40 +835,53 @@ class ExecutionEngine:
                                 self._trigger_leg_cooldown(leg, spot)
 
                     if regime == "TRANSITION":
-                        # Dead zone: don't reenter from cooldown, don't roll
-                        # anything. Only the SL check above stays active.
+                        # Dead zone: SL check stays active but no rolls or re-entries.
                         pass
                     else:
                         self._check_cooldown_and_reenter(spot, atm, atr, regime, trend, dte_days=dte_days)
 
+                        # Fix: If cooldown cleared and both legs present, restore mode.
+                        if self.mode == "COOLDOWN":
+                            if not any(v.get("active", False) for v in self.cooldown_tracker.values()):
+                                self.mode = "CHOP_MODE" if regime == "CHOP" else "RUNNING"
+                                log_info(f"✅ All cooldowns cleared. Resuming mode: {self.mode}")
+
                         if regime == "CHOP":
-                            chop_ce, chop_pe = self.calculate_strangle_strikes(atm, atr, "CHOP", dte_days=dte_days, adx=adx)
-                            if "CE" in self.positions and self.positions["CE"]["strike"] < chop_ce:
-                                log_info(f"Choppiness rising. Rolling CE from {self.positions['CE']['strike']} to {chop_ce}...")
-                                self._exit_leg("CE", reason="CHOP_ROLL_OUT")
-                                self._enter_leg("CE", chop_ce, "SELL", spot, atr)
-                            if "PE" in self.positions and self.positions["PE"]["strike"] > chop_pe:
-                                log_info(f"Choppiness rising. Rolling PE from {self.positions['PE']['strike']} to {chop_pe}...")
-                                self._exit_leg("PE", reason="CHOP_ROLL_OUT")
-                                self._enter_leg("PE", chop_pe, "SELL", spot, atr)
+                            # CHOP rolls: debounced to once per CHOP_ROLL_DEBOUNCE_MIN minutes
+                            now_ts = time.time()
+                            if now_ts - self._last_chop_roll_time >= CHOP_ROLL_DEBOUNCE_MIN * 60:
+                                chop_ce, chop_pe = self.calculate_strangle_strikes(atm, atr, "CHOP", dte_days=dte_days, adx=adx)
+                                rolled = False
+                                if "CE" in self.positions and self.positions["CE"]["strike"] < chop_ce:
+                                    log_info(f"Choppiness rising. Rolling CE from {self.positions['CE']['strike']} to {chop_ce}...")
+                                    self._exit_leg("CE", reason="CHOP_ROLL_OUT")
+                                    self._enter_leg("CE", chop_ce, "SELL", spot, atr)
+                                    rolled = True
+                                if "PE" in self.positions and self.positions["PE"]["strike"] > chop_pe:
+                                    log_info(f"Choppiness rising. Rolling PE from {self.positions['PE']['strike']} to {chop_pe}...")
+                                    self._exit_leg("PE", reason="CHOP_ROLL_OUT")
+                                    self._enter_leg("PE", chop_pe, "SELL", spot, atr)
+                                    rolled = True
+                                if rolled:
+                                    self._last_chop_roll_time = now_ts
 
                         elif regime == "TREND" and is_new_1m_bar:
-                            # Gate to once per new bar so this doesn't churn every
-                            # 1s tick — each roll costs slippage + two order legs.
+                            # TREND rolls: only fire once per new 1m bar AND only if
+                            # the strike has drifted more than TREND_ROLL_MIN_ATR_MULT * ATR.
+                            min_drift = max(50, int(TREND_ROLL_MIN_ATR_MULT * atr))
                             trend_ce, trend_pe = self.calculate_strangle_strikes(atm, atr, "TREND", dte_days=dte_days, trend=trend, adx=adx)
-                            if "CE" in self.positions and abs(self.positions["CE"]["strike"] - trend_ce) >= 50:
-                                log_info(f"KAMA trend-follow. Rolling CE from {self.positions['CE']['strike']} to {trend_ce}...")
+                            if "CE" in self.positions and abs(self.positions["CE"]["strike"] - trend_ce) >= min_drift:
+                                log_info(f"KAMA trend-follow. Rolling CE from {self.positions['CE']['strike']} to {trend_ce} (drift >= {min_drift}pts)...")
                                 self._exit_leg("CE", reason="TREND_FOLLOW_ROLL")
                                 self._enter_leg("CE", trend_ce, "SELL", spot, atr)
-                            if "PE" in self.positions and abs(self.positions["PE"]["strike"] - trend_pe) >= 50:
-                                log_info(f"KAMA trend-follow. Rolling PE from {self.positions['PE']['strike']} to {trend_pe}...")
+                            if "PE" in self.positions and abs(self.positions["PE"]["strike"] - trend_pe) >= min_drift:
+                                log_info(f"KAMA trend-follow. Rolling PE from {self.positions['PE']['strike']} to {trend_pe} (drift >= {min_drift}pts)...")
                                 self._exit_leg("PE", reason="TREND_FOLLOW_ROLL")
                                 self._enter_leg("PE", trend_pe, "SELL", spot, atr)
 
                 # CLI Print
-                print(f"[{_now_str()}] Spot: {spot:.2f} | ADX: {adx:.1f} ({regime}) | KAMA Trend: {trend} | Mode: {self.mode}", flush=True)
+                print(f"[{_now_str()}] Spot: {spot:.2f} | ADX: {adx:.1f} ({regime}) | KAMA Trend: {trend} | Mode: {self.mode} | P&L: ₹{self.realized_pnl:,.0f}", flush=True)
                 
-                # Sleep for 1 second for ultra-fast, real-time tick evaluation
                 time.sleep(1.0)
 
             except KeyboardInterrupt:
@@ -864,3 +895,4 @@ class ExecutionEngine:
 if __name__ == "__main__":
     engine = ExecutionEngine()
     engine.run()
+
