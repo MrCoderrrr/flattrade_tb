@@ -681,6 +681,12 @@ class ExecutionEngine:
                     self._save_state()
                     break
 
+                # 1. Pre-Market Sleep Loop
+                if now.hour < 9 or (now.hour == 9 and now.minute < 15):
+                    print(f"[{_now_str()}] Pre-market. Sleeping until 09:15 AM to save API limits...")
+                    time.sleep(60.0)
+                    continue
+                    
                 spot, atm, is_new_1m_bar = self.market_data.fetch_live_tick()
                 df_1m = self.market_data.get_1m_dataframe()
                 df_5m = self.market_data.get_5m_dataframe()
