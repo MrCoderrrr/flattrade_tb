@@ -745,10 +745,11 @@ class ExecutionEngine:
                 saved_mode = state.get("mode", "WAIT_DATA")
                 now = get_ist_now()
                 market_closed = (now.hour > AUTO_SQUAREOFF_HOUR or (now.hour == AUTO_SQUAREOFF_HOUR and now.minute >= AUTO_SQUAREOFF_MINUTE))
-                if saved_mode in ("SESSION_DONE", "SESSION_DONE_FLAT") and not market_closed:
-                    self.mode = "RUNNING" if self.positions else "WAIT_DATA"
+                if market_closed:
+                    self.mode = "SESSION_DONE"
                 else:
-                    self.mode = saved_mode
+                    self.mode = "RUNNING" if self.positions else "WAIT_DATA"
+
                 for leg, pos in self.positions.items():
                     if pos.get("side") == "SELL":
                         if "premium_sl_state" not in pos or not pos["premium_sl_state"]:
@@ -901,13 +902,11 @@ class ExecutionEngine:
             # Step 3: Set correct mode based on reconciled positions
             # ---------------------------------------------------------------
             if self.positions:
-                if self.mode in ("WAIT_DATA", "SESSION_DONE", "SESSION_DONE_FLAT"):
-                    self.mode = "RUNNING"
-                    log_info(f"Mode → RUNNING ({len(self.positions)} legs found).")
+                self.mode = "RUNNING"
+                log_info(f"Mode → RUNNING ({len(self.positions)} open positions active).")
             else:
-                if self.mode not in ("COOLDOWN",):
-                    self.mode = "WAIT_DATA"
-                    log_info("No open positions — mode → WAIT_DATA.")
+                self.mode = "WAIT_DATA"
+                log_info("No open positions — mode → WAIT_DATA.")
 
             self._save_state()
             log_info(f"Sync done. Tracking {len(self.positions)} legs: {list(self.positions.keys())}")
