@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import json
+import math
 import socket
 import select
 import traceback
@@ -127,18 +128,21 @@ class FlattradeBroker:
             except Exception:
                 pass
         
-        # Use marketable limit order to guarantee fill while complying with NSE exchange rules (which block raw MKT on NFO options)
+        # Marketable limit order with guaranteed 0.05 tick multiple
+        # NSE blocks price_type="MKT" on options, so we must use LMT with buffer
         if price > 0.0:
-            buffer_pts = max(2.0, price * 0.08)
+            buffer_pts = max(3.0, price * 0.10) # 10% marketable buffer
             if action == 'B':
-                lmt_price = round(price + buffer_pts, 1)
+                raw_lmt = price + buffer_pts
+                lmt_price = round(math.ceil(raw_lmt / 0.05) * 0.05, 2)
             else:
-                lmt_price = max(0.05, round(price - buffer_pts, 1))
+                raw_lmt = max(0.05, price - buffer_pts)
+                lmt_price = max(0.05, round(math.floor(raw_lmt / 0.05) * 0.05, 2))
             prctyp = "LMT"
             prc_str = f"{lmt_price:.2f}"
         else:
-            prctyp = "MKT"
-            prc_str = "0"
+            prctyp = "LMT"
+            prc_str = "500.00" if action == 'B' else "0.05"
             
         try:
             res = self.api.place_order(
@@ -150,8 +154,9 @@ class FlattradeBroker:
                 discloseqty="0",
                 price_type=prctyp,
                 price=prc_str,
-                trigger_price=None,
-                retention="DAY"
+                trigger_price="0",
+                retention="DAY",
+                remarks="API_V2_PRO"
             )
             if not res or not isinstance(res, dict) or res.get('stat') != 'Ok':
                 err = res.get('emsg', str(res)) if isinstance(res, dict) else str(res)
