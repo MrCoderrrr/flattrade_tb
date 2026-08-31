@@ -111,21 +111,58 @@ class FlattradeBroker:
     def __init__(self, paper_trading=False):
         self.api = global_api
 
-    def place_option_order(self, symbol, transaction_type, quantity, price):
-        action = transaction_type[0] # 'B' or 'S'
-        res = self.api.place_order(
-            buy_or_sell=str(action),
-            product_type="M",
-            exchange="NFO",
-            tradingsymbol=str(symbol),
-            quantity=str(quantity),
-            discloseqty="0",
-            price_type="MKT",
-            price="0",
-            trigger_price=None,
-            retention="DAY"
-        )
-        return res
+    def place_option_order(self, symbol: str, transaction_type: str, quantity: int, price: float = 0.0, product_type: str = "M"):
+        action = transaction_type[0].upper() # 'B' or 'S'
+        
+        # If price <= 0, try to get live quote
+        if price <= 0.0:
+            try:
+                res_q = self.api.searchscrip(exchange='NFO', searchtext=symbol)
+                if res_q and isinstance(res_q, dict) and res_q.get('values'):
+                    for item in res_q['values']:
+                        if item.get('tsym') == symbol:
+                            q = self.api.get_quotes(exchange='NFO', token=item['token'])
+                            if q: price = float(q.get('lp', q.get('ltp', 0.0)))
+                            break
+            except Exception:
+                pass
+        
+        # Use marketable limit order to guarantee fill while complying with NSE exchange rules (which block raw MKT on NFO options)
+        if price > 0.0:
+            buffer_pts = max(2.0, price * 0.08)
+            if action == 'B':
+                lmt_price = round(price + buffer_pts, 1)
+            else:
+                lmt_price = max(0.05, round(price - buffer_pts, 1))
+            prctyp = "LMT"
+            prc_str = f"{lmt_price:.2f}"
+        else:
+            prctyp = "MKT"
+            prc_str = "0"
+            
+        try:
+            res = self.api.place_order(
+                buy_or_sell=str(action),
+                product_type=str(product_type),
+                exchange="NFO",
+                tradingsymbol=str(symbol),
+                quantity=str(quantity),
+                discloseqty="0",
+                price_type=prctyp,
+                price=prc_str,
+                trigger_price=None,
+                retention="DAY"
+            )
+            if not res or not isinstance(res, dict) or res.get('stat') != 'Ok':
+                err = res.get('emsg', str(res)) if isinstance(res, dict) else str(res)
+                log_alert(f"❌ Flattrade Order REJECTED [{action} {quantity}x {symbol} @ ₹{prc_str}]: {err}")
+            else:
+                ord_id = res.get('norenordno', res.get('order_id', 'OK'))
+                log_info(f"✅ Flattrade Order FILLED/PLACED [{action} {quantity}x {symbol} @ ₹{prc_str}]: OrderID={ord_id}")
+            return res
+        except Exception as e:
+            log_alert(f"❌ Flattrade Order EXCEPTION: {e}")
+            return {"stat": "Not_Ok", "emsg": str(e)}
 
 class VolatilityEngine:
     @staticmethod
@@ -708,7 +745,7 @@ class ExecutionEngine:
                 log_warn("Broker sync: empty response — using state file only.")
                 return
 
-            # Build broker map: tsym -> {netqty, avgprc}
+            # Build broker map: tsym -> {netqty, avgprc, prd, token}
             # Flattrade uses 'exch' (not 'exchange') as field name
             broker_map: Dict[str, Dict] = {}
             for p in res:
@@ -717,10 +754,42 @@ class ExecutionEngine:
                 tsym   = p.get('tsym', '')
                 netqty = int(p.get('netqty', 0) or 0)
                 avgprc = float(p.get('netavgprc', p.get('avgprc', 0.0)) or 0.0)
+                prd    = p.get('prd', 'M')
+                token  = p.get('token', '')
                 if tsym:
-                    broker_map[tsym] = {'netqty': netqty, 'avgprc': avgprc}
+                    broker_map[tsym] = {'netqty': netqty, 'avgprc': avgprc, 'prd': prd, 'token': token}
 
             log_info(f"Broker NFO positions ({len(broker_map)}): {list(broker_map.keys())}")
+
+            # Recompute true Realized P&L from Flattrade Trade Book on startup
+            try:
+                tb_res = self.broker.api.get_trade_book()
+                if tb_res and isinstance(tb_res, list):
+                    nfo_trades = [t for t in tb_res if t.get('exch', t.get('exchange', '')) == 'NFO']
+                    sym_fills = {}
+                    for t in nfo_trades:
+                        s = t.get('tsym', '')
+                        q = int(t.get('qty', t.get('fillshares', 0)) or 0)
+                        p_fill = float(t.get('avgprc', t.get('flprc', 0.0)) or 0.0)
+                        side_t = t.get('trantype', t.get('buy_or_sell', 'B')).upper()
+                        if s not in sym_fills: sym_fills[s] = {'buy': 0.0, 'sell': 0.0, 'net': 0}
+                        if side_t == 'B':
+                            sym_fills[s]['buy'] += q * p_fill
+                            sym_fills[s]['net'] += q
+                        else:
+                            sym_fills[s]['sell'] += q * p_fill
+                            sym_fills[s]['net'] -= q
+                    realized_calc = 0.0
+                    for s, f_data in sym_fills.items():
+                        realized_calc += f_data['sell'] - f_data['buy']
+                    self.realized_pnl = round(realized_calc, 2)
+                    log_info(f"Verified Realized P&L from Flattrade Trade Book: ₹{self.realized_pnl:,.2f}")
+                else:
+                    if self.realized_pnl < -10000.0 * (self.qty / LOT_SIZE):
+                        log_warn(f"Resetting corrupted realized PnL ({self.realized_pnl}) to ₹0.00")
+                        self.realized_pnl = 0.0
+            except Exception as e:
+                log_warn(f"Trade book PnL verification error: {e}")
 
             atr  = self.current_indicators.get('atr', DEFAULT_ATR_5M)
             spot = self.market_data.latest_spot
@@ -748,6 +817,7 @@ class ExecutionEngine:
                 side   = "SELL" if netqty < 0 else "BUY"
                 qty    = abs(netqty)
                 avgprc = bdata['avgprc']
+                prd    = bdata.get('prd', 'M')
 
                 # ---- Correct base detection for Flattrade symbol format ----
                 # Format: NIFTY01SEP26C24050 → C24050 at end → base=CE, strike=24050
@@ -783,6 +853,7 @@ class ExecutionEngine:
                     "entry_price": avgprc,
                     "entry_time": time.time(),
                     "entry_spot": spot,
+                    "prd":        prd,
                 }
                 if side == "SELL":
                     pos_info["spot_sl_state"] = self.risk_manager.init_spot_sl(base, spot, atr)
@@ -838,15 +909,15 @@ class ExecutionEngine:
             self._ltp_cache[key] = float(q.get("lp", 0.0))
         return self._ltp_cache[key]
 
-    def _enter_leg(self, leg: str, strike: int, side: str, spot: float, atr: float):
+    def _enter_leg(self, leg: str, strike: int, side: str, spot: float, atr: float, product_type: str = "M"):
         base = leg.split("_")[0]
         q = self.market_data.streamer.get_live_quote(strike, base)
         tsym = q.get("tsym", f"NIFTY_{strike}_{base}")
         self._ltp_cache[f"{strike}_{base}"] = q.get("lp", 0.0)
-        ltp = self._get_ltp(strike, base)
+        ltp = self._get_ltp(strike, base, tsym=tsym)
         
-        self.broker.place_option_order(symbol=tsym, transaction_type=side, quantity=self.qty, price=ltp)
-        pos_info = {"strike": strike, "tsym": tsym, "base": base, "side": side, "qty": self.qty, "entry_price": ltp, "entry_time": time.time(), "entry_spot": spot}
+        self.broker.place_option_order(symbol=tsym, transaction_type=side, quantity=self.qty, price=ltp, product_type=product_type)
+        pos_info = {"strike": strike, "tsym": tsym, "base": base, "side": side, "qty": self.qty, "entry_price": ltp, "entry_time": time.time(), "entry_spot": spot, "prd": product_type}
         if side == "SELL": pos_info["spot_sl_state"] = self.risk_manager.init_spot_sl(leg, spot, atr)
         self.positions[leg] = pos_info
         log_trade(f"{side} {leg:10s} Strike: {strike} @ ₹{ltp:.2f} (Spot: {spot:.2f})")
@@ -857,13 +928,14 @@ class ExecutionEngine:
         pos = self.positions[leg]
         base = pos["base"]
         tsym = pos.get("tsym", "")
+        prd = pos.get("prd", "M")
         # Pass tsym so _get_ltp can do a direct lookup when strike=0 (imported positions)
         ltp = self._get_ltp(pos["strike"], base, tsym=tsym)
         if ltp <= 0.0:
             log_warn(f"_exit_leg: LTP=0 for {leg} ({tsym}), using entry_price as fallback.")
             ltp = float(pos.get("entry_price", 0.0))
         close_side = "BUY" if pos["side"] == "SELL" else "SELL"
-        self.broker.place_option_order(symbol=tsym, transaction_type=close_side, quantity=pos["qty"], price=ltp)
+        self.broker.place_option_order(symbol=tsym, transaction_type=close_side, quantity=pos["qty"], price=ltp, product_type=prd)
         pnl = (pos["entry_price"] - ltp) * pos["qty"] if pos["side"] == "SELL" else (ltp - pos["entry_price"]) * pos["qty"]
         self.realized_pnl += pnl
         log_trade(f"EXITED {leg:10s} Strike: {pos['strike']} @ ₹{ltp:.2f} | P&L: ₹{pnl:,.2f} (Reason: {reason})")

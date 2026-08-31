@@ -214,15 +214,31 @@ def build_positions_from_flattrade(ft_positions: List[Dict]) -> Dict[str, Dict]:
         else:
             live_pnl = (ltp - avg_price) * qty_abs
 
-        # Guess leg name from symbol
-        leg_name = tsym
-        if 'CE' in tsym: leg_name = f"CE_{i}"
-        elif 'PE' in tsym: leg_name = f"PE_{i}"
+        # Guess leg name and strike from Flattrade symbol format (e.g. NIFTY01SEP26C24050)
+        import re
+        strike = 0
+        base = "CE"
+        m = re.search(r'([CP])(\d{4,6})$', tsym)
+        if m:
+            base = "CE" if m.group(1) == 'C' else "PE"
+            strike = int(m.group(2))
+        elif "CE" in tsym:
+            base = "CE"
+        elif "PE" in tsym:
+            base = "PE"
+
+        if side == "BUY":
+            leg_name = f"{base}_HEDGE"
+        else:
+            leg_name = base
+
+        if leg_name in positions_view:
+            leg_name = f"{leg_name}_{tsym[-4:]}"
 
         positions_view[leg_name] = {
-            "strike": int(p.get('strike', 0) or 0),
+            "strike": strike,
             "tsym": tsym,
-            "base": "CE" if "CE" in tsym else ("PE" if "PE" in tsym else "?"),
+            "base": base,
             "side": side,
             "qty": qty_abs,
             "entry_price": avg_price,
