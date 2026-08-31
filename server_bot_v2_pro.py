@@ -929,7 +929,7 @@ class ExecutionEngine:
             live_pnl = (pos["entry_price"] - ltp) * pos["qty"] if pos["side"] == "SELL" else (ltp - pos["entry_price"]) * pos["qty"]
             positions_view[leg] = {**pos, "live_ltp": ltp, "live_pnl": live_pnl}
 
-        return {
+        snap = {
             "now_str": _now_str(),
             "mode": self.mode,
             "paper_mode": self.broker.paper_trading,
@@ -940,6 +940,14 @@ class ExecutionEngine:
             "cooldown_tracker": self.cooldown_tracker,
             "last_event": _LAST_EVENT["msg"],
         }
+        try:
+            tmp_snap = self.live_snap_file + ".tmp"
+            with open(tmp_snap, "w") as f:
+                json.dump(snap, f, indent=2)
+            os.replace(tmp_snap, self.live_snap_file)
+        except Exception:
+            pass
+        return snap
 
     def run(self):
         log_info("Starting V2 Pro Algorithmic State Machine...")
