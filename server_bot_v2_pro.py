@@ -158,10 +158,10 @@ REFRESH_INTERVAL_SEC    = 1
 
 
 def _now_str() -> str: return datetime.now().strftime("%H:%M:%S")
-def log_info(msg: str): print(f"[{_now_str()} INFO]  {msg}")
-def log_warn(msg: str): print(f"[{_now_str()} WARNING]  {msg}")
-def log_alert(msg: str): print(f"[{_now_str()} ALERT]  {msg}")
-def log_trade(msg: str): print(f"[{_now_str()} TRADE]  {msg}")
+def log_info(msg: str): print(f"[{_now_str()} INFO]  {msg}", flush=True)
+def log_warn(msg: str): print(f"[{_now_str()} WARNING]  {msg}", flush=True)
+def log_alert(msg: str): print(f"[{_now_str()} ALERT]  {msg}", flush=True)
+def log_trade(msg: str): print(f"[{_now_str()} TRADE]  {msg}", flush=True)
 def round_to_strike(price: float, strike_step: int = 50) -> int: return int(round(price / float(strike_step)) * strike_step)
 
 
@@ -689,7 +689,7 @@ class ExecutionEngine:
 
                 # 1. Pre-Market Sleep Loop
                 if now.hour < 9 or (now.hour == 9 and now.minute < 15):
-                    print(f"[{_now_str()}] Pre-market. Sleeping until 09:15 AM to save API limits...")
+                    print(f"[{_now_str()}] Pre-market. Sleeping until 09:15 AM to save API limits...", flush=True)
                     time.sleep(60.0)
                     continue
                     
@@ -750,7 +750,7 @@ class ExecutionEngine:
                             self._enter_leg("PE", chop_pe, "SELL", spot, atr)
 
                 # CLI Print
-                print(f"[{_now_str()}] Spot: {spot:.2f} | ADX: {self.current_indicators.get('adx', 18):.1f} ({regime}) | KAMA Trend: {trend} | Mode: {self.mode}")
+                print(f"[{_now_str()}] Spot: {spot:.2f} | ADX: {self.current_indicators.get('adx', 18):.1f} ({regime}) | KAMA Trend: {trend} | Mode: {self.mode}", flush=True)
                 
                 # Sleep for 1 second for ultra-fast, real-time tick evaluation
                 time.sleep(1.0)
