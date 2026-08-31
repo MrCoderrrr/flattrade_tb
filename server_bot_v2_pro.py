@@ -76,7 +76,7 @@ class NSEATMStreamer:
     def get_near_expiry_dte(self) -> Tuple[Optional[datetime], float]:
         """Real DTE lookup (was previously a hardcoded stub returning (None, 2.0) always).
         Caches the nearest expiry for the day so we don't hit searchscrip every tick."""
-        today = datetime.now().date()
+        today = get_ist_now().date()
         if self._cached_expiry_date is None or self._cached_expiry_day != today:
             try:
                 res = self.api.searchscrip(exchange='NFO', searchtext='NIFTY')
@@ -94,12 +94,12 @@ class NSEATMStreamer:
                 elif candidates:
                     self._cached_expiry_date = min(candidates)
                 else:
-                    self._cached_expiry_date = datetime.now() + timedelta(days=2)
+                    self._cached_expiry_date = get_ist_now() + timedelta(days=2)
             except Exception as e:
                 print(f"Error fetching near expiry: {e}")
-                self._cached_expiry_date = datetime.now() + timedelta(days=2)
+                self._cached_expiry_date = get_ist_now() + timedelta(days=2)
             self._cached_expiry_day = today
-        dte = (self._cached_expiry_date - datetime.now()).total_seconds() / 86400.0
+        dte = (self._cached_expiry_date - get_ist_now()).total_seconds() / 86400.0
         return self._cached_expiry_date, max(0.0, dte)
 
 class FlattradeBroker:
@@ -207,7 +207,7 @@ AUTO_SQUAREOFF_MINUTE   = 28
 REFRESH_INTERVAL_SEC    = 1          
 
 
-def _now_str() -> str: return datetime.now().strftime("%H:%M:%S")
+def _now_str() -> str: return get_ist_now().strftime("%H:%M:%S")
 def log_info(msg: str): print(f"[{_now_str()} INFO]  {msg}", flush=True)
 def log_warn(msg: str): print(f"[{_now_str()} WARNING]  {msg}", flush=True)
 def log_alert(msg: str): print(f"[{_now_str()} ALERT]  {msg}", flush=True)
@@ -265,7 +265,7 @@ class MarketData:
         if len(self.bars_5m) >= 30: return
         try:
             log_info("MarketData: Seeding historical 5-min bars from Flattrade for instant indicator readiness...")
-            end_time = datetime.now()
+            end_time = get_ist_now()
             start_time = end_time - timedelta(days=5)
             
             # Use Flattrade API directly to get 5m data
@@ -295,7 +295,7 @@ class MarketData:
                 if seeded_5m:
                     # Sort chronologically just in case
                     seeded_5m.sort(key=lambda x: x['timestamp'])
-                    today = datetime.now().date()
+                    today = get_ist_now().date()
                     prior_bars = [b for b in seeded_5m if b['timestamp'].date() < today][-50:]
                     self.bars_5m = prior_bars + self.bars_5m
                     log_info(f"Successfully seeded {len(prior_bars)} 5m bars from Flattrade.")
@@ -316,7 +316,7 @@ class MarketData:
         spot, atm = self.streamer.get_spot_and_atm()
         self.latest_spot = spot
         self.latest_atm = atm
-        now = datetime.now()
+        now = get_ist_now()
         current_min_key = now.strftime("%Y-%m-%d %H:%M")
         is_new_1m_bar = (current_min_key != self.last_completed_1m_key)
         
@@ -646,7 +646,7 @@ class ExecutionEngine:
 
     def _save_state(self):
         try:
-            state = {"date": str(datetime.now().date()), "mode": self.mode, "realized_pnl": self.realized_pnl, "positions": self.positions, "cooldown_tracker": self.cooldown_tracker}
+            state = {"date": str(get_ist_now().date()), "mode": self.mode, "realized_pnl": self.realized_pnl, "positions": self.positions, "cooldown_tracker": self.cooldown_tracker}
             with open(self.state_file, "w") as f: json.dump(state, f, indent=4)
         except: pass
 
@@ -654,12 +654,12 @@ class ExecutionEngine:
         if not os.path.exists(self.state_file): return
         try:
             with open(self.state_file, "r") as f: state = json.load(f)
-            if state.get("date") == str(datetime.now().date()):
+            if state.get("date") == str(get_ist_now().date()):
                 self.realized_pnl = float(state.get("realized_pnl", 0.0))
                 self.positions = state.get("positions", {})
                 self.cooldown_tracker = state.get("cooldown_tracker", self.cooldown_tracker)
                 saved_mode = state.get("mode", "WAIT_DATA")
-                now = datetime.now()
+                now = get_ist_now()
                 market_closed = (now.hour > AUTO_SQUAREOFF_HOUR or (now.hour == AUTO_SQUAREOFF_HOUR and now.minute >= AUTO_SQUAREOFF_MINUTE))
                 if saved_mode in ("SESSION_DONE", "SESSION_DONE_FLAT") and not market_closed:
                     self.mode = "RUNNING" if self.positions else "WAIT_DATA"
@@ -745,7 +745,7 @@ class ExecutionEngine:
         log_info("Starting V2 Pro Algorithmic State Machine...")
         while True:
             try:
-                now = datetime.now()
+                now = get_ist_now()
                 self._ltp_cache.clear()
                 
                 # Check Auto Square-off Time
