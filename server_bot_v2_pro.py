@@ -18,7 +18,7 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # Setup IST Timezone
 IST = timezone(timedelta(hours=5, minutes=30))
-def get_ist_now() -> datetime: return datetime.now(IST)
+def get_ist_now() -> datetime: return datetime.now(IST).replace(tzinfo=None)
 
 # ==============================================================================
 # FLATTRADE CORE POLYFILLS (Replacing missing core.* modules)
