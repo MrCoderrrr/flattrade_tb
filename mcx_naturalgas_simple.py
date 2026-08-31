@@ -16,7 +16,7 @@ except Exception:
     NorenApiPy = None
 
 TOKEN_FILE = "token.txt"
-STRIKE_STEP = 1.0
+STRIKE_STEP = 5.0
 ENTRY_TIME = "18:00"
 EXIT_TIME = "11:24"
 
@@ -83,11 +83,12 @@ class NaturalGasBot:
 
     def get_spot(self) -> float:
         try:
-            res = self.api.searchscrip(exchange="MCX", searchtext="NATGAS")
+            res = self.api.searchscrip(exchange="MCX", searchtext="NATURALGAS")
             if not res or not isinstance(res, dict) or not res.get("values"):
                 return 0.0
             for item in res["values"]:
-                if "NATGAS" in str(item.get("tsym", "")).upper():
+                tsym = str(item.get("tsym", "")).upper()
+                if "NATURALGAS" in tsym and "MINI" not in tsym:
                     q = self.api.get_quotes(exchange="MCX", token=item.get("token"))
                     if q and isinstance(q, dict):
                         val = q.get("lp", q.get("ltp", 0.0))
@@ -98,16 +99,16 @@ class NaturalGasBot:
         return 0.0
 
     def find_option_symbol(self, strike: float, option_type: str) -> Optional[Dict]:
-        """Find a matching MCX NATGAS option contract for the strike."""
+        """Find a matching MCX NATURALGAS option contract for the strike."""
         try:
-            search_text = f"NATGAS {int(strike)} {option_type}"
+            search_text = f"NATURALGAS {int(strike)} {option_type}"
             res = self.api.searchscrip(exchange="MCX", searchtext=search_text)
             if not res or not isinstance(res, dict) or not res.get("values"):
                 return None
 
             for item in res["values"]:
                 tsym = str(item.get("tsym", "")).upper()
-                if str(int(strike)) in tsym and option_type in tsym:
+                if str(int(strike)) in tsym and option_type in tsym and "MINI" not in tsym:
                     q = self.api.get_quotes(exchange="MCX", token=item.get("token"))
                     lp = float(q.get("lp", q.get("ltp", 0.0))) if q else 0.0
                     return {"tsym": item.get("tsym"), "lp": lp, "ls": int(item.get("ls", 1)), "token": item.get("token")}
