@@ -491,7 +491,8 @@ class RiskManager:
 
     def init_spot_sl(self, leg: str, entry_spot: float, atr: float):
         initial_distance = max(12.0, SPOT_SL_ATR_MULT * atr)
-        if leg == "CE":
+        base = "CE" if "CE" in leg else "PE"
+        if base == "CE":
             initial_sl = entry_spot + initial_distance
             best_spot = entry_spot 
         else:
@@ -516,7 +517,8 @@ class RiskManager:
         deep_lock_at = favorable_lock_at * 1.6
         sl_buffer = max(1.5, safe_atr * 0.08)
         
-        if leg == "CE":
+        base = "CE" if "CE" in leg else "PE"
+        if base == "CE":
             if current_spot < best_spot:
                 best_spot = current_spot
                 sl_state["best_spot"] = round(best_spot, 2)
@@ -691,9 +693,12 @@ class ExecutionEngine:
         Query Flattrade live positions and reconcile with self.positions.
         Called once on startup to prevent duplicate orders after a restart.
 
-        - Legs in broker but NOT in self.positions  → import them (bot will track, not re-enter)
-        - Legs in self.positions but net qty=0 in broker → remove (ghost, already closed externally)
-        - Legs in both → keep self.positions data (has SL state, entry_spot, etc.)
+        Flattrade symbol format: NIFTY01SEP26C24050  (ends in C{strike} or P{strike})
+        NOT: NIFTY24050CE — so we must use regex [CP](\\d+)$ to detect option type.
+
+        - Legs open in broker but missing from state → import them (track, don't re-enter)
+        - Legs in state but net qty=0 in broker (closed externally) → remove ghost
+        - Legs in both → keep existing state (has SL state, entry_spot, etc.)
         """
         import re as _re
         log_info("Syncing with Flattrade live positions...")
@@ -704,7 +709,7 @@ class ExecutionEngine:
                 return
 
             # Build broker map: tsym -> {netqty, avgprc}
-            # NOTE: Flattrade uses 'exch' not 'exchange' as field name
+            # Flattrade uses 'exch' (not 'exchange') as field name
             broker_map: Dict[str, Dict] = {}
             for p in res:
                 exch = p.get('exch', p.get('exchange', ''))
@@ -715,64 +720,87 @@ class ExecutionEngine:
                 if tsym:
                     broker_map[tsym] = {'netqty': netqty, 'avgprc': avgprc}
 
-
-            log_info(f"Broker NFO positions: {list(broker_map.keys())}")
+            log_info(f"Broker NFO positions ({len(broker_map)}): {list(broker_map.keys())}")
 
             atr  = self.current_indicators.get('atr', DEFAULT_ATR_5M)
             spot = self.market_data.latest_spot
 
-            # Step 1: Remove ghost positions (closed in broker but still in state)
+            # ---------------------------------------------------------------
+            # Step 1: Remove ghost positions (in state but closed/missing in broker)
+            # ---------------------------------------------------------------
             for leg in list(self.positions.keys()):
-                tsym   = self.positions[leg].get('tsym', '')
-                bqty   = broker_map.get(tsym, {}).get('netqty', None)
+                tsym = self.positions[leg].get('tsym', '')
+                bqty = broker_map.get(tsym, {}).get('netqty', None)
                 if bqty is None or bqty == 0:
                     log_warn(f"Removing ghost: {leg} ({tsym}) — not open in broker.")
                     del self.positions[leg]
 
+            # ---------------------------------------------------------------
             # Step 2: Import positions open in broker but missing from state
+            # ---------------------------------------------------------------
             known_tsyms = {p.get('tsym') for p in self.positions.values()}
+
             for tsym, bdata in broker_map.items():
                 netqty = bdata['netqty']
-                if netqty == 0 or tsym in known_tsyms: continue
+                if netqty == 0 or tsym in known_tsyms:
+                    continue
 
                 side   = "SELL" if netqty < 0 else "BUY"
                 qty    = abs(netqty)
                 avgprc = bdata['avgprc']
-                base   = 'CE' if 'CE' in tsym else ('PE' if 'PE' in tsym else 'XX')
 
-                # Determine leg label
-                if base == 'CE':
-                    leg = 'CE' if 'CE' not in self.positions else ('CE_HEDGE' if 'CE_HEDGE' not in self.positions else f'CE_{tsym[-4:]}')
-                elif base == 'PE':
-                    leg = 'PE' if 'PE' not in self.positions else ('PE_HEDGE' if 'PE_HEDGE' not in self.positions else f'PE_{tsym[-4:]}')
-                else:
-                    leg = tsym[:8]
-
-                # Try to parse strike
+                # ---- Correct base detection for Flattrade symbol format ----
+                # Format: NIFTY01SEP26C24050 → C24050 at end → base=CE, strike=24050
+                # Format: NIFTY01SEP26P23950 → P23950 at end → base=PE, strike=23950
                 strike = 0
-                m = _re.search(r'(\d{4,6})(CE|PE)$', tsym)
-                if m: strike = int(m.group(1))
+                base   = 'CE'  # default
+                m = _re.search(r'([CP])(\d{4,6})$', tsym)
+                if m:
+                    base   = 'CE' if m.group(1) == 'C' else 'PE'
+                    strike = int(m.group(2))
+                else:
+                    log_warn(f"Could not parse option type from tsym: {tsym}, defaulting to CE")
 
+                # ---- Leg naming: use SIDE to distinguish hedge vs short ----
+                # BUY positions = hedges (CE_HEDGE / PE_HEDGE)
+                # SELL positions = main short legs (CE / PE)
+                if side == 'BUY':
+                    preferred = f'{base}_HEDGE'
+                    fallback  = f'{base}_HEDGE_{tsym[-4:]}'
+                else:
+                    preferred = base  # 'CE' or 'PE'
+                    fallback  = f'{base}_{tsym[-4:]}'
+
+                leg = preferred if preferred not in self.positions else fallback
+
+                # ---- Build position dict ----
                 pos_info = {
-                    "strike": strike, "tsym": tsym, "base": base,
-                    "side": side, "qty": qty, "entry_price": avgprc,
-                    "entry_time": time.time(), "entry_spot": spot
+                    "strike":     strike,
+                    "tsym":       tsym,
+                    "base":       base,
+                    "side":       side,
+                    "qty":        qty,
+                    "entry_price": avgprc,
+                    "entry_time": time.time(),
+                    "entry_spot": spot,
                 }
                 if side == "SELL":
                     pos_info["spot_sl_state"] = self.risk_manager.init_spot_sl(base, spot, atr)
 
                 self.positions[leg] = pos_info
-                log_info(f"Imported from broker: {leg} — {side} {qty}x {tsym} @ ₹{avgprc:.2f}")
+                log_info(f"Imported: {leg} ({side} {qty}x {tsym} strike={strike} base={base} @ ₹{avgprc:.2f})")
 
-            # Step 3: Fix mode based on reconciled positions
+            # ---------------------------------------------------------------
+            # Step 3: Set correct mode based on reconciled positions
+            # ---------------------------------------------------------------
             if self.positions:
                 if self.mode in ("WAIT_DATA", "SESSION_DONE", "SESSION_DONE_FLAT"):
                     self.mode = "RUNNING"
-                    log_info(f"Mode set to RUNNING ({len(self.positions)} legs found).")
+                    log_info(f"Mode → RUNNING ({len(self.positions)} legs found).")
             else:
                 if self.mode not in ("COOLDOWN",):
                     self.mode = "WAIT_DATA"
-                    log_info("No open positions — mode set to WAIT_DATA.")
+                    log_info("No open positions — mode → WAIT_DATA.")
 
             self._save_state()
             log_info(f"Sync done. Tracking {len(self.positions)} legs: {list(self.positions.keys())}")
@@ -781,7 +809,29 @@ class ExecutionEngine:
             log_warn(f"Position sync error (non-fatal, continuing): {e}")
             traceback.print_exc()
 
-    def _get_ltp(self, strike: int, option_type: str) -> float:
+    def _get_ltp_by_tsym(self, tsym: str) -> float:
+        """Fetch LTP directly by full trading symbol (tsym) — used when strike=0."""
+        if not tsym: return 0.0
+        try:
+            res = self.market_data.streamer.api.searchscrip(exchange='NFO', searchtext=tsym)
+            if res and isinstance(res, dict) and res.get('stat') == 'Ok' and res.get('values'):
+                for item in res['values']:
+                    if item.get('tsym') == tsym:
+                        q = self.market_data.streamer.api.get_quotes(exchange='NFO', token=item['token'])
+                        if q: return float(q.get('lp', q.get('ltp', 0.0)))
+        except Exception:
+            pass
+        return 0.0
+
+    def _get_ltp(self, strike: int, option_type: str, tsym: str = '') -> float:
+        """Get LTP by strike+type. Falls back to tsym-based lookup if strike=0."""
+        if strike == 0 and tsym:
+            # Strike unknown (imported position) — use tsym directly
+            cached = self._ltp_cache.get(f'tsym_{tsym}')
+            if cached is not None: return cached
+            ltp = self._get_ltp_by_tsym(tsym)
+            self._ltp_cache[f'tsym_{tsym}'] = ltp
+            return ltp
         key = f"{strike}_{option_type}"
         if key not in self._ltp_cache:
             q = self.market_data.streamer.get_live_quote(strike, option_type)
@@ -806,15 +856,21 @@ class ExecutionEngine:
         if leg not in self.positions: return 0.0
         pos = self.positions[leg]
         base = pos["base"]
-        ltp = self._get_ltp(pos["strike"], base)
+        tsym = pos.get("tsym", "")
+        # Pass tsym so _get_ltp can do a direct lookup when strike=0 (imported positions)
+        ltp = self._get_ltp(pos["strike"], base, tsym=tsym)
+        if ltp <= 0.0:
+            log_warn(f"_exit_leg: LTP=0 for {leg} ({tsym}), using entry_price as fallback.")
+            ltp = float(pos.get("entry_price", 0.0))
         close_side = "BUY" if pos["side"] == "SELL" else "SELL"
-        self.broker.place_option_order(symbol=pos["tsym"], transaction_type=close_side, quantity=pos["qty"], price=ltp)
+        self.broker.place_option_order(symbol=tsym, transaction_type=close_side, quantity=pos["qty"], price=ltp)
         pnl = (pos["entry_price"] - ltp) * pos["qty"] if pos["side"] == "SELL" else (ltp - pos["entry_price"]) * pos["qty"]
         self.realized_pnl += pnl
         log_trade(f"EXITED {leg:10s} Strike: {pos['strike']} @ ₹{ltp:.2f} | P&L: ₹{pnl:,.2f} (Reason: {reason})")
         del self.positions[leg]
         self._save_state()
         return pnl
+
 
     def _exit_all_positions(self, reason: str = "GLOBAL_EXIT"):
         for leg in list(self.positions.keys()): self._exit_leg(leg, reason=reason)
@@ -824,6 +880,68 @@ class ExecutionEngine:
         log_alert(f"⏳ {stopped_leg} entered Adaptive COOLDOWN.")
         self.mode = "COOLDOWN"
         self._save_state()
+
+    def _calculate_unrealized_pnl(self) -> float:
+        total = 0.0
+        for p in self.positions.values():
+            tsym = p.get("tsym", "")
+            strike = int(p.get("strike", 0))
+            base = p.get("base", "CE")
+            entry = float(p.get("entry_price", 0.0))
+            ltp = self._get_ltp(strike, base, tsym=tsym)
+            # If LTP is 0 or failed to fetch, fall back to entry price so unrealized is 0 rather than a huge fake loss
+            if ltp <= 0.0:
+                ltp = entry
+            qty = int(p.get("qty", self.qty))
+            side = p.get("side", "SELL")
+            pnl = (entry - ltp) * qty if side == "SELL" else (ltp - entry) * qty
+            total += pnl
+        return total
+
+    def _write_snapshot(self, spot: float, atm: int, atr: float, regime: str, trend: int, adx: float, dte_days: float, unrealized: float):
+        try:
+            positions_view = {}
+            for leg, p in self.positions.items():
+                tsym = p.get("tsym", "")
+                strike = int(p.get("strike", 0))
+                base = p.get("base", "CE")
+                entry = float(p.get("entry_price", 0.0))
+                ltp = self._get_ltp(strike, base, tsym=tsym)
+                if ltp <= 0.0: ltp = entry
+                qty = int(p.get("qty", self.qty))
+                side = p.get("side", "SELL")
+                pnl = (entry - ltp) * qty if side == "SELL" else (ltp - entry) * qty
+                positions_view[leg] = {
+                    **p,
+                    "live_ltp": ltp,
+                    "live_pnl": pnl,
+                }
+
+            kama_val = self.current_indicators.get("kama")
+            snap = {
+                "now_str": _now_str(),
+                "mode": self.mode,
+                "paper_mode": False,
+                "spot": spot,
+                "atm": atm,
+                "adx": adx,
+                "kama": kama_val,
+                "regime": regime,
+                "trend": trend,
+                "atr": atr,
+                "dte": dte_days,
+                "realized_pnl": self.realized_pnl,
+                "unrealized_pnl": unrealized,
+                "positions": positions_view,
+                "cooldown_tracker": self.cooldown_tracker,
+                "last_event": f"Active in {regime} regime | {len(self.positions)} open legs"
+            }
+            tmp_file = self.live_snap_file + ".tmp"
+            with open(tmp_file, "w") as f:
+                json.dump(snap, f, indent=2)
+            os.replace(tmp_file, self.live_snap_file)
+        except Exception:
+            pass
 
     def _check_cooldown_and_reenter(self, spot: float, atm: int, atr: float, regime: str, trend: int, dte_days: float = 2.0):
         for leg in ("CE", "PE"):
@@ -898,7 +1016,7 @@ class ExecutionEngine:
                 adx = self.current_indicators.get('adx', 18.0)
                 _, dte_days = self.market_data.streamer.get_near_expiry_dte()
                 
-                unrealized = sum([((p["entry_price"] - self._get_ltp(p["strike"], p["base"])) if p["side"] == "SELL" else (self._get_ltp(p["strike"], p["base"]) - p["entry_price"])) * p["qty"] for p in self.positions.values()])
+                unrealized = self._calculate_unrealized_pnl()
                 cb_triggered, cb_msg = self.risk_manager.check_portfolio_circuit_breaker(self.realized_pnl, unrealized)
                 if cb_triggered:
                     log_alert(cb_msg)
@@ -978,6 +1096,9 @@ class ExecutionEngine:
                                 log_info(f"KAMA trend-follow. Rolling PE from {self.positions['PE']['strike']} to {trend_pe} (drift >= {min_drift}pts)...")
                                 self._exit_leg("PE", reason="TREND_FOLLOW_ROLL")
                                 self._enter_leg("PE", trend_pe, "SELL", spot, atr)
+
+                # Write live dashboard snapshot
+                self._write_snapshot(spot, atm, atr, regime, trend, adx, dte_days, unrealized)
 
                 # CLI Print
                 print(f"[{_now_str()}] Spot: {spot:.2f} | ADX: {adx:.1f} ({regime}) | KAMA Trend: {trend} | Mode: {self.mode} | P&L: ₹{self.realized_pnl:,.0f}", flush=True)
