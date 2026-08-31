@@ -207,7 +207,7 @@ PORTFOLIO_CIRCUIT_PCT   = 1.5         # Emergency Portfolio Halt at -1.5% combin
 KAMA_PERIOD             = 13          # KAMA 13 Lookback (1-minute resolution)
 KAMA_FAST_EMA           = 3           # KAMA Fast EMA constant
 KAMA_SLOW_EMA           = 30          # KAMA Slow EMA constant
-KAMA_MIN_SLOPE          = 1.0         # Minimum KAMA slope (pts) to flip trend
+KAMA_MIN_SLOPE          = 3.5         # Minimum KAMA slope (pts) to flip trend
 
 ADX_PERIOD              = 6           # 5 min 6 candles for ADX (30m lookback)
 ADX_CHOP_THRESHOLD      = 20.0        # 20 Gateway: ADX < 20 = CHOP (Iron Condor)
@@ -240,7 +240,7 @@ SPOT_SL_DEBOUNCE_BARS   = 1           # 1-bar debounce confirmation for quick pr
 
 # Anti-Whipsaw Cooldown
 COOLDOWN_MINUTES        = 3           # Fallback cooldown timer
-COOLDOWN_SPOT_PCT       = 0.0010      # 0.10% spot movement (~24 pts) resets cooldown early
+COOLDOWN_SPOT_PCT       = 0.0020      # 0.10% spot movement (~24 pts) resets cooldown early
 
 # Session Timing
 MARKET_START_HOUR       = 9
@@ -957,7 +957,11 @@ class ExecutionEngine:
         self.mode = "COOLDOWN"
         self._save_state()
 
-    def _check_cooldown_and_reenter(self, spot: float, atm: int, atr: float, regime: str, trend: int, dte_days: float = 2.0):
+    def _check_cooldown_and_reenter(self, spot: float, atm: int, atr: float, regime: str, trend: int, is_new_1m_bar: bool, dte_days: float = 2.0):
+        # Only evaluate structural re-entry on confirmed 1-minute candle closes
+        if not is_new_1m_bar:
+            return
+
         for leg in ("CE", "PE"):
             cd = self.cooldown_tracker.get(leg)
             if not cd or not cd.get("active", False): continue
@@ -965,18 +969,34 @@ class ExecutionEngine:
             spot_displacement = abs(spot - cd["stopped_spot"]) / max(0.1, cd["stopped_spot"])
             
             indicator_cleared = False
-            if leg == "CE" and trend == -1: indicator_cleared = True
-            elif leg == "PE" and trend == 1: indicator_cleared = True
-            elif regime == "CHOP" and elapsed_sec >= 60.0: indicator_cleared = True
-            elif spot_displacement >= COOLDOWN_SPOT_PCT: indicator_cleared = True
-            elif elapsed_sec >= COOLDOWN_MINUTES * 60: indicator_cleared = True
+            clear_reason = ""
+
+            # Require minimum 2 minutes elapsed or significant spot displacement to avoid immediate re-whipsaw
+            if elapsed_sec >= 120.0:
+                if leg == "CE" and trend == -1:
+                    indicator_cleared = True
+                    clear_reason = "KAMA trend reversed DOWN (-1)"
+                elif leg == "PE" and trend == 1:
+                    indicator_cleared = True
+                    clear_reason = "KAMA trend reversed UP (+1)"
+                elif regime == "CHOP" and elapsed_sec >= 180.0:
+                    indicator_cleared = True
+                    clear_reason = "Chop regime stabilized over 3m"
+            
+            if spot_displacement >= COOLDOWN_SPOT_PCT and elapsed_sec >= 60.0:
+                indicator_cleared = True
+                clear_reason = f"Spot displaced {spot_displacement*100:.2f}% away from stop level"
+
+            if elapsed_sec >= COOLDOWN_MINUTES * 60:
+                indicator_cleared = True
+                clear_reason = "Full cooldown timer elapsed"
             
             if indicator_cleared:
                 trend_safe = True
                 if leg == "CE" and regime == "TREND" and trend == 1: trend_safe = False
                 elif leg == "PE" and regime == "TREND" and trend == -1: trend_safe = False
                 if trend_safe:
-                    log_info(f"✅ Cooldown Bypassed for {leg} -> Re-shorting...")
+                    log_info(f"✅ Cooldown Cleared for {leg} ({clear_reason}) -> Re-entering short strike...")
                     ce_strike, pe_strike = self.calculate_strangle_strikes(atm, atr, regime, dte_days=dte_days)
                     if leg not in self.positions: self._enter_leg(leg, ce_strike if leg == "CE" else pe_strike, "SELL", spot, atr)
                     cd["active"] = False
@@ -1094,18 +1114,8 @@ class ExecutionEngine:
                                 self._exit_leg(leg, reason="SPOT_TSL_HIT")
                                 self._trigger_leg_cooldown(leg, spot)
 
-                    self._check_cooldown_and_reenter(spot, atm, atr, regime, trend, dte_days=dte_days)
-
-                    if regime == "CHOP":
-                        chop_ce, chop_pe = self.calculate_strangle_strikes(atm, atr, "CHOP", dte_days=dte_days)
-                        if "CE" in self.positions and self.positions["CE"]["strike"] < chop_ce:
-                            log_info(f"ADX < 20. Rolling CE from {self.positions['CE']['strike']} to {chop_ce}...")
-                            self._exit_leg("CE", reason="CHOP_ROLL_OUT")
-                            self._enter_leg("CE", chop_ce, "SELL", spot, atr)
-                        if "PE" in self.positions and self.positions["PE"]["strike"] > chop_pe:
-                            log_info(f"ADX < 20. Rolling PE from {self.positions['PE']['strike']} to {chop_pe}...")
-                            self._exit_leg("PE", reason="CHOP_ROLL_OUT")
-                            self._enter_leg("PE", chop_pe, "SELL", spot, atr)
+                    # Handle disciplined re-entry after cooldown only on confirmed 1-min closes
+                    self._check_cooldown_and_reenter(spot, atm, atr, regime, trend, is_new_1m_bar, dte_days=dte_days)
 
                 snap = self._build_dashboard_snapshot(spot, atm, atr, regime, trend, dte_days, unrealized)
                 self.dashboard.update(snap)
