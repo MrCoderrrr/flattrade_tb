@@ -753,7 +753,7 @@ class ExecutionEngine:
                 for leg, pos in self.positions.items():
                     if pos.get("side") == "SELL":
                         if "premium_sl_state" not in pos or not pos["premium_sl_state"]:
-                            pos["premium_sl_state"] = self.risk_manager.init_premium_sl(float(pos.get("entry_price", 0.0)), self.current_indicators.get("regime", "CHOP"))
+                            pos["premium_sl_state"] = self.risk_manager.init_premium_sl(float(pos.get("entry_price", 0.0)), regime=self.current_indicators.get("regime", "CHOP"))
         except: pass
 
     def _sync_positions_from_broker(self):
@@ -893,7 +893,7 @@ class ExecutionEngine:
                     "prd":        prd,
                 }
                 if side == "SELL":
-                    pos_info["premium_sl_state"] = self.risk_manager.init_premium_sl(avgprc, self.current_indicators.get("regime", "CHOP"))
+                    pos_info["premium_sl_state"] = self.risk_manager.init_premium_sl(avgprc, regime=self.current_indicators.get("regime", "CHOP"))
 
                 self.positions[leg] = pos_info
                 log_info(f"Imported: {leg} ({side} {qty}x {tsym} strike={strike} base={base} @ ₹{avgprc:.2f})")
@@ -954,7 +954,7 @@ class ExecutionEngine:
         self.broker.place_option_order(symbol=tsym, transaction_type=side, quantity=self.qty, price=ltp, product_type=product_type)
         pos_info = {"strike": strike, "tsym": tsym, "base": base, "side": side, "qty": self.qty, "entry_price": ltp, "entry_time": time.time(), "entry_spot": spot, "prd": product_type}
         if side == "SELL":
-            pos_info["premium_sl_state"] = self.risk_manager.init_premium_sl(ltp, regime)
+            pos_info["premium_sl_state"] = self.risk_manager.init_premium_sl(ltp, regime=regime)
         self.positions[leg] = pos_info
         log_trade(f"{side} {leg:10s} Strike: {strike} @ ₹{ltp:.2f} (Spot: {spot:.2f})")
         self._save_state()
