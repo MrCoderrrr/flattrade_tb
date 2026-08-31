@@ -308,20 +308,31 @@ def load_data() -> Optional[Dict]:
                     if pos["strike"] == 0:
                         pos["strike"] = b_pos.get("strike", 0)
 
-                # Fallback TSL state if bot state is missing
-                if pos.get("side") == "SELL" and not pos.get("premium_sl_state"):
+                # Ensure TSL state is clean and accurate for short option legs
+                if pos.get("side") == "SELL":
                     entry_p = float(pos.get("entry_price", 0.0))
                     live_p  = float(pos.get("live_ltp", entry_p))
-                    lowest_p = min(entry_p, live_p) if live_p > 0 else entry_p
+                    if live_p <= 0.0: live_p = entry_p
+
+                    sl_state = pos.get("premium_sl_state")
                     regime = bot_snap.get("regime", "CHOP")
                     trail_pct = 0.05 if regime == "CHOP" else 0.07
-                    init_sl = round(entry_p * (1.30 if regime == "CHOP" else 1.40), 2)
-                    cur_sl  = min(init_sl, round(lowest_p + max(1.0, lowest_p * trail_pct), 2))
+
+                    if sl_state and isinstance(sl_state, dict):
+                        raw_lowest = float(sl_state.get("lowest_ltp", entry_p))
+                        lowest_p = min(raw_lowest, entry_p, live_p)
+                    else:
+                        lowest_p = min(entry_p, live_p)
+
+                    cur_sl = round(lowest_p * (1.0 + trail_pct), 2)
+                    if lowest_p < entry_p and cur_sl > entry_p:
+                        cur_sl = entry_p
+
                     pos["premium_sl_state"] = {
                         "entry_price": entry_p,
-                        "lowest_ltp": lowest_p,
+                        "lowest_ltp": round(lowest_p, 2),
                         "current_sl": cur_sl,
-                        "initial_sl": init_sl,
+                        "initial_sl": round(entry_p * (1.0 + trail_pct), 2),
                         "trail_pct": trail_pct,
                     }
 
