@@ -99,8 +99,9 @@ def fetch_flattrade_order_book() -> List[Dict]:
             today = get_ist_now().date()
             filled = []
             for o in res:
-                # Only count filled NFO orders from today
-                if o.get('exchange') != 'NFO': continue
+                # NOTE: Flattrade uses 'exch' not 'exchange'
+                exch = o.get('exch', o.get('exchange', ''))
+                if exch != 'NFO': continue
                 if o.get('status', '').upper() not in ('COMPLETE', 'FILLED', 'FIL'): continue
                 # Flattrade order time format: "HH:MM:SS DD-MM-YYYY"
                 try:
@@ -133,7 +134,7 @@ def fetch_flattrade_trade_book() -> List[Dict]:
     try:
         res = api.get_trade_book()
         if res and isinstance(res, list):
-            return [t for t in res if t.get('exchange') == 'NFO']
+            return [t for t in res if t.get('exch', t.get('exchange', '')) == 'NFO']
     except Exception as e:
         print(f"[DASHBOARD] Trade book fetch error: {e}", flush=True)
     return []
@@ -147,7 +148,7 @@ def fetch_flattrade_positions() -> List[Dict]:
     try:
         res = api.get_positions()
         if res and isinstance(res, list):
-            return [p for p in res if p.get('exchange') == 'NFO' and int(p.get('netqty', 0)) != 0]
+            return [p for p in res if p.get('exch', p.get('exchange', '')) == 'NFO' and int(p.get('netqty', 0)) != 0]
     except Exception as e:
         print(f"[DASHBOARD] Positions fetch error: {e}", flush=True)
     return []

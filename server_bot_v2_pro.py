@@ -704,14 +704,17 @@ class ExecutionEngine:
                 return
 
             # Build broker map: tsym -> {netqty, avgprc}
+            # NOTE: Flattrade uses 'exch' not 'exchange' as field name
             broker_map: Dict[str, Dict] = {}
             for p in res:
-                if p.get('exchange') != 'NFO': continue
+                exch = p.get('exch', p.get('exchange', ''))
+                if exch != 'NFO': continue
                 tsym   = p.get('tsym', '')
                 netqty = int(p.get('netqty', 0) or 0)
                 avgprc = float(p.get('netavgprc', p.get('avgprc', 0.0)) or 0.0)
                 if tsym:
                     broker_map[tsym] = {'netqty': netqty, 'avgprc': avgprc}
+
 
             log_info(f"Broker NFO positions: {list(broker_map.keys())}")
 
