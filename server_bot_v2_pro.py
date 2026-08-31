@@ -872,8 +872,16 @@ class ExecutionEngine:
 
             for leg, pos in self.positions.items():
                 if pos.get("side") == "SELL" and leg in ("CE", "PE"):
-                    if "spot_sl_state" not in pos or not pos["spot_sl_state"]:
-                        pos["spot_sl_state"] = self.risk_manager.init_spot_sl(leg, float(pos.get("entry_spot", self.market_data.latest_spot)), float(self.current_indicators.get("atr", DEFAULT_ATR_5M)))
+                    entry_spot = float(pos.get("entry_spot", self.market_data.latest_spot))
+                    atr_val = float(self.current_indicators.get("atr", DEFAULT_ATR_5M))
+                    new_sl_state = self.risk_manager.init_spot_sl(leg, entry_spot, atr_val)
+                    if "spot_sl_state" in pos and isinstance(pos["spot_sl_state"], dict):
+                        old_best = pos["spot_sl_state"].get("best_spot")
+                        if old_best:
+                            new_sl_state["best_spot"] = float(old_best)
+                    pos["spot_sl_state"] = new_sl_state
+                    log_info(f"Re-aligned {leg} Spot TSL: Entry={entry_spot:.2f}, SL={new_sl_state['current_sl']:.2f}, ATR={atr_val:.2f}")
+            self._save_state()
         except Exception as e:
             log_alert(f"[STATE LOAD ERROR] Unexpected error applying loaded state: {e}. Resetting to WAIT_DATA.")
             traceback.print_exc()
