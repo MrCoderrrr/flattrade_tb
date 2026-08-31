@@ -209,11 +209,11 @@ EXPIRY_WIDTH_LOOKAHEAD_DAYS = 8.0
 EXPIRY_NEAR_DAYS            = 2.0     
 EXPIRY_NEAR_BONUS           = 0.42    
 
-SPOT_SL_ATR_MULT        = 0.90        
-SPOT_SL_TRAIL_RATIO     = 0.55        
-SPOT_SL_TRAIL_RATIO_STRONG = 0.72     
-SPOT_SL_TRAIL_RATIO_DEEP   = 0.85     
-SPOT_SL_BREAKEVEN_LOCK_ATR = 1.10     
+SPOT_SL_ATR_MULT        = 1.60                
+SPOT_SL_TRAIL_RATIO     = 0.40                
+SPOT_SL_TRAIL_RATIO_STRONG = 0.55          
+SPOT_SL_TRAIL_RATIO_DEEP   = 0.70          
+SPOT_SL_BREAKEVEN_LOCK_ATR = 1.50          
 SPOT_SL_BREAKEVEN_BUFFER_PTS = 5.0    
 SPOT_SL_DEBOUNCE_BARS   = 2           
 
@@ -254,6 +254,8 @@ class MarketData:
         self.bars_1m: List[Dict[str, Any]] = []
         self.logged_1m_keys: set = set()
         self.bars_5m: List[Dict[str, Any]] = []
+        self.seeded_bars_5m: List[Dict[str, Any]] = []
+        self.seeded_bars_1m: List[Dict[str, Any]] = []
         self.latest_spot: float = 24000.0
         self.latest_atm: int = 24000
         self.last_completed_1m_key: Optional[str] = None
@@ -290,26 +292,24 @@ class MarketData:
             log_warn(f"MarketData: Error loading cache: {e}")
 
     def _seed_history_if_needed(self):
-        if len(self.bars_5m) >= 30: return
         try:
-            log_info("MarketData: Seeding historical 5-min bars from Flattrade for instant indicator readiness...")
+            log_info("MarketData: Seeding historical candles from Flattrade for instant indicator readiness...")
             end_time = get_ist_now()
             start_time = end_time - timedelta(days=5)
             
-            # Use Flattrade API directly to get 5m data
-            res = global_api.get_time_price_series(
+            # Fetch 5-minute historical series
+            res_5m = global_api.get_time_price_series(
                 exchange='NSE', token='26000', 
                 starttime=start_time.timestamp(), 
                 endtime=end_time.timestamp(), 
                 interval=5
             )
-            
-            if res and isinstance(res, list) and len(res) > 0:
-                seeded_5m = []
-                for row in res:
+            if res_5m and isinstance(res_5m, list) and len(res_5m) > 0:
+                s5 = []
+                for row in res_5m:
                     try:
                         ts = datetime.strptime(row['time'], "%d-%m-%Y %H:%M:%S")
-                        seeded_5m.append({
+                        s5.append({
                             'timestamp': ts,
                             'open': float(row['into']),
                             'high': float(row['inth']),
@@ -318,16 +318,37 @@ class MarketData:
                         })
                     except Exception:
                         continue
-                        
-                if seeded_5m:
-                    seeded_5m.sort(key=lambda x: x['timestamp'])
-                    today = get_ist_now().date()
-                    prior_bars = [b for b in seeded_5m if b['timestamp'].date() < today][-50:]
-                    self.bars_5m = prior_bars + self.bars_5m
-                    log_info(f"Successfully seeded {len(prior_bars)} 5m bars from Flattrade.")
-            else:
-                log_warn("Flattrade get_time_price_series returned empty or failed.")
-                
+                if s5:
+                    s5.sort(key=lambda x: x['timestamp'])
+                    self.seeded_bars_5m = s5[-100:]
+                    log_info(f"Successfully seeded {len(self.seeded_bars_5m)} 5m bars from Flattrade.")
+
+            # Fetch 1-minute historical series
+            start_1m = end_time - timedelta(days=1)
+            res_1m = global_api.get_time_price_series(
+                exchange='NSE', token='26000', 
+                starttime=start_1m.timestamp(), 
+                endtime=end_time.timestamp(), 
+                interval=1
+            )
+            if res_1m and isinstance(res_1m, list) and len(res_1m) > 0:
+                s1 = []
+                for row in res_1m:
+                    try:
+                        ts = datetime.strptime(row['time'], "%d-%m-%Y %H:%M:%S")
+                        s1.append({
+                            'timestamp': ts,
+                            'open': float(row['into']),
+                            'high': float(row['inth']),
+                            'low': float(row['intl']),
+                            'close': float(row['intc'])
+                        })
+                    except Exception:
+                        continue
+                if s1:
+                    s1.sort(key=lambda x: x['timestamp'])
+                    self.seeded_bars_1m = s1[-120:]
+                    log_info(f"Successfully seeded {len(self.seeded_bars_1m)} 1m bars for KAMA readiness.")
         except Exception as e:
             log_warn(f"Flattrade history seeding skipped ({e}).")
 
@@ -363,15 +384,25 @@ class MarketData:
         return spot, atm, is_new_1m_bar
 
     def get_5m_dataframe(self) -> pd.DataFrame:
-        if not self.bars_5m: return pd.DataFrame(columns=['open', 'high', 'low', 'close'])
-        return pd.DataFrame(self.bars_5m)
+        all_5m = self.seeded_bars_5m + self.bars_5m
+        if not all_5m: return pd.DataFrame(columns=['open', 'high', 'low', 'close'])
+        df = pd.DataFrame(all_5m)
+        df.drop_duplicates(subset=['timestamp'], keep='last', inplace=True)
+        return df
 
     def get_1m_dataframe(self) -> pd.DataFrame:
-        if not self.bars_1m: return pd.DataFrame(columns=['open', 'high', 'low', 'close'])
-        df = pd.DataFrame(self.bars_1m)
-        df.set_index('timestamp', inplace=True)
-        df_1m = df['spot'].resample('1min', label='left', closed='left').ohlc().dropna()
-        return df_1m
+        all_1m = []
+        if self.seeded_bars_1m:
+            all_1m.extend(self.seeded_bars_1m)
+        if self.bars_1m:
+            df_curr = pd.DataFrame(self.bars_1m)
+            df_curr.set_index('timestamp', inplace=True)
+            df_res = df_curr['spot'].resample('1min', label='left', closed='left').ohlc().dropna().reset_index()
+            all_1m.extend(df_res.to_dict('records'))
+        if not all_1m: return pd.DataFrame(columns=['open', 'high', 'low', 'close'])
+        df = pd.DataFrame(all_1m)
+        df.drop_duplicates(subset=['timestamp'], keep='last', inplace=True)
+        return df
 
 
 # ==============================================================================
@@ -421,17 +452,16 @@ class Indicators:
     @staticmethod
     def calculate_adx(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int = ADX_PERIOD):
         n = len(closes)
-        if n < period * 2: return 18.0, 20.0, 20.0
+        if n < period + 2: return 18.0, 20.0, 20.0
+        
         tr = np.zeros(n)
         plus_dm = np.zeros(n)
         minus_dm = np.zeros(n)
         for i in range(1, n):
             up_move = highs[i] - highs[i - 1]
             down_move = lows[i - 1] - lows[i]
-            if up_move > down_move and up_move > 0: plus_dm[i] = up_move
-            else: plus_dm[i] = 0.0
-            if down_move > up_move and down_move > 0: minus_dm[i] = down_move
-            else: minus_dm[i] = 0.0
+            plus_dm[i] = up_move if (up_move > down_move and up_move > 0) else 0.0
+            minus_dm[i] = down_move if (down_move > up_move and down_move > 0) else 0.0
             hl = highs[i] - lows[i]
             hpc = abs(highs[i] - closes[i - 1])
             lpc = abs(lows[i] - closes[i - 1])
@@ -448,27 +478,29 @@ class Indicators:
             plus_dm_smooth[i] = plus_dm_smooth[i - 1] - (plus_dm_smooth[i - 1] / period) + plus_dm[i]
             minus_dm_smooth[i] = minus_dm_smooth[i - 1] - (minus_dm_smooth[i - 1] / period) + minus_dm[i]
             
-        plus_di = 100.0 * (plus_dm_smooth / np.where(tr_smooth == 0, 1e-6, tr_smooth))
-        minus_di = 100.0 * (minus_dm_smooth / np.where(tr_smooth == 0, 1e-6, tr_smooth))
+        valid = np.arange(period, n)
+        tr_safe = np.where(tr_smooth[valid] == 0, 1e-6, tr_smooth[valid])
+        plus_di = 100.0 * (plus_dm_smooth[valid] / tr_safe)
+        minus_di = 100.0 * (minus_dm_smooth[valid] / tr_safe)
+        
         di_sum = plus_di + minus_di
         di_diff = np.abs(plus_di - minus_di)
         dx = 100.0 * (di_diff / np.where(di_sum == 0, 1e-6, di_sum))
         
-        adx = np.zeros(n)
-        start_idx = period * 2 - 1
-        if start_idx < n:
-            adx[start_idx] = np.mean(dx[period:start_idx + 1])
-            for i in range(start_idx + 1, n):
-                adx[i] = (adx[i - 1] * (period - 1) + dx[i]) / period
-            current_adx = float(adx[-1])
-        else:
-            current_adx = float(np.mean(dx[period:])) if len(dx) > period else 18.0
-        return current_adx, float(plus_di[-1]), float(minus_di[-1])
+        if len(dx) < period:
+            return float(np.mean(dx)) if len(dx) > 0 else 18.0, float(plus_di[-1]), float(minus_di[-1])
+            
+        adx = np.zeros(len(dx))
+        adx[period - 1] = np.mean(dx[:period])
+        for i in range(period, len(dx)):
+            adx[i] = (adx[i - 1] * (period - 1) + dx[i]) / period
+            
+        return float(adx[-1]), float(plus_di[-1]), float(minus_di[-1])
 
     @classmethod
     def evaluate_all(cls, df_1m: pd.DataFrame, df_5m: pd.DataFrame):
-        if df_5m.empty or len(df_5m) < 5:
-            return {'kama': None, 'prev_kama': None, 'trend': 0, 'atr': DEFAULT_ATR_5M, 'adx': 18.0, 'plus_di': 20.0, 'minus_di': 20.0, 'regime': 'CHOP'}
+        if df_5m.empty:
+            return {'kama': 0.0, 'prev_kama': 0.0, 'trend': 0, 'atr': DEFAULT_ATR_5M, 'adx': 18.0, 'plus_di': 20.0, 'minus_di': 20.0, 'regime': 'CHOP'}
             
         highs = df_5m['high'].to_numpy(dtype=float)
         lows = df_5m['low'].to_numpy(dtype=float)
@@ -522,8 +554,7 @@ class RiskManager:
         breach_count = int(sl_state.get("breach_count", 0))
         safe_atr = max(5.0, atr_at_entry if atr_at_entry > 0 else 1.0)
         favorable_lock_at = safe_atr * SPOT_SL_BREAKEVEN_LOCK_ATR
-        deep_lock_at = favorable_lock_at * 1.6
-        sl_buffer = max(1.5, safe_atr * 0.08)
+        deep_lock_at = favorable_lock_at * 1.5
         
         if leg == "CE":
             if current_spot < best_spot:
@@ -536,7 +567,8 @@ class RiskManager:
                 candidate_sl = sl_state["initial_sl"] - trail_amount
                 sl_state["current_sl"] = min(current_sl, round(candidate_sl, 2))
                 sl_state["trail_amount"] = round(trail_amount, 2)
-            is_breaching = (current_spot >= (sl_state["current_sl"] - sl_buffer))
+            is_breaching = (current_spot >= sl_state["current_sl"])
+            hard_breach = (current_spot >= (sl_state["current_sl"] + 1.5 * safe_atr))
         else:
             if current_spot > best_spot:
                 best_spot = current_spot
@@ -548,7 +580,8 @@ class RiskManager:
                 candidate_sl = sl_state["initial_sl"] + trail_amount
                 sl_state["current_sl"] = max(current_sl, round(candidate_sl, 2))
                 sl_state["trail_amount"] = round(trail_amount, 2)
-            is_breaching = (current_spot <= (sl_state["current_sl"] + sl_buffer))
+            is_breaching = (current_spot <= sl_state["current_sl"])
+            hard_breach = (current_spot <= (sl_state["current_sl"] - 1.5 * safe_atr))
 
         if is_new_1m_bar:
             if is_breaching:
@@ -556,15 +589,14 @@ class RiskManager:
                 sl_state["breach_count"] = breach_count
             else:
                 sl_state["breach_count"] = 0
-        else:
-            if is_breaching and breach_count == 0:
-                breach_count = 1
-                sl_state["breach_count"] = 1
-            elif not is_breaching and breach_count == 1:
-                sl_state["breach_count"] = 0
 
+        # Hard breach triggers immediate exit without waiting for 1m bar close
+        if hard_breach:
+            return True, f"⛔ Hard Emergency Spot SL Triggered for {leg} | Spot: {current_spot:.2f} violently crossed SL: {sl_state['current_sl']:.2f}"
+
+        # Standard debounce exit requires 2 consecutive 1m bar closes beyond SL
         if sl_state["breach_count"] >= SPOT_SL_DEBOUNCE_BARS:
-            return True, f"⛔ Spot SL Triggered for {leg} | Spot: {current_spot:.2f} breached SL: {sl_state['current_sl']:.2f}"
+            return True, f"⛔ Spot SL Triggered for {leg} | Spot: {current_spot:.2f} breached SL: {sl_state['current_sl']:.2f} on {SPOT_SL_DEBOUNCE_BARS} consecutive 1m closes"
         return False, ""
 
     def check_portfolio_circuit_breaker(self, realized_pnl: float, unrealized_pnl: float):
@@ -933,7 +965,10 @@ class ExecutionEngine:
             "now_str": _now_str(),
             "mode": self.mode,
             "paper_mode": self.broker.paper_trading,
-            "spot": spot, "atm": atm, "adx": self.current_indicators.get("adx", 18.0),
+            "spot": spot, "atm": atm,
+            "adx": self.current_indicators.get("adx", 18.0),
+            "kama": self.current_indicators.get("kama"),
+            "prev_kama": self.current_indicators.get("prev_kama"),
             "regime": regime, "trend": trend, "atr": atr, "dte": dte_days,
             "realized_pnl": self.realized_pnl, "unrealized_pnl": unrealized,
             "positions": positions_view,

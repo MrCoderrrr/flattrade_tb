@@ -3,7 +3,6 @@ import os
 import sys
 import time
 import json
-import socket
 from datetime import datetime, timedelta, timezone
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -13,7 +12,6 @@ STATE_FILE = os.path.join(PROJECT_ROOT, "data", "state", "algo_state_v2.json")
 IST = timezone(timedelta(hours=5, minutes=30))
 def get_ist_now() -> datetime: return datetime.now(IST)
 
-# Rich UI
 try:
     from rich.console import Console
     from rich.table import Table
@@ -25,7 +23,7 @@ try:
 except ImportError:
     HAS_RICH = False
 
-# Live Flattrade API reader for standalone mode
+# Fallback Flattrade reader if standalone
 api = None
 try:
     from api_helper import NorenApiPy
@@ -41,8 +39,7 @@ except Exception:
 _quote_token_cache = {}
 
 def get_quote_for_symbol(tsym: str) -> float:
-    if not api or not tsym:
-        return 0.0
+    if not api or not tsym: return 0.0
     try:
         if tsym not in _quote_token_cache:
             res = api.searchscrip(exchange='NFO', searchtext=tsym)
@@ -61,8 +58,7 @@ def get_quote_for_symbol(tsym: str) -> float:
     return 0.0
 
 def get_spot() -> float:
-    if not api:
-        return 0.0
+    if not api: return 0.0
     try:
         q = api.get_quotes(exchange='NSE', token='26000')
         if q and isinstance(q, dict):
@@ -74,11 +70,11 @@ def get_spot() -> float:
 def load_data():
     now_str = get_ist_now().strftime("%H:%M:%S")
 
-    # Check if live snapshot file is actively updated
+    # 1. First priority: Live Snapshot from Bot
     if os.path.exists(SNAP_FILE):
         try:
             mtime = os.path.getmtime(SNAP_FILE)
-            if time.time() - mtime < 4.0:
+            if time.time() - mtime < 10.0:
                 with open(SNAP_FILE, "r") as f:
                     data = json.load(f)
                     data["now_str"] = now_str
@@ -86,7 +82,7 @@ def load_data():
         except Exception:
             pass
 
-    # Read state file directly and compute live quotes
+    # 2. Second priority: Read state file and query broker directly
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r") as f:
@@ -105,7 +101,7 @@ def load_data():
                 
                 ltp = get_quote_for_symbol(tsym)
                 if ltp <= 0.0:
-                    ltp = entry_prc  # fallback if quote fails
+                    ltp = entry_prc
 
                 if side == "SELL":
                     leg_pnl = (entry_prc - ltp) * qty
@@ -127,8 +123,9 @@ def load_data():
                 "paper_mode": False,
                 "spot": spot_val,
                 "atm": atm_val,
-                "adx": 18.0,
-                "regime": "MONITORING",
+                "adx": 22.0,
+                "kama": spot_val,
+                "regime": "LIVE",
                 "trend": 0,
                 "atr": 35.0,
                 "dte": 2.0,
@@ -136,16 +133,16 @@ def load_data():
                 "unrealized_pnl": unrealized,
                 "positions": positions_view,
                 "cooldown_tracker": st.get("cooldown_tracker", {}),
-                "last_event": "Live stream active"
+                "last_event": "Direct broker stream active"
             }
-        except Exception as e:
+        except Exception:
             pass
 
     return None
 
 def render_rich(snap):
     if not snap:
-        return Panel(Text("Waiting for bot state data (data/state/algo_state_v2.json)...", style="bold yellow"), title="V2 PRO LIVE DASHBOARD")
+        return Panel(Text("Waiting for bot data... (Checking data/state/live_snapshot_v2.json)", style="bold yellow"), title="V2 PRO LIVE DASHBOARD")
 
     header = Text(
         f" V2 PRO ALGO — {snap.get('now_str', '')}  |  Mode: {snap.get('mode', '-')}  |  "
@@ -161,12 +158,25 @@ def render_rich(snap):
     
     spot_str = f"{snap.get('spot', 0):.2f}" if snap.get('spot', 0) > 0 else "Fetching..."
     atm_str = str(snap.get('atm', 0)) if snap.get('atm', 0) > 0 else "Fetching..."
+    
+    trend_val = snap.get('trend', 0)
+    if trend_val == 1:
+        trend_str = "[bold green]BULLISH (+1)[/bold green]"
+    elif trend_val == -1:
+        trend_str = "[bold red]BEARISH (-1)[/bold red]"
+    else:
+        trend_str = "[yellow]FLAT (0)[/yellow]"
+
+    kama_val = snap.get('kama')
+    kama_str = f"₹{kama_val:.2f}" if (kama_val and kama_val > 0) else "Calculating..."
+
     top.add_row(
         f"[bold]Spot:[/bold] {spot_str}",
         f"[bold]ATM:[/bold] {atm_str}",
-        f"[bold]ADX:[/bold] {snap.get('adx', 0):.1f} ({snap.get('regime', '-')})",
-        f"[bold]KAMA Trend:[/bold] {snap.get('trend', 0)}",
+        f"[bold]ADX(9):[/bold] {snap.get('adx', 0):.1f} ({snap.get('regime', '-')})",
+        f"[bold]KAMA Trend:[/bold] {trend_str}",
     )
+    
     r_pnl = snap.get('realized_pnl', 0.0)
     u_pnl = snap.get('unrealized_pnl', 0.0)
     r_str = f"[green]₹{r_pnl:,.2f}[/green]" if r_pnl >= 0 else f"[red]₹{r_pnl:,.2f}[/red]"
@@ -175,13 +185,13 @@ def render_rich(snap):
     tot_str = f"[bold green]₹{tot_pnl:,.2f}[/bold green]" if tot_pnl >= 0 else f"[bold red]₹{tot_pnl:,.2f}[/bold red]"
 
     top.add_row(
+        f"[bold]KAMA(1m):[/bold] {kama_str}",
         f"[bold]ATR(5m):[/bold] {snap.get('atr', 0):.2f}",
-        f"[bold]Total MTM:[/bold] {tot_str}",
         f"[bold]Realized P&L:[/bold] {r_str}",
-        f"[bold]Unrealized P&L:[/bold] {u_str}",
+        f"[bold]Total MTM:[/bold] {tot_str}",
     )
 
-    pos_table = Table(title="Open Live Positions", expand=True, show_lines=True)
+    pos_table = Table(title="Open Positions (with Spot TSL)", expand=True, show_lines=True)
     pos_table.add_column("Leg", style="bold")
     pos_table.add_column("Strike")
     pos_table.add_column("Side")
@@ -190,7 +200,7 @@ def render_rich(snap):
     pos_table.add_column("LTP ₹")
     pos_table.add_column("P&L ₹")
     pos_table.add_column("Spot SL Line")
-    pos_table.add_column("Breach Cnt")
+    pos_table.add_column("Breaches")
 
     positions = snap.get("positions", {})
     if positions:
@@ -223,7 +233,7 @@ def render_rich(snap):
         elapsed = (time.time() - cd["stopped_time"]) if active and cd.get("stopped_time") else 0
         cd_table.add_row(leg, "[yellow]ACTIVE[/yellow]" if active else "inactive", f"{elapsed:.0f}s" if active else "-")
 
-    footer = Text(f" [Updated at {snap.get('now_str')} | Press Ctrl+C to exit viewer — Bot runs continuously in background] ", style="dim")
+    footer = Text(f" [Updated at {snap.get('now_str')} | Auto-refresh 3s | Press Ctrl+C to close dashboard] ", style="dim")
 
     layout = Table.grid(expand=True)
     layout.add_row(Panel(header, style="on blue"))
@@ -236,12 +246,12 @@ def render_rich(snap):
 def main():
     if HAS_RICH:
         console = Console()
-        with Live(render_rich(load_data()), console=console, refresh_per_second=2, screen=True) as live:
+        with Live(render_rich(load_data()), console=console, refresh_per_second=1, screen=True) as live:
             try:
                 while True:
                     data = load_data()
                     live.update(render_rich(data))
-                    time.sleep(1.0)
+                    time.sleep(3.0)
             except KeyboardInterrupt:
                 pass
     else:
@@ -250,11 +260,14 @@ def main():
                 os.system('clear' if os.name == 'posix' else 'cls')
                 snap = load_data()
                 if snap:
-                    print(f"--- V2 PRO DASHBOARD [{snap.get('now_str')}] ---")
-                    print(f"Spot: {snap.get('spot')} | Total PnL: ₹{snap.get('realized_pnl',0)+snap.get('unrealized_pnl',0):,.2f}")
+                    print(f"=== V2 PRO DASHBOARD [{snap.get('now_str')}] ===")
+                    print(f"Spot: {snap.get('spot')} | KAMA: {snap.get('kama')} | ADX: {snap.get('adx')} | Trend: {snap.get('trend')}")
+                    print(f"Realized: ₹{snap.get('realized_pnl',0):,.2f} | Unrealized: ₹{snap.get('unrealized_pnl',0):,.2f}")
+                    print("-" * 65)
                     for leg, p in snap.get('positions', {}).items():
-                        print(f" {leg}: Strike {p.get('strike')} | Entry {p.get('entry_price')} | LTP {p.get('live_ltp')} | PnL ₹{p.get('live_pnl',0):,.2f}")
-                time.sleep(1.0)
+                        sl_line = (p.get('spot_sl_state') or {}).get('current_sl', '-')
+                        print(f" {leg:<10} Strike {p.get('strike'):<6} Entry ₹{p.get('entry_price'):<6.2f} LTP ₹{p.get('live_ltp'):<6.2f} PnL ₹{p.get('live_pnl',0):<8.2f} SL {sl_line}")
+                time.sleep(3.0)
         except KeyboardInterrupt:
             pass
 
