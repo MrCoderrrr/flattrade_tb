@@ -290,51 +290,27 @@ class NaturalGasBot:
                 else:
                     reversal = False
 
-                # If we have no positions, open 1 leg based on the KAMA trend
+                # If we have no positions, start with a Straddle
                 if not self.positions:
                     if now.hour >= 18:
                         atm = self.find_atm_strike(spot)
                         
-                        # Directional Entry (Capital only allows 1 leg)
-                        if trend == 1:
-                            # Bullish -> Sell Put
-                            pe_strike = atm - STRIKE_STEP
-                            self._enter_leg("PE", pe_strike, "SELL", 0.10, 0.05)
-                            print(f"[INIT] Bullish trend -> Sell PE at {pe_strike}")
-                        elif trend == -1:
-                            # Bearish -> Sell Call
-                            ce_strike = atm + STRIKE_STEP
-                            self._enter_leg("CE", ce_strike, "SELL", 0.10, 0.05)
-                            print(f"[INIT] Bearish trend -> Sell CE at {ce_strike}")
-                        else:
-                            # Chop -> Wait for a trend
-                            pass
+                        # Straddle Entry (Sell CE and PE at ATM)
+                        self._enter_leg("CE", atm, "SELL", 0.10, 0.05)
+                        self._enter_leg("PE", atm, "SELL", 0.10, 0.05)
+                        print(f"[INIT] ATM straddle opened at {atm}")
                 else:
-                    # We have a position. Check if trend reversed to flip the leg
+                    # We have a position.
                     short_legs = [leg for leg in self.positions if self.positions[leg]["side"] == "SELL"]
                     if len(short_legs) == 1 and reversal:
                         if time.time() - self.last_reentry_ts < 60:
                             pass
                         else:
-                            current_leg = short_legs[0]
-                            # If trend reversed against our leg, close it and open the other
-                            if (current_leg == "PE" and trend == -1) or (current_leg == "CE" and trend == 1):
-                                print(f"[REVERSAL] Trend changed to {trend}. Squaring off {current_leg}...")
-                                self._exit_leg(current_leg, "KAMA_REVERSAL")
-                                
-                                atm = self.find_atm_strike(spot)
-                                if trend == -1:
-                                    # Bearish -> Sell Call
-                                    ce_strike = atm + STRIKE_STEP
-                                    self._enter_leg("CE", ce_strike, "SELL", 0.10, 0.05)
-                                    print(f"[REVERSAL] Entered CE at {ce_strike}")
-                                elif trend == 1:
-                                    # Bullish -> Sell Put
-                                    pe_strike = atm - STRIKE_STEP
-                                    self._enter_leg("PE", pe_strike, "SELL", 0.10, 0.05)
-                                    print(f"[REVERSAL] Entered PE at {pe_strike}")
-                                
-                                self.last_reentry_ts = time.time()
+                            missing_leg = "CE" if "PE" in short_legs else "PE"
+                            atm = self.find_atm_strike(spot)
+                            self._enter_leg(missing_leg, atm, "SELL", 0.02, 0.02)
+                            self.last_reentry_ts = time.time()
+                            print(f"[REENTRY] KAMA reversal triggered, re-entered {missing_leg} at {atm} to form Straddle")
 
                     for leg in list(self.positions.keys()):
                         pos = self.positions[leg]
