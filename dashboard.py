@@ -156,9 +156,9 @@ def fetch_flattrade_positions() -> List[Dict]:
 def compute_realized_pnl_from_trades(trade_book: List[Dict]) -> float:
     """
     Compute realized P&L from trade book by matching BUY vs SELL fills
-    on the same symbol. Net position = 0 means fully closed and realized.
+    on each symbol. Only closed/matched quantities contribute to Realized P&L.
+    Open positions do NOT count as realized.
     """
-    # Build net qty and avg cost per symbol
     symbol_fills: Dict[str, Dict] = {}
     for t in trade_book:
         tsym = t.get('tsym', '')
@@ -166,20 +166,22 @@ def compute_realized_pnl_from_trades(trade_book: List[Dict]) -> float:
         price = float(t.get('avgprc', t.get('flprc', 0.0)) or 0.0)
         side = t.get('trantype', t.get('buy_or_sell', 'B')).upper()
         if tsym not in symbol_fills:
-            symbol_fills[tsym] = {'net_qty': 0, 'buy_cost': 0.0, 'sell_proceeds': 0.0}
+            symbol_fills[tsym] = {'buy_qty': 0, 'sell_qty': 0, 'buy_cost': 0.0, 'sell_proceeds': 0.0}
         if side == 'B':
             symbol_fills[tsym]['buy_cost'] += qty * price
-            symbol_fills[tsym]['net_qty'] += qty
+            symbol_fills[tsym]['buy_qty'] += qty
         else:
             symbol_fills[tsym]['sell_proceeds'] += qty * price
-            symbol_fills[tsym]['net_qty'] -= qty
+            symbol_fills[tsym]['sell_qty'] += qty
 
     realized = 0.0
     for sym, fills in symbol_fills.items():
-        # Short strangle: we sell first then buy back
-        # Realized when net_qty == 0 (fully closed)
-        realized += fills['sell_proceeds'] - fills['buy_cost']
-    return realized
+        matched_qty = min(fills['buy_qty'], fills['sell_qty'])
+        if matched_qty > 0 and fills['buy_qty'] > 0 and fills['sell_qty'] > 0:
+            avg_buy = fills['buy_cost'] / fills['buy_qty']
+            avg_sell = fills['sell_proceeds'] / fills['sell_qty']
+            realized += (avg_sell - avg_buy) * matched_qty
+    return round(realized, 2)
 
 def build_positions_from_flattrade(ft_positions: List[Dict]) -> Dict[str, Dict]:
     """

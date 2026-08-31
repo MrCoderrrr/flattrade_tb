@@ -771,16 +771,22 @@ class ExecutionEngine:
                         q = int(t.get('qty', t.get('fillshares', 0)) or 0)
                         p_fill = float(t.get('avgprc', t.get('flprc', 0.0)) or 0.0)
                         side_t = t.get('trantype', t.get('buy_or_sell', 'B')).upper()
-                        if s not in sym_fills: sym_fills[s] = {'buy': 0.0, 'sell': 0.0, 'net': 0}
+                        if s not in sym_fills:
+                            sym_fills[s] = {'buy_qty': 0, 'sell_qty': 0, 'buy_cost': 0.0, 'sell_proceeds': 0.0}
                         if side_t == 'B':
-                            sym_fills[s]['buy'] += q * p_fill
-                            sym_fills[s]['net'] += q
+                            sym_fills[s]['buy_cost'] += q * p_fill
+                            sym_fills[s]['buy_qty'] += q
                         else:
-                            sym_fills[s]['sell'] += q * p_fill
-                            sym_fills[s]['net'] -= q
+                            sym_fills[s]['sell_proceeds'] += q * p_fill
+                            sym_fills[s]['sell_qty'] += q
+
                     realized_calc = 0.0
                     for s, f_data in sym_fills.items():
-                        realized_calc += f_data['sell'] - f_data['buy']
+                        matched_qty = min(f_data['buy_qty'], f_data['sell_qty'])
+                        if matched_qty > 0 and f_data['buy_qty'] > 0 and f_data['sell_qty'] > 0:
+                            avg_buy = f_data['buy_cost'] / f_data['buy_qty']
+                            avg_sell = f_data['sell_proceeds'] / f_data['sell_qty']
+                            realized_calc += (avg_sell - avg_buy) * matched_qty
                     self.realized_pnl = round(realized_calc, 2)
                     log_info(f"Verified Realized P&L from Flattrade Trade Book: ₹{self.realized_pnl:,.2f}")
                 else:
