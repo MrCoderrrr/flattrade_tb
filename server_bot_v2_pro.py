@@ -252,10 +252,10 @@ COOLDOWN_MINUTES        = 3
 COOLDOWN_SPOT_PCT       = 0.0010      
 
 MARKET_START_HOUR       = 9
-MARKET_START_MINUTE     = 18          
+MARKET_START_MINUTE     = 18
 AUTO_SQUAREOFF_HOUR     = 15
-AUTO_SQUAREOFF_MINUTE   = 25          
-REFRESH_INTERVAL_SEC    = 1          
+AUTO_SQUAREOFF_MINUTE   = 25
+REFRESH_INTERVAL_SEC    = 1
 
 # Trend rolls: only roll if the new ideal strike is at least this many ATRs
 # away from the current strike. Prevents micro-roll churn on every 1m bar.
@@ -557,18 +557,18 @@ class Indicators:
                 'kama': kama, 'prev_kama': prev_kama, 'trend': trend, 'kama_slope': kama_slope,
                 'atr': DEFAULT_ATR_5M, 'adx': 18.0, 'plus_di': 20.0, 'minus_di': 20.0, 'regime': 'CHOP'
             }
-            
+
         highs_5m = df_5m['high'].to_numpy(dtype=float)
         lows_5m = df_5m['low'].to_numpy(dtype=float)
         closes_5m = df_5m['close'].to_numpy(dtype=float)
-        
+
         atr = cls.calculate_atr(highs_5m, lows_5m, closes_5m, period=ATR_PERIOD)
         adx, p_di, m_di = cls.calculate_adx(highs_5m, lows_5m, closes_5m, period=ADX_PERIOD)
-        
+
         if adx < ADX_CHOP_THRESHOLD: regime = "CHOP"
         elif adx >= ADX_TREND_THRESHOLD: regime = "TREND"
         else: regime = "TRANSITION"
-        
+
         return {
             'kama': kama, 'prev_kama': prev_kama, 'trend': trend, 'kama_slope': kama_slope,
             'atr': atr, 'adx': adx, 'plus_di': p_di, 'minus_di': m_di, 'regime': regime
@@ -584,107 +584,102 @@ class RiskManager:
         self.capital = capital
         self.circuit_breaker_loss_limit = -1.0 * (capital * PORTFOLIO_CIRCUIT_PCT / 100.0)
 
-    def init_premium_sl(self, entry_price: float, live_ltp: float = 0.0, regime: str = "CHOP") -> Dict[str, Any]:
-        """
-        Initialize Stop Loss tracking state for a newly SOLD option leg.
+    def init_premium_sl(self, entry_price: float, live_ltp: float = 0.0, regime: str = "CHOP", distance_from_atm_pts: int = 0, loss_stop_pct: float = 0.10, tsl_pct: float = 0.05) -> Dict[str, Any]:
+        """Initialize the stoploss and premium-based trailing stop for a short leg.
 
-        KEY DESIGN PRINCIPLE — lowest_ltp is the single source of truth:
-        • lowest_ltp = the MINIMUM LTP ever seen since this leg was entered.
-        • It is saved to state JSON on every tick and loaded back on restart.
-        • It NEVER increases (only ratchets down as option decays).
-        • It is cleared ONLY when _exit_leg() removes the position entirely.
-
-        SL / TSL formulas:
-            initial_sl   = entry_price × (1 + trail_pct)   ← absolute worst-case
-            current_sl   = min(initial_sl, lowest_ltp × (1 + trail_pct))
-            Breakeven lock: when lowest_ltp ≤ entry_price × 0.95 (5%+ profit),
-                            current_sl is capped at ≤ entry_price (can't turn into loss).
+        NIFTY V2 strategy:
+        - each short leg keeps a distance-aware stop
+        - premium TSL varies by regime and strike distance
+        - the strategy allows one leg to survive if the other leg is stopped
         """
         safe_entry = max(0.5, float(entry_price))
-        # live_ltp seeds lowest_ltp so initial TSL is calibrated to actual market
-        cur_ltp    = float(live_ltp) if live_ltp > 0.0 else safe_entry
-        lowest_p   = min(safe_entry, cur_ltp)
+        cur_ltp = float(live_ltp) if live_ltp > 0.0 else safe_entry
+        lowest_p = min(safe_entry, cur_ltp)
 
-        trail_pct       = 0.05 if regime == "CHOP" else 0.07
-        initial_sl      = round(safe_entry * (1.0 + trail_pct), 2)
-        current_sl      = round(lowest_p   * (1.0 + trail_pct), 2)
-        # Never allow current_sl to exceed initial_sl
-        current_sl      = min(initial_sl, current_sl)
+        loss_stop_pct = max(0.01, float(loss_stop_pct))
+        tsl_pct = max(0.01, float(tsl_pct))
+
+        initial_sl = round(safe_entry * (1.0 + loss_stop_pct), 2)
+        current_sl = round(lowest_p * (1.0 + loss_stop_pct), 2)
+        current_sl = min(initial_sl, current_sl)
+
+        trailing_sl = round(safe_entry * (1.0 + tsl_pct), 2)
+        trailing_current = round(lowest_p * (1.0 + tsl_pct), 2)
+        trailing_current = min(trailing_sl, trailing_current)
 
         return {
-            "entry_price":  safe_entry,
-            "lowest_ltp":   round(lowest_p, 2),   # ← persisted to JSON, never resets
-            "initial_sl":   initial_sl,
-            "current_sl":   current_sl,
-            "regime":       regime,
-            "trail_pct":    trail_pct,
+            "entry_price": safe_entry,
+            "lowest_ltp": round(lowest_p, 2),
+            "initial_sl": initial_sl,
+            "current_sl": current_sl,
+            "regime": regime,
+            "trail_pct": tsl_pct,
+            "loss_stop_pct": round(loss_stop_pct, 4),
+            "tsl_pct": round(tsl_pct, 4),
+            "distance_from_atm_pts": int(distance_from_atm_pts),
             "profit_locked": False,
-            "imported_at":  time.time(),           # grace-period anchor (5s skip on import)
+            "imported_at": time.time(),
+            "premium_tsl": trailing_current,
         }
 
     def update_premium_tsl_and_check(self, leg: str, pos_data: Dict[str, Any], live_ltp: float, regime: str = "CHOP") -> Tuple[bool, str]:
-        """
-        Called every second for every active short leg.
-
-        Logic:
-        1. Load lowest_ltp from sl_state (persisted across restarts).
-        2. If live_ltp < lowest_ltp → new low reached → update lowest_ltp immediately.
-        3. Recompute TSL from lowest_ltp.
-        4. If live_ltp >= current_sl → SL triggered → return (True, reason).
-        5. Save updated lowest_ltp back to sl_state (auto-persisted via _save_state).
-
-        Grace period:
-        - For 10 seconds after import/entry, we skip the trigger check so that a stale
-          avgprc (entry_price) that is already OTM doesn't fire an immediate exit.
-        - The lowest_ltp is STILL updated during grace so TSL starts calibrated.
-        """
+        """Check stoploss + premium TSL for a short leg."""
         entry_price = float(pos_data.get("entry_price", 0.0))
         if entry_price <= 0.0 or live_ltp <= 0.0:
             return False, ""
 
-        trail_pct = 0.05 if regime == "CHOP" else 0.07
+        loss_stop_pct = float(pos_data.get("loss_stop_pct", 0.10) or 0.10)
+        tsl_pct = float(pos_data.get("tsl_pct", 0.05) or 0.05)
 
         sl_state = pos_data.get("premium_sl_state")
         if not sl_state or not isinstance(sl_state, dict):
-            # First time for this leg — initialise with live price
-            sl_state = self.init_premium_sl(entry_price, live_ltp, regime=regime)
+            sl_state = self.init_premium_sl(
+                entry_price,
+                live_ltp,
+                regime=regime,
+                distance_from_atm_pts=int(pos_data.get("distance_from_atm_pts", 0) or 0),
+                loss_stop_pct=loss_stop_pct,
+                tsl_pct=tsl_pct,
+            )
             pos_data["premium_sl_state"] = sl_state
 
-        # ── 1. Update lowest_ltp (ONLY ever decreases) ──────────────────────
         stored_lowest = float(sl_state.get("lowest_ltp", entry_price))
-        # Sanity: lowest can never be higher than entry_price
         stored_lowest = min(stored_lowest, entry_price)
         if live_ltp < stored_lowest:
-            stored_lowest = live_ltp          # new all-time low — ratchet down
+            stored_lowest = live_ltp
         sl_state["lowest_ltp"] = round(stored_lowest, 2)
 
-        # ── 2. Recalculate SL lines ──────────────────────────────────────────
-        initial_sl     = round(entry_price   * (1.0 + trail_pct), 2)
-        candidate_sl   = round(stored_lowest * (1.0 + trail_pct), 2)
+        initial_sl = round(entry_price * (1.0 + loss_stop_pct), 2)
+        current_sl = round(stored_lowest * (1.0 + loss_stop_pct), 2)
+        current_sl = min(initial_sl, current_sl)
 
-        # Breakeven lock: once 5%+ profit locked, TSL cannot exceed entry price
-        if stored_lowest <= (entry_price * 0.95):
-            candidate_sl = min(candidate_sl, entry_price)
-            sl_state["profit_locked"] = True
+        tsl_initial = round(entry_price * (1.0 + tsl_pct), 2)
+        tsl_current = round(stored_lowest * (1.0 + tsl_pct), 2)
+        tsl_current = min(tsl_initial, tsl_current)
 
-        current_sl = min(initial_sl, candidate_sl)
-        sl_state["initial_sl"]  = initial_sl
-        sl_state["current_sl"]  = current_sl
-        sl_state["trail_pct"]   = trail_pct
+        sl_state["initial_sl"] = initial_sl
+        sl_state["current_sl"] = current_sl
+        sl_state["trail_pct"] = tsl_pct
+        sl_state["loss_stop_pct"] = round(loss_stop_pct, 4)
+        sl_state["tsl_pct"] = round(tsl_pct, 4)
+        sl_state["premium_tsl"] = tsl_current
 
-        # ── 3. Grace period (10 seconds after import) — skip trigger ────────
         imported_at = float(sl_state.get("imported_at", 0.0))
         if imported_at > 0.0 and (time.time() - imported_at) < 10.0:
-            return False, ""   # SL updated but NOT triggered yet
+            return False, ""
 
-        # ── 4. Trigger check ─────────────────────────────────────────────────
         if live_ltp >= current_sl:
-            loss_or_profit = "Loss" if live_ltp > entry_price else "Profit-Lock"
             return True, (
-                f"⛔ Premium TSL Hit for {leg} ({loss_or_profit}) | "
-                f"Entry: ₹{entry_price:.2f}, BestLow: ₹{stored_lowest:.2f}, "
-                f"TSL: ₹{current_sl:.2f}, LTP: ₹{live_ltp:.2f} "
-                f"({regime}, Trail: {int(trail_pct*100)}%)"
+                f"⛔ Leg stop hit for {leg} | Entry: ₹{entry_price:.2f}, BestLow: ₹{stored_lowest:.2f}, "
+                f"Stop: ₹{current_sl:.2f}, LTP: ₹{live_ltp:.2f} "
+                f"(loss_stop={loss_stop_pct*100:.0f}%)"
+            )
+
+        if live_ltp >= tsl_current:
+            return True, (
+                f"⛔ Premium TSL hit for {leg} | Entry: ₹{entry_price:.2f}, BestLow: ₹{stored_lowest:.2f}, "
+                f"TSL: ₹{tsl_current:.2f}, LTP: ₹{live_ltp:.2f} "
+                f"(tsl={tsl_pct*100:.0f}%)"
             )
 
         return False, ""
@@ -743,6 +738,7 @@ class ExecutionEngine:
         
         self._ltp_cache: Dict[str, float] = {}
         self._last_whipsaw_time: float = 0.0         # timestamp of last whipsaw dual-leg exit
+        self._last_kama_delta: float = 0.0            # slope of KAMA; used to detect reversal by delta, not raw sign
         self._processed_1m_bar: Optional[str] = None # ensures is_new_1m_bar is one-shot per bar
         self._load_state()
 
@@ -1050,17 +1046,37 @@ class ExecutionEngine:
             self._ltp_cache[key] = float(q.get("lp", 0.0))
         return self._ltp_cache[key]
 
-    def _enter_leg(self, leg: str, strike: int, side: str, spot: float, atr: float, product_type: str = "M", regime: str = "CHOP"):
+    def _enter_leg(self, leg: str, strike: int, side: str, spot: float, atr: float, product_type: str = "M", regime: str = "CHOP", distance_from_atm_pts: int = 0, loss_stop_pct: float = 0.10, tsl_pct: float = 0.05):
         base = leg.split("_")[0]
         q = self.market_data.streamer.get_live_quote(strike, base)
         tsym = q.get("tsym", f"NIFTY_{strike}_{base}")
         self._ltp_cache[f"{strike}_{base}"] = q.get("lp", 0.0)
         ltp = self._get_ltp(strike, base, tsym=tsym)
-        
+
         self.broker.place_option_order(symbol=tsym, transaction_type=side, quantity=self.qty, price=ltp, product_type=product_type)
-        pos_info = {"strike": strike, "tsym": tsym, "base": base, "side": side, "qty": self.qty, "entry_price": ltp, "entry_time": time.time(), "entry_spot": spot, "prd": product_type}
+        pos_info = {
+            "strike": strike,
+            "tsym": tsym,
+            "base": base,
+            "side": side,
+            "qty": self.qty,
+            "entry_price": ltp,
+            "entry_time": time.time(),
+            "entry_spot": spot,
+            "prd": product_type,
+            "distance_from_atm_pts": int(distance_from_atm_pts),
+            "loss_stop_pct": float(loss_stop_pct),
+            "tsl_pct": float(tsl_pct),
+        }
         if side == "SELL":
-            pos_info["premium_sl_state"] = self.risk_manager.init_premium_sl(ltp, regime=regime)
+            pos_info["premium_sl_state"] = self.risk_manager.init_premium_sl(
+                ltp,
+                live_ltp=ltp,
+                regime=regime,
+                distance_from_atm_pts=distance_from_atm_pts,
+                loss_stop_pct=loss_stop_pct,
+                tsl_pct=tsl_pct,
+            )
         self.positions[leg] = pos_info
         log_trade(f"{side} {leg:10s} Strike: {strike} @ ₹{ltp:.2f} (Spot: {spot:.2f})")
         self._save_state()
@@ -1150,6 +1166,45 @@ class ExecutionEngine:
         except Exception:
             pass
 
+    def _single_missing_short_leg(self):
+        short_legs = [leg for leg, pos in self.positions.items() if pos.get("side") == "SELL"]
+        if "CE" in short_legs and "PE" not in short_legs:
+            return "PE"
+        if "PE" in short_legs and "CE" not in short_legs:
+            return "CE"
+        return None
+
+    def _kama_reversal_confirmed(self):
+        """Detect reversal from KAMA slope/delta, not from a raw sign flip.
+
+        A reversal is only valid when:
+        1) current KAMA slope magnitude is large enough to matter
+        2) the slope has changed direction relative to the previous bar
+        3) both old and new slopes are materially away from zero
+        """
+        kama = self.current_indicators.get("kama")
+        prev_kama = self.current_indicators.get("prev_kama")
+        if kama is None or prev_kama is None:
+            return False
+
+        current_delta = float(kama - prev_kama)
+        abs_delta = abs(current_delta)
+        if abs_delta < KAMA_MIN_SLOPE:
+            return False
+
+        prev_delta = self._last_kama_delta
+        if prev_delta == 0.0:
+            self._last_kama_delta = current_delta
+            return False
+
+        if (current_delta > 0 and prev_delta < 0) or (current_delta < 0 and prev_delta > 0):
+            if abs(prev_delta) >= KAMA_MIN_SLOPE:
+                self._last_kama_delta = current_delta
+                return True
+
+        self._last_kama_delta = current_delta
+        return False
+
     def run(self):
         global _EMERGENCY_STOP, _EXIT_IN_PROGRESS
         log_info("Starting V2 Pro Algorithmic State Machine...")
@@ -1223,7 +1278,6 @@ class ExecutionEngine:
                 # ── WAIT_DATA: enter new strangle ────────────────────────────
                 if self.mode == "WAIT_DATA":
                     if now.hour > MARKET_START_HOUR or (now.hour == MARKET_START_HOUR and now.minute >= MARKET_START_MINUTE):
-                        # Re-entry cooldown: minimum REENTRY_COOLDOWN_SEC seconds after any exit
                         secs_since_last_exit = time.time() - self._last_whipsaw_time
                         if secs_since_last_exit < REENTRY_COOLDOWN_SEC:
                             remaining = int(REENTRY_COOLDOWN_SEC - secs_since_last_exit)
@@ -1252,33 +1306,29 @@ class ExecutionEngine:
                         self._save_state()
                         continue
 
-                    # If only hedges remain (no CE/PE short legs), re-enter core legs
                     if "CE" not in self.positions and "PE" not in self.positions:
                         log_info("Core short legs (CE/PE) missing. Reverting to WAIT_DATA to re-enter.")
                         self.mode = "WAIT_DATA"
                         self._save_state()
                         continue
 
-                    # Skip TSL check if a global exit is already in progress
                     if _EXIT_IN_PROGRESS:
                         pass
                     else:
-                        # Check every SELL leg's premium TSL every second
                         whipsaw_triggered = False
-                        whipsaw_leg       = ""
-                        whipsaw_reason    = ""
+                        whipsaw_leg = ""
+                        whipsaw_reason = ""
                         for leg in list(self.positions.keys()):
                             pos = self.positions.get(leg)
                             if not pos or pos.get("side") != "SELL":
                                 continue
                             ltp = self._get_ltp(pos.get("strike", 0), pos.get("base", "CE"), tsym=pos.get("tsym", ""))
                             pos["live_ltp"] = ltp
-                            # lowest_ltp is updated inside this call and auto-persisted
                             is_stopped, reason = self.risk_manager.update_premium_tsl_and_check(leg, pos, ltp, regime=regime)
                             if is_stopped and not whipsaw_triggered:
                                 whipsaw_triggered = True
-                                whipsaw_leg       = leg
-                                whipsaw_reason    = reason
+                                whipsaw_leg = leg
+                                whipsaw_reason = reason
 
                         if whipsaw_triggered:
                             _EXIT_IN_PROGRESS = True
