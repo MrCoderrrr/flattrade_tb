@@ -291,7 +291,7 @@ class NaturalGasBot:
 
                 # If we have no positions, open 1 leg based on the KAMA trend
                 if not self.positions:
-                    if now.hour == 9 and now.minute >= 15:
+                    if now.hour > 9 or (now.hour == 9 and now.minute >= 15):
                         atm = self.find_atm_strike(spot)
                         
                         # Directional Entry (Capital only allows 1 leg)
