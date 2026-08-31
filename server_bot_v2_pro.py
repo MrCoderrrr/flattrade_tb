@@ -108,6 +108,7 @@ class FlattradeBroker:
             log_warn("FlattradeBroker running in PAPER TRADING mode. NO REAL ORDERS WILL BE PLACED.")
 
     def place_option_order(self, symbol, transaction_type, quantity, price) -> Dict[str, Any]:
+        import requests
         action = transaction_type[0]  # 'B' or 'S'
 
         if self.paper_trading:
@@ -115,36 +116,49 @@ class FlattradeBroker:
             log_info(f"[PAPER] {action} {quantity} x {symbol} @ ~₹{price:.2f} (simulated, no real order sent)")
             return {"ok": True, "order_no": fake_order_no, "msg": "Simulated fill (paper trading)", "raw": None}
 
+        # Marketable limit price: Exchange/RMS blocks MKT orders on Options
+        # For BUY: limit price slightly above LTP to guarantee instant fill
+        # For SELL: limit price slightly below LTP to guarantee instant fill
+        if action == 'B':
+            limit_price = round(max(0.05, float(price) + 2.0), 2)
+        else:
+            limit_price = round(max(0.05, float(price) - 2.0), 2)
+
         try:
-            res = self.api.place_order(
-                buy_or_sell=str(action),
-                product_type="M",
-                exchange="NFO",
-                tradingsymbol=str(symbol),
-                quantity=str(quantity),
-                discloseqty="0",
-                price_type="MKT",
-                price="0",
-                trigger_price="0",
-                retention="DAY"
-            )
+            url = "https://piconnect.flattrade.in/PiConnectAPI/PlaceOrder"
+            with open("token.txt", "r") as f:
+                token = f.read().strip()
+            values = {
+                'ordersource': 'API',
+                'uid': str(USER_ID).strip(),
+                'actid': str(USER_ID).strip(),
+                'trantype': str(action),
+                'prd': 'M',
+                'exch': 'NFO',
+                'tsym': str(symbol),
+                'qty': str(quantity),
+                'dscqty': '0',
+                'prctyp': 'LMT',
+                'prc': str(limit_price),
+                'trgprc': '0',
+                'ret': 'DAY',
+                'remarks': 'V2_PRO_ALGO'
+            }
+            payload = 'jData=' + json.dumps(values) + f'&jKey={token}'
+            resp = requests.post(url, data=payload, timeout=8)
+            res_dict = json.loads(resp.text)
+
+            if res_dict.get('stat') == 'Ok':
+                order_no = res_dict.get('norenordno')
+                log_trade(f"[ORDER OK] {action} {quantity} x {symbol} @ Limit ₹{limit_price:.2f} (LTP ₹{price:.2f}) | Order No: {order_no}")
+                return {"ok": True, "order_no": order_no, "msg": "Order placed", "raw": res_dict}
+            else:
+                err_msg = res_dict.get('emsg', resp.text)
+                log_alert(f"[ORDER REJECTED BY BROKER] {action} {symbol}: {err_msg}")
+                return {"ok": False, "order_no": None, "msg": err_msg, "raw": res_dict}
         except Exception as e:
             log_alert(f"[ORDER EXCEPTION] {action} {symbol}: {e}")
-            traceback.print_exc()
             return {"ok": False, "order_no": None, "msg": f"Exception: {e}", "raw": None}
-
-        if res is None:
-            log_alert(f"[ORDER FAILED] {action} {symbol}: API returned None (no response / network issue).")
-            return {"ok": False, "order_no": None, "msg": "No response from API", "raw": None}
-
-        if isinstance(res, dict) and res.get("stat") == "Ok":
-            order_no = res.get("norenordno")
-            log_trade(f"[ORDER OK] {action} {quantity} x {symbol} | Order No: {order_no}")
-            return {"ok": True, "order_no": order_no, "msg": "Order placed", "raw": res}
-
-        err_msg = res.get("emsg", "Unknown error") if isinstance(res, dict) else str(res)
-        log_alert(f"[ORDER REJECTED] {action} {symbol}: {err_msg}")
-        return {"ok": False, "order_no": None, "msg": err_msg, "raw": res}
 
 class VolatilityEngine:
     @staticmethod
