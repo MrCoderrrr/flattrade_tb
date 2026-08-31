@@ -12,10 +12,7 @@ from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
 import pandas as pd
 
-from colorama import init, Fore, Style
-
 urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
-init(autoreset=True)
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
@@ -161,10 +158,10 @@ REFRESH_INTERVAL_SEC    = 1
 
 
 def _now_str() -> str: return datetime.now().strftime("%H:%M:%S")
-def log_info(msg: str): print(f"{Fore.CYAN}[{_now_str()} INFO]{Style.RESET_ALL}  {msg}")
-def log_warn(msg: str): print(f"{Fore.YELLOW}[{_now_str()} WARN]{Style.RESET_ALL}  {msg}")
-def log_alert(msg: str): print(f"{Fore.RED}{Style.BRIGHT}[{_now_str()} ALERT]{Style.RESET_ALL} {msg}")
-def log_trade(msg: str): print(f"{Fore.MAGENTA}{Style.BRIGHT}[{_now_str()} TRADE]{Style.RESET_ALL} {msg}")
+def log_info(msg: str): print(f"[{_now_str()} INFO]  {msg}")
+def log_warn(msg: str): print(f"[{_now_str()} WARNING]  {msg}")
+def log_alert(msg: str): print(f"[{_now_str()} ALERT]  {msg}")
+def log_trade(msg: str): print(f"[{_now_str()} TRADE]  {msg}")
 def round_to_strike(price: float, strike_step: int = 50) -> int: return int(round(price / float(strike_step)) * strike_step)
 
 
