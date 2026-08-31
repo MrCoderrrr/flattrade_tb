@@ -281,7 +281,7 @@ class NaturalGasBot:
 
                 hist.append(spot)
                 if len(hist) >= 12:
-                    current_kama, prev_kama, delta, trend = KAMA.compute(hist)
+                    current_kama, prev_kama, delta, trend = KAMA.compute(hist, period=10, fast=3, slow=30)
                     if current_kama is not None and prev_kama is not None:
                         reversal = self._kama_reversal_confirmed(current_kama, prev_kama)
                     else:
