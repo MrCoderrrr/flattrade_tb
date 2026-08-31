@@ -41,16 +41,21 @@ class NSEATMStreamer:
         self.api = global_api
         self._cached_expiry_date: Optional[datetime] = None
         self._cached_expiry_day: Optional[Any] = None
+        self._last_spot: float = 24000.0
+        self._last_atm: int = 24000
 
     def get_spot_and_atm(self) -> Tuple[float, int]:
         try:
             res = self.api.get_quotes(exchange='NSE', token='26000')
             if res and isinstance(res, dict) and res.get('stat') == 'Ok':
-                spot = float(res.get('lp', res.get('ltp', 24000.0)))
-                return spot, int(round(spot / 50.0) * 50)
+                spot = float(res.get('lp', res.get('ltp', self._last_spot)))
+                if spot > 0:
+                    self._last_spot = spot
+                    self._last_atm = int(round(spot / 50.0) * 50)
+                return self._last_spot, self._last_atm
         except Exception as e:
-            print(f"Error fetching spot: {e}")
-        return 24000.0, 24000
+            pass
+        return self._last_spot, self._last_atm
 
     def get_live_quote(self, strike: int, option_type: str) -> Dict[str, Any]:
         search_text = f"NIFTY {strike} {option_type}"
