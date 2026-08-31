@@ -280,6 +280,7 @@ class NaturalGasBot:
                     continue
 
                 hist.append(spot)
+                trend = 0
                 if len(hist) >= 12:
                     current_kama, prev_kama, delta, trend = KAMA.compute(hist, period=10, fast=3, slow=30)
                     if current_kama is not None and prev_kama is not None:
