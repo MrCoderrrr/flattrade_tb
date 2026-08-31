@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
+
 from colorama import init, Fore, Style
 
 urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
