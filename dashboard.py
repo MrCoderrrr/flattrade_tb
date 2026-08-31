@@ -224,18 +224,22 @@ def render_rich(snap):
     else:
         pos_table.add_row("No Open Positions", "-", "-", "-", "-", "-", "-", "-", "-")
 
-    cd_table = Table(title="Anti-Whipsaw Protection (Consecutive Tick Engine)", expand=True, show_lines=False)
+    cd_table = Table(title="Anti-Whipsaw Protection (Strict Re-entry Engine)", expand=True, show_lines=False)
     cd_table.add_column("Leg", style="bold")
     cd_table.add_column("Status")
-    cd_table.add_column("Consecutive Safe Ticks")
+    cd_table.add_column("Progress (Consecutive Safe Ticks)")
+    cd_table.add_column("Reversal Type")
     cd_table.add_column("Stopped Spot")
     for leg, cd in snap.get("cooldown_tracker", {}).items():
         active = cd.get("active", False)
         safe_t = cd.get("safe_ticks", 0)
+        target_t = cd.get("target_ticks", 45)
+        is_sharp = cd.get("is_sharp", False)
         status_txt = "[yellow]COOLING DOWN[/yellow]" if active else "[green]Active / Ready[/green]"
-        progress_txt = f"[bold cyan]{safe_t}/10 Ticks[/bold cyan]" if active else "—"
+        progress_txt = f"[bold cyan]{safe_t}/{target_t} Ticks[/bold cyan]" if active else "—"
+        mode_txt = "[bold magenta]Sharp Reversal (75+ pts)[/bold magenta]" if is_sharp else ("Long Consolidation (3m+)" if active else "—")
         stopped_txt = f"₹{cd.get('stopped_spot', 0):.2f}" if active else "—"
-        cd_table.add_row(leg, status_txt, progress_txt, stopped_txt)
+        cd_table.add_row(leg, status_txt, progress_txt, mode_txt, stopped_txt)
 
     footer = Text(f" [Updated at {snap.get('now_str')} | Auto-refresh 3s | Press Ctrl+C to close dashboard] ", style="dim")
 

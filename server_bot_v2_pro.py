@@ -961,40 +961,57 @@ class ExecutionEngine:
 
     def _check_cooldown_and_reenter(self, spot: float, atm: int, atr: float, regime: str, trend: int, dte_days: float = 2.0):
         """
-        Evaluates active cooldowns on every 1-second live tick.
-        Re-enters ONLY when CONSECUTIVE_TICKS_REQUIRED safe/favorable ticks are achieved consecutively.
-        Any adverse tick (adverse momentum or push against stop) immediately resets counter to 0!
+        STRICT RE-ENTRY ENGINE (Sharp or Long Reversal Requirement):
+        Re-entry is prohibited on minor wiggles or small pauses.
+        Requires EITHER:
+          1. VERY SHARP REVERSAL: Spot moves >= 0.30% (~75 pts) away from stop level WITH decisive KAMA Trend (+1/-1), confirmed over 15 consecutive ticks.
+          2. VERY LONG CONSOLIDATION: Minimum 3 minutes (180s) elapsed + Spot at least 15 pts away + 45 consecutive unbroken seconds of stability (trend <= 0 for CE, trend >= 0 for PE).
+        Any adverse tick resets the counter to 0 immediately!
         """
         for leg in ("CE", "PE"):
             cd = self.cooldown_tracker.get(leg)
             if not cd or not cd.get("active", False): continue
             
             stopped_spot = cd.get("stopped_spot", spot)
+            stopped_time = cd.get("stopped_time", time.time())
+            elapsed_sec = time.time() - stopped_time
             safe_ticks = cd.get("safe_ticks", 0)
             
-            # ── 1. Evaluate Condition for Current Tick ──
-            is_favorable_tick = False
-            
+            is_sharp_reversal = False
+            is_long_reversal = False
+
             if leg == "CE":
-                # CE is safe when spot is NOT aggressively making higher highs and KAMA trend is not Bullish (+1)
-                if spot <= (stopped_spot + 3.0) and trend <= 0:
-                    is_favorable_tick = True
+                favorable_pts = stopped_spot - spot
+                favorable_pct = favorable_pts / max(0.1, stopped_spot)
+                # Sharp: Spot dropped >= 75 pts (0.30%) AND KAMA trend confirmed Bearish (-1)
+                is_sharp_reversal = (favorable_pct >= 0.0030) and (trend == -1)
+                # Long: Elapsed >= 180s AND Spot pulled back >= 15 pts AND KAMA not Bullish
+                is_long_reversal = (elapsed_sec >= 180.0) and (favorable_pts >= 15.0) and (trend <= 0)
             else:  # PE
-                # PE is safe when spot is NOT aggressively making lower lows and KAMA trend is not Bearish (-1)
-                if spot >= (stopped_spot - 3.0) and trend >= 0:
-                    is_favorable_tick = True
-            
-            # ── 2. Increment or Reset Tick Counter ──
-            if is_favorable_tick:
+                favorable_pts = spot - stopped_spot
+                favorable_pct = favorable_pts / max(0.1, stopped_spot)
+                # Sharp: Spot rallied >= 75 pts (0.30%) AND KAMA trend confirmed Bullish (+1)
+                is_sharp_reversal = (favorable_pct >= 0.0030) and (trend == 1)
+                # Long: Elapsed >= 180s AND Spot bounced >= 15 pts AND KAMA not Bearish
+                is_long_reversal = (elapsed_sec >= 180.0) and (favorable_pts >= 15.0) and (trend >= 0)
+
+            # Check if this tick qualifies under either strict pathway
+            if is_sharp_reversal or is_long_reversal:
                 safe_ticks += 1
                 cd["safe_ticks"] = safe_ticks
             else:
                 if safe_ticks > 0:
                     cd["safe_ticks"] = 0
-            
-            # ── 3. Check if Consecutive Requirement Met ──
-            if safe_ticks >= CONSECUTIVE_TICKS_REQUIRED:
-                log_info(f"✅ Consecutive Tick Condition Cleared for {leg} ({safe_ticks}/{CONSECUTIVE_TICKS_REQUIRED} stable ticks confirmed) -> Re-entering short strike...")
+
+            # Target required consecutive ticks
+            target_ticks = 15 if is_sharp_reversal else 45
+            cd["target_ticks"] = target_ticks
+            cd["is_sharp"] = is_sharp_reversal
+
+            # Execute re-entry only when strict target confirmed
+            if safe_ticks >= target_ticks:
+                reentry_type = "SHARP REVERSAL (75+ pts & KAMA Trend)" if is_sharp_reversal else "LONG SUSTAINED REVERSAL (3m+ & 45s calm)"
+                log_info(f"✅ Re-entry Authorized for {leg} | Mode: {reentry_type} ({safe_ticks}/{target_ticks} confirmed ticks) -> Re-shorting...")
                 ce_strike, pe_strike = self.calculate_strangle_strikes(atm, atr, regime, dte_days=dte_days)
                 target_strike = ce_strike if leg == "CE" else pe_strike
                 if leg not in self.positions:
