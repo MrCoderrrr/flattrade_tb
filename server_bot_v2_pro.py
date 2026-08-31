@@ -88,6 +88,7 @@ class FlattradeBroker:
             discloseqty="0",
             price_type="MKT",
             price="0",
+            trigger_price=None,
             retention="DAY"
         )
         return res
@@ -216,25 +217,46 @@ class MarketData:
     def _seed_history_if_needed(self):
         if len(self.bars_5m) >= 30: return
         try:
-            log_info("MarketData: Seeding historical 5-min bars for instant indicator readiness...")
-            df = yf.download("^NSEI", period="5d", interval="5m", progress=False, timeout=8)
-            if df is not None and not df.empty:
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0)
+            log_info("MarketData: Seeding historical 5-min bars from Flattrade for instant indicator readiness...")
+            end_time = datetime.now()
+            start_time = end_time - timedelta(days=5)
+            
+            # Use Flattrade API directly to get 5m data
+            res = global_api.get_time_price_series(
+                exchange='NSE', token='26000', 
+                starttime=start_time.timestamp(), 
+                endtime=end_time.timestamp(), 
+                interval=5
+            )
+            
+            if res and isinstance(res, list) and len(res) > 0:
                 seeded_5m = []
-                for idx, row in df.iterrows():
-                    ts = idx.to_pydatetime() if hasattr(idx, 'to_pydatetime') else idx
-                    seeded_5m.append({
-                        'timestamp': ts, 'open': float(row['Open']), 'high': float(row['High']),
-                        'low': float(row['Low']), 'close': float(row['Close'])
-                    })
+                for row in res:
+                    try:
+                        # Flattrade returns: 'time', 'into' (open), 'inth' (high), 'intl' (low), 'intc' (close)
+                        ts = datetime.strptime(row['time'], "%d-%m-%Y %H:%M:%S")
+                        seeded_5m.append({
+                            'timestamp': ts,
+                            'open': float(row['into']),
+                            'high': float(row['inth']),
+                            'low': float(row['intl']),
+                            'close': float(row['intc'])
+                        })
+                    except Exception:
+                        continue
+                        
                 if seeded_5m:
+                    # Sort chronologically just in case
+                    seeded_5m.sort(key=lambda x: x['timestamp'])
                     today = datetime.now().date()
                     prior_bars = [b for b in seeded_5m if b['timestamp'].date() < today][-50:]
                     self.bars_5m = prior_bars + self.bars_5m
-                    log_info(f"Successfully seeded {len(prior_bars)} 5m bars.")
+                    log_info(f"Successfully seeded {len(prior_bars)} 5m bars from Flattrade.")
+            else:
+                log_warn("Flattrade get_time_price_series returned empty or failed.")
+                
         except Exception as e:
-            log_warn(f"yfinance seeding skipped ({e}).")
+            log_warn(f"Flattrade history seeding skipped ({e}).")
 
     def _rebuild_5m_candles(self):
         if not self.bars_1m: return
