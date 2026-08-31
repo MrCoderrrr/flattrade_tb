@@ -1,3 +1,20 @@
+"""
+================================================================================
+🚀 ADAPTIVE KAMA-ADX HEDGED STRANGLE (VERSION 2.0 - PRODUCTION ENGINE)
+================================================================================
+Live Algorithmic State Machine for NIFTY 50 Options on Flattrade.
+
+KEY STRATEGY CONFIGURATION (USER-TUNED):
+1. Trailing Stop Loss: 50% Trailing Ratio on Underlying Spot.
+2. Debounce: 1-bar confirmation for rapid, safe execution.
+3. KAMA: (13, 3, 30) calculated on 1-minute chart with real-time second updates.
+4. ADX Gateway: 20.0 (ADX < 20 = CHOP / Iron Condor, ADX >= 20 = TREND).
+5. ADX Lookback: 6 candles on 5-minute chart (30-minute lookback).
+6. Anti-Whipsaw Cooldown: Freezes stopped leg until KAMA trend reverses or chop confirms.
+7. Portfolio Circuit Breaker: -1.5% capital emergency halt.
+================================================================================
+"""
+
 import os
 import sys
 import time
@@ -11,7 +28,9 @@ from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
 import pandas as pd
+import requests
 
+# Rich UI Support
 try:
     from rich.console import Console
     from rich.table import Table
@@ -23,16 +42,17 @@ try:
 except ImportError:
     HAS_RICH = False
 
+# Force IPv4
 urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
-# Setup IST Timezone (Ensures proper operation on UTC / Greenwich servers)
+# Setup IST Timezone (UTC + 5:30) for AWS / Greenwich servers
 IST = timezone(timedelta(hours=5, minutes=30))
 def get_ist_now() -> datetime: return datetime.now(IST)
 
 # ==============================================================================
-# FLATTRADE CORE POLYFILLS (Replacing missing core.* modules)
+# FLATTRADE CORE POLYFILLS & BROKER INTEGRATION
 # ==============================================================================
 
 from api_helper import NorenApiPy
@@ -108,7 +128,6 @@ class FlattradeBroker:
             log_warn("FlattradeBroker running in PAPER TRADING mode. NO REAL ORDERS WILL BE PLACED.")
 
     def place_option_order(self, symbol, transaction_type, quantity, price) -> Dict[str, Any]:
-        import requests
         action = transaction_type[0]  # 'B' or 'S'
 
         if self.paper_trading:
@@ -116,9 +135,9 @@ class FlattradeBroker:
             log_info(f"[PAPER] {action} {quantity} x {symbol} @ ~₹{price:.2f} (simulated, no real order sent)")
             return {"ok": True, "order_no": fake_order_no, "msg": "Simulated fill (paper trading)", "raw": None}
 
-        # Marketable limit price: Exchange/RMS blocks MKT orders on Options
-        # For BUY: limit price slightly above LTP to guarantee instant fill
-        # For SELL: limit price slightly below LTP to guarantee instant fill
+        # Marketable limit price: Exchange blocks MKT orders on Options
+        # BUY: Limit price slightly above LTP for instant fill
+        # SELL: Limit price slightly below LTP for instant fill
         if action == 'B':
             limit_price = round(max(0.05, float(price) + 2.0), 2)
         else:
@@ -175,29 +194,31 @@ db = DBManager()
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║                     STRATEGY CONFIGURATION (V2)                          ║
+# ║                     STRATEGY CONFIGURATION (USER-TUNED)                  ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-CAPITAL                 = 10_00_000   
-LOT_SIZE                = 65          
-CAPITAL_BUFFER          = 0.95        
-MARGIN_IRON_CONDOR      = 95_000      
-PORTFOLIO_CIRCUIT_PCT   = 1.8         
+CAPITAL                 = 10_00_000   # Default Capital: ₹10 Lakhs
+LOT_SIZE                = 65          # NIFTY Lot size
+CAPITAL_BUFFER          = 0.95        # Usable capital buffer (95%)
+MARGIN_IRON_CONDOR      = 95_000      # Margin required for 4-leg Iron Condor per lot
+PORTFOLIO_CIRCUIT_PCT   = 1.5         # Emergency Portfolio Halt at -1.5% combined MTM
 
-KAMA_PERIOD             = 13          
-KAMA_FAST_EMA           = 3           
-KAMA_SLOW_EMA           = 30          
-KAMA_MIN_SLOPE          = 1.0         
+# Indicators Parameters
+KAMA_PERIOD             = 13          # KAMA 13 Lookback (1-minute resolution)
+KAMA_FAST_EMA           = 3           # KAMA Fast EMA constant
+KAMA_SLOW_EMA           = 30          # KAMA Slow EMA constant
+KAMA_MIN_SLOPE          = 1.0         # Minimum KAMA slope (pts) to flip trend
 
-ADX_PERIOD              = 9           
-ADX_CHOP_THRESHOLD      = 20.0        
-ADX_TREND_THRESHOLD     = 20.0        
+ADX_PERIOD              = 6           # 5 min 6 candles for ADX (30m lookback)
+ADX_CHOP_THRESHOLD      = 20.0        # 20 Gateway: ADX < 20 = CHOP (Iron Condor)
+ADX_TREND_THRESHOLD     = 20.0        # 20 Gateway: ADX >= 20 = TREND
 
-ATR_PERIOD              = 14          
-DEFAULT_ATR_5M          = 35.0        
+ATR_PERIOD              = 14          # ATR lookback period on 5m candles
+DEFAULT_ATR_5M          = 35.0        # Fallback 5m ATR if warming up
 
-HEDGE_WIDTH_PTS         = 1000        
-BASE_MIN_WIDTH_PTS      = 0           
+# Strike Selection & Distances
+HEDGE_WIDTH_PTS         = 1000        # Long Leg (Hedge) distance OTM from ATM at entry
+BASE_MIN_WIDTH_PTS      = 0           # ATM Straddle / Strangle width
 BASE_MAX_WIDTH_PTS      = 0           
 BASE_ATR_MULTIPLIER     = 1.0         
 
@@ -209,22 +230,24 @@ EXPIRY_WIDTH_LOOKAHEAD_DAYS = 8.0
 EXPIRY_NEAR_DAYS            = 2.0     
 EXPIRY_NEAR_BONUS           = 0.42    
 
-SPOT_SL_ATR_MULT        = 1.60                
-SPOT_SL_TRAIL_RATIO     = 0.40                
-SPOT_SL_TRAIL_RATIO_STRONG = 0.55          
-SPOT_SL_TRAIL_RATIO_DEEP   = 0.70          
-SPOT_SL_BREAKEVEN_LOCK_ATR = 1.50          
-SPOT_SL_BREAKEVEN_BUFFER_PTS = 5.0    
-SPOT_SL_DEBOUNCE_BARS   = 2           
+# Spot-Based Trailing Stop Loss (User tuned: 50% Trail, 1 Debounce)
+SPOT_SL_ATR_MULT        = 1.20        # Initial Spot SL distance = 1.2 * ATR (~42 pts from entry spot)
+SPOT_SL_TRAIL_RATIO     = 0.50        # 50% Trailing Stop Loss on favorable spot movement
+SPOT_SL_TRAIL_RATIO_STRONG = 0.65     # Stronger trail once trade is in deep profit
+SPOT_SL_TRAIL_RATIO_DEEP   = 0.80     
+SPOT_SL_BREAKEVEN_LOCK_ATR = 1.30     
+SPOT_SL_DEBOUNCE_BARS   = 1           # 1-bar debounce confirmation for quick protection
 
-COOLDOWN_MINUTES        = 3           
-COOLDOWN_SPOT_PCT       = 0.0010      
+# Anti-Whipsaw Cooldown
+COOLDOWN_MINUTES        = 3           # Fallback cooldown timer
+COOLDOWN_SPOT_PCT       = 0.0010      # 0.10% spot movement (~24 pts) resets cooldown early
 
+# Session Timing
 MARKET_START_HOUR       = 9
-MARKET_START_MINUTE     = 18          
+MARKET_START_MINUTE     = 18          # Start trading at 09:18 AM
 AUTO_SQUAREOFF_HOUR     = 15
-AUTO_SQUAREOFF_MINUTE   = 28          
-REFRESH_INTERVAL_SEC    = 1          
+AUTO_SQUAREOFF_MINUTE   = 28          # Auto square-off at 15:28 PM
+REFRESH_INTERVAL_SEC    = 1           # 1-second continuous live loop
 
 
 _LAST_EVENT: Dict[str, str] = {"msg": "Engine starting..."}
@@ -244,7 +267,7 @@ def round_to_strike(price: float, strike_step: int = 50) -> int: return int(roun
 
 
 # ==============================================================================
-# MODULE 1: MARKET DATA INGESTION & 5-MIN AGGREGATION
+# MODULE 1: MARKET DATA INGESTION & TIME-PRICE SERIES
 # ==============================================================================
 
 class MarketData:
@@ -323,7 +346,7 @@ class MarketData:
                     self.seeded_bars_5m = s5[-100:]
                     log_info(f"Successfully seeded {len(self.seeded_bars_5m)} 5m bars from Flattrade.")
 
-            # Fetch 1-minute historical series
+            # Fetch 1-minute historical series for KAMA(13,3,30)
             start_1m = end_time - timedelta(days=1)
             res_1m = global_api.get_time_price_series(
                 exchange='NSE', token='26000', 
@@ -406,7 +429,7 @@ class MarketData:
 
 
 # ==============================================================================
-# MODULE 2: INDICATORS & REGIME DETECTION
+# MODULE 2: INDICATORS (KAMA 13/3/30 & ADX 6 on 5M)
 # ==============================================================================
 
 class Indicators:
@@ -522,7 +545,7 @@ class Indicators:
 
 
 # ==============================================================================
-# MODULE 3: RISK MANAGER
+# MODULE 3: RISK MANAGER (SPOT-BASED TRAILING STOP LOSS & CIRCUIT BREAKER)
 # ==============================================================================
 
 class RiskManager:
@@ -531,7 +554,7 @@ class RiskManager:
         self.circuit_breaker_loss_limit = -1.0 * (capital * PORTFOLIO_CIRCUIT_PCT / 100.0)
 
     def init_spot_sl(self, leg: str, entry_spot: float, atr: float):
-        initial_distance = max(12.0, SPOT_SL_ATR_MULT * atr)
+        initial_distance = max(15.0, SPOT_SL_ATR_MULT * atr)
         if leg == "CE":
             initial_sl = entry_spot + initial_distance
             best_spot = entry_spot 
@@ -594,20 +617,20 @@ class RiskManager:
         if hard_breach:
             return True, f"⛔ Hard Emergency Spot SL Triggered for {leg} | Spot: {current_spot:.2f} violently crossed SL: {sl_state['current_sl']:.2f}"
 
-        # Standard debounce exit requires 2 consecutive 1m bar closes beyond SL
+        # Standard debounce exit requires confirmed 1-min close past SL
         if sl_state["breach_count"] >= SPOT_SL_DEBOUNCE_BARS:
-            return True, f"⛔ Spot SL Triggered for {leg} | Spot: {current_spot:.2f} breached SL: {sl_state['current_sl']:.2f} on {SPOT_SL_DEBOUNCE_BARS} consecutive 1m closes"
+            return True, f"⛔ Spot SL Triggered for {leg} | Spot: {current_spot:.2f} breached SL: {sl_state['current_sl']:.2f} on {SPOT_SL_DEBOUNCE_BARS} 1m close"
         return False, ""
 
     def check_portfolio_circuit_breaker(self, realized_pnl: float, unrealized_pnl: float):
         combined_mtm = realized_pnl + unrealized_pnl
         if combined_mtm <= self.circuit_breaker_loss_limit:
-            return True, f"🚨 PORTFOLIO CIRCUIT BREAKER HIT 🚨 Combined MTM breached limit. Shutting down!"
+            return True, f"🚨 PORTFOLIO CIRCUIT BREAKER HIT 🚨 Combined MTM: ₹{combined_mtm:,.2f} breached limit. Shutting down!"
         return False, ""
 
 
 # ==============================================================================
-# MODULE 3B: LIVE PER-SECOND DASHBOARD
+# MODULE 3B: LIVE DASHBOARD SNAPSHOT HANDLER
 # ==============================================================================
 
 class Dashboard:
@@ -615,7 +638,7 @@ class Dashboard:
         self.has_rich = HAS_RICH and sys.stdout.isatty()
         if self.has_rich:
             self.console = Console()
-            self.live = Live(self._render({}), console=self.console, refresh_per_second=2, screen=False)
+            self.live = Live(self._render({}), console=self.console, refresh_per_second=1, screen=False)
             self._started = False
         else:
             self._started = False
@@ -649,12 +672,12 @@ class Dashboard:
         top.add_row(
             f"[bold]Spot:[/bold] {snap.get('spot', 0):.2f}",
             f"[bold]ATM:[/bold] {snap.get('atm', 0)}",
-            f"[bold]ADX:[/bold] {snap.get('adx', 0):.1f} ({snap.get('regime', '-')})",
+            f"[bold]ADX(6 on 5m):[/bold] {snap.get('adx', 0):.1f} ({snap.get('regime', '-')})",
             f"[bold]KAMA Trend:[/bold] {snap.get('trend', 0)}",
         )
         top.add_row(
+            f"[bold]KAMA(1m):[/bold] ₹{snap.get('kama', 0):.2f}" if snap.get('kama') else "[bold]KAMA(1m):[/bold] WARMUP",
             f"[bold]ATR(5m):[/bold] {snap.get('atr', 0):.2f}",
-            f"[bold]DTE:[/bold] {snap.get('dte', 0):.2f}d",
             f"[bold]Realized P&L:[/bold] " + (f"[green]₹{snap.get('realized_pnl', 0):,.2f}[/green]" if snap.get('realized_pnl', 0) >= 0 else f"[red]₹{snap.get('realized_pnl', 0):,.2f}[/red]"),
             f"[bold]Unrealized P&L:[/bold] " + (f"[green]₹{snap.get('unrealized_pnl', 0):,.2f}[/green]" if snap.get('unrealized_pnl', 0) >= 0 else f"[red]₹{snap.get('unrealized_pnl', 0):,.2f}[/red]"),
         )
@@ -667,7 +690,7 @@ class Dashboard:
         pos_table.add_column("LTP ₹")
         pos_table.add_column("P&L ₹")
         pos_table.add_column("SL Line")
-        pos_table.add_column("Breach Cnt")
+        pos_table.add_column("Breaches")
 
         for leg, pos in snap.get("positions", {}).items():
             pnl = pos.get("live_pnl", 0.0)
@@ -708,7 +731,8 @@ class Dashboard:
             except Exception as e:
                 log_warn(f"Dashboard render error (non-fatal): {e}")
         else:
-            print(f"[{snap.get('now_str', _now_str())}] Spot: {snap.get('spot', 0):.2f} | ADX: {snap.get('adx', 0):.1f} ({snap.get('regime', '-')}) | KAMA Trend: {snap.get('trend', 0)} | Mode: {snap.get('mode', '-')}", flush=True)
+            kama_txt = f"{snap.get('kama', 0):.2f}" if snap.get('kama') else "-"
+            print(f"[{snap.get('now_str', _now_str())}] Spot: {snap.get('spot', 0):.2f} | KAMA: {kama_txt} | ADX: {snap.get('adx', 0):.1f} ({snap.get('regime', '-')}) | Trend: {snap.get('trend', 0)} | Mode: {snap.get('mode', '-')}", flush=True)
 
 
 # ==============================================================================
@@ -834,8 +858,7 @@ class ExecutionEngine:
             saved_mode = state.get("mode", "WAIT_DATA")
 
             if saved_mode not in self._KNOWN_MODES:
-                log_alert(f"[STATE CORRUPT] Unrecognized saved mode '{saved_mode}'. "
-                          f"Resetting to WAIT_DATA to avoid a silent stuck state.")
+                log_alert(f"[STATE CORRUPT] Unrecognized saved mode '{saved_mode}'. Resetting to WAIT_DATA.")
                 self.mode = "RUNNING" if self.positions else "WAIT_DATA"
             else:
                 now = get_ist_now()
