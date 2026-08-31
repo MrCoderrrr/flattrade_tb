@@ -686,6 +686,98 @@ class ExecutionEngine:
                             pos["spot_sl_state"] = self.risk_manager.init_spot_sl(leg, float(pos.get("entry_spot", self.market_data.latest_spot)), float(self.current_indicators.get("atr", DEFAULT_ATR_5M)))
         except: pass
 
+    def _sync_positions_from_broker(self):
+        """
+        Query Flattrade live positions and reconcile with self.positions.
+        Called once on startup to prevent duplicate orders after a restart.
+
+        - Legs in broker but NOT in self.positions  → import them (bot will track, not re-enter)
+        - Legs in self.positions but net qty=0 in broker → remove (ghost, already closed externally)
+        - Legs in both → keep self.positions data (has SL state, entry_spot, etc.)
+        """
+        import re as _re
+        log_info("Syncing with Flattrade live positions...")
+        try:
+            res = self.broker.api.get_positions()
+            if not res or not isinstance(res, list):
+                log_warn("Broker sync: empty response — using state file only.")
+                return
+
+            # Build broker map: tsym -> {netqty, avgprc}
+            broker_map: Dict[str, Dict] = {}
+            for p in res:
+                if p.get('exchange') != 'NFO': continue
+                tsym   = p.get('tsym', '')
+                netqty = int(p.get('netqty', 0) or 0)
+                avgprc = float(p.get('netavgprc', p.get('avgprc', 0.0)) or 0.0)
+                if tsym:
+                    broker_map[tsym] = {'netqty': netqty, 'avgprc': avgprc}
+
+            log_info(f"Broker NFO positions: {list(broker_map.keys())}")
+
+            atr  = self.current_indicators.get('atr', DEFAULT_ATR_5M)
+            spot = self.market_data.latest_spot
+
+            # Step 1: Remove ghost positions (closed in broker but still in state)
+            for leg in list(self.positions.keys()):
+                tsym   = self.positions[leg].get('tsym', '')
+                bqty   = broker_map.get(tsym, {}).get('netqty', None)
+                if bqty is None or bqty == 0:
+                    log_warn(f"Removing ghost: {leg} ({tsym}) — not open in broker.")
+                    del self.positions[leg]
+
+            # Step 2: Import positions open in broker but missing from state
+            known_tsyms = {p.get('tsym') for p in self.positions.values()}
+            for tsym, bdata in broker_map.items():
+                netqty = bdata['netqty']
+                if netqty == 0 or tsym in known_tsyms: continue
+
+                side   = "SELL" if netqty < 0 else "BUY"
+                qty    = abs(netqty)
+                avgprc = bdata['avgprc']
+                base   = 'CE' if 'CE' in tsym else ('PE' if 'PE' in tsym else 'XX')
+
+                # Determine leg label
+                if base == 'CE':
+                    leg = 'CE' if 'CE' not in self.positions else ('CE_HEDGE' if 'CE_HEDGE' not in self.positions else f'CE_{tsym[-4:]}')
+                elif base == 'PE':
+                    leg = 'PE' if 'PE' not in self.positions else ('PE_HEDGE' if 'PE_HEDGE' not in self.positions else f'PE_{tsym[-4:]}')
+                else:
+                    leg = tsym[:8]
+
+                # Try to parse strike
+                strike = 0
+                m = _re.search(r'(\d{4,6})(CE|PE)$', tsym)
+                if m: strike = int(m.group(1))
+
+                pos_info = {
+                    "strike": strike, "tsym": tsym, "base": base,
+                    "side": side, "qty": qty, "entry_price": avgprc,
+                    "entry_time": time.time(), "entry_spot": spot
+                }
+                if side == "SELL":
+                    pos_info["spot_sl_state"] = self.risk_manager.init_spot_sl(base, spot, atr)
+
+                self.positions[leg] = pos_info
+                log_info(f"Imported from broker: {leg} — {side} {qty}x {tsym} @ ₹{avgprc:.2f}")
+
+            # Step 3: Fix mode based on reconciled positions
+            if self.positions:
+                if self.mode in ("WAIT_DATA", "SESSION_DONE", "SESSION_DONE_FLAT"):
+                    self.mode = "RUNNING"
+                    log_info(f"Mode set to RUNNING ({len(self.positions)} legs found).")
+            else:
+                if self.mode not in ("COOLDOWN",):
+                    self.mode = "WAIT_DATA"
+                    log_info("No open positions — mode set to WAIT_DATA.")
+
+            self._save_state()
+            log_info(f"Sync done. Tracking {len(self.positions)} legs: {list(self.positions.keys())}")
+
+        except Exception as e:
+            log_warn(f"Position sync error (non-fatal, continuing): {e}")
+            traceback.print_exc()
+
     def _get_ltp(self, strike: int, option_type: str) -> float:
         key = f"{strike}_{option_type}"
         if key not in self._ltp_cache:
@@ -759,6 +851,11 @@ class ExecutionEngine:
 
     def run(self):
         log_info("Starting V2 Pro Algorithmic State Machine...")
+        # Sync with Flattrade live positions before entering the main loop.
+        # This prevents duplicate orders after a restart by importing what's
+        # already open in the broker and removing ghost positions from the state.
+        self._sync_positions_from_broker()
+
         while True:
             try:
                 now = get_ist_now()
