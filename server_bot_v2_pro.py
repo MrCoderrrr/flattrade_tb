@@ -649,9 +649,8 @@ class ExecutionEngine:
         self.current_indicators = Indicators.evaluate_all(df_1m, df_5m) if not df_5m.empty else {'atr': 35.0, 'regime': 'CHOP', 'trend': 0, 'adx': 18.0}
         
         self._ltp_cache: Dict[str, float] = {}
-        self._last_chop_roll_time: float = 0.0       # timestamp of last CHOP roll check
-        self._last_trend_roll_bar: Optional[str] = None  # 1m key of last TREND roll
-        self._processed_1m_bar: Optional[str] = None    # ensures is_new_1m_bar is one-shot per bar
+        self._last_whipsaw_time: float = 0.0         # timestamp of last whipsaw dual-leg exit
+        self._processed_1m_bar: Optional[str] = None # ensures is_new_1m_bar is one-shot per bar
         self._load_state()
 
     def _expiry_width_multiplier(self, dte_days: float) -> float:
@@ -947,12 +946,6 @@ class ExecutionEngine:
     def _exit_all_positions(self, reason: str = "GLOBAL_EXIT"):
         for leg in list(self.positions.keys()): self._exit_leg(leg, reason=reason)
 
-    def _trigger_leg_cooldown(self, stopped_leg: str, current_spot: float):
-        self.cooldown_tracker[stopped_leg] = {'stopped_time': time.time(), 'stopped_spot': current_spot, 'active': True}
-        log_alert(f"⏳ {stopped_leg} entered Adaptive COOLDOWN.")
-        self.mode = "COOLDOWN"
-        self._save_state()
-
     def _calculate_unrealized_pnl(self) -> float:
         total = 0.0
         for p in self.positions.values():
@@ -1015,33 +1008,6 @@ class ExecutionEngine:
         except Exception:
             pass
 
-    def _check_cooldown_and_reenter(self, spot: float, atm: int, atr: float, regime: str, trend: int, dte_days: float = 2.0):
-        for leg in ("CE", "PE"):
-            cd = self.cooldown_tracker.get(leg)
-            if not cd or not cd.get("active", False): continue
-            elapsed_sec = time.time() - cd["stopped_time"]
-            spot_displacement = abs(spot - cd["stopped_spot"]) / max(0.1, cd["stopped_spot"])
-            
-            indicator_cleared = False
-            if leg == "CE" and trend == -1: indicator_cleared = True
-            elif leg == "PE" and trend == 1: indicator_cleared = True
-            elif regime == "CHOP" and elapsed_sec >= 60.0: indicator_cleared = True
-            elif spot_displacement >= COOLDOWN_SPOT_PCT: indicator_cleared = True
-            elif elapsed_sec >= COOLDOWN_MINUTES * 60: indicator_cleared = True
-            
-            if indicator_cleared:
-                trend_safe = True
-                if leg == "CE" and regime == "TREND" and trend == 1: trend_safe = False
-                elif leg == "PE" and regime == "TREND" and trend == -1: trend_safe = False
-                if trend_safe:
-                    log_info(f"✅ Cooldown Bypassed for {leg} -> Re-shorting...")
-                    ce_strike, pe_strike = self.calculate_strangle_strikes(atm, atr, regime, dte_days=dte_days, trend=trend, adx=self.current_indicators.get('adx', 18.0))
-                    if leg not in self.positions: self._enter_leg(leg, ce_strike if leg == "CE" else pe_strike, "SELL", spot, atr)
-                    cd["active"] = False
-                    self._save_state()
-                    if not any(v.get("active", False) for v in self.cooldown_tracker.values()):
-                        self.mode = "CHOP_MODE" if regime == "CHOP" else "RUNNING"
-
     def run(self):
         log_info("Starting V2 Pro Algorithmic State Machine...")
         # Sync with Flattrade live positions before entering the main loop.
@@ -1097,77 +1063,48 @@ class ExecutionEngine:
 
                 if self.mode == "WAIT_DATA":
                     if now.hour > MARKET_START_HOUR or (now.hour == MARKET_START_HOUR and now.minute >= MARKET_START_MINUTE):
-                        if regime == "TRANSITION":
+                        # After a whipsaw exit, pause 5 minutes before entering a new strangle
+                        if time.time() - self._last_whipsaw_time < 300.0:
+                            pass
+                        elif regime == "TRANSITION":
                             log_info(f"09:18 AM reached but ADX {adx:.1f} is in the TRANSITION band — holding entry.")
                         else:
-                            log_info(f"09:18 AM Reached. Entering Market (Regime: {regime})...")
+                            log_info(f"Market Ready. Entering Strangle (Regime: {regime})...")
                             hedge_width = HEDGE_WIDTH_PTS
                             if "CE_HEDGE" not in self.positions: self._enter_leg("CE_HEDGE", atm + hedge_width, "BUY", spot, atr)
                             if "PE_HEDGE" not in self.positions: self._enter_leg("PE_HEDGE", atm - hedge_width, "BUY", spot, atr)
                             ce_strike, pe_strike = self.calculate_strangle_strikes(atm, atr, regime, dte_days=dte_days, trend=trend, adx=adx)
                             if "CE" not in self.positions: self._enter_leg("CE", ce_strike, "SELL", spot, atr)
                             if "PE" not in self.positions: self._enter_leg("PE", pe_strike, "SELL", spot, atr)
-                            self.mode = "CHOP_MODE" if regime == "CHOP" else "RUNNING"
+                            self.mode = "RUNNING"
                             self._save_state()
 
-                elif self.mode in ("RUNNING", "CHOP_MODE", "COOLDOWN"):
+                elif self.mode in ("RUNNING", "CHOP_MODE"):
                     if not self.positions:
                         self.mode = "WAIT_DATA"
                         continue
 
-                    # Spot-Based SL Check — always runs, even in TRANSITION.
-                    for leg in ("CE", "PE"):
-                        if leg in self.positions and self.positions[leg]["side"] == "SELL":
-                            is_stopped, reason = self.risk_manager.update_spot_sl_and_check(leg, self.positions[leg], spot, is_new_1m_bar)
+                    # Spot-Based SL Check: If ANY short leg breaches Stop Loss, close BOTH legs immediately (Whipsaw Exit)
+                    whipsaw_triggered = False
+                    whipsaw_leg = ""
+                    whipsaw_reason = ""
+                    for leg in list(self.positions.keys()):
+                        pos = self.positions.get(leg)
+                        if pos and pos.get("side") == "SELL":
+                            is_stopped, reason = self.risk_manager.update_spot_sl_and_check(leg, pos, spot, is_new_1m_bar)
                             if is_stopped:
-                                log_alert(reason)
-                                self._exit_leg(leg, reason="SPOT_TSL_HIT")
-                                self._trigger_leg_cooldown(leg, spot)
+                                whipsaw_triggered = True
+                                whipsaw_leg = leg
+                                whipsaw_reason = reason
+                                break
 
-                    if regime == "TRANSITION":
-                        # Dead zone: SL check stays active but no rolls or re-entries.
-                        pass
-                    else:
-                        self._check_cooldown_and_reenter(spot, atm, atr, regime, trend, dte_days=dte_days)
-
-                        # Fix: If cooldown cleared and both legs present, restore mode.
-                        if self.mode == "COOLDOWN":
-                            if not any(v.get("active", False) for v in self.cooldown_tracker.values()):
-                                self.mode = "CHOP_MODE" if regime == "CHOP" else "RUNNING"
-                                log_info(f"✅ All cooldowns cleared. Resuming mode: {self.mode}")
-
-                        if regime == "CHOP":
-                            # CHOP rolls: debounced to once per CHOP_ROLL_DEBOUNCE_MIN minutes
-                            now_ts = time.time()
-                            if now_ts - self._last_chop_roll_time >= CHOP_ROLL_DEBOUNCE_MIN * 60:
-                                chop_ce, chop_pe = self.calculate_strangle_strikes(atm, atr, "CHOP", dte_days=dte_days, adx=adx)
-                                rolled = False
-                                if "CE" in self.positions and self.positions["CE"]["strike"] < chop_ce:
-                                    log_info(f"Choppiness rising. Rolling CE from {self.positions['CE']['strike']} to {chop_ce}...")
-                                    self._exit_leg("CE", reason="CHOP_ROLL_OUT")
-                                    self._enter_leg("CE", chop_ce, "SELL", spot, atr)
-                                    rolled = True
-                                if "PE" in self.positions and self.positions["PE"]["strike"] > chop_pe:
-                                    log_info(f"Choppiness rising. Rolling PE from {self.positions['PE']['strike']} to {chop_pe}...")
-                                    self._exit_leg("PE", reason="CHOP_ROLL_OUT")
-                                    self._enter_leg("PE", chop_pe, "SELL", spot, atr)
-                                    rolled = True
-                                if rolled:
-                                    self._last_chop_roll_time = now_ts
-
-                        elif regime == "TREND" and is_new_1m_bar:
-                            # TREND rolls: only fire once per new 1m bar AND only if
-                            # the strike has drifted more than TREND_ROLL_MIN_ATR_MULT * ATR.
-                            min_drift = max(50, int(TREND_ROLL_MIN_ATR_MULT * atr))
-                            trend_ce, trend_pe = self.calculate_strangle_strikes(atm, atr, "TREND", dte_days=dte_days, trend=trend, adx=adx)
-                            if "CE" in self.positions and abs(self.positions["CE"]["strike"] - trend_ce) >= min_drift:
-                                log_info(f"KAMA trend-follow. Rolling CE from {self.positions['CE']['strike']} to {trend_ce} (drift >= {min_drift}pts)...")
-                                self._exit_leg("CE", reason="TREND_FOLLOW_ROLL")
-                                self._enter_leg("CE", trend_ce, "SELL", spot, atr)
-                            if "PE" in self.positions and abs(self.positions["PE"]["strike"] - trend_pe) >= min_drift:
-                                log_info(f"KAMA trend-follow. Rolling PE from {self.positions['PE']['strike']} to {trend_pe} (drift >= {min_drift}pts)...")
-                                self._exit_leg("PE", reason="TREND_FOLLOW_ROLL")
-                                self._enter_leg("PE", trend_pe, "SELL", spot, atr)
+                    if whipsaw_triggered:
+                        log_alert(whipsaw_reason)
+                        log_alert(f"⚠️ WHIPSAW DETECTED on {whipsaw_leg} | Spot: {spot:.2f} — Closing BOTH short legs to protect capital!")
+                        self._exit_all_positions(reason="WHIPSAW_DUAL_LEG_EXIT")
+                        self._last_whipsaw_time = time.time()
+                        self.mode = "WAIT_DATA"
+                        self._save_state()
 
                 # Write live dashboard snapshot
                 self._write_snapshot(spot, atm, atr, regime, trend, adx, dte_days, unrealized)
