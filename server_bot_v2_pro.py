@@ -540,8 +540,12 @@ class RiskManager:
     def init_premium_sl(self, entry_price: float, live_ltp: float = 0.0, regime: str = "CHOP") -> Dict[str, Any]:
         """
         Initialize premium-based trailing stop loss state for a sold option.
-        - Stop Loss buffer: 5% in CHOP, max 7% in TREND
-        - Trailing Stop Loss is tightly pegged to lowest price achieved.
+        - Initial Stop Loss is set ABOVE the entry price:
+            CHOP mode:  Initial SL = entry_price * 1.05 (+5% max loss)
+            TREND mode: Initial SL = entry_price * 1.07 (+7% max loss)
+        - lowest_ltp tracks the lowest price reached by the short option contract.
+        - As lowest_ltp drops below entry, TSL follows it from above:
+            TSL = lowest_ltp * (1.0 + trail_pct)
         """
         safe_entry = max(0.5, float(entry_price))
         cur_ltp = float(live_ltp) if live_ltp > 0.0 else safe_entry
@@ -553,24 +557,24 @@ class RiskManager:
 
         return {
             "entry_price": safe_entry,
-            "lowest_ltp": round(lowest_p, 2),      # lowest price reached (strictly <= entry and live)
+            "lowest_ltp": round(lowest_p, 2),
             "initial_sl": initial_sl_price,
             "current_sl": current_sl_price,
             "regime": regime,
             "trail_pct": trail_pct,
-            "profit_locked": (lowest_p < safe_entry)
+            "profit_locked": False
         }
 
     def update_premium_tsl_and_check(self, leg: str, pos_data: Dict[str, Any], live_ltp: float, regime: str = "CHOP") -> Tuple[bool, str]:
         """
         Dynamic Premium-Based Trailing Stop Loss — evaluated every second on live tick data.
         
-        Rules:
-        - TSL is strictly MAX 5% in CHOP, MAX 7% in TREND above lowest price achieved / live LTP.
-        - Lowest price is strictly clamped to min(lowest_ltp, entry_price, live_ltp).
-        - Trailing SL ratchets down as price falls: current_sl = lowest_ltp * (1 + trail_pct).
-        - Trailing SL can only move down (never widens).
-        - If live_ltp >= current_sl: triggers immediate stop loss!
+        For a short option:
+        - Price going DOWN = Profit. lowest_ltp updates when live_ltp < lowest_ltp.
+        - SL is always ABOVE the lowest price achieved.
+        - Trailing SL: current_sl = min(initial_sl, lowest_ltp * (1 + trail_pct))
+        - If profit >= 5% (lowest_ltp <= entry_price * 0.95), TSL is locked at or below entry price.
+        - If live_ltp >= current_sl: Stop Loss triggers immediately!
         """
         entry_price = float(pos_data.get("entry_price", 0.0))
         if entry_price <= 0.0:
@@ -586,29 +590,36 @@ class RiskManager:
             sl_state = self.init_premium_sl(entry_price, live_ltp, regime)
             pos_data["premium_sl_state"] = sl_state
 
-        # Sanity check lowest_ltp: must NEVER be higher than entry_price or live_ltp
+        # Update lowest_ltp if live price made a new lower low (profit for short seller)
         raw_lowest = float(sl_state.get("lowest_ltp", entry_price))
-        lowest_ltp = min(raw_lowest, entry_price, live_ltp)
+        if live_ltp < raw_lowest:
+            raw_lowest = live_ltp
+        # Lowest can never exceed entry_price
+        lowest_ltp = min(raw_lowest, entry_price)
         sl_state["lowest_ltp"] = round(lowest_ltp, 2)
 
-        # Dynamic TSL line based on lowest price achieved (max 7%)
+        # Initial SL is entry_price + 5%/7%
+        initial_sl = round(entry_price * (1.0 + trail_pct), 2)
+        sl_state["initial_sl"] = initial_sl
+
+        # Dynamic Trailing SL based on the lowest price reached
         candidate_sl = round(lowest_ltp * (1.0 + trail_pct), 2)
-        current_sl = float(sl_state.get("current_sl", entry_price * (1.0 + trail_pct)))
+        
+        # When position has generated >= 5% profit (price dropped below 95% of entry),
+        # ensure current_sl cannot exceed entry price (breakeven lock)
+        if lowest_ltp <= (entry_price * 0.95):
+            candidate_sl = min(candidate_sl, entry_price)
+            sl_state["profit_locked"] = True
 
-        # Ratchet down if candidate_sl is tighter (or if current_sl was corrupted/too wide)
-        if candidate_sl < current_sl or current_sl > (lowest_ltp * (1.0 + trail_pct) + 0.5):
-            sl_state["current_sl"] = candidate_sl
-            current_sl = candidate_sl
-
-        # If in profit, ensure TSL cannot exceed entry price
-        if lowest_ltp < entry_price and current_sl > entry_price:
-            current_sl = entry_price
-            sl_state["current_sl"] = entry_price
+        # Current SL is the minimum of initial_sl and candidate_sl (ratchets down only)
+        current_sl = min(initial_sl, candidate_sl)
+        sl_state["current_sl"] = current_sl
 
         # Check trigger condition
         if live_ltp >= current_sl:
+            loss_or_profit = "Loss" if live_ltp > entry_price else "Profit"
             return True, (
-                f"⛔ Premium TSL Hit for {leg} | Entry: ₹{entry_price:.2f}, "
+                f"⛔ Premium TSL Hit for {leg} ({loss_or_profit}) | Entry: ₹{entry_price:.2f}, "
                 f"Best Low: ₹{lowest_ltp:.2f}, TSL: ₹{current_sl:.2f}, Live LTP: ₹{live_ltp:.2f} "
                 f"(Regime: {regime}, Trail: {int(trail_pct*100)}%)"
             )

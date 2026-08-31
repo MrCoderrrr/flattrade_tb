@@ -318,21 +318,23 @@ def load_data() -> Optional[Dict]:
                     regime = bot_snap.get("regime", "CHOP")
                     trail_pct = 0.05 if regime == "CHOP" else 0.07
 
-                    if sl_state and isinstance(sl_state, dict):
-                        raw_lowest = float(sl_state.get("lowest_ltp", entry_p))
-                        lowest_p = min(raw_lowest, entry_p, live_p)
-                    else:
-                        lowest_p = min(entry_p, live_p)
+                    raw_lowest = float(sl_state.get("lowest_ltp", entry_p)) if (sl_state and isinstance(sl_state, dict)) else entry_p
+                    if live_p < raw_lowest:
+                        raw_lowest = live_p
+                    lowest_p = min(raw_lowest, entry_p)
 
-                    cur_sl = round(lowest_p * (1.0 + trail_pct), 2)
-                    if lowest_p < entry_p and cur_sl > entry_p:
-                        cur_sl = entry_p
+                    initial_sl = round(entry_p * (1.0 + trail_pct), 2)
+                    candidate_sl = round(lowest_p * (1.0 + trail_pct), 2)
+                    if lowest_p <= (entry_p * 0.95):
+                        candidate_sl = min(candidate_sl, entry_p)
+
+                    cur_sl = min(initial_sl, candidate_sl)
 
                     pos["premium_sl_state"] = {
                         "entry_price": entry_p,
                         "lowest_ltp": round(lowest_p, 2),
                         "current_sl": cur_sl,
-                        "initial_sl": round(entry_p * (1.0 + trail_pct), 2),
+                        "initial_sl": initial_sl,
                         "trail_pct": trail_pct,
                     }
 
