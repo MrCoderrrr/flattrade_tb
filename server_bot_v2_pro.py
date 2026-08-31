@@ -543,19 +543,33 @@ class RiskManager:
 
     def update_spot_sl_and_check(self, leg: str, pos_data: Dict[str, Any], current_spot: float, is_new_1m_bar: bool):
         sl_state = pos_data.get("spot_sl_state")
-        if not sl_state: return False, ""
-        entry_spot = float(sl_state["entry_spot"])
+        if not sl_state or not isinstance(sl_state, dict):
+            # Auto-initialize SL state if missing or corrupted
+            atr = float(pos_data.get("atr_at_entry", DEFAULT_ATR_5M))
+            sl_state = self.init_spot_sl(leg, current_spot, atr)
+            pos_data["spot_sl_state"] = sl_state
+
+        entry_spot = float(sl_state.get("entry_spot", current_spot))
+        if entry_spot <= 1000.0:
+            entry_spot = current_spot
+            sl_state["entry_spot"] = entry_spot
+            sl_dist = max(12.0, SPOT_SL_ATR_MULT * DEFAULT_ATR_5M)
+            sl_state["initial_sl"] = current_spot + sl_dist if ("CE" in leg) else current_spot - sl_dist
+            sl_state["current_sl"] = sl_state["initial_sl"]
+            sl_state["best_spot"] = entry_spot
+
         atr_at_entry = float(sl_state.get("atr_at_entry", 0.0) or 0.0)
         current_sl = float(sl_state["current_sl"])
         best_spot = float(sl_state.get("best_spot", entry_spot))
-        breach_count = int(sl_state.get("breach_count", 0))
-        safe_atr = max(5.0, atr_at_entry if atr_at_entry > 0 else 1.0)
+        safe_atr = max(5.0, atr_at_entry if atr_at_entry > 0 else DEFAULT_ATR_5M)
         favorable_lock_at = safe_atr * SPOT_SL_BREAKEVEN_LOCK_ATR
         deep_lock_at = favorable_lock_at * 1.6
-        sl_buffer = max(1.5, safe_atr * 0.08)
         
         base = "CE" if "CE" in leg else "PE"
+        is_breaching = False
+
         if base == "CE":
+            # For CE: favorable move is Spot going DOWN
             if current_spot < best_spot:
                 best_spot = current_spot
                 sl_state["best_spot"] = round(best_spot, 2)
@@ -566,8 +580,10 @@ class RiskManager:
                 candidate_sl = sl_state["initial_sl"] - trail_amount
                 sl_state["current_sl"] = min(current_sl, round(candidate_sl, 2))
                 sl_state["trail_amount"] = round(trail_amount, 2)
-            is_breaching = (current_spot >= (sl_state["current_sl"] - sl_buffer))
+            # CE breached if Spot rises above Stop Loss line
+            is_breaching = (current_spot >= sl_state["current_sl"])
         else:
+            # For PE: favorable move is Spot going UP
             if current_spot > best_spot:
                 best_spot = current_spot
                 sl_state["best_spot"] = round(best_spot, 2)
@@ -578,23 +594,20 @@ class RiskManager:
                 candidate_sl = sl_state["initial_sl"] + trail_amount
                 sl_state["current_sl"] = max(current_sl, round(candidate_sl, 2))
                 sl_state["trail_amount"] = round(trail_amount, 2)
-            is_breaching = (current_spot <= (sl_state["current_sl"] + sl_buffer))
+            # PE breached if Spot falls below Stop Loss line
+            is_breaching = (current_spot <= sl_state["current_sl"])
 
-        if is_new_1m_bar:
-            if is_breaching:
-                breach_count += 1
-                sl_state["breach_count"] = breach_count
-            else:
-                sl_state["breach_count"] = 0
-        else:
-            if is_breaching and breach_count == 0:
-                breach_count = 1
-                sl_state["breach_count"] = 1
-            elif not is_breaching and breach_count == 1:
-                sl_state["breach_count"] = 0
+        # 1. Immediate Spot SL Trigger
+        if is_breaching:
+            return True, f"⛔ Spot SL Hit for {leg} | Spot: {current_spot:.2f} crossed SL: {sl_state['current_sl']:.2f} (Entry Spot: {entry_spot:.2f})"
 
-        if sl_state["breach_count"] >= SPOT_SL_DEBOUNCE_BARS:
-            return True, f"⛔ Spot SL Triggered for {leg} | Spot: {current_spot:.2f} breached SL: {sl_state['current_sl']:.2f}"
+        # 2. Option Premium Stop Loss: 50% Max Loss on sold premium
+        entry_price = float(pos_data.get("entry_price", 0.0))
+        live_ltp = float(pos_data.get("live_ltp", 0.0))
+        if entry_price > 0.0 and live_ltp > 0.0:
+            if (live_ltp - entry_price) >= (entry_price * 0.50):
+                return True, f"⛔ Option Premium 50% SL Hit for {leg} | Entry: ₹{entry_price:.2f}, LTP: ₹{live_ltp:.2f} (+50% loss)"
+
         return False, ""
 
     def check_portfolio_circuit_breaker(self, realized_pnl: float, unrealized_pnl: float):
@@ -1097,6 +1110,7 @@ class ExecutionEngine:
                     for leg in list(self.positions.keys()):
                         pos = self.positions.get(leg)
                         if pos and pos.get("side") == "SELL":
+                            pos["live_ltp"] = self._get_ltp(pos.get("strike", 0), pos.get("base", "CE"), tsym=pos.get("tsym", ""))
                             is_stopped, reason = self.risk_manager.update_spot_sl_and_check(leg, pos, spot, is_new_1m_bar)
                             if is_stopped:
                                 whipsaw_triggered = True
