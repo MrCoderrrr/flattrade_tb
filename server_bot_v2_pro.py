@@ -89,9 +89,10 @@ class FlattradeBroker:
             discloseqty="0",
             price_type="MKT",
             price="0",
-            trigger_price=None,
+            trigger_price="0",
             retention="DAY"
         )
+        log_info(f"Order API Response: {res}")
         return res
 
 class VolatilityEngine:
