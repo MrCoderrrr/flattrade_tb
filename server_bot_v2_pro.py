@@ -524,8 +524,17 @@ class ExecutionEngine:
         self.positions: Dict[str, Dict[str, Any]] = {}
         self.realized_pnl: float = 0.0
         
-        usable_capital = CAPITAL * CAPITAL_BUFFER
-        self.qty = max(1, int(usable_capital / MARGIN_IRON_CONDOR)) * LOT_SIZE
+        # Read Multiplier
+        lots_multiplier = 1
+        if os.path.exists("multiplier.txt"):
+            try:
+                with open("multiplier.txt", "r") as f:
+                    lots_multiplier = max(1, int(f.read().strip()))
+            except Exception:
+                pass
+                
+        self.qty = lots_multiplier * LOT_SIZE
+        log_info(f"Loaded Lot Multiplier: {lots_multiplier}x (Total Qty per leg: {self.qty})")
         
         self.cooldown_tracker: Dict[str, Dict[str, Any]] = {
             'CE': {'stopped_time': 0.0, 'stopped_spot': 0.0, 'active': False},

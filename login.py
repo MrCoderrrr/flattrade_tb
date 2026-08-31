@@ -37,11 +37,23 @@ if __name__ == "__main__":
     if not request_code:
         sys.exit("No code provided.")
         
+    try:
+        lots = input("\nEnter Lot Multiplier (How many lots per leg?) [Default 1]: ").strip()
+        lots_int = int(lots) if lots else 1
+    except ValueError:
+        print("Invalid number. Defaulting to 1 lot.")
+        lots_int = 1
+        
     token = get_token(request_code)
     if token:
         with open("token.txt", "w") as f:
             f.write(token)
-        print("\n[SUCCESS] Token saved to token.txt!")
-        print("Your background server_bot.py will now automatically use this token.")
+            
+        with open("multiplier.txt", "w") as f:
+            f.write(str(lots_int))
+            
+        print(f"\n[SUCCESS] Token saved!")
+        print(f"[SUCCESS] Strategy set to trade {lots_int} Lot(s) ({lots_int * 65} Qty per leg).")
+        print("Your background server_bot.py will now automatically use this setup.")
     else:
         print("\n[FAILED] Could not generate token.")
