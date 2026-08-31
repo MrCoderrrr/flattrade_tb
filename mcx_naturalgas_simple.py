@@ -47,9 +47,9 @@ class KAMA:
         current = float(kama[-1])
         previous = float(kama[-2])
         delta = current - previous
-        if delta > 2.5:
+        if delta > 0.1:
             trend = 1
-        elif delta < -2.5:
+        elif delta < -0.1:
             trend = -1
         else:
             trend = 0
@@ -233,7 +233,7 @@ class NaturalGasBot:
         if current_kama is None or prev_kama is None:
             return False
         delta = current_kama - prev_kama
-        if abs(delta) < 2.5:
+        if abs(delta) < 0.1:
             return False
 
         if (self.kama_prev_delta > 0 and delta < 0) or (self.kama_prev_delta < 0 and delta > 0):
