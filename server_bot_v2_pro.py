@@ -3,8 +3,10 @@ import sys
 import time
 import json
 import math
+import signal
 import socket
 import select
+import threading
 import traceback
 import urllib3.util.connection as urllib3_cn
 from datetime import datetime, timedelta, timezone
@@ -250,7 +252,7 @@ COOLDOWN_SPOT_PCT       = 0.0010
 MARKET_START_HOUR       = 9
 MARKET_START_MINUTE     = 18          
 AUTO_SQUAREOFF_HOUR     = 15
-AUTO_SQUAREOFF_MINUTE   = 28          
+AUTO_SQUAREOFF_MINUTE   = 25          
 REFRESH_INTERVAL_SEC    = 1          
 
 # Trend rolls: only roll if the new ideal strike is at least this many ATRs
@@ -259,6 +261,16 @@ TREND_ROLL_MIN_ATR_MULT = 0.5         # e.g. 0.5 * 35 ATR = 17.5pts minimum drif
 
 # CHOP rolls: only re-evaluate strike width once per N minutes, not every tick.
 CHOP_ROLL_DEBOUNCE_MIN  = 5           # re-check chop strike every 5 minutes max
+
+# Minimum seconds to wait before re-entering after any exit (prevents re-entry loops)
+REENTRY_COOLDOWN_SEC    = 90          # 90 seconds minimum between any exit and re-entry
+
+# ──────────────────────────────────────────────────────────────────────────────
+# EMERGENCY STOP — shared flag. Set to True from keyboard thread or signal handler.
+# When True the main loop will square-off everything and exit cleanly.
+# ──────────────────────────────────────────────────────────────────────────────
+_EMERGENCY_STOP: bool = False
+_EXIT_IN_PROGRESS: bool = False       # prevents duplicate exit calls in the same tick
 
 
 
@@ -269,6 +281,39 @@ def log_alert(msg: str): print(f"[{_now_str()} ALERT]  {msg}", flush=True)
 def log_trade(msg: str): print(f"[{_now_str()} TRADE]  {msg}", flush=True)
 def round_to_strike(price: float, strike_step: int = 50) -> int: return int(round(price / float(strike_step)) * strike_step)
 
+
+# ==============================================================================
+# EMERGENCY KILL SWITCH — press 'z' then 'x' then 'c' in terminal
+# Works in both interactive TTY and piped/nohup environments (graceful fallback)
+# ==============================================================================
+
+def _start_kill_switch_listener():
+    """
+    Background thread that watches stdin for the sequence z→x→c.
+    When detected, sets _EMERGENCY_STOP = True so the main loop squares off
+    all positions and exits cleanly. Works with 'tail -f bot.log' and SSH sessions.
+    Uses line-buffered mode (no tty needed) so it works even with nohup.
+    """
+    global _EMERGENCY_STOP
+    buffer = ""
+    try:
+        while True:
+            try:
+                line = sys.stdin.readline()
+                if not line:
+                    time.sleep(0.1)
+                    continue
+                buffer += line.strip().lower()
+                if "zxc" in buffer:
+                    _EMERGENCY_STOP = True
+                    log_alert("🛑🛑🛑 EMERGENCY KILL SWITCH ACTIVATED (zxc detected)! Squaring off all positions NOW...")
+                    break
+                # Keep only last 10 chars to avoid runaway buffer
+                buffer = buffer[-10:]
+            except Exception:
+                time.sleep(0.5)
+    except Exception:
+        pass
 
 # ==============================================================================
 # MODULE 1: MARKET DATA INGESTION & 5-MIN AGGREGATION
@@ -539,89 +584,105 @@ class RiskManager:
 
     def init_premium_sl(self, entry_price: float, live_ltp: float = 0.0, regime: str = "CHOP") -> Dict[str, Any]:
         """
-        Initialize premium-based trailing stop loss state for a sold option.
-        - Initial Stop Loss is set ABOVE the entry price:
-            CHOP mode:  Initial SL = entry_price * 1.05 (+5% max loss)
-            TREND mode: Initial SL = entry_price * 1.07 (+7% max loss)
-        - lowest_ltp tracks the lowest price reached by the short option contract.
-        - As lowest_ltp drops below entry, TSL follows it from above:
-            TSL = lowest_ltp * (1.0 + trail_pct)
+        Initialize Stop Loss tracking state for a newly SOLD option leg.
+
+        KEY DESIGN PRINCIPLE — lowest_ltp is the single source of truth:
+        • lowest_ltp = the MINIMUM LTP ever seen since this leg was entered.
+        • It is saved to state JSON on every tick and loaded back on restart.
+        • It NEVER increases (only ratchets down as option decays).
+        • It is cleared ONLY when _exit_leg() removes the position entirely.
+
+        SL / TSL formulas:
+            initial_sl   = entry_price × (1 + trail_pct)   ← absolute worst-case
+            current_sl   = min(initial_sl, lowest_ltp × (1 + trail_pct))
+            Breakeven lock: when lowest_ltp ≤ entry_price × 0.95 (5%+ profit),
+                            current_sl is capped at ≤ entry_price (can't turn into loss).
         """
         safe_entry = max(0.5, float(entry_price))
-        cur_ltp = float(live_ltp) if live_ltp > 0.0 else safe_entry
-        lowest_p = min(safe_entry, cur_ltp)
-        
-        trail_pct = 0.05 if regime == "CHOP" else 0.07  # max 7%
-        initial_sl_price = round(safe_entry * (1.0 + trail_pct), 2)
-        current_sl_price = round(lowest_p * (1.0 + trail_pct), 2)
+        # live_ltp seeds lowest_ltp so initial TSL is calibrated to actual market
+        cur_ltp    = float(live_ltp) if live_ltp > 0.0 else safe_entry
+        lowest_p   = min(safe_entry, cur_ltp)
+
+        trail_pct       = 0.05 if regime == "CHOP" else 0.07
+        initial_sl      = round(safe_entry * (1.0 + trail_pct), 2)
+        current_sl      = round(lowest_p   * (1.0 + trail_pct), 2)
+        # Never allow current_sl to exceed initial_sl
+        current_sl      = min(initial_sl, current_sl)
 
         return {
-            "entry_price": safe_entry,
-            "lowest_ltp": round(lowest_p, 2),
-            "initial_sl": initial_sl_price,
-            "current_sl": current_sl_price,
-            "regime": regime,
-            "trail_pct": trail_pct,
-            "profit_locked": False
+            "entry_price":  safe_entry,
+            "lowest_ltp":   round(lowest_p, 2),   # ← persisted to JSON, never resets
+            "initial_sl":   initial_sl,
+            "current_sl":   current_sl,
+            "regime":       regime,
+            "trail_pct":    trail_pct,
+            "profit_locked": False,
+            "imported_at":  time.time(),           # grace-period anchor (5s skip on import)
         }
 
     def update_premium_tsl_and_check(self, leg: str, pos_data: Dict[str, Any], live_ltp: float, regime: str = "CHOP") -> Tuple[bool, str]:
         """
-        Dynamic Premium-Based Trailing Stop Loss — evaluated every second on live tick data.
-        
-        For a short option:
-        - Price going DOWN = Profit. lowest_ltp updates when live_ltp < lowest_ltp.
-        - SL is always ABOVE the lowest price achieved.
-        - Trailing SL: current_sl = min(initial_sl, lowest_ltp * (1 + trail_pct))
-        - If profit >= 5% (lowest_ltp <= entry_price * 0.95), TSL is locked at or below entry price.
-        - If live_ltp >= current_sl: Stop Loss triggers immediately!
+        Called every second for every active short leg.
+
+        Logic:
+        1. Load lowest_ltp from sl_state (persisted across restarts).
+        2. If live_ltp < lowest_ltp → new low reached → update lowest_ltp immediately.
+        3. Recompute TSL from lowest_ltp.
+        4. If live_ltp >= current_sl → SL triggered → return (True, reason).
+        5. Save updated lowest_ltp back to sl_state (auto-persisted via _save_state).
+
+        Grace period:
+        - For 10 seconds after import/entry, we skip the trigger check so that a stale
+          avgprc (entry_price) that is already OTM doesn't fire an immediate exit.
+        - The lowest_ltp is STILL updated during grace so TSL starts calibrated.
         """
         entry_price = float(pos_data.get("entry_price", 0.0))
-        if entry_price <= 0.0:
+        if entry_price <= 0.0 or live_ltp <= 0.0:
             return False, ""
 
-        if live_ltp <= 0.0:
-            return False, ""
-
-        trail_pct = 0.05 if regime == "CHOP" else 0.07  # max 7%
+        trail_pct = 0.05 if regime == "CHOP" else 0.07
 
         sl_state = pos_data.get("premium_sl_state")
         if not sl_state or not isinstance(sl_state, dict):
-            sl_state = self.init_premium_sl(entry_price, live_ltp, regime)
+            # First time for this leg — initialise with live price
+            sl_state = self.init_premium_sl(entry_price, live_ltp, regime=regime)
             pos_data["premium_sl_state"] = sl_state
 
-        # Update lowest_ltp if live price made a new lower low (profit for short seller)
-        raw_lowest = float(sl_state.get("lowest_ltp", entry_price))
-        if live_ltp < raw_lowest:
-            raw_lowest = live_ltp
-        # Lowest can never exceed entry_price
-        lowest_ltp = min(raw_lowest, entry_price)
-        sl_state["lowest_ltp"] = round(lowest_ltp, 2)
+        # ── 1. Update lowest_ltp (ONLY ever decreases) ──────────────────────
+        stored_lowest = float(sl_state.get("lowest_ltp", entry_price))
+        # Sanity: lowest can never be higher than entry_price
+        stored_lowest = min(stored_lowest, entry_price)
+        if live_ltp < stored_lowest:
+            stored_lowest = live_ltp          # new all-time low — ratchet down
+        sl_state["lowest_ltp"] = round(stored_lowest, 2)
 
-        # Initial SL is entry_price + 5%/7%
-        initial_sl = round(entry_price * (1.0 + trail_pct), 2)
-        sl_state["initial_sl"] = initial_sl
+        # ── 2. Recalculate SL lines ──────────────────────────────────────────
+        initial_sl     = round(entry_price   * (1.0 + trail_pct), 2)
+        candidate_sl   = round(stored_lowest * (1.0 + trail_pct), 2)
 
-        # Dynamic Trailing SL based on the lowest price reached
-        candidate_sl = round(lowest_ltp * (1.0 + trail_pct), 2)
-        
-        # When position has generated >= 5% profit (price dropped below 95% of entry),
-        # ensure current_sl cannot exceed entry price (breakeven lock)
-        if lowest_ltp <= (entry_price * 0.95):
+        # Breakeven lock: once 5%+ profit locked, TSL cannot exceed entry price
+        if stored_lowest <= (entry_price * 0.95):
             candidate_sl = min(candidate_sl, entry_price)
             sl_state["profit_locked"] = True
 
-        # Current SL is the minimum of initial_sl and candidate_sl (ratchets down only)
         current_sl = min(initial_sl, candidate_sl)
-        sl_state["current_sl"] = current_sl
+        sl_state["initial_sl"]  = initial_sl
+        sl_state["current_sl"]  = current_sl
+        sl_state["trail_pct"]   = trail_pct
 
-        # Check trigger condition
+        # ── 3. Grace period (10 seconds after import) — skip trigger ────────
+        imported_at = float(sl_state.get("imported_at", 0.0))
+        if imported_at > 0.0 and (time.time() - imported_at) < 10.0:
+            return False, ""   # SL updated but NOT triggered yet
+
+        # ── 4. Trigger check ─────────────────────────────────────────────────
         if live_ltp >= current_sl:
-            loss_or_profit = "Loss" if live_ltp > entry_price else "Profit"
+            loss_or_profit = "Loss" if live_ltp > entry_price else "Profit-Lock"
             return True, (
-                f"⛔ Premium TSL Hit for {leg} ({loss_or_profit}) | Entry: ₹{entry_price:.2f}, "
-                f"Best Low: ₹{lowest_ltp:.2f}, TSL: ₹{current_sl:.2f}, Live LTP: ₹{live_ltp:.2f} "
-                f"(Regime: {regime}, Trail: {int(trail_pct*100)}%)"
+                f"⛔ Premium TSL Hit for {leg} ({loss_or_profit}) | "
+                f"Entry: ₹{entry_price:.2f}, BestLow: ₹{stored_lowest:.2f}, "
+                f"TSL: ₹{current_sl:.2f}, LTP: ₹{live_ltp:.2f} "
+                f"({regime}, Trail: {int(trail_pct*100)}%)"
             )
 
         return False, ""
@@ -629,8 +690,9 @@ class RiskManager:
     def check_portfolio_circuit_breaker(self, realized_pnl: float, unrealized_pnl: float):
         combined_mtm = realized_pnl + unrealized_pnl
         if combined_mtm <= self.circuit_breaker_loss_limit:
-            return True, f"🚨 PORTFOLIO CIRCUIT BREAKER HIT 🚨 Combined MTM breached limit. Shutting down!"
+            return True, "🚨 PORTFOLIO CIRCUIT BREAKER HIT 🚨 Combined MTM breached limit. Shutting down!"
         return False, ""
+
 
 
 # ==============================================================================
@@ -737,24 +799,45 @@ class ExecutionEngine:
     def _load_state(self):
         if not os.path.exists(self.state_file): return
         try:
-            with open(self.state_file, "r") as f: state = json.load(f)
-            if state.get("date") == str(get_ist_now().date()):
-                self.realized_pnl = float(state.get("realized_pnl", 0.0))
-                self.positions = state.get("positions", {})
-                self.cooldown_tracker = state.get("cooldown_tracker", self.cooldown_tracker)
-                saved_mode = state.get("mode", "WAIT_DATA")
-                now = get_ist_now()
-                market_closed = (now.hour > AUTO_SQUAREOFF_HOUR or (now.hour == AUTO_SQUAREOFF_HOUR and now.minute >= AUTO_SQUAREOFF_MINUTE))
-                if market_closed:
-                    self.mode = "SESSION_DONE"
-                else:
-                    self.mode = "RUNNING" if self.positions else "WAIT_DATA"
+            with open(self.state_file, "r") as f:
+                state = json.load(f)
+            # Use IST date consistently (server may be UTC — this fixes date mismatch)
+            today_ist = str(get_ist_now().date())
+            if state.get("date") != today_ist:
+                log_warn(f"State file date '{state.get('date')}' != today IST '{today_ist}' — ignoring stale state.")
+                return
+            self.realized_pnl    = float(state.get("realized_pnl", 0.0))
+            self.positions       = state.get("positions", {})
+            self.cooldown_tracker = state.get("cooldown_tracker", self.cooldown_tracker)
+            now = get_ist_now()
+            market_closed = (now.hour > AUTO_SQUAREOFF_HOUR or (now.hour == AUTO_SQUAREOFF_HOUR and now.minute >= AUTO_SQUAREOFF_MINUTE))
+            self.mode = "SESSION_DONE" if market_closed else ("RUNNING" if self.positions else "WAIT_DATA")
 
-                for leg, pos in self.positions.items():
-                    if pos.get("side") == "SELL":
-                        if "premium_sl_state" not in pos or not pos["premium_sl_state"]:
-                            pos["premium_sl_state"] = self.risk_manager.init_premium_sl(float(pos.get("entry_price", 0.0)), regime=self.current_indicators.get("regime", "CHOP"))
-        except: pass
+            # ── Restore / validate TSL state for each loaded SELL position ──
+            for leg, pos in self.positions.items():
+                if pos.get("side") != "SELL":
+                    continue
+                entry_p = float(pos.get("entry_price", 0.0))
+                sl_state = pos.get("premium_sl_state")
+                if not sl_state or not isinstance(sl_state, dict):
+                    # No SL state at all — create fresh, let grace period protect us
+                    pos["premium_sl_state"] = self.risk_manager.init_premium_sl(
+                        entry_p, regime=self.current_indicators.get("regime", "CHOP")
+                    )
+                else:
+                    # SL state exists — PRESERVE the lowest_ltp that was accumulated
+                    # before the restart. Only sanitize obvious corruptions.
+                    raw_lowest = float(sl_state.get("lowest_ltp", entry_p))
+                    if raw_lowest > entry_p or raw_lowest <= 0.0:
+                        raw_lowest = entry_p   # corrupt value — reset to entry
+                    sl_state["lowest_ltp"] = round(raw_lowest, 2)
+                    # Refresh imported_at so the 10-second grace period starts fresh
+                    sl_state["imported_at"] = time.time()
+                    pos["premium_sl_state"] = sl_state
+            log_info(f"State loaded: mode={self.mode}, positions={list(self.positions.keys())}, realized_pnl=₹{self.realized_pnl:,.2f}")
+        except Exception as e:
+            log_warn(f"_load_state error (continuing fresh): {e}")
+
 
     def _sync_positions_from_broker(self):
         """
@@ -880,23 +963,44 @@ class ExecutionEngine:
 
                 leg = preferred if preferred not in self.positions else fallback
 
+                # ---- Fetch live LTP for this imported position ----
+                # This is critical: without the live price, init_premium_sl
+                # uses avgprc as both entry and lowest, so TSL fires immediately
+                # if market has already moved against the position.
+                live_ltp_now = 0.0
+                try:
+                    if strike > 0:
+                        q_live = self.market_data.streamer.get_live_quote(strike, base)
+                        live_ltp_now = float(q_live.get("lp", 0.0))
+                    if live_ltp_now <= 0.0:
+                        # Fallback: direct API lookup by token
+                        q_live2 = self.broker.api.get_quotes(exchange='NFO', token=bdata.get('token', ''))
+                        if q_live2:
+                            live_ltp_now = float(q_live2.get('lp', q_live2.get('ltp', 0.0)))
+                except Exception:
+                    live_ltp_now = avgprc  # worst-case fallback
+
                 # ---- Build position dict ----
                 pos_info = {
-                    "strike":     strike,
-                    "tsym":       tsym,
-                    "base":       base,
-                    "side":       side,
-                    "qty":        qty,
+                    "strike":      strike,
+                    "tsym":        tsym,
+                    "base":        base,
+                    "side":        side,
+                    "qty":         qty,
                     "entry_price": avgprc,
-                    "entry_time": time.time(),
-                    "entry_spot": spot,
-                    "prd":        prd,
+                    "entry_time":  time.time(),
+                    "entry_spot":  spot,
+                    "prd":         prd,
                 }
                 if side == "SELL":
-                    pos_info["premium_sl_state"] = self.risk_manager.init_premium_sl(avgprc, regime=self.current_indicators.get("regime", "CHOP"))
+                    regime_now = self.current_indicators.get("regime", "CHOP")
+                    # Pass live_ltp so that lowest_ltp = min(avgprc, live_ltp)
+                    # This prevents TSL from firing immediately when live > avgprc
+                    sl_init = self.risk_manager.init_premium_sl(avgprc, live_ltp=live_ltp_now, regime=regime_now)
+                    pos_info["premium_sl_state"] = sl_init
 
                 self.positions[leg] = pos_info
-                log_info(f"Imported: {leg} ({side} {qty}x {tsym} strike={strike} base={base} @ ₹{avgprc:.2f})")
+                log_info(f"Imported: {leg} ({side} {qty}x {tsym} strike={strike} base={base} @ ₹{avgprc:.2f}, LiveLTP=₹{live_ltp_now:.2f})")
 
             # ---------------------------------------------------------------
             # Step 3: Set correct mode based on reconciled positions
@@ -1045,35 +1149,51 @@ class ExecutionEngine:
             pass
 
     def run(self):
+        global _EMERGENCY_STOP, _EXIT_IN_PROGRESS
         log_info("Starting V2 Pro Algorithmic State Machine...")
+        log_info("💡 TYPE 'zxc' + ENTER in this terminal at any time to EMERGENCY STOP and square off all positions.")
+
+        # Start background keyboard listener for emergency kill switch
+        kill_thread = threading.Thread(target=_start_kill_switch_listener, daemon=True)
+        kill_thread.start()
+
         # Sync with Flattrade live positions before entering the main loop.
-        # This prevents duplicate orders after a restart by importing what's
-        # already open in the broker and removing ghost positions from the state.
         self._sync_positions_from_broker()
 
         while True:
             try:
                 now = get_ist_now()
                 self._ltp_cache.clear()
-                
-                # Check Auto Square-off Time
+
+                # ── EMERGENCY STOP — highest priority ────────────────────────
+                if _EMERGENCY_STOP:
+                    log_alert("🛑 EMERGENCY STOP flag set. Squaring off ALL positions immediately...")
+                    _EXIT_IN_PROGRESS = True
+                    self._exit_all_positions(reason="EMERGENCY_STOP")
+                    self.mode = "EMERGENCY_STOPPED"
+                    self._save_state()
+                    log_alert("🛑 All positions closed. Bot has STOPPED. No more orders will be placed.")
+                    log_alert("🛑 To restart, fix the issue and run the bot again.")
+                    sys.exit(0)
+
+                # ── AUTO SQUARE-OFF at 3:25 PM ───────────────────────────────
                 if now.hour > AUTO_SQUAREOFF_HOUR or (now.hour == AUTO_SQUAREOFF_HOUR and now.minute >= AUTO_SQUAREOFF_MINUTE):
-                    log_alert("🕒 Auto Square-Off Time Reached. Liquidating all positions...")
+                    log_alert("🕒 3:25 PM Auto Square-Off. Liquidating all positions...")
+                    _EXIT_IN_PROGRESS = True
                     self._exit_all_positions(reason="SESSION_END")
                     self.mode = "SESSION_DONE"
                     self._save_state()
                     break
 
-                # 1. Pre-Market Sleep Loop
+                # ── PRE-MARKET SLEEP ─────────────────────────────────────────
                 if now.hour < 9 or (now.hour == 9 and now.minute < 15):
-                    print(f"[{_now_str()}] Pre-market. Sleeping until 09:15 AM to save API limits...", flush=True)
+                    print(f"[{_now_str()}] Pre-market. Sleeping until 09:15 AM...", flush=True)
                     time.sleep(60.0)
                     continue
-                    
+
                 spot, atm, is_new_1m_bar = self.market_data.fetch_live_tick()
 
-                # One-shot guard: treat is_new_1m_bar as True only ONCE per bar,
-                # not on every 1s tick within the same minute window.
+                # One-shot guard: is_new_1m_bar fires ONCE per bar, not every second
                 current_bar_key = self.market_data.last_completed_1m_key
                 if is_new_1m_bar and current_bar_key == self._processed_1m_bar:
                     is_new_1m_bar = False
@@ -1083,86 +1203,118 @@ class ExecutionEngine:
                 df_1m = self.market_data.get_1m_dataframe()
                 df_5m = self.market_data.get_5m_dataframe()
                 self.current_indicators = Indicators.evaluate_all(df_1m, df_5m)
-                
-                atr = self.current_indicators.get('atr', DEFAULT_ATR_5M)
+
+                atr    = self.current_indicators.get('atr', DEFAULT_ATR_5M)
                 regime = self.current_indicators.get('regime', 'CHOP')
-                trend = self.current_indicators.get('trend', 0)
-                adx = self.current_indicators.get('adx', 18.0)
+                trend  = self.current_indicators.get('trend', 0)
+                adx    = self.current_indicators.get('adx', 18.0)
                 _, dte_days = self.market_data.streamer.get_near_expiry_dte()
-                
+
                 unrealized = self._calculate_unrealized_pnl()
                 cb_triggered, cb_msg = self.risk_manager.check_portfolio_circuit_breaker(self.realized_pnl, unrealized)
                 if cb_triggered:
                     log_alert(cb_msg)
+                    _EXIT_IN_PROGRESS = True
                     self._exit_all_positions(reason="CIRCUIT_BREAKER_HALT")
                     sys.exit(0)
 
+                # ── WAIT_DATA: enter new strangle ────────────────────────────
                 if self.mode == "WAIT_DATA":
                     if now.hour > MARKET_START_HOUR or (now.hour == MARKET_START_HOUR and now.minute >= MARKET_START_MINUTE):
-                        if regime == "TRANSITION":
-                            log_info(f"09:18 AM reached but ADX {adx:.1f} is in the TRANSITION band — holding entry.")
+                        # Re-entry cooldown: minimum REENTRY_COOLDOWN_SEC seconds after any exit
+                        secs_since_last_exit = time.time() - self._last_whipsaw_time
+                        if secs_since_last_exit < REENTRY_COOLDOWN_SEC:
+                            remaining = int(REENTRY_COOLDOWN_SEC - secs_since_last_exit)
+                            print(f"[{_now_str()}] Re-entry cooldown: {remaining}s remaining...", flush=True)
+                        elif regime == "TRANSITION":
+                            log_info(f"ADX {adx:.1f} in TRANSITION band — holding entry.")
                         else:
-                            log_info(f"Market Ready. Entering Strangle (Regime: {regime}, KAMA 1m Trend: {trend})...")
+                            log_info(f"Entering Strangle (Regime: {regime}, ATR: {atr:.1f}, Trend: {trend})...")
                             hedge_width = HEDGE_WIDTH_PTS
-                            if "CE_HEDGE" not in self.positions: self._enter_leg("CE_HEDGE", atm + hedge_width, "BUY", spot, atr, regime=regime)
-                            if "PE_HEDGE" not in self.positions: self._enter_leg("PE_HEDGE", atm - hedge_width, "BUY", spot, atr, regime=regime)
+                            if "CE_HEDGE" not in self.positions:
+                                self._enter_leg("CE_HEDGE", atm + hedge_width, "BUY", spot, atr, regime=regime)
+                            if "PE_HEDGE" not in self.positions:
+                                self._enter_leg("PE_HEDGE", atm - hedge_width, "BUY", spot, atr, regime=regime)
                             ce_strike, pe_strike = self.calculate_strangle_strikes(atm, atr, regime, dte_days=dte_days, trend=trend, adx=adx)
-                            if "CE" not in self.positions: self._enter_leg("CE", ce_strike, "SELL", spot, atr, regime=regime)
-                            if "PE" not in self.positions: self._enter_leg("PE", pe_strike, "SELL", spot, atr, regime=regime)
+                            if "CE" not in self.positions:
+                                self._enter_leg("CE", ce_strike, "SELL", spot, atr, regime=regime)
+                            if "PE" not in self.positions:
+                                self._enter_leg("PE", pe_strike, "SELL", spot, atr, regime=regime)
                             self.mode = "RUNNING"
                             self._save_state()
 
+                # ── RUNNING: monitor positions, check TSL ────────────────────
                 elif self.mode in ("RUNNING", "CHOP_MODE"):
                     if not self.positions:
                         self.mode = "WAIT_DATA"
+                        self._save_state()
                         continue
-                    
+
+                    # If only hedges remain (no CE/PE short legs), re-enter core legs
                     if "CE" not in self.positions and "PE" not in self.positions:
-                        log_info("Core short legs (CE/PE) are missing. Reverting to WAIT_DATA to re-enter strangle.")
-                        self.mode = "WAIT_DATA"
-                        continue
-
-                    # Dynamic Premium-Based Trailing SL Check — evaluated every second on live tick data
-                    whipsaw_triggered = False
-                    whipsaw_leg = ""
-                    whipsaw_reason = ""
-                    for leg in list(self.positions.keys()):
-                        pos = self.positions.get(leg)
-                        if pos and pos.get("side") == "SELL":
-                            ltp = self._get_ltp(pos.get("strike", 0), pos.get("base", "CE"), tsym=pos.get("tsym", ""))
-                            pos["live_ltp"] = ltp
-                            is_stopped, reason = self.risk_manager.update_premium_tsl_and_check(leg, pos, ltp, regime=regime)
-                            if is_stopped:
-                                whipsaw_triggered = True
-                                whipsaw_leg = leg
-                                whipsaw_reason = reason
-                                break
-
-                    if whipsaw_triggered:
-                        log_alert(whipsaw_reason)
-                        log_alert(f"⚠️ WHIPSAW DETECTED on {whipsaw_leg} — Closing BOTH short legs to protect capital!")
-                        self._exit_all_positions(reason="WHIPSAW_DUAL_LEG_EXIT")
-                        self._last_whipsaw_time = time.time()
+                        log_info("Core short legs (CE/PE) missing. Reverting to WAIT_DATA to re-enter.")
                         self.mode = "WAIT_DATA"
                         self._save_state()
+                        continue
 
-                # Write live dashboard snapshot
+                    # Skip TSL check if a global exit is already in progress
+                    if _EXIT_IN_PROGRESS:
+                        pass
+                    else:
+                        # Check every SELL leg's premium TSL every second
+                        whipsaw_triggered = False
+                        whipsaw_leg       = ""
+                        whipsaw_reason    = ""
+                        for leg in list(self.positions.keys()):
+                            pos = self.positions.get(leg)
+                            if not pos or pos.get("side") != "SELL":
+                                continue
+                            ltp = self._get_ltp(pos.get("strike", 0), pos.get("base", "CE"), tsym=pos.get("tsym", ""))
+                            pos["live_ltp"] = ltp
+                            # lowest_ltp is updated inside this call and auto-persisted
+                            is_stopped, reason = self.risk_manager.update_premium_tsl_and_check(leg, pos, ltp, regime=regime)
+                            if is_stopped and not whipsaw_triggered:
+                                whipsaw_triggered = True
+                                whipsaw_leg       = leg
+                                whipsaw_reason    = reason
+
+                        if whipsaw_triggered:
+                            _EXIT_IN_PROGRESS = True
+                            log_alert(whipsaw_reason)
+                            log_alert(f"⚠️ TSL HIT on {whipsaw_leg} — Closing ALL positions now!")
+                            self._exit_all_positions(reason="TSL_EXIT")
+                            self._last_whipsaw_time = time.time()
+                            self.mode = "WAIT_DATA"
+                            self._save_state()
+                            _EXIT_IN_PROGRESS = False
+
+                # ── Save lowest_ltp to disk every tick ───────────────────────
+                # (positions dict is already updated in-place by update_premium_tsl_and_check)
+                self._save_state()
+
+                # Write dashboard snapshot
                 self._write_snapshot(spot, atm, atr, regime, trend, adx, dte_days, unrealized)
 
-                # CLI Print
-                print(f"[{_now_str()}] Spot: {spot:.2f} | ADX: {adx:.1f} ({regime}) | KAMA 1m Trend: {trend} | Mode: {self.mode} | P&L: ₹{self.realized_pnl:,.0f}", flush=True)
-                
+                # CLI heartbeat
+                total_pnl = self.realized_pnl + unrealized
+                print(
+                    f"[{_now_str()}] Spot:{spot:.0f} | ADX:{adx:.1f}({regime}) | Trend:{trend} | "
+                    f"Mode:{self.mode} | R:₹{self.realized_pnl:,.0f} U:₹{unrealized:,.0f} T:₹{total_pnl:,.0f}",
+                    flush=True
+                )
+
                 time.sleep(1.0)
 
             except KeyboardInterrupt:
-                log_alert(f"Algo manually stopped. Realized PnL: ₹{self.realized_pnl:,.2f}")
+                log_alert(f"Ctrl+C pressed. Realized PnL: ₹{self.realized_pnl:,.2f}")
+                log_alert("Positions remain OPEN in broker. Restart bot to resume monitoring.")
                 break
             except Exception as e:
                 log_warn(f"Unhandled exception: {e}")
                 traceback.print_exc()
                 time.sleep(5.0)
 
+
 if __name__ == "__main__":
     engine = ExecutionEngine()
     engine.run()
-
