@@ -2,7 +2,7 @@ import os
 import sys
 import time
 import math
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 
 try:
@@ -256,17 +256,20 @@ class NaturalGasBot:
 
         while True:
             try:
-                now = datetime.now()
+                IST = timezone(timedelta(hours=5, minutes=30))
+                now = datetime.now(IST)
                 if now.weekday() >= 5:
                     print("Weekend. Exit.")
                     self._close_all("WEEKEND")
                     break
 
-                if now.hour > 11 or (now.hour == 11 and now.minute >= 24):
-                    print("[AUTO] Exit time reached. Closing all positions.")
+                # Auto-square off at 11:24 PM (23:24 IST)
+                if now.hour > 23 or (now.hour == 23 and now.minute >= 24):
+                    print("[AUTO] Exit time reached (11:24 PM IST). Closing all positions.")
                     self._close_all("SESSION_END")
                     break
 
+                # Pre-market wait until 9:15 AM
                 if now.hour < 9 or (now.hour == 9 and now.minute < 15):
                     time.sleep(30)
                     continue
