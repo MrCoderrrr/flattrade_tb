@@ -131,9 +131,11 @@ class FlattradeBroker:
                 pass
         
         # Marketable limit order with guaranteed 0.05 tick multiple
-        # NSE blocks price_type="MKT" on options, so we must use LMT with adaptive buffer
+        # NSE blocks price_type="MKT" on options, so we must use LMT with adaptive buffer.
+        # Note: NSE has strict Execution Range bounds (usually ±5% of theoretical price).
+        # We use a 3% buffer to ensure the order is marketable but safely within the exchange limit.
         if price > 0.0:
-            buffer_pts = max(0.10, min(5.0, price * 0.08)) # 8% buffer, max 5 pts, min 10 paise
+            buffer_pts = max(0.10, min(5.0, price * 0.03)) # 3% buffer, max 5 pts, min 10 paise
             if action == 'B':
                 raw_lmt = price + buffer_pts
                 lmt_price = round(math.ceil(raw_lmt / 0.05) * 0.05, 2)
