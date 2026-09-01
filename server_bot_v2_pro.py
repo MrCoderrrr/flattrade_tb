@@ -191,10 +191,10 @@ db = DBManager()
 # ║                     STRATEGY CONFIGURATION (V2)                          ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-CAPITAL                 = 10_00_000   
+CAPITAL                 = 2_00_000  
 LOT_SIZE                = 65          
 CAPITAL_BUFFER          = 0.95        
-MARGIN_IRON_CONDOR      = 95_000      
+MARGIN_IRON_CONDOR      = 1_25_000     
 PORTFOLIO_CIRCUIT_PCT   = 1.8         
 
 KAMA_PERIOD             = 13          
