@@ -53,6 +53,10 @@ from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
 import pandas as pd
+try:
+    import yfinance as yf
+except ImportError:
+    yf = None
 from colorama import init, Fore, Style
 
 # Force IPv4 for reliable API / Broker connections
@@ -464,53 +468,83 @@ class MarketData:
             log_warn(f"MarketData: Error loading cache: {e}")
 
     def _seed_history_if_needed(self):
-        """Seeds historical 5-minute bars directly from Flattrade API (Token 26000)."""
+        """
+        Seeds 50 historical 5-minute bars for instant indicator readiness.
+        Primary: Flattrade API timeseries (Token 26000).
+        Fallback: yfinance (^NSEI) if Flattrade timeseries is empty or unavailable.
+        """
         if len(self.bars_5m) >= 30:
             return
-        
+
+        seeded_5m = []
+
+        # 1. Primary: Seed from Flattrade API
         api = getattr(self.streamer, "api", global_api)
-        if not api or not hasattr(api, "get_time_price_series"):
-            log_warn("MarketData: Flattrade API not available for historical seeding. Warming up from live 1m Flattrade feed.")
-            return
+        if api and hasattr(api, "get_time_price_series"):
+            try:
+                log_info("MarketData: Attempting historical 5-min seeding from Flattrade (Token 26000)...")
+                end_time = get_ist_now()
+                start_time = end_time - timedelta(days=5)
 
-        try:
-            log_info("MarketData: Seeding historical 5-min bars from Flattrade (Token 26000) for instant indicator readiness...")
-            end_time = get_ist_now()
-            start_time = end_time - timedelta(days=5)
+                res = api.get_time_price_series(
+                    exchange='NSE',
+                    token='26000',
+                    starttime=start_time.timestamp(),
+                    endtime=end_time.timestamp(),
+                    interval=5
+                )
 
-            res = api.get_time_price_series(
-                exchange='NSE',
-                token='26000',
-                starttime=start_time.timestamp(),
-                endtime=end_time.timestamp(),
-                interval=5
-            )
+                if res and isinstance(res, list) and len(res) > 0:
+                    for row in res:
+                        try:
+                            ts = datetime.strptime(row['time'], "%d-%m-%Y %H:%M:%S")
+                            seeded_5m.append({
+                                'timestamp': ts,
+                                'open': float(row['into']),
+                                'high': float(row['inth']),
+                                'low': float(row['intl']),
+                                'close': float(row['intc'])
+                            })
+                        except Exception:
+                            continue
 
-            if res and isinstance(res, list) and len(res) > 0:
-                seeded_5m = []
-                for row in res:
-                    try:
-                        ts = datetime.strptime(row['time'], "%d-%m-%Y %H:%M:%S")
+                    if seeded_5m:
+                        log_info(f"MarketData: Successfully fetched {len(seeded_5m)} 5m bars from Flattrade.")
+                else:
+                    log_warn("MarketData: Flattrade get_time_price_series returned empty.")
+            except Exception as e:
+                log_warn(f"MarketData: Flattrade history seeding skipped ({e}).")
+
+        # 2. Fallback: Seed from yfinance if Flattrade returned fewer than 30 bars
+        if len(seeded_5m) < 30 and yf is not None:
+            try:
+                log_info("MarketData: Using yfinance fallback for 50 historical 5-min bars (^NSEI)...")
+                df = yf.download("^NSEI", period="5d", interval="5m", progress=False, timeout=8)
+                if df is not None and not df.empty:
+                    if isinstance(df.columns, pd.MultiIndex):
+                        df.columns = df.columns.get_level_values(0)
+                    for idx, row in df.iterrows():
+                        ts = idx.to_pydatetime() if hasattr(idx, "to_pydatetime") else idx
                         seeded_5m.append({
-                            'timestamp': ts,
-                            'open': float(row['into']),
-                            'high': float(row['inth']),
-                            'low': float(row['intl']),
-                            'close': float(row['intc'])
+                            "timestamp": ts,
+                            "open": float(row["Open"]),
+                            "high": float(row["High"]),
+                            "low": float(row["Low"]),
+                            "close": float(row["Close"])
                         })
-                    except Exception:
-                        continue
+                    if seeded_5m:
+                        log_info(f"MarketData: Successfully seeded {len(seeded_5m)} 5m bars from yfinance.")
+            except Exception as e:
+                log_warn(f"MarketData: yfinance history seeding fallback skipped ({e}).")
 
-                if seeded_5m:
-                    seeded_5m.sort(key=lambda x: x['timestamp'])
-                    today = get_ist_now().date()
-                    prior_bars = [b for b in seeded_5m if b['timestamp'].date() < today][-50:]
-                    self.bars_5m = prior_bars + self.bars_5m
-                    log_info(f"MarketData: Successfully seeded {len(prior_bars)} 5m bars from Flattrade.")
-            else:
-                log_warn("MarketData: Flattrade get_time_price_series returned empty.")
-        except Exception as e:
-            log_warn(f"MarketData: Flattrade history seeding skipped ({e}). Indicators will warm up from live 1m Flattrade feed.")
+        if seeded_5m:
+            seeded_5m.sort(key=lambda x: x['timestamp'])
+            today = get_ist_now().date()
+            prior_bars = [b for b in seeded_5m if b['timestamp'].date() < today][-50:]
+            self.bars_5m = prior_bars + self.bars_5m
+            log_info(f"MarketData: Loaded {len(prior_bars)} historical 5m bars. Total 5m bars: {len(self.bars_5m)}. KAMA ready immediately!")
+        else:
+            log_warn("MarketData: History seeding could not load 5m bars. Indicators will warm up from live 1m Flattrade feed.")
 
     def _rebuild_5m_candles(self):
         if not self.bars_1m:
