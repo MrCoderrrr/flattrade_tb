@@ -134,7 +134,7 @@ except ImportError:
 
     class DBManager:
         def record_trade(self, *args, **kwargs): pass
-        def get_strategy_pnl_summary(self, *args, **kwargs): return {"today_pnl": 0.0, "mtd_pnl": 0.0, "ytd_pnl": 0.0, "current_capital": 1000000.0}
+        def get_strategy_pnl_summary(self, *args, **kwargs): return {"today_pnl": 0.0, "mtd_pnl": 0.0, "ytd_pnl": 0.0, "current_capital": kwargs.get("base_capital", 150000.0)}
     db = DBManager()
 
 
