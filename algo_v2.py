@@ -376,7 +376,9 @@ SPOT_SL_TRAIL_RATIO_STRONG = 0.72     # Stronger trail once trade is in meaningf
 SPOT_SL_TRAIL_RATIO_DEEP   = 0.85     # Aggressive profit protection for extended favorable moves
 SPOT_SL_BREAKEVEN_LOCK_ATR = 1.10     # Once favorable move exceeds this ATR multiple, lock at/near breakeven
 SPOT_SL_BREAKEVEN_BUFFER_PTS = 5.0    # Small buffer beyond entry to avoid scratch exits
-PREM_SL_DEBOUNCE_BARS   = 1           # Require 1 1-min close past Premium SL to exit (Debounce = 1)
+PREM_SL_DEBOUNCE_BARS   = 1
+TSL_STRANGLE_PCT        = 0.05
+TSL_TREND_ORPHAN_PCT    = 0.08
 
 # Anti-Whipsaw Re-entry Cooldown: 3-MIN COOLDOWN REMOVED
 COOLDOWN_MINUTES        = 0           # 3-minute cooldown removed as requested
@@ -1700,7 +1702,7 @@ class ExecutionEngine:
             msg = f"  {c_yellow}No open positions. State: {self.mode}{res}"
             print(f"{V}{msg}{' ' * max(0, W - ansi_len(msg))}{V}")
         else:
-            hdr = f"  {'LEG':<10} {VS} {'STRIKE':>7} {VS} {'SIDE':<5} {VS} {'QTY':>3} {VS} {'ENTRY':>7} {VS} {'LTP':>7} {VS} {'ENTRY SPOT':>10} {VS} {'SPOT SL':>10} {VS} {'DEBOUNCE':>8} {VS} {'PNL':>10}  "
+            hdr = f"  {'LEG':<10} {VS} {'STRIKE':>7} {VS} {'SIDE':<5} {VS} {'QTY':>3} {VS} {'ENTRY':>7} {VS} {'LTP':>7} {VS} {'BEST PREM':>10} {VS} {'PREM SL':>10} {VS} {'DEBOUNCE':>8} {VS} {'PNL':>10}  "
             print(f"{V}{hdr}{' ' * max(0, W - ansi_len(hdr))}{V}")
             print(MID_S)
 
@@ -1719,10 +1721,10 @@ class ExecutionEngine:
                 pnl_col = c_green if pnl >= 0 else c_red
                 sign = "+" if pnl >= 0 else ""
                 
-                sl_state = pos.get("spot_sl_state")
+                sl_state = pos.get("premium_sl_state")
                 if sl_state and is_short:
-                    entry_spot_str = f"{sl_state['entry_spot']:.1f}"
-                    spot_sl_str = f"{sl_state['current_sl']:.1f}"
+                    entry_spot_str = f"{sl_state['best_premium']:.2f}"
+                    spot_sl_str = f"{sl_state['current_sl']:.2f}"
                     debounce_str = f"{sl_state.get('breach_count', 0)}/{PREM_SL_DEBOUNCE_BARS}"
                 else:
                     entry_spot_str = "—"
