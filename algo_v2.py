@@ -377,8 +377,8 @@ SPOT_SL_TRAIL_RATIO_DEEP   = 0.85     # Aggressive profit protection for extende
 SPOT_SL_BREAKEVEN_LOCK_ATR = 1.10     # Once favorable move exceeds this ATR multiple, lock at/near breakeven
 SPOT_SL_BREAKEVEN_BUFFER_PTS = 5.0    # Small buffer beyond entry to avoid scratch exits
 PREM_SL_DEBOUNCE_BARS   = 1
-TSL_STRANGLE_PCT        = 0.05
-TSL_TREND_ORPHAN_PCT    = 0.08
+TSL_STRANGLE_PCT        = 0.08
+TSL_TREND_ORPHAN_PCT    = 0.10
 
 # Anti-Whipsaw Re-entry Cooldown: 3-MIN COOLDOWN REMOVED
 COOLDOWN_MINUTES        = 0           # 3-minute cooldown removed as requested
@@ -799,7 +799,7 @@ class RiskManager:
         return {
             "entry_premium": round(entry_premium, 2),
             "best_premium": round(entry_premium, 2),
-            "current_sl": round(entry_premium * 1.05, 2),
+            "current_sl": round(entry_premium * 1.08, 2),
             "breach_count": 0
         }
 
@@ -1682,7 +1682,7 @@ class ExecutionEngine:
         
         print()
         print(TOP)
-        title_left = f"  {c_cyan}ADAPTIVE KAMA-ADX HEDGED STRANGLE (V2.0){res}  {c_dim}│{res}  {c_yellow}PREM-TSL (5%/8%) ACTIVE{res}  {c_dim}│{res}  {c_green}TYPE 'zxc' TO STOP{res}"
+        title_left = f"  {c_cyan}ADAPTIVE KAMA-ADX HEDGED STRANGLE (V2.0){res}  {c_dim}│{res}  {c_yellow}PREM-TSL (8%/10%) ACTIVE{res}  {c_dim}│{res}  {c_green}TYPE 'zxc' TO STOP{res}"
         title_right = f"{c_dim}{_now_str()}{res}  "
         pad = max(0, W - ansi_len(title_left) - ansi_len(title_right))
         print(f"{V}{title_left}{' ' * pad}{title_right}{V}")
