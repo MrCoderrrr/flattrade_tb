@@ -374,7 +374,7 @@ SPOT_SL_TRAIL_RATIO_STRONG = 0.72     # Stronger trail once trade is in meaningf
 SPOT_SL_TRAIL_RATIO_DEEP   = 0.85     # Aggressive profit protection for extended favorable moves
 SPOT_SL_BREAKEVEN_LOCK_ATR = 1.10     # Once favorable move exceeds this ATR multiple, lock at/near breakeven
 SPOT_SL_BREAKEVEN_BUFFER_PTS = 5.0    # Small buffer beyond entry to avoid scratch exits
-SPOT_SL_DEBOUNCE_BARS   = 2           # Require 2 consecutive 1-min closes past Spot SL to exit
+SPOT_SL_DEBOUNCE_BARS   = 1           # Require 1 1-min close past Spot SL to exit (Debounce = 1)
 
 # Anti-Whipsaw Re-entry Cooldown: 3-MIN COOLDOWN REMOVED
 COOLDOWN_MINUTES        = 0           # 3-minute cooldown removed as requested
@@ -894,7 +894,12 @@ class ExecutionEngine:
 
         self.market_data = MarketData(self.cache_file)
         self.risk_manager = RiskManager(capital=CAPITAL)
-        self.broker = FlattradeBroker(paper_trading=True)
+        is_live = (global_api is not None)
+        self.broker = FlattradeBroker(paper_trading=not is_live)
+        if is_live:
+            log_info("🚀 LIVE TRADING VIA FLATTRADE API: All order executions will route directly to Flattrade!")
+        else:
+            log_warn("⚠️ Flattrade API not connected. Running in paper trading fallback.")
         
         self.mode = "WAIT_DATA"
         self.session_em_1sd = 0.0
@@ -1837,7 +1842,7 @@ def prompt_user_variables():
         gate = ask("ADX Regime Gate", 20.0, float)
         ADX_CHOP_THRESHOLD = gate
         ADX_TREND_THRESHOLD = gate
-        SPOT_SL_DEBOUNCE_BARS = ask("Debounce Bars", 2, int)
+        SPOT_SL_DEBOUNCE_BARS = ask("Debounce Bars", 1, int)
         width = ask("Strangle Width (pts)", 0, int)
         BASE_MIN_WIDTH_PTS = width
         BASE_MAX_WIDTH_PTS = width
