@@ -333,7 +333,7 @@ class FlattradeBroker:
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 # Capital & Allocation
-CAPITAL                 = 10_00_000   # Total Capital: ₹10 Lakhs
+CAPITAL                 = 1_50_000    # Total Capital: ₹1.5 Lakhs
 LOT_SIZE                = 65          # NIFTY Lot size (revised Jan 2026)
 CAPITAL_BUFFER          = 0.95        # Usable capital buffer (95%)
 MARGIN_IRON_CONDOR      = 95_000      # Margin required for 4-leg Iron Condor per lot
@@ -1838,7 +1838,7 @@ def prompt_user_variables():
                 print(f"    {Fore.RED}Invalid input. Using default: {default}{Style.RESET_ALL}")
                 return default
 
-        CAPITAL = ask("Initial Capital (₹)", 1000000.0, float)
+        CAPITAL = ask("Initial Capital (₹)", 150000.0, float)
         KAMA_PERIOD = ask("KAMA Lookback", 13, int)
         KAMA_FAST_EMA = ask("KAMA Fast EMA", 2, int)
         KAMA_SLOW_EMA = ask("KAMA Slow EMA", 30, int)
