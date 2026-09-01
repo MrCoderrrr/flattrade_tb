@@ -1334,34 +1334,40 @@ class ExecutionEngine:
     def _verify_order_status(self, ord_id: str, tsym: str, side: str, qty: int) -> Tuple[bool, str]:
         """
         Deeply verifies order acceptance against broker OMS & Exchange Order Book.
-        Guarantees that if an order succeeded, we NEVER duplicate it!
+        Polls for up to 2 seconds to ensure RMS margin rejections are caught.
         Returns: (is_confirmed_placed: bool, reason_string: str)
         """
-        # Look for API provider on broker or broker itself
         api = getattr(self.broker, "api", self.broker)
+        is_live = not getattr(self.broker, "paper_trading", False)
+        
+        for check_attempt in range(4):
+            if is_live:
+                time.sleep(0.5)
+                
+            # Method 1: Check single order history
+            if hasattr(api, "single_order_history"):
+                try:
+                    history = api.single_order_history(orderno=str(ord_id))
+                    if history and isinstance(history, list) and len(history) > 0:
+                        latest = history[-1]
+                        status = str(latest.get("status", "")).upper()
+                        
+                        if status in ("REJECTED", "CANCELLED"):
+                            rej = latest.get("rejreason", latest.get("emsg", "Order Rejected by RMS/Exchange"))
+                            return False, f"REJECTED: {rej} (OrderID={ord_id})"
+                            
+                        if status in ("COMPLETE", "FILLED"):
+                            return True, f"COMPLETE (OrderID={ord_id})"
+                            
+                        if status in ("OPEN", "PENDING", "TRIGGER_PENDING"):
+                            # Give RMS time to reject it; only return True if it survives all checks
+                            if check_attempt == 3 or not is_live:
+                                return True, f"OPEN on exchange (OrderID={ord_id})"
+                            continue # Check again
+                except Exception as e:
+                    log_warn(f"Error querying single_order_history: {e}")
 
-        # Wait 300ms for exchange RMS acknowledgment if real broker
-        if not getattr(self.broker, "paper_trading", False):
-            time.sleep(0.3)
-
-        # Method 1: Check single order history
-        if hasattr(api, "single_order_history"):
-            try:
-                history = api.single_order_history(orderno=str(ord_id))
-                if history and isinstance(history, list) and len(history) > 0:
-                    latest = history[-1]
-                    status = str(latest.get("status", "")).upper()
-                    if status in ("COMPLETE", "FILLED"):
-                        return True, f"COMPLETE (OrderID={ord_id})"
-                    elif status in ("OPEN", "PENDING", "TRIGGER_PENDING"):
-                        return True, f"OPEN on exchange (OrderID={ord_id})"
-                    elif status in ("REJECTED", "CANCELLED"):
-                        rej = latest.get("rejreason", latest.get("emsg", "Order Rejected by RMS/Exchange"))
-                        return False, f"REJECTED: {rej} (OrderID={ord_id})"
-            except Exception as e:
-                log_warn(f"Error querying single_order_history: {e}")
-
-        # Method 2: Check full order book
+        # Method 2: Fallback to full order book
         if hasattr(api, "get_order_book"):
             try:
                 book = api.get_order_book()
