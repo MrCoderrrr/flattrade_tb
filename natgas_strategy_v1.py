@@ -340,7 +340,8 @@ class RiskManager:
             "lowest_premium_seen": lowest_seen,
             "is_armed": armed,
             "active_stop": active_stop,
-            "breach_count": current_state.get("breach_count", 0)
+            "breach_count": current_state.get("breach_count", 0),
+            "is_reentry": is_reentry
         }
 
 
@@ -710,7 +711,7 @@ class ExecutionEngine:
                         ltp = self._get_ltp(p["strike"], leg)
                         
                         tsl_state = p["tsl_state"]
-                        new_tsl = self.risk_manager.update_premium_tsl(tsl_state, ltp, tsl_state["is_reentry"])
+                        new_tsl = self.risk_manager.update_premium_tsl(tsl_state, ltp, tsl_state.get("is_reentry", False))
                         
                         if ltp >= new_tsl["active_stop"]:
                             new_tsl["breach_count"] += 1
