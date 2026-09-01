@@ -184,10 +184,11 @@ class NSEATMStreamer:
         self._last_spot: float = 24000.0
         self._last_atm: int = 24000
 
-    def get_spot_and_atm(self) -> Tuple[float, int]:
+    def get_spot_and_atm(self) -> Tuple[float, int, bool]:
         """
         Fetches live NIFTY 50 Spot price directly from Flattrade every minute (Token 26000 on NSE).
         No dependency on yfinance.
+        Returns: (spot, atm, is_stale)
         """
         if self.api and hasattr(self.api, "get_quotes"):
             try:
@@ -198,10 +199,10 @@ class NSEATMStreamer:
                     if spot > 0:
                         self._last_spot = spot
                         self._last_atm = int(round(spot / 50.0) * 50)
-                        return self._last_spot, self._last_atm
+                        return self._last_spot, self._last_atm, False
             except Exception as e:
                 log_warn(f"Flattrade get_quotes error for Spot: {e}")
-        return self._last_spot, self._last_atm
+        return self._last_spot, self._last_atm, True
 
     def get_live_quote(self, strike: int, option_type: str) -> Dict[str, Any]:
         """Fetches live option quote directly from Flattrade with zero-price fallbacks."""
@@ -294,7 +295,7 @@ class FlattradeBroker:
         self.order_counter = 1000
         self.simulated_order_book: Dict[str, Dict[str, Any]] = {}
 
-    def place_option_order(self, symbol: str, transaction_type: str, quantity: int, price: float = 0.0, product_type: str = "M") -> Dict[str, Any]:
+    def place_option_order(self, symbol: str, transaction_type: str, quantity: int, price: float = 0.0, product_type: str = "M", order_type: str = "MKT", remarks: str = "") -> Dict[str, Any]:
         if self.paper_trading or not self.api:
             self.order_counter += 1
             ord_id = f"ORD_{int(time.time())}_{self.order_counter}"
@@ -335,11 +336,11 @@ class FlattradeBroker:
                 tradingsymbol=str(symbol),
                 quantity=str(quantity),
                 discloseqty="0",
-                price_type=prctyp,
+                price_type=order_type,
                 price=prc_str,
                 trigger_price="0",
                 retention="DAY",
-                remarks="API_V2_PRO"
+                remarks=remarks or "API_V2_PRO"
             )
             return res
         except Exception as e:
@@ -443,15 +444,7 @@ EXPIRY_NEAR_DAYS            = 2.0     # Aggressive compression starts around 2 D
 EXPIRY_NEAR_BONUS           = 0.42    # Extra curvature inside the last 2 days
 
 # Spot-Based Trailing Stop Loss
-SPOT_SL_ATR_MULT        = 0.90        # Initial Premium SL distance = 0.9 * ATR from entry spot
-SPOT_SL_TRAIL_RATIO     = 0.55        # Base spot trail ratio (55.0%)
-SPOT_SL_TRAIL_RATIO_STRONG = 0.72     # Stronger trail once trade is in meaningful profit
-SPOT_SL_TRAIL_RATIO_DEEP   = 0.85     # Aggressive profit protection for extended favorable moves
-SPOT_SL_BREAKEVEN_LOCK_ATR = 1.10     # Once favorable move exceeds this ATR multiple, lock at/near breakeven
-SPOT_SL_BREAKEVEN_BUFFER_PTS = 5.0    # Small buffer beyond entry to avoid scratch exits
 PREM_SL_DEBOUNCE_BARS   = 1
-TSL_STRANGLE_PCT        = 0.08
-TSL_TREND_ORPHAN_PCT    = 0.10
 
 # Anti-Whipsaw Re-entry Cooldown: 3-MIN COOLDOWN REMOVED
 COOLDOWN_MINUTES        = 0           # 3-minute cooldown removed as requested
@@ -652,8 +645,8 @@ class MarketData:
                 "close": float(row["close"]),
             })
 
-    def fetch_live_tick(self) -> Tuple[float, int, bool]:
-        spot, atm = self.streamer.get_spot_and_atm()
+    def fetch_live_tick(self) -> Tuple[float, int, bool, bool]:
+        spot, atm, is_stale = self.streamer.get_spot_and_atm()
         self.latest_spot = spot
         self.latest_atm = atm
         
@@ -679,7 +672,7 @@ class MarketData:
             
             self.last_completed_1m_key = current_min_key
             
-        return spot, atm, is_new_1m_bar
+        return spot, atm, is_new_1m_bar, is_stale
 
     def get_1m_dataframe(self) -> pd.DataFrame:
         if not self.bars_1m:
@@ -860,12 +853,19 @@ class Indicators:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class RiskManager:
-    def __init__(self):
-        self.portfolio_circuit_pct = PORTFOLIO_CIRCUIT_PCT
+    def __init__(self, capital=CAPITAL):
+        self.capital = capital
+        self.circuit_breaker_loss_limit = -1 * capital * (PORTFOLIO_CIRCUIT_PCT / 100.0)
         
-    def init_dual_sl(self, leg: str, entry_spot: float, entry_premium: float, atr: float, iv: float, dte_days: float) -> dict:
+    def check_portfolio_circuit_breaker(self, realized_pnl: float, unrealized_pnl: float) -> tuple:
+        total_pnl = realized_pnl + unrealized_pnl
+        if total_pnl <= self.circuit_breaker_loss_limit:
+            return True, f"Global Circuit Breaker Hit! PnL {total_pnl:.2f} <= Limit {self.circuit_breaker_loss_limit:.2f}"
+        return False, ""
+
+    def init_dual_sl(self, leg: str, entry_spot: float, strike: float, entry_premium: float, atr: float, iv: float, dte_days: float) -> dict:
         is_call = "CE" in leg
-        delta = bs_delta(entry_spot, entry_spot, dte_days, iv, is_call)
+        delta = bs_delta(entry_spot, strike, dte_days, iv, is_call)
         return {
             "entry_spot": entry_spot,
             "entry_premium": entry_premium,
@@ -944,6 +944,11 @@ class ExecutionEngine:
             "CE": {"stopped_time": 0.0, "stopped_spot": 0.0, "active": False},
             "PE": {"stopped_time": 0.0, "stopped_spot": 0.0, "active": False}
         }
+        self.total_reentries_today = 0
+        self.strangle_resets_today = 0
+        self.last_reconciliation = 0
+        self.last_feed_tick = 0
+        self.stale_count = 0
         
         self.current_indicators: Dict[str, Any] = {
             "kama": None, "prev_kama": None, "trend": 0,
@@ -957,6 +962,22 @@ class ExecutionEngine:
         
         self._ltp_cache: Dict[str, float] = {}
         self._load_state()
+        
+        # Bug 13: Startup Reconciliation
+        log_info("Performing Startup Reconciliation against Broker...")
+        actual_pos = self._get_live_exchange_positions()
+        if actual_pos is not None:
+            mismatch = False
+            for leg, p in list(self.positions.items()):
+                if p["tsym"] not in actual_pos or actual_pos[p["tsym"]] == 0:
+                    log_alert(f"⚠️ RECONCILIATION: {leg} is missing on exchange! Removing from local state.")
+                    del self.positions[leg]
+                    mismatch = True
+            if mismatch:
+                self._save_state()
+                log_info("State reconciled with Broker.")
+        else:
+            log_warn("Startup reconciliation failed to fetch live positions. Proceeding with local state.")
         self._write_pid()
         
         self._start_kill_switch_listener()
@@ -968,16 +989,16 @@ class ExecutionEngine:
             os.makedirs(os.path.dirname(pid_file), exist_ok=True)
             with open(pid_file, "w") as f:
                 f.write(str(os.getpid()))
-        except Exception:
-            pass
+        except Exception as e:
+            log_warn(f"Dashboard snap fail: {e}")
 
     def _remove_pid(self):
         try:
             pid_file = os.path.join(PROJECT_ROOT, "data", "state", "v2.pid")
             if os.path.exists(pid_file):
                 os.remove(pid_file)
-        except Exception:
-            pass
+        except Exception as e:
+            log_warn(f"Dashboard snap fail: {e}")
 
     def _setup_signal_handlers(self):
         def handler(sig, frame):
@@ -987,8 +1008,8 @@ class ExecutionEngine:
         try:
             signal.signal(signal.SIGINT, handler)
             signal.signal(signal.SIGTERM, handler)
-        except Exception:
-            pass
+        except Exception as e:
+            log_warn(f"Dashboard snap fail: {e}")
 
     def _start_kill_switch_listener(self):
         def listener():
@@ -1189,8 +1210,51 @@ class ExecutionEngine:
         short_dist = max(ce_short_strike - atm_spot, atm_spot - pe_short_strike)
         hedge_dist = max(HEDGE_DISTANCE_FLOOR, int(short_dist * HEDGE_DISTANCE_RATIO))
         return atm_spot + hedge_dist, atm_spot - hedge_dist
+
+    def _log_trade(self, action: str, leg: str, strike: int, side: str, qty: int, price: float, pnl: float = None, reason: str = ""):
+        try:
+            import json, os, datetime
+            if not os.path.exists(TRADE_LOG_FILE):
+                with open(TRADE_LOG_FILE, "w") as f: f.write("timestamp,action,leg,strike,side,qty,price,pnl,reason\n")
+            with open(TRADE_LOG_FILE, "a") as f:
+                ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                pnl_str = f"{pnl:.2f}" if pnl is not None else ""
+                f.write(f"{ts},{action},{leg},{strike},{side},{qty},{price:.2f},{pnl_str},{reason}\n")
+        except: pass
+
+    def _get_ltp(self, strike: int, option_type: str) -> float:
+        key = f"{strike}_{option_type}"
+        if key not in getattr(self, "_ltp_cache", {}):
+            if not hasattr(self, "_ltp_cache"): self._ltp_cache = {}
+            q = self.market_data.streamer.get_live_quote(strike, option_type)
+            self._ltp_cache[key] = float(q.get("lp", q.get("ltp", 0.0)))
+        return self._ltp_cache[key]
+
+    def _verify_order_status(self, ord_id: str, tsym: str, side: str, qty: int) -> tuple:
+        api = getattr(self.broker, "api", self.broker)
+        is_live = not getattr(self.broker, "paper_trading", False)
+        import time
+        for check_attempt in range(4):
+            if is_live: time.sleep(0.5)
+            if hasattr(api, "single_order_history"):
+                try:
+                    history = api.single_order_history(orderno=str(ord_id))
+                    if history and isinstance(history, list) and len(history) > 0:
+                        latest = history[-1]
+                        status = str(latest.get("status", "")).upper()
+                        if status in ("REJECTED", "CANCELLED"): return False, f"REJECTED: {latest.get('rejreason', 'Rejected')}"
+                        if status in ("COMPLETE", "FILLED"): return True, "COMPLETE"
+                        if status in ("OPEN", "PENDING", "TRIGGER_PENDING"):
+                            if check_attempt == 3 or not is_live: return True, "OPEN"
+                            continue
+                except: pass
+        if getattr(self.broker, "paper_trading", False): return True, f"Paper fill confirmed"
+        return False, "INCONCLUSIVE_IN_LIVE_MODE"
+
     def _enter_leg(self, leg: str, strike: int, side: str, spot: float, atr: float, dte_days: float = 2.0) -> bool:
-        tsym = self.market_data.get_token_from_strike(strike, leg)
+        base = leg.split("_")[0]
+        q = self.market_data.streamer.get_live_quote(strike, base)
+        tsym = q.get("tsym", f"NIFTY{strike}{base}")
         if not tsym: return False
         ltp = self._get_ltp(strike, leg.split("_")[0])
         if ltp <= 0: return False
@@ -1201,14 +1265,15 @@ class ExecutionEngine:
             current_iv = (self.session_em_1sd / spot) * 19.1 * 100.0
         ivr = update_and_get_ivr(current_iv)
         
-        if ivr < IVR_THRESHOLD_PCT and IVR_ACTION == "SKIP":
+        if side == "SELL" and ivr < IVR_THRESHOLD_PCT and IVR_ACTION == "SKIP":
             log_warn(f"IVR {ivr:.1f}% < {IVR_THRESHOLD_PCT}%. Skipping {leg} entry.")
             return False
 
         if not self._ask_user_confirm(leg=leg, side=side, strike=strike, qty=self.qty, ltp=ltp):
             return False
             
-        qty = MAX_LOTS_PER_LEG * LOT_SIZE
+        self.qty = self._calculate_lot_quantity()
+        qty = self.qty
         slippage = max(LIMIT_SLIPPAGE_MIN_PTS, ltp * LIMIT_SLIPPAGE_PCT)
         limit_price = round(ltp - slippage if side == "SELL" else ltp + slippage, 2)
         
@@ -1222,7 +1287,7 @@ class ExecutionEngine:
                 order_type="LMT", price=limit_price, remarks=order_id
             )
             if res and res.get("stat") == "Ok":
-                if self._verify_order_status(res.get("NOrdNo")):
+                if self._verify_order_status(res.get("norenordno", res.get("NOrdNo", res.get("order_id", "OK"))), tsym, side, qty)[0]:
                     placed = True
                     break
         
@@ -1230,7 +1295,7 @@ class ExecutionEngine:
         
         pos_info = {"strike": strike, "tsym": tsym, "side": side, "qty": qty, "entry_price": ltp, "base": leg.split("_")[0]}
         if side == "SELL":
-            pos_info["dual_sl_state"] = self.risk_manager.init_dual_sl(leg, spot, ltp, atr, current_iv, dte_days)
+            pos_info["dual_sl_state"] = self.risk_manager.init_dual_sl(leg, spot, strike, ltp, atr, current_iv, dte_days)
             
         self.positions[leg] = pos_info
         self._log_trade("ENTRY", leg, strike, side, qty, ltp, reason="SIGNAL")
@@ -1274,7 +1339,7 @@ class ExecutionEngine:
                 )
                 
                 if res and isinstance(res, dict) and str(res.get("stat", "")).lower() in ("ok", "success"):
-                    ord_id = res.get("norenordno", res.get("order_id", "OK"))
+                    ord_id = res.get("norenordno", res.get("NOrdNo", res.get("order_id", "OK")))
                     confirmed, detail = self._verify_order_status(ord_id, tsym, close_side, close_qty)
                     if confirmed:
                         placed_successfully = True
@@ -1459,7 +1524,7 @@ class ExecutionEngine:
         
         print()
         print(TOP)
-        title_left = f"  {c_cyan}ADAPTIVE KAMA-ADX HEDGED STRANGLE (V2.0){res}  {c_dim}│{res}  {c_yellow}PREM-TSL (8%/10%) ACTIVE{res}  {c_dim}│{res}  {c_green}TYPE 'zxc' TO STOP{res}"
+        title_left = f"  {c_cyan}ADAPTIVE KAMA-ADX HEDGED STRANGLE (V2.0){res}  {c_dim}│{res}  {c_yellow}DUAL-TSL (SPOT+PREM) ACTIVE{res}  {c_dim}│{res}  {c_green}TYPE 'zxc' TO STOP{res}"
         title_right = f"{c_dim}{_now_str()}{res}  "
         pad = max(0, W - ansi_len(title_left) - ansi_len(title_right))
         print(f"{V}{title_left}{' ' * pad}{title_right}{V}")
@@ -1572,8 +1637,7 @@ class ExecutionEngine:
                     "debounce_bars": PREM_SL_DEBOUNCE_BARS,
                     "strangle_width": BASE_MIN_WIDTH_PTS,
                     "hedge_dist": HEDGE_WIDTH_PTS,
-                    "spot_sl_atr": SPOT_SL_ATR_MULT,
-                    "spot_trail_pct": SPOT_SL_TRAIL_RATIO * 100.0,
+                    
                     "cooldown_min": 0
                 },
                 "indicators": self.current_indicators,
@@ -1590,8 +1654,84 @@ class ExecutionEngine:
             }
             with open(self.live_snap_file, "w") as sf:
                 json.dump(snap, sf)
-        except Exception:
+        except Exception as e:
+            log_warn(f"Dashboard snap fail: {e}")
+
+
+    def _calculate_lot_quantity(self) -> int:
+        capital = CAPITAL
+        try:
+            api = getattr(self.broker, "api", None)
+            if not getattr(self.broker, "paper_trading", False) and api and hasattr(api, "get_limits"):
+                limits = api.get_limits()
+                if limits and isinstance(limits, dict) and limits.get('stat') == 'Ok':
+                    cash = float(limits.get('cash', 0.0))
+                    payin = float(limits.get('payin', 0.0))
+                    margin_used = float(limits.get('margin', 0.0))
+                    live_avail = (cash + payin) - margin_used
+                    if live_avail > 0:
+                        capital = min(capital, live_avail)
+        except Exception as e:
+            log_warn(f"Failed to fetch live margin for lot sizing: {e}")
+            
+        allowed_cap = capital * CAPITAL_FRACTION_LIVE
+        max_lots_by_cap = int(allowed_cap // MARGIN_IRON_CONDOR)
+        if max_lots_by_cap <= 0: max_lots_by_cap = 1
+        return min(MAX_LOTS_PER_LEG * LOT_SIZE, max_lots_by_cap * LOT_SIZE)
+
+    def _get_live_exchange_positions(self) -> dict:
+        api = getattr(self.broker, "api", None)
+        if not api or getattr(self.broker, "paper_trading", False):
+            return {p["tsym"]: p["qty"] for p in self.positions.values()} if self.positions else {}
+        
+        try:
+            pos_resp = api.get_positions()
+            if pos_resp and isinstance(pos_resp, list):
+                live_book = {}
+                for p in pos_resp:
+                    netqty = int(p.get("netqty", 0))
+                    if netqty != 0:
+                        live_book[p.get("tsym")] = abs(netqty)
+                return live_book
+        except Exception as e:
+            log_warn(f"Failed to fetch live exchange positions: {e}")
+        return None
+
+    def _save_state(self):
+        try:
+            state = {
+                "date": str(get_ist_now().date()),
+                "realized_pnl": self.realized_pnl,
+                "positions": self.positions,
+                "cooldown_tracker": self.cooldown_tracker,
+                "session_em_1sd": getattr(self, "session_em_1sd", 0.0),
+                "total_reentries_today": getattr(self, "total_reentries_today", 0),
+                "strangle_resets_today": getattr(self, "strangle_resets_today", 0)
+            }
+            with open(self.state_file, "w") as sf:
+                import json
+                json.dump(state, sf)
+        except Exception as e:
             pass
+
+    def _load_state(self):
+        import os
+        if os.path.exists(self.state_file):
+            try:
+                with open(self.state_file, "r") as sf:
+                    import json
+                    state = json.load(sf)
+                if state.get("date") == str(get_ist_now().date()):
+                    self.realized_pnl = state.get("realized_pnl", 0.0)
+                    self.positions = state.get("positions", {})
+                    self.cooldown_tracker = state.get("cooldown_tracker", {})
+                    self.session_em_1sd = state.get("session_em_1sd", 0.0)
+                    self.total_reentries_today = state.get("total_reentries_today", 0)
+                    self.strangle_resets_today = state.get("strangle_resets_today", 0)
+                    if self.positions:
+                        self.mode = "RUNNING"
+            except Exception:
+                pass
 
     def run(self):
         log_info("Starting Adaptive KAMA-ADX Hedged Strangle Strategy (v2.0)...")
@@ -1604,10 +1744,21 @@ class ExecutionEngine:
                 now = get_ist_now()
                 import time
                 current_time = time.time()
-                self.last_feed_tick = current_time
+                if not is_stale:
+                    self.last_feed_tick = current_time
+                
+                # Bug 9: Feed Stale Check
+                if self.last_feed_tick > 0 and (current_time - self.last_feed_tick) > FEED_STALE_TIMEOUT_S:
+                    log_alert(f'🛑 FEED STALE FOR >{FEED_STALE_TIMEOUT_S}s! Emergency Halt.')
+                    self.trigger_emergency_shutdown(reason="FEED_STALE")
+                    break
+                    
+                # Bug 10: Kill Switch
                 if os.path.exists(KILL_SWITCH_FILE):
-                    log_alert('🛑 KILL SWITCH ENGAGED! Halting.')
-                    self.mode = 'HALTED'
+                    log_alert('🛑 KILL SWITCH ENGAGED! Emergency Halt.')
+                    self.trigger_emergency_shutdown(reason="KILL_SWITCH")
+                    break
+                    
                 if current_time - self.last_reconciliation > RECONCILIATION_INTERVAL_S:
                     self.last_reconciliation = current_time
                     actual_pos = self._get_live_exchange_positions()
@@ -1630,7 +1781,9 @@ class ExecutionEngine:
                     sys.exit(0)
 
                 # ── 1. STRICT 1-MINUTE EXECUTION CADENCE ──
-                spot, atm, is_new_1m_bar = self.market_data.fetch_live_tick()
+                spot, atm, is_new_1m_bar, is_stale = self.market_data.fetch_live_tick()
+                if not is_stale:
+                    self.last_feed_tick = current_time
                 
                 if not is_new_1m_bar:
                     now_curr = get_ist_now()
@@ -1685,6 +1838,7 @@ class ExecutionEngine:
                             
                         ce_strike, pe_strike = self.calculate_strangle_strikes(atm, atr, regime, dte_days=dte_days)
                         ce_hedge, pe_hedge = self.calculate_hedge_strikes(atm, ce_strike, pe_strike, dte_days=dte_days)
+                        hedge_width = ce_hedge - atm
                         log_info(f"Market Start Time (09:18 AM) reached. Ingesting positions (Regime: {regime}, ATR: {atr:.1f}, Hedge Dist: {hedge_width})...")
                         
                         # Step 1: Buy Far-OTM Hedges
@@ -1725,6 +1879,11 @@ class ExecutionEngine:
                     has_short = any(p.get("side") == "SELL" for p in self.positions.values())
                     if not has_short:
                         log_info("All short legs stopped out. Resetting to WAIT_DATA to re-center new Strangle...")
+                        self.strangle_resets_today += 1
+                        if self.strangle_resets_today >= MAX_STRANGLE_RESETS:
+                            log_alert(f"🛑 MAX STRANGLE RESETS ({MAX_STRANGLE_RESETS}) REACHED! Halting new entries.")
+                            self.mode = "HALTED"
+                            break
                         self.mode = "WAIT_DATA"
                         self.cooldown_tracker.clear()
                         self._save_state()
@@ -1881,8 +2040,7 @@ def prompt_user_variables():
         width = ask("Strangle Width (pts)", 0, int)
         BASE_MIN_WIDTH_PTS = width
         BASE_MAX_WIDTH_PTS = width
-        # TSL inputs removed to use hardcoded 5% / 8% logic
-
+        
         mode_label = "PAPER" if PAPER_TRADING_MODE else "LIVE"
         print(f"\n{Fore.GREEN}{Style.BRIGHT}{'═'*78}")
         print(f"  ✅ [{mode_label}] Parameters Confirmed — Deploying V2 Pro Strategy...")
