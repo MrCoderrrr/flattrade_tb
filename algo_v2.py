@@ -1085,11 +1085,10 @@ class ExecutionEngine:
     def _calculate_lot_quantity(self) -> int:
         """
         Strict User Specification:
-        '1 lot in each leg only'
-        '65 qnty'
-        Fixes position sizing strictly to 1 lot (65 quantity) per leg.
+        '1 lot in each leg only — 65 quantity only'
+        Hard-fixed to exactly 1 lot = LOT_SIZE (65). No dynamic scaling.
         """
-        return LOT_SIZE
+        return LOT_SIZE  # Always exactly 65, never more, never less
 
     def _save_state(self):
         try:
@@ -1129,6 +1128,9 @@ class ExecutionEngine:
                     self.mode = saved_mode
                 
                 for leg, pos in self.positions.items():
+                    # CRITICAL: Always sanitize qty from disk to exactly 1 lot (65).
+                    # Prevents stale multi-lot qty from old sessions from firing wrong-size orders.
+                    pos["qty"] = LOT_SIZE
                     if pos.get("side") == "SELL" and leg in ("CE", "PE"):
                         if "spot_sl_state" not in pos or not pos["spot_sl_state"]:
                             entry_spot = float(pos.get("entry_spot", self.market_data.latest_spot))
@@ -1335,6 +1337,10 @@ class ExecutionEngine:
         ltp = self._get_ltp(pos["strike"], base)
         close_side = "BUY" if pos["side"] == "SELL" else "SELL"
         
+        # HARD GUARD: Always cap exit qty to exactly 1 lot (65). Never more.
+        close_qty = LOT_SIZE
+        pos["qty"] = LOT_SIZE  # sanitize in-memory too
+        
         # Enforce rate limit
         self._wait_order_rate_limit()
         
@@ -1342,22 +1348,22 @@ class ExecutionEngine:
             self.broker.place_option_order(
                 symbol=pos["tsym"],
                 transaction_type=close_side,
-                quantity=pos["qty"],
+                quantity=close_qty,      # Always exactly LOT_SIZE (65)
                 price=ltp
             )
         except Exception as e:
             log_warn(f"Broker exit exception for {leg}: {e}")
         
         if pos["side"] == "SELL":
-            pnl = (pos["entry_price"] - ltp) * pos["qty"]
+            pnl = (pos["entry_price"] - ltp) * close_qty
         else:
-            pnl = (ltp - pos["entry_price"]) * pos["qty"]
+            pnl = (ltp - pos["entry_price"]) * close_qty
             
         self.realized_pnl += pnl
         col = Fore.GREEN if pnl >= 0 else Fore.RED
         sign = "+" if pnl >= 0 else ""
         log_trade(f"EXITED {leg:10s} Strike: {pos['strike']} @ ₹{ltp:.2f} | P&L: {col}{sign}₹{pnl:,.2f}{Style.RESET_ALL} (Reason: {reason})")
-        self._log_trade("EXIT", leg, pos["strike"], close_side, pos["qty"], ltp, pnl=pnl, reason=reason)
+        self._log_trade("EXIT", leg, pos["strike"], close_side, close_qty, ltp, pnl=pnl, reason=reason)
         
         del self.positions[leg]
         self._save_state()
