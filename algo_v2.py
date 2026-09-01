@@ -45,7 +45,6 @@ from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
 from colorama import init, Fore, Style
 
 # Force IPv4 for reliable API / Broker connections
@@ -65,45 +64,25 @@ if PROJECT_ROOT not in sys.path:
 
 init(autoreset=True)
 
-# ─── Imports / Polyfills ──────────────────────────────────────────────────────
+# ─── Flattrade Core Integration & Polyfills ────────────────────────────────────
+global_api = None
 try:
-    from core.stream_atm_prices import NSEATMStreamer
+    from api_helper import NorenApiPy
+    from creds import USER_ID
+    global_api = NorenApiPy()
+    token_file = "token.txt" if os.path.exists("token.txt") else os.path.join(PROJECT_ROOT, "token.txt")
+    if os.path.exists(token_file):
+        with open(token_file, "r") as f:
+            access_token = f.read().strip()
+            if access_token:
+                global_api.set_session(userid=str(USER_ID).strip(), password='', usertoken=access_token)
+except Exception:
+    global_api = None
+
+try:
     from core.volatility_engine import VolatilityEngine
-    from core.flattrade_broker import FlattradeBroker
     from core.db_manager import db
 except ImportError:
-    class NSEATMStreamer:
-        def __init__(self):
-            self._last_spot: float = 24000.0
-            self._last_atm: int = 24000
-
-        def get_spot_and_atm(self) -> Tuple[float, int]:
-            try:
-                ticker = yf.Ticker("^NSEI")
-                tod = ticker.history(period="1d", interval="1m")
-                if tod is not None and not tod.empty:
-                    spot = float(tod["Close"].iloc[-1])
-                    if spot > 0:
-                        self._last_spot = spot
-                        self._last_atm = int(round(spot / 50.0) * 50)
-            except Exception:
-                pass
-            return self._last_spot, self._last_atm
-
-        def get_live_quote(self, strike: int, option_type: str) -> Dict[str, Any]:
-            diff = abs(self._last_spot - strike)
-            est_prem = max(15.0, 180.0 - (diff * 0.35))
-            return {"lp": round(est_prem, 2), "tsym": f"NIFTY_{strike}_{option_type}", "ls": 65}
-
-        def get_near_expiry_dte(self) -> Tuple[Optional[datetime], float]:
-            now = datetime.now()
-            days_ahead = (3 - now.weekday()) % 7
-            if days_ahead == 0 and now.hour >= 15:
-                days_ahead = 7
-            exp_date = now + timedelta(days=days_ahead)
-            dte = max(0.01, (exp_date - now).total_seconds() / 86400.0)
-            return exp_date, dte
-
     class VolatilityEngine:
         @staticmethod
         def calculate_realized_volatility(bars_1m: List[Dict[str, Any]]) -> float:
@@ -125,13 +104,112 @@ except ImportError:
                 return round(0.80 * straddle_price, 2)
             return round(spot * (iv / 100.0) / np.sqrt(252), 2)
 
-    class FlattradeBroker:
-        def __init__(self, paper_trading: bool = True):
-            self.paper_trading = paper_trading
-            self.order_counter = 1000
-            self.simulated_order_book: Dict[str, Dict[str, Any]] = {}
+    class DBManager:
+        def record_trade(self, *args, **kwargs): pass
+        def get_strategy_pnl_summary(self, *args, **kwargs): return {"today_pnl": 0.0, "mtd_pnl": 0.0, "ytd_pnl": 0.0, "current_capital": 1000000.0}
+    db = DBManager()
 
-        def place_option_order(self, symbol: str, transaction_type: str, quantity: int, price: float = 0.0) -> Dict[str, Any]:
+
+class NSEATMStreamer:
+    def __init__(self, api=None):
+        self.api = api or global_api
+        self._cached_expiry_date: Optional[datetime] = None
+        self._cached_expiry_day: Optional[Any] = None
+        self._last_spot: float = 24000.0
+        self._last_atm: int = 24000
+
+    def get_spot_and_atm(self) -> Tuple[float, int]:
+        """
+        Fetches live NIFTY 50 Spot price directly from Flattrade every minute (Token 26000 on NSE).
+        No dependency on yfinance.
+        """
+        if self.api and hasattr(self.api, "get_quotes"):
+            try:
+                res = self.api.get_quotes(exchange='NSE', token='26000')
+                if res and isinstance(res, dict) and str(res.get('stat', '')).lower() in ('ok', 'success'):
+                    raw_lp = res.get('lp', res.get('ltp', 0.0))
+                    spot = float(raw_lp)
+                    if spot > 0:
+                        self._last_spot = spot
+                        self._last_atm = int(round(spot / 50.0) * 50)
+                        return self._last_spot, self._last_atm
+            except Exception as e:
+                log_warn(f"Flattrade get_quotes error for Spot: {e}")
+        return self._last_spot, self._last_atm
+
+    def get_live_quote(self, strike: int, option_type: str) -> Dict[str, Any]:
+        """Fetches live option quote directly from Flattrade."""
+        if self.api and hasattr(self.api, "searchscrip"):
+            try:
+                search_text = f"NIFTY {strike} {option_type}"
+                res = self.api.searchscrip(exchange='NFO', searchtext=search_text)
+                if res and isinstance(res, dict) and res.get('stat') == 'Ok' and res.get('values'):
+                    valid = []
+                    for item in res['values']:
+                        if 'exd' in item:
+                            try:
+                                valid.append({'item': item, 'dt': datetime.strptime(item['exd'], "%d-%b-%Y")})
+                            except ValueError:
+                                continue
+                    if valid:
+                        valid.sort(key=lambda x: x['dt'])
+                        match = valid[0]['item']
+                        tsym = match['tsym']
+                        quote = self.api.get_quotes(exchange='NFO', token=match['token'])
+                        lp = float(quote.get('lp', quote.get('ltp', 0.0))) if quote else 0.0
+                        return {"lp": lp, "tsym": tsym, "ls": int(match.get('ls', 65))}
+            except Exception:
+                pass
+        diff = abs(self._last_spot - strike)
+        est_prem = max(15.0, 180.0 - (diff * 0.35))
+        return {"lp": round(est_prem, 2), "tsym": f"NIFTY_{strike}_{option_type}", "ls": 65}
+
+    def get_near_expiry_dte(self) -> Tuple[Optional[datetime], float]:
+        """Fetches near expiry date and DTE directly from Flattrade NFO contracts."""
+        today = datetime.now().date()
+        if self._cached_expiry_date is None or self._cached_expiry_day != today:
+            if self.api and hasattr(self.api, "searchscrip"):
+                try:
+                    res = self.api.searchscrip(exchange='NFO', searchtext='NIFTY')
+                    candidates = []
+                    if res and isinstance(res, dict) and res.get('stat') == 'Ok' and res.get('values'):
+                        for item in res['values']:
+                            if 'exd' in item:
+                                try:
+                                    candidates.append(datetime.strptime(item['exd'], "%d-%b-%Y"))
+                                except ValueError:
+                                    continue
+                    future = [d for d in candidates if d.date() >= today]
+                    if future:
+                        self._cached_expiry_date = min(future)
+                    elif candidates:
+                        self._cached_expiry_date = min(candidates)
+                except Exception:
+                    pass
+            if self._cached_expiry_date is None:
+                days_ahead = (3 - datetime.now().weekday()) % 7
+                if days_ahead == 0 and datetime.now().hour >= 15:
+                    days_ahead = 7
+                self._cached_expiry_date = datetime.now() + timedelta(days=days_ahead)
+            self._cached_expiry_day = today
+        dte = max(0.01, (self._cached_expiry_date - datetime.now()).total_seconds() / 86400.0)
+        return self._cached_expiry_date, dte
+
+
+class FlattradeBroker:
+    def __init__(self, paper_trading: Optional[bool] = None):
+        self.api = global_api
+        if paper_trading is None:
+            token_file = "token.txt" if os.path.exists("token.txt") else os.path.join(PROJECT_ROOT, "token.txt")
+            has_token = os.path.exists(token_file) and os.path.getsize(token_file) > 0
+            self.paper_trading = not (has_token and self.api is not None)
+        else:
+            self.paper_trading = paper_trading
+        self.order_counter = 1000
+        self.simulated_order_book: Dict[str, Dict[str, Any]] = {}
+
+    def place_option_order(self, symbol: str, transaction_type: str, quantity: int, price: float = 0.0, product_type: str = "M") -> Dict[str, Any]:
+        if self.paper_trading or not self.api:
             self.order_counter += 1
             ord_id = f"ORD_{int(time.time())}_{self.order_counter}"
             order_info = {
@@ -148,19 +226,61 @@ except ImportError:
             self.simulated_order_book[ord_id] = order_info
             return order_info
 
-        def get_order_book(self) -> List[Dict[str, Any]]:
-            return list(self.simulated_order_book.values())
+        action = transaction_type[0].upper() # 'B' or 'S'
+        if price > 0.0:
+            buffer_pts = max(0.10, min(5.0, price * 0.03))
+            if action == 'B':
+                raw_lmt = price + buffer_pts
+                lmt_price = round(math.ceil(raw_lmt / 0.05) * 0.05, 2)
+            else:
+                raw_lmt = max(0.05, price - buffer_pts)
+                lmt_price = max(0.05, round(math.floor(raw_lmt / 0.05) * 0.05, 2))
+            prctyp = "LMT"
+            prc_str = f"{lmt_price:.2f}"
+        else:
+            prctyp = "LMT"
+            prc_str = "50.00" if action == 'B' else "0.50"
 
-        def single_order_history(self, orderno: str) -> List[Dict[str, Any]]:
-            if orderno in self.simulated_order_book:
-                return [self.simulated_order_book[orderno]]
-            return []
+        try:
+            res = self.api.place_order(
+                buy_or_sell=str(action),
+                product_type=str(product_type),
+                exchange="NFO",
+                tradingsymbol=str(symbol),
+                quantity=str(quantity),
+                discloseqty="0",
+                price_type=prctyp,
+                price=prc_str,
+                trigger_price="0",
+                retention="DAY",
+                remarks="API_V2_PRO"
+            )
+            return res
+        except Exception as e:
+            log_alert(f"❌ Flattrade Order EXCEPTION: {e}")
+            return {"stat": "Not_Ok", "emsg": str(e)}
 
-    class DBManager:
-        def record_trade(self, *args, **kwargs): pass
-        def get_strategy_pnl_summary(self, *args, **kwargs): return {"today_pnl": 0.0, "mtd_pnl": 0.0, "ytd_pnl": 0.0, "current_capital": 1000000.0}
-    db = DBManager()
+    def get_order_book(self) -> List[Dict[str, Any]]:
+        if not self.paper_trading and self.api and hasattr(self.api, "get_order_book"):
+            try:
+                res = self.api.get_order_book()
+                if res and isinstance(res, list):
+                    return res
+            except Exception:
+                pass
+        return list(self.simulated_order_book.values())
 
+    def single_order_history(self, orderno: str) -> List[Dict[str, Any]]:
+        if not self.paper_trading and self.api and hasattr(self.api, "single_order_history"):
+            try:
+                res = self.api.single_order_history(orderno=str(orderno))
+                if res and isinstance(res, list):
+                    return res
+            except Exception:
+                pass
+        if orderno in self.simulated_order_book:
+            return [self.simulated_order_book[orderno]]
+        return []
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║                     STRATEGY CONFIGURATION (V2)                          ║
@@ -302,35 +422,53 @@ class MarketData:
             log_warn(f"MarketData: Error loading cache: {e}")
 
     def _seed_history_if_needed(self):
+        """Seeds historical 5-minute bars directly from Flattrade API (Token 26000)."""
         if len(self.bars_5m) >= 30:
             return
+        
+        api = getattr(self.streamer, "api", global_api)
+        if not api or not hasattr(api, "get_time_price_series"):
+            log_warn("MarketData: Flattrade API not available for historical seeding. Warming up from live 1m Flattrade feed.")
+            return
+
         try:
-            log_info("MarketData: Seeding historical 5-min bars for instant indicator readiness...")
-            df = yf.download("^NSEI", period="5d", interval="5m", progress=False, timeout=8)
-            if df is not None and not df.empty:
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0)
-                
+            log_info("MarketData: Seeding historical 5-min bars from Flattrade (Token 26000) for instant indicator readiness...")
+            end_time = datetime.now()
+            start_time = end_time - timedelta(days=5)
+
+            res = api.get_time_price_series(
+                exchange='NSE',
+                token='26000',
+                starttime=start_time.timestamp(),
+                endtime=end_time.timestamp(),
+                interval=5
+            )
+
+            if res and isinstance(res, list) and len(res) > 0:
                 seeded_5m = []
-                for idx, row in df.iterrows():
-                    ts = idx.to_pydatetime() if hasattr(idx, "to_pydatetime") else idx
-                    seeded_5m.append({
-                        "timestamp": ts,
-                        "open": float(row["Open"]),
-                        "high": float(row["High"]),
-                        "low": float(row["Low"]),
-                        "close": float(row["Close"]),
-                    })
-                
+                for row in res:
+                    try:
+                        ts = datetime.strptime(row['time'], "%d-%m-%Y %H:%M:%S")
+                        seeded_5m.append({
+                            'timestamp': ts,
+                            'open': float(row['into']),
+                            'high': float(row['inth']),
+                            'low': float(row['intl']),
+                            'close': float(row['intc'])
+                        })
+                    except Exception:
+                        continue
+
                 if seeded_5m:
+                    seeded_5m.sort(key=lambda x: x['timestamp'])
                     today = datetime.now().date()
-                    prior_bars = [b for b in seeded_5m if b["timestamp"].date() < today]
-                    if len(prior_bars) > 50:
-                        prior_bars = prior_bars[-50:]
+                    prior_bars = [b for b in seeded_5m if b['timestamp'].date() < today][-50:]
                     self.bars_5m = prior_bars + self.bars_5m
-                    log_info(f"MarketData: Successfully seeded {len(prior_bars)} historical 5m bars. Total 5m bars: {len(self.bars_5m)}")
+                    log_info(f"MarketData: Successfully seeded {len(prior_bars)} 5m bars from Flattrade.")
+            else:
+                log_warn("MarketData: Flattrade get_time_price_series returned empty.")
         except Exception as e:
-            log_warn(f"MarketData: yfinance seeding skipped ({e}). Indicators will warm up from live feed.")
+            log_warn(f"MarketData: Flattrade history seeding skipped ({e}). Indicators will warm up from live 1m Flattrade feed.")
 
     def _rebuild_5m_candles(self):
         if not self.bars_1m:
