@@ -33,6 +33,44 @@ import os
 import sys
 import time
 import json
+
+import math
+def norm_cdf(x):
+    return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
+
+def bs_delta(spot, strike, dte_days, iv, is_call):
+    if dte_days <= 0 or iv <= 0:
+        return 1.0 if (is_call and spot >= strike) or (not is_call and spot < strike) else 0.0
+    t = dte_days / 365.0
+    d1 = (math.log(spot / strike) + (iv**2 / 2.0) * t) / (iv * math.sqrt(t))
+    delta = norm_cdf(d1)
+    return delta if is_call else delta - 1.0
+
+def update_and_get_ivr(current_iv):
+    import json
+    history_file = os.path.join(CURRENT_DIR, "data", "state", "iv_history.json")
+    try:
+        with open(history_file, 'r') as f: history = json.load(f)
+    except: history = []
+    
+    # approximate timezone
+    from datetime import datetime, timezone, timedelta
+    today = str(datetime.now(timezone(timedelta(hours=5, minutes=30))).date())
+    
+    if history and history[-1].get("date") == today: history[-1]["iv"] = current_iv
+    else: history.append({"date": today, "iv": current_iv})
+    
+    if len(history) > IVR_LOOKBACK_DAYS: history = history[-IVR_LOOKBACK_DAYS:]
+    
+    os.makedirs(os.path.dirname(history_file), exist_ok=True)
+    with open(history_file, 'w') as f: json.dump(history, f, indent=2)
+    
+    if len(history) < 2: return 100.0
+    ivs = [h["iv"] for h in history]
+    m_iv, x_iv = min(ivs), max(ivs)
+    if x_iv == m_iv: return 100.0
+    return ((current_iv - m_iv) / (x_iv - m_iv)) * 100.0
+
 import math
 import signal
 import socket
@@ -335,13 +373,48 @@ class FlattradeBroker:
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 # Capital & Allocation
-CAPITAL                 = 195784.0    # Total Capital
-LOT_SIZE                = 65          # NIFTY Lot size (revised Jan 2026)
-CAPITAL_BUFFER          = 0.95        # Usable capital buffer (95%)
-MARGIN_IRON_CONDOR      = 95_000      # Margin required for 4-leg Iron Condor per lot
-PORTFOLIO_CIRCUIT_PCT   = 1.8         # Emergency Portfolio Halt at -1.8% combined MTM
+CAPITAL                 = 195784.0
+LOT_SIZE                = 65
+CAPITAL_BUFFER          = 0.95
+MARGIN_IRON_CONDOR      = 95_000
+PORTFOLIO_CIRCUIT_PCT   = 1.8
 
-# Indicators Parameters (5-Minute Timeframe)
+# --- REAL-MONEY SAFETY & GOVERNANCE ---
+TELEGRAM_BOT_TOKEN        = ""
+TELEGRAM_CHAT_ID          = ""
+KILL_SWITCH_FILE          = os.path.join(CURRENT_DIR, "kill_switch.txt")
+CAPITAL_FRACTION_LIVE     = 0.40
+MAX_LOTS_PER_LEG          = 1
+MAX_CONCURRENT_SHORT_LEGS = 2
+LIMIT_SLIPPAGE_PCT        = 0.025
+LIMIT_SLIPPAGE_MIN_PTS    = 0.50
+RECONCILIATION_INTERVAL_S = 30
+FEED_STALE_TIMEOUT_S      = 15
+
+# --- IV FILTER ---
+IVR_LOOKBACK_DAYS         = 60
+IVR_THRESHOLD_PCT         = 20.0
+IVR_ACTION                = "SKIP"
+
+# --- DYNAMIC STRIKE & HEDGE ---
+ATR_MULT_CHOP             = 1.5
+ATR_MULT_TREND            = 1.0
+HEDGE_DISTANCE_FLOOR      = 300
+HEDGE_DISTANCE_RATIO      = 1.5
+
+# --- DUAL TSL ---
+SPOT_SL_K_STRANGLE        = 0.5
+SPOT_SL_K_ORPHAN          = 0.85
+PREM_SL_ATR_MULT_STRANGLE = 1.0
+PREM_SL_ATR_MULT_ORPHAN   = 1.5
+
+# --- REENTRY CAPS ---
+KAMA_REVERSAL_ATR_RATIO   = 0.15
+KAMA_CONSECUTIVE_BARS     = 2
+MAX_REENTRIES_PER_LEG     = 2
+MAX_REENTRIES_TOTAL       = 4
+MAX_STRANGLE_RESETS       = 2
+BACKOFF_BASE_SEC          = 60
 KAMA_PERIOD             = 13          # KAMA Efficiency Ratio lookback
 KAMA_FAST_EMA           = 2           # KAMA Fast EMA constant
 KAMA_SLOW_EMA           = 30          # KAMA Slow EMA constant
@@ -418,6 +491,11 @@ def log_warn(msg: str):
     print(f"{Fore.YELLOW}[{_now_str()} WARN]{Style.RESET_ALL}  {msg}", flush=True)
 
 def log_alert(msg: str):
+    try:
+        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+            import requests
+            requests.post(f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage', json={'chat_id': TELEGRAM_CHAT_ID, 'text': f'[Algo v2] {msg}'}, timeout=2)
+    except: pass
     print(f"{Fore.RED}{Style.BRIGHT}[{_now_str()} ALERT]{Style.RESET_ALL} {msg}", flush=True)
 
 def log_trade(msg: str):
@@ -782,83 +860,51 @@ class Indicators:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class RiskManager:
-    def __init__(self, capital: float = CAPITAL):
-        self.capital = capital
-        self.circuit_breaker_loss_limit = -1.0 * (capital * PORTFOLIO_CIRCUIT_PCT / 100.0)
-        self.circuit_breaker_triggered = False
-
-    def check_portfolio_circuit_breaker(self, unrealized_pnl: float, realized_pnl: float) -> Tuple:
-        net_mtm = realized_pnl + unrealized_pnl
-        if net_mtm <= self.circuit_breaker_loss_limit:
-            self.circuit_breaker_triggered = True
-            return True, f"PORTFOLIO CIRCUIT BREAKER HIT: Net MTM {net_mtm:.2f} breached limit {self.circuit_breaker_loss_limit:.2f}"
-        return False, ""
-
-    def init_premium_sl(self, leg: str, entry_premium: float) -> Dict:
-        """Initializes Premium Trailing Stop Loss tracker."""
+    def __init__(self):
+        self.portfolio_circuit_pct = PORTFOLIO_CIRCUIT_PCT
+        
+    def init_dual_sl(self, leg: str, entry_spot: float, entry_premium: float, atr: float, iv: float, dte_days: float) -> dict:
+        is_call = "CE" in leg
+        delta = bs_delta(entry_spot, entry_spot, dte_days, iv, is_call)
         return {
-            "entry_premium": round(entry_premium, 2),
-            "best_premium": round(entry_premium, 2),
-            "current_sl": round(entry_premium * 1.08, 2),
+            "entry_spot": entry_spot,
+            "entry_premium": entry_premium,
+            "atr_at_entry": atr,
+            "delta_at_entry": delta,
+            "current_premium_sl": 0.0,
             "breach_count": 0
         }
 
-    def update_premium_sl_and_check(self, leg: str, pos_data: Dict, current_premium: float, is_strangle: bool, regime: str, is_new_1m_bar: bool) -> Tuple:
-        sl_state = pos_data.get("premium_sl_state")
-        if not sl_state:
-            return False, ""
+    def update_dual_sl_and_check(self, leg: str, pos_data: dict, current_spot: float, current_premium: float, is_strangle: bool, is_new_1m_bar: bool) -> tuple:
+        sl_state = pos_data.get("dual_sl_state")
+        if not sl_state: return False, ""
+        spot_k = SPOT_SL_K_STRANGLE if is_strangle else SPOT_SL_K_ORPHAN
+        prem_mult = PREM_SL_ATR_MULT_STRANGLE if is_strangle else PREM_SL_ATR_MULT_ORPHAN
+        strike = float(pos_data["strike"])
+        atr = float(sl_state["atr_at_entry"])
         
-        best_premium = float(sl_state.get("best_premium", pos_data["entry_price"]))
-        current_sl = float(sl_state["current_sl"])
-        breach_count = int(sl_state.get("breach_count", 0))
-        
-        # Determine trailing percentage based on strategy rules
-        if is_strangle:
-            tsl_pct = TSL_STRANGLE_PCT
+        if "CE" in leg:
+            spot_sl = strike + (spot_k * atr)
+            spot_breached = current_spot >= spot_sl
         else:
-            if regime == "TREND":
-                tsl_pct = TSL_TREND_ORPHAN_PCT
-            else:
-                tsl_pct = TSL_STRANGLE_PCT
-                
-        # Update best premium if it dropped (favorable for sellers)
-        if current_premium < best_premium:
-            best_premium = current_premium
-            sl_state["best_premium"] = round(best_premium, 2)
+            spot_sl = strike - (spot_k * atr)
+            spot_breached = current_spot <= spot_sl
             
-        # Calculate trailing SL
-        candidate_sl = best_premium * (1.0 + tsl_pct)
+        entry_prem = float(sl_state["entry_premium"])
+        delta = abs(float(sl_state["delta_at_entry"]))
+        prem_sl = entry_prem + (delta * atr * prem_mult)
+        sl_state["current_premium_sl"] = prem_sl
+        prem_breached = current_premium >= prem_sl
         
-        # Only tighten SL, never loosen unless pct changed (e.g. 5% to 8% expansion)
-        if is_strangle:
-            sl_state["current_sl"] = min(current_sl, round(candidate_sl, 2))
-        else:
-            sl_state["current_sl"] = round(candidate_sl, 2)
-            
-        is_breaching = (current_premium >= sl_state["current_sl"])
-        
-        if is_breaching:
-            if PREM_SL_DEBOUNCE_BARS <= 0:
-                return True, f"⛔ Premium SL Triggered for {leg} | Premium: ₹{current_premium:.2f} breached SL: ₹{sl_state['current_sl']:.2f}"
-            
-            if is_new_1m_bar:
-                breach_count += 1
-                sl_state["breach_count"] = breach_count
-                if breach_count >= PREM_SL_DEBOUNCE_BARS:
-                    return True, f"⛔ Premium SL Triggered for {leg} | Premium: ₹{current_premium:.2f} breached SL: ₹{sl_state['current_sl']:.2f} (Confirmed over {PREM_SL_DEBOUNCE_BARS} 1-min bars)"
-                else:
-                    log_warn(f"⚠️ {leg} Premium SL Warning: ₹{current_premium:.2f} >= ₹{sl_state['current_sl']:.2f}. Need {PREM_SL_DEBOUNCE_BARS - breach_count} more closes.")
-        else:
-            if breach_count > 0:
-                log_info(f"🛡️ {leg} recovered. Premium SL threat cleared.")
+        if (spot_breached or prem_breached) and is_new_1m_bar:
+            sl_state["breach_count"] = sl_state.get("breach_count", 0) + 1
+        elif is_new_1m_bar:
             sl_state["breach_count"] = 0
             
+        if sl_state.get("breach_count", 0) >= PREM_SL_DEBOUNCE_BARS:
+            r = "SPOT" if spot_breached else "PREM"
+            return True, f"⛔ {leg} SL Triggered! {r} | Spot: {current_spot:.2f} | Prem: {current_premium:.2f} >= {prem_sl:.2f}"
         return False, ""
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MODULE 4: EXECUTION STATE MACHINE & STRATEGY ENGINE
-# ══════════════════════════════════════════════════════════════════════════════
-
 class ExecutionEngine:
     def __init__(self):
         self.state_file = os.path.join(PROJECT_ROOT, "data", "state", "algo_state_v2.json")
@@ -1129,332 +1175,67 @@ class ExecutionEngine:
 
     @classmethod
     def calculate_strangle_strikes(cls, atm_spot: int, atr: float, regime: str, dte_days: float = 2.0) -> Tuple[int, int]:
-        if regime == "CHOP":
-            min_w = CHOP_MIN_WIDTH_PTS
-            max_w = CHOP_MAX_WIDTH_PTS
-            mult  = CHOP_ATR_MULTIPLIER
-        else:
-            min_w = BASE_MIN_WIDTH_PTS
-            max_w = BASE_MAX_WIDTH_PTS
-            mult  = BASE_ATR_MULTIPLIER
-
-        if float(dte_days) <= 1.0:
-            return atm_spot, atm_spot
-
-        calculated_width = max(min_w, min(max_w, mult * atr))
+        mult = ATR_MULT_CHOP if regime == 'CHOP' else ATR_MULT_TREND
+        width = atr * mult
+        if dte_days <= 1.0: return atm_spot, atm_spot
         expiry_curve = cls._expiry_width_multiplier(dte_days)
-        expiry_floor = 50 if dte_days <= EXPIRY_NEAR_DAYS else min_w
-        compressed_width = max(expiry_floor, round(max(min_w, calculated_width) * (1.0 - 0.65 * expiry_curve) + min_w * (0.65 * expiry_curve)))
-
+        expiry_floor = 50 if dte_days <= EXPIRY_NEAR_DAYS else 0
+        compressed_width = max(expiry_floor, round(width * (1.0 - 0.65 * expiry_curve)))
         stride_50 = int(round(compressed_width / 50.0) * 50)
-        final_width = max(expiry_floor, min(max_w, stride_50))
+        return atm_spot + stride_50, atm_spot - stride_50
+
+    @classmethod
+    def calculate_hedge_strikes(cls, atm_spot: int, ce_short_strike: int, pe_short_strike: int, dte_days: float = 2.0) -> Tuple[int, int]:
+        short_dist = max(ce_short_strike - atm_spot, atm_spot - pe_short_strike)
+        hedge_dist = max(HEDGE_DISTANCE_FLOOR, int(short_dist * HEDGE_DISTANCE_RATIO))
+        return atm_spot + hedge_dist, atm_spot - hedge_dist
+    def _enter_leg(self, leg: str, strike: int, side: str, spot: float, atr: float, dte_days: float = 2.0) -> bool:
+        tsym = self.market_data.get_token_from_strike(strike, leg)
+        if not tsym: return False
+        ltp = self._get_ltp(strike, leg.split("_")[0])
+        if ltp <= 0: return False
         
-        ce_strike = atm_spot + final_width
-        pe_strike = atm_spot - final_width
+        # IV Gate
+        current_iv = 15.0
+        if hasattr(self, 'session_em_1sd') and self.session_em_1sd > 0:
+            current_iv = (self.session_em_1sd / spot) * 19.1 * 100.0
+        ivr = update_and_get_ivr(current_iv)
         
-        if ce_strike <= atm_spot or pe_strike >= atm_spot or ce_strike == pe_strike:
-            if float(dte_days) <= 1.0:
-                ce_strike = atm_spot
-                pe_strike = atm_spot
-            else:
-                ce_strike = atm_spot + 50
-                pe_strike = atm_spot - 50
-            
-        return ce_strike, pe_strike
-
-    def _calculate_lot_quantity(self) -> int:
-        """
-        Strict User Specification:
-        '1 lot in each leg only — 65 quantity only'
-        Hard-fixed to exactly 1 lot = LOT_SIZE (65). No dynamic scaling.
-        """
-        return LOT_SIZE  # Always exactly 65, never more, never less
-
-    def _save_state(self):
-        try:
-            state = {
-                "date": str(get_ist_now().date()),
-                "mode": self.mode,
-                "realized_pnl": self.realized_pnl,
-                "positions": self.positions,
-                "cooldown_tracker": self.cooldown_tracker
-            }
-            with open(self.state_file, "w") as f:
-                json.dump(state, f, indent=4)
-        except Exception as e:
-            log_warn(f"Failed to save state: {e}")
-
-    def _get_live_exchange_positions(self) -> Dict[str, int]:
-        if self.broker.paper_trading or not self.broker.api:
-            return None
-        try:
-            res = self.broker.api.get_positions()
-            if isinstance(res, list):
-                pos_map = {}
-                for p in res:
-                    if isinstance(p, dict) and "tsym" in p and "netqty" in p:
-                        try:
-                            netqty = int(p["netqty"])
-                            if netqty != 0:
-                                pos_map[p["tsym"]] = netqty
-                        except ValueError:
-                            pass
-                return pos_map
-        except Exception as e:
-            log_warn(f"Failed to fetch exchange positions: {e}")
-        return None
-
-    def _load_state(self):
-        if not os.path.exists(self.state_file):
-            return
-        try:
-            with open(self.state_file, "r") as f:
-                state = json.load(f)
-            today_str = str(get_ist_now().date())
-            if state.get("date") == today_str:
-                self.realized_pnl = float(state.get("realized_pnl", 0.0))
-                self.positions = state.get("positions", {})
-                self.cooldown_tracker = state.get("cooldown_tracker", self.cooldown_tracker)
-
-                saved_mode = state.get("mode", "WAIT_DATA")
-                market_closed = (
-                    get_ist_now().hour > AUTO_SQUAREOFF_HOUR or
-                    (get_ist_now().hour == AUTO_SQUAREOFF_HOUR and get_ist_now().minute >= AUTO_SQUAREOFF_MINUTE)
-                )
-                if saved_mode in ("SESSION_DONE", "SESSION_DONE_FLAT") and not market_closed:
-                    self.mode = "RUNNING" if self.positions else "WAIT_DATA"
-                    log_warn(f"Recovered from persisted {saved_mode}; resuming as {self.mode} because session is still live.")
-                else:
-                    self.mode = saved_mode
-                
-                for leg, pos in self.positions.items():
-                    # CRITICAL: Always sanitize qty from disk to exactly 1 lot (65).
-                    # Prevents stale multi-lot qty from old sessions from firing wrong-size orders.
-                    pos["qty"] = LOT_SIZE
-                    if pos.get("side") == "SELL" and leg in ("CE", "PE"):
-                        if "premium_sl_state" not in pos or not pos["premium_sl_state"]:
-                            entry_spot = float(pos.get("entry_spot", self.market_data.latest_spot))
-                            atr_val = float(self.current_indicators.get("atr", DEFAULT_ATR_5M))
-                            pos["premium_sl_state"] = self.risk_manager.init_premium_sl(leg, float(pos.get("entry_price", 100.0)))
-
-                # Sync with exchange on startup
-                actual_positions = self._get_live_exchange_positions()
-                if actual_positions is not None:
-                    removed_any = False
-                    for leg in list(self.positions.keys()):
-                        tsym = self.positions[leg]["tsym"]
-                        if tsym not in actual_positions or actual_positions[tsym] == 0:
-                            log_warn(f"Startup Sync: {leg} ({tsym}) is no longer open on exchange. Removing from local state.")
-                            del self.positions[leg]
-                            removed_any = True
-                    
-                    if removed_any and not self.positions:
-                        log_info("Startup Sync: No active positions found on exchange. Resetting to fresh WAIT_DATA state.")
-                        self.mode = "WAIT_DATA"
-                        
-                log_info(f"Loaded existing session state for today ({today_str}). Realized PnL: ₹{self.realized_pnl:,.2f}")
-        except Exception as e:
-            log_warn(f"Failed to load state: {e}")
-
-    def _log_trade(self, action: str, leg: str, strike: int, side: str, qty: int, price: float, pnl: Optional[float] = None, reason: str = ""):
-        now_dt = get_ist_now()
-        ts_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
-        today_str = now_dt.strftime("%Y-%m-%d")
-        pnl_val = float(pnl) if pnl is not None else 0.0
-        adx_val = float(self.current_indicators.get("adx", 0.0) or 0.0)
-        regime_str = self.current_indicators.get("regime", "CHOP")
-
-        try:
-            db.record_trade(
-                timestamp=ts_str,
-                session_date=today_str,
-                strategy_id="v2",
-                action=action,
-                leg=leg,
-                strike=strike,
-                side=side,
-                qty=qty,
-                price=price,
-                pnl=pnl_val,
-                reason=reason,
-                adx=adx_val,
-                regime=regime_str
-            )
-        except Exception as e:
-            log_warn(f"DB Error recording trade: {e}")
-
-        log_file = os.path.join(self.trade_book_dir, f"trade_log_v2_{today_str}.csv")
-        file_exists = os.path.exists(log_file)
-        try:
-            with open(log_file, "a") as f:
-                if not file_exists:
-                    f.write("Timestamp,Action,Leg,Strike,Side,Qty,Price,PnL,Reason,ADX,Regime\n")
-                pnl_str = f"{pnl:.2f}" if pnl is not None else ""
-                f.write(f"{ts_str},{action},{leg},{strike},{side},{qty},{price:.2f},{pnl_str},{reason},{adx_val:.1f},{regime_str}\n")
-        except Exception as e:
-            log_warn(f"Failed to write trade log: {e}")
-
-    def _get_ltp(self, strike: int, option_type: str) -> float:
-        key = f"{strike}_{option_type}"
-        if key not in self._ltp_cache:
-            q = self.market_data.streamer.get_live_quote(strike, option_type)
-            self._ltp_cache[key] = float(q.get("lp", 0.0))
-        return self._ltp_cache[key]
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # Deep Order Verification & Anti-Duplicate Trade Engine
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def _verify_order_status(self, ord_id: str, tsym: str, side: str, qty: int) -> Tuple[bool, str]:
-        """
-        Deeply verifies order acceptance against broker OMS & Exchange Order Book.
-        Polls for up to 2 seconds to ensure RMS margin rejections are caught.
-        Returns: (is_confirmed_placed: bool, reason_string: str)
-        """
-        api = getattr(self.broker, "api", self.broker)
-        is_live = not getattr(self.broker, "paper_trading", False)
-        
-        for check_attempt in range(4):
-            if is_live:
-                time.sleep(0.5)
-                
-            # Method 1: Check single order history
-            if hasattr(api, "single_order_history"):
-                try:
-                    history = api.single_order_history(orderno=str(ord_id))
-                    if history and isinstance(history, list) and len(history) > 0:
-                        latest = history[-1]
-                        status = str(latest.get("status", "")).upper()
-                        
-                        if status in ("REJECTED", "CANCELLED"):
-                            rej = latest.get("rejreason", latest.get("emsg", "Order Rejected by RMS/Exchange"))
-                            return False, f"REJECTED: {rej} (OrderID={ord_id})"
-                            
-                        if status in ("COMPLETE", "FILLED"):
-                            return True, f"COMPLETE (OrderID={ord_id})"
-                            
-                        if status in ("OPEN", "PENDING", "TRIGGER_PENDING"):
-                            # Give RMS time to reject it; only return True if it survives all checks
-                            if check_attempt == 3 or not is_live:
-                                return True, f"OPEN on exchange (OrderID={ord_id})"
-                            continue # Check again
-                except Exception as e:
-                    log_warn(f"Error querying single_order_history: {e}")
-
-        # Method 2: Fallback to full order book
-        if hasattr(api, "get_order_book"):
-            try:
-                book = api.get_order_book()
-                if book and isinstance(book, list):
-                    for o in book:
-                        if str(o.get("norenordno", "")) == str(ord_id):
-                            status = str(o.get("status", "")).upper()
-                            if status in ("COMPLETE", "FILLED", "OPEN", "PENDING"):
-                                return True, f"{status} (OrderID={ord_id})"
-                            elif status in ("REJECTED", "CANCELLED"):
-                                rej = o.get("rejreason", "Order Rejected by RMS")
-                                return False, f"REJECTED: {rej} (OrderID={ord_id})"
-            except Exception as e:
-                log_warn(f"Error querying get_order_book: {e}")
-
-        # Paper trading fallback
-        if getattr(self.broker, "paper_trading", False):
-            return True, f"Paper fill confirmed (OrderID={ord_id})"
-
-        return True, f"Placed with OrderID={ord_id}"
-
-    def _enter_leg(self, leg: str, strike: int, side: str, spot: float, atr: float) -> bool:
-        """
-        Executes order for a leg with up to 3 retries.
-        Guarantees:
-          1. 1 order dispatched per 1.05s max.
-          2. Deep verification prevents placing duplicate trades.
-          3. If all 3 attempts fail, returns False to trigger 'ONLY HEDGES LEFT'.
-        """
-        base = leg.split("_")[0]
-        q = self.market_data.streamer.get_live_quote(strike, base)
-        tsym = q.get("tsym", f"NIFTY_{strike}_{base}")
-        ltp = self._get_ltp(strike, base)
-        
-        if ltp <= 0:
-            log_warn(f"Skipping {leg} entry — LTP is 0 or unavailable for strike {strike}.")
+        if ivr < IVR_THRESHOLD_PCT and IVR_ACTION == "SKIP":
+            log_warn(f"IVR {ivr:.1f}% < {IVR_THRESHOLD_PCT}%. Skipping {leg} entry.")
             return False
-        
-        # ── USER CONFIRMATION GATE ─────────────────────────────────────────────
-        # Ask Y/N once before attempting any retry. One approval = all retries allowed.
+
         if not self._ask_user_confirm(leg=leg, side=side, strike=strike, qty=self.qty, ltp=ltp):
-            log_info(f"Trade SKIPPED by user for {leg} {side} Strike={strike}.")
             return False
-        # ──────────────────────────────────────────────────────────────────────
             
-        placed_successfully = False
-        last_reason = ""
+        qty = MAX_LOTS_PER_LEG * LOT_SIZE
+        slippage = max(LIMIT_SLIPPAGE_MIN_PTS, ltp * LIMIT_SLIPPAGE_PCT)
+        limit_price = round(ltp - slippage if side == "SELL" else ltp + slippage, 2)
         
+        placed = False
+        import uuid
         for attempt in range(1, ORDER_MAX_RETRIES + 1):
-            # Enforce 1 order per sec pacing
             self._wait_order_rate_limit()
-            
-            # Refresh price quote before each attempt
-            if attempt > 1:
-                self._ltp_cache.pop(f"{strike}_{base}", None)
-                ltp = self._get_ltp(strike, base)
-            
-            log_info(f"Submitting order (Attempt {attempt}/{ORDER_MAX_RETRIES}) [{side} {self.qty}x {tsym} @ ₹{ltp:.2f}]...")
-            
-            try:
-                res = self.broker.place_option_order(
-                    symbol=tsym,
-                    transaction_type=side,
-                    quantity=self.qty,
-                    price=ltp
-                )
-                
-                # Check initial API submission
-                if res and isinstance(res, dict) and str(res.get("stat", "")).lower() in ("ok", "success"):
-                    ord_id = res.get("norenordno", res.get("order_id", "OK"))
-                    # Deep verification with exchange order book
-                    confirmed, detail = self._verify_order_status(ord_id, tsym, side, self.qty)
-                    if confirmed:
-                        placed_successfully = True
-                        log_info(f"✅ Trade Placed & Verified [{side} {self.qty}x {tsym}]: {detail}")
-                        break
-                    else:
-                        last_reason = detail
-                        log_warn(f"⚠️ Order {ord_id} was REJECTED by exchange: {detail}")
-                else:
-                    err_msg = res.get("emsg", str(res)) if isinstance(res, dict) else str(res)
-                    last_reason = f"Broker Submission Rejected: {err_msg}"
-                    log_warn(f"⚠️ Attempt {attempt} rejected by OMS: {err_msg}")
-                    
-            except Exception as e:
-                last_reason = f"Exception: {e}"
-                log_warn(f"⚠️ Attempt {attempt} threw exception: {e}")
-
-        if not placed_successfully:
-            log_alert(f"❌ ORDER FAILED for {leg} {side} Strike {strike} after {ORDER_MAX_RETRIES} attempts ({last_reason})!")
-            return False
+            order_id = str(uuid.uuid4())
+            res = self.broker.place_option_order(
+                symbol=tsym, transaction_type=side, quantity=qty,
+                order_type="LMT", price=limit_price, remarks=order_id
+            )
+            if res and res.get("stat") == "Ok":
+                if self._verify_order_status(res.get("NOrdNo")):
+                    placed = True
+                    break
         
-        pos_info = {
-            "strike": strike,
-            "tsym": tsym,
-            "base": base,
-            "side": side,
-            "qty": self.qty,
-            "entry_price": ltp,
-            "entry_time": time.time(),
-            "entry_spot": spot
-        }
+        if not placed: return False
         
+        pos_info = {"strike": strike, "tsym": tsym, "side": side, "qty": qty, "entry_price": ltp, "base": leg.split("_")[0]}
         if side == "SELL":
-            pos_info["premium_sl_state"] = self.risk_manager.init_premium_sl(leg, ltp)
+            pos_info["dual_sl_state"] = self.risk_manager.init_dual_sl(leg, spot, ltp, atr, current_iv, dte_days)
             
         self.positions[leg] = pos_info
-        verb = "SOLD" if side == "SELL" else "BOUGHT"
-        log_trade(f"{verb} {leg:10s} Strike: {strike} @ ₹{ltp:.2f} (Qty: {self.qty} | Spot: {spot:.2f})")
-        self._log_trade("ENTRY", leg, strike, side, self.qty, ltp, reason="SIGNAL")
+        self._log_trade("ENTRY", leg, strike, side, qty, ltp, reason="SIGNAL")
         self._save_state()
         return True
-
     def _exit_leg(self, leg: str, reason: str = "MANUAL") -> float:
         """Exits an open leg with rate limiting, retries, and deep verification."""
         if leg not in self.positions:
@@ -1483,11 +1264,13 @@ class ExecutionEngine:
             log_info(f"Submitting EXIT order (Attempt {attempt}/{MAX_EXIT_RETRIES}) [{close_side} {close_qty}x {tsym} @ ₹{ltp:.2f}]...")
             
             try:
+                import uuid
+                order_id = str(uuid.uuid4())
+                slippage = max(LIMIT_SLIPPAGE_MIN_PTS, ltp * LIMIT_SLIPPAGE_PCT)
+                limit_price = round(ltp + slippage if close_side == 'BUY' else ltp - slippage, 2)
                 res = self.broker.place_option_order(
-                    symbol=tsym,
-                    transaction_type=close_side,
-                    quantity=close_qty,
-                    price=ltp
+                    symbol=tsym, transaction_type=close_side, quantity=close_qty,
+                    order_type='LMT', price=limit_price, remarks=order_id
                 )
                 
                 if res and isinstance(res, dict) and str(res.get("stat", "")).lower() in ("ok", "success"):
@@ -1599,62 +1382,54 @@ class ExecutionEngine:
         self._save_state()
 
     def _check_cooldown_and_reenter(self, spot: float, atm: int, atr: float, regime: str, trend: int, dte_days: float = 2.0):
-        """
-        Requires KAMA to reverse by >= 7.5 points from its extreme before re-entering.
-        """
-        if regime == "TREND":
-            return  # NEVER re-enter opposing legs while a strong trend is active!
-        KAMA_REVERSAL_REQUIRED = 1.0
+        if regime == "TREND": return
+        if self.strangle_resets_today >= MAX_STRANGLE_RESETS: return
+        
+        reversal_req = KAMA_REVERSAL_ATR_RATIO * atr
         current_kama = float(self.current_indicators.get("kama", spot) or spot)
         
+        import time
         for leg in ("PE", "CE"):
             cd = self.cooldown_tracker.get(leg)
-            if not cd or not cd.get("active", False):
-                continue
-                
-            extreme = cd.get("extreme_kama", current_kama)
-            reversal_met = False
+            if not cd or not cd.get("active", False): continue
             
+            if cd.get("reentries_today", 0) >= MAX_REENTRIES_PER_LEG: continue
+            if self.total_reentries_today >= MAX_REENTRIES_TOTAL: continue
+            if time.time() < cd.get("next_eligible_time", 0): continue
+            
+            extreme = cd.get("extreme_kama", current_kama)
             if leg == "CE":
-                # CE stopped out means market rallied. Track highest KAMA.
                 if current_kama > extreme:
                     cd["extreme_kama"] = current_kama
                     extreme = current_kama
-                
-                # To re-enter CE, market must fall (KAMA must drop 7.5 points from highest KAMA)
-                if current_kama <= extreme - KAMA_REVERSAL_REQUIRED:
-                    reversal_met = True
+                    cd["consecutive_bars"] = 0
+                if current_kama <= extreme - reversal_req:
+                    cd["consecutive_bars"] = cd.get("consecutive_bars", 0) + 1
+                else: cd["consecutive_bars"] = 0
             else:
-                # PE stopped out means market crashed. Track lowest KAMA.
                 if current_kama < extreme:
                     cd["extreme_kama"] = current_kama
                     extreme = current_kama
+                    cd["consecutive_bars"] = 0
+                if current_kama >= extreme + reversal_req:
+                    cd["consecutive_bars"] = cd.get("consecutive_bars", 0) + 1
+                else: cd["consecutive_bars"] = 0
                 
-                # To re-enter PE, market must bounce (KAMA must rise 7.5 points from lowest KAMA)
-                if current_kama >= extreme + KAMA_REVERSAL_REQUIRED:
-                    reversal_met = True
-                    
-            if reversal_met:
-                log_info(f"✅ KAMA Reversal of 1.0+ pts achieved for {leg}! Extreme: {extreme:.2f}, Current: {current_kama:.2f}. Attempting re-shorting...")
-                ce_strike, pe_strike = self.calculate_strangle_strikes(atm, atr, regime, dte_days=dte_days)
-                target_strike = ce_strike if leg == "CE" else pe_strike
+            if cd.get("consecutive_bars", 0) >= KAMA_CONSECUTIVE_BARS:
+                mult = ATR_MULT_CHOP if regime == "CHOP" else ATR_MULT_TREND
+                width = int(round((atr * mult) / 50.0) * 50)
+                strike = atm + width if leg == "CE" else atm - width
                 
-                if leg not in self.positions:
-                    success = self._enter_leg(leg, target_strike, "SELL", spot, atr)
-                    if not success:
-                        # Re-entry failed after 3 tries -> ONLY HEDGES LEFT!
-                        self.square_off_all_short_legs(reason="REENTRY_3_TRIES_FAILED")
-
-                cd["active"] = False
-                self._save_state()
+                has_short = sum(1 for p in self.positions.values() if p.get("side") == "SELL")
+                if has_short >= MAX_CONCURRENT_SHORT_LEGS: continue
                 
-                if not any(v.get("active", False) for v in self.cooldown_tracker.values()):
-                    self.mode = "CHOP_MODE" if regime == "CHOP" else "RUNNING"
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # Terminal UI & Dashboard Renderer
-    # ──────────────────────────────────────────────────────────────────────────
-
+                if self._enter_leg(leg, strike, "SELL", spot, atr, dte_days):
+                    cd["active"] = False
+                    cd["reentries_today"] = cd.get("reentries_today", 0) + 1
+                    self.total_reentries_today += 1
+                    backoff = BACKOFF_BASE_SEC * (2 ** cd["reentries_today"])
+                    cd["next_eligible_time"] = time.time() + backoff
+                    self._save_state()
     def _render_dashboard(self, spot: float, atm: int):
         import re
         def ansi_len(s): return len(re.sub(r"\x1b\[[0-9;]*m", "", s))
@@ -1827,6 +1602,20 @@ class ExecutionEngine:
         while self.is_running and not _EMERGENCY_STOP_TRIGGERED:
             try:
                 now = get_ist_now()
+                import time
+                current_time = time.time()
+                self.last_feed_tick = current_time
+                if os.path.exists(KILL_SWITCH_FILE):
+                    log_alert('🛑 KILL SWITCH ENGAGED! Halting.')
+                    self.mode = 'HALTED'
+                if current_time - self.last_reconciliation > RECONCILIATION_INTERVAL_S:
+                    self.last_reconciliation = current_time
+                    actual_pos = self._get_live_exchange_positions()
+                    if actual_pos is not None:
+                        for l, p in list(self.positions.items()):
+                            if p['tsym'] not in actual_pos or actual_pos[p['tsym']] == 0:
+                                log_alert(f'⚠️ RECONCILIATION MISMATCH: {l} closed on exchange!')
+                                del self.positions[l]
                 self._ltp_cache.clear()
                 
                 # Check Auto Square-off Time (15:28 PM)
@@ -1894,16 +1683,17 @@ class ExecutionEngine:
                             self.session_em_1sd = VolatilityEngine.compute_expected_move(spot, straddle, 15.0)
                             log_info(f"Frozen Session EM_1sd: {self.session_em_1sd:.2f}")
                             
-                        hedge_width = HEDGE_WIDTH_PTS
+                        ce_strike, pe_strike = self.calculate_strangle_strikes(atm, atr, regime, dte_days=dte_days)
+                        ce_hedge, pe_hedge = self.calculate_hedge_strikes(atm, ce_strike, pe_strike, dte_days=dte_days)
                         log_info(f"Market Start Time (09:18 AM) reached. Ingesting positions (Regime: {regime}, ATR: {atr:.1f}, Hedge Dist: {hedge_width})...")
                         
                         # Step 1: Buy Far-OTM Hedges
                         ce_h_ok = True
                         pe_h_ok = True
                         if "CE_HEDGE" not in self.positions:
-                            ce_h_ok = self._enter_leg("CE_HEDGE", atm + hedge_width, "BUY", spot, atr)
+                            ce_h_ok = self._enter_leg("CE_HEDGE", ce_hedge, "BUY", spot, atr, dte_days)
                         if "PE_HEDGE" not in self.positions:
-                            pe_h_ok = self._enter_leg("PE_HEDGE", atm - hedge_width, "BUY", spot, atr)
+                            pe_h_ok = self._enter_leg("PE_HEDGE", pe_hedge, "BUY", spot, atr, dte_days)
                             
                         if not (ce_h_ok and pe_h_ok):
                             log_alert("⚠️ Hedge entry failed after 3 tries. Aborting short leg entry to protect capital.")
@@ -1911,14 +1701,13 @@ class ExecutionEngine:
                             continue
 
                         # Step 2: Sell Dynamic ATR-Calculated Strangle
-                        ce_strike, pe_strike = self.calculate_strangle_strikes(atm, atr, regime, dte_days=dte_days)
                         
                         ce_s_ok = True
                         pe_s_ok = True
                         if "PE" not in self.positions:
-                            pe_s_ok = self._enter_leg("PE", pe_strike, "SELL", spot, atr)
+                            pe_s_ok = self._enter_leg("PE", pe_strike, "SELL", spot, atr, dte_days)
                         if "CE" not in self.positions:
-                            ce_s_ok = self._enter_leg("CE", ce_strike, "SELL", spot, atr)
+                            ce_s_ok = self._enter_leg("CE", ce_strike, "SELL", spot, atr, dte_days)
                             
                         # CRITICAL RULE: If either short leg failed after 3 retries, square off all short legs -> ONLY HEDGES LEFT!
                         if not (ce_s_ok and pe_s_ok):
@@ -1946,8 +1735,8 @@ class ExecutionEngine:
                         if leg in self.positions and self.positions[leg]["side"] == "SELL":
                             is_strangle = ("CE" in self.positions and "PE" in self.positions)
                             ltp_premium = self._get_ltp(self.positions[leg]["strike"], self.positions[leg]["base"])
-                            is_stopped, reason = self.risk_manager.update_premium_sl_and_check(
-                                leg, self.positions[leg], ltp_premium, is_strangle, regime, is_new_1m_bar
+                            is_stopped, reason = self.risk_manager.update_dual_sl_and_check(
+                                leg, self.positions[leg], spot, ltp_premium, is_strangle, is_new_1m_bar
                             )
                             if is_stopped:
                                 log_alert(reason)
