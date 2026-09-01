@@ -391,6 +391,10 @@ REFRESH_INTERVAL_SEC    = 60          # 1-minute evaluation cadence
 ORDER_MAX_RETRIES       = 3           # Max retry attempts for rejected orders
 MIN_ORDER_INTERVAL_SEC  = 1.05        # 1 order in 1 sec not more (Strict pacing)
 
+# Trade Confirmation (Y/N Before Each Order)
+CONFIRM_BEFORE_TRADE    = True        # Ask Y/N before every order (set False to auto-place)
+CONFIRM_TIMEOUT_SEC     = 120         # Auto-reject if no response within 120 seconds
+
 # Global Kill Switch State
 _EMERGENCY_STOP_TRIGGERED: bool = False
 _EMERGENCY_STOP_LOCK = threading.Lock()
@@ -1033,8 +1037,104 @@ class ExecutionEngine:
         self._last_order_time = time.time()
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Mathematical Strike-Selection Barrier (Guarantees CE != PE)
+    # Trade Confirmation Gate (Y/N Before Every Order)
     # ──────────────────────────────────────────────────────────────────────────
+
+    def _ask_user_confirm(self, leg: str, side: str, strike: int, qty: int, ltp: float) -> bool:
+        """
+        Asks user Y/N before placing any order.
+
+        Works in TWO ways (auto-detected):
+          1. FOREGROUND: If running directly in terminal, reads Y/N from keyboard (stdin).
+          2. NOHUP / BACKGROUND: Creates a flag file at data/state/confirm_trade.txt.
+             User runs from another terminal:
+               echo y > /path/to/confirm_trade.txt    → APPROVE
+               echo n > /path/to/confirm_trade.txt    → REJECT
+
+        Auto-rejects if no response within CONFIRM_TIMEOUT_SEC (120s).
+        """
+        if not CONFIRM_BEFORE_TRADE:
+            return True
+
+        confirm_file = os.path.join(PROJECT_ROOT, "data", "state", "confirm_trade.txt")
+
+        verb = "SELL (SHORT)" if side == "SELL" else "BUY (HEDGE)"
+        separator = "═" * 62
+        msg_lines = [
+            "",
+            f"  {separator}",
+            f"  🔔 TRADE CONFIRMATION REQUIRED",
+            f"  {separator}",
+            f"  Leg     : {leg}",
+            f"  Action  : {verb}",
+            f"  Strike  : {strike}",
+            f"  Qty     : {qty} (1 lot)",
+            f"  LTP     : ₹{ltp:.2f}",
+            f"  Timeout : {CONFIRM_TIMEOUT_SEC}s (auto-REJECT if no response)",
+            f"  {separator}",
+        ]
+
+        # Check if stdin is a real terminal (foreground mode)
+        is_tty = sys.stdin and hasattr(sys.stdin, "isatty") and sys.stdin.isatty()
+
+        if is_tty:
+            # ── FOREGROUND MODE: read from keyboard ──
+            for line in msg_lines:
+                print(f"{Fore.YELLOW}{Style.BRIGHT}{line}{Style.RESET_ALL}", flush=True)
+            print(f"{Fore.YELLOW}{Style.BRIGHT}  Type Y to PLACE or N to SKIP: {Style.RESET_ALL}", end="", flush=True)
+
+            import select as _select
+            start = time.time()
+            while time.time() - start < CONFIRM_TIMEOUT_SEC:
+                rlist, _, _ = _select.select([sys.stdin], [], [], 1.0)
+                if rlist:
+                    ans = sys.stdin.readline().strip().lower()
+                    if ans in ("y", "yes"):
+                        print(f"{Fore.GREEN}  ✅ APPROVED — Placing order...{Style.RESET_ALL}\n", flush=True)
+                        return True
+                    elif ans in ("n", "no", ""):
+                        print(f"{Fore.RED}  ❌ REJECTED — Skipping trade.{Style.RESET_ALL}\n", flush=True)
+                        return False
+            print(f"{Fore.RED}  ⏰ TIMEOUT — No response in {CONFIRM_TIMEOUT_SEC}s. REJECTED.{Style.RESET_ALL}\n", flush=True)
+            return False
+
+        else:
+            # ── NOHUP / BACKGROUND MODE: file-based confirmation ──
+            # Clear any stale confirm file first
+            try:
+                if os.path.exists(confirm_file):
+                    os.remove(confirm_file)
+                os.makedirs(os.path.dirname(confirm_file), exist_ok=True)
+            except Exception:
+                pass
+
+            for line in msg_lines:
+                print(f"{line}", flush=True)
+            print(f"\n  ⏳ Waiting for confirmation. Run in your terminal:", flush=True)
+            print(f"     echo y > {confirm_file}   ← APPROVE", flush=True)
+            print(f"     echo n > {confirm_file}   ← REJECT\n", flush=True)
+            log_alert(f"AWAITING CONFIRMATION FOR: {side} {leg} Strike={strike} @ ₹{ltp:.2f} | echo y/n > {confirm_file}")
+
+            deadline = time.time() + CONFIRM_TIMEOUT_SEC
+            while time.time() < deadline:
+                if os.path.exists(confirm_file):
+                    try:
+                        ans = open(confirm_file).read().strip().lower()
+                        os.remove(confirm_file)
+                        if ans in ("y", "yes"):
+                            log_info(f"✅ Trade APPROVED by user: {side} {leg} Strike={strike}")
+                            return True
+                        else:
+                            log_alert(f"❌ Trade REJECTED by user: {side} {leg} Strike={strike}")
+                            return False
+                    except Exception:
+                        pass
+                time.sleep(0.5)
+
+            log_alert(f"⏰ Confirmation TIMEOUT ({CONFIRM_TIMEOUT_SEC}s) for {side} {leg} Strike={strike} — REJECTED.")
+            return False
+
+
 
     @staticmethod
     def _expiry_width_multiplier(dte_days: float) -> float:
@@ -1258,6 +1358,13 @@ class ExecutionEngine:
         if ltp <= 0:
             log_warn(f"Skipping {leg} entry — LTP is 0 or unavailable for strike {strike}.")
             return False
+        
+        # ── USER CONFIRMATION GATE ─────────────────────────────────────────────
+        # Ask Y/N once before attempting any retry. One approval = all retries allowed.
+        if not self._ask_user_confirm(leg=leg, side=side, strike=strike, qty=self.qty, ltp=ltp):
+            log_info(f"Trade SKIPPED by user for {leg} {side} Strike={strike}.")
+            return False
+        # ──────────────────────────────────────────────────────────────────────
             
         placed_successfully = False
         last_reason = ""
