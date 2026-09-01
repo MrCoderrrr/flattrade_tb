@@ -134,7 +134,7 @@ except ImportError:
 
     class DBManager:
         def record_trade(self, *args, **kwargs): pass
-        def get_strategy_pnl_summary(self, *args, **kwargs): return {"today_pnl": 0.0, "mtd_pnl": 0.0, "ytd_pnl": 0.0, "current_capital": kwargs.get("base_capital", 145585.75)}
+        def get_strategy_pnl_summary(self, *args, **kwargs): return {"today_pnl": 0.0, "mtd_pnl": 0.0, "ytd_pnl": 0.0, "current_capital": kwargs.get("base_capital", 195784.0)}
     db = DBManager()
 
 
@@ -335,7 +335,7 @@ class FlattradeBroker:
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 # Capital & Allocation
-CAPITAL                 = 145585.75   # Total Capital
+CAPITAL                 = 195784.0    # Total Capital
 LOT_SIZE                = 65          # NIFTY Lot size (revised Jan 2026)
 CAPITAL_BUFFER          = 0.95        # Usable capital buffer (95%)
 MARGIN_IRON_CONDOR      = 95_000      # Margin required for 4-leg Iron Condor per lot
@@ -2047,7 +2047,7 @@ def prompt_user_variables():
                 print(f"    {Fore.RED}Invalid input. Using default: {default}{Style.RESET_ALL}")
                 return default
 
-        CAPITAL = ask("Initial Capital (Rs.)", 145585.75, float)
+        CAPITAL = ask("Initial Capital (Rs.)", 195784.0, float)
         KAMA_PERIOD = ask("KAMA Lookback", 13, int)
         KAMA_FAST_EMA = ask("KAMA Fast EMA", 2, int)
         KAMA_SLOW_EMA = ask("KAMA Slow EMA", 30, int)
