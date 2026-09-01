@@ -1083,9 +1083,13 @@ class ExecutionEngine:
         return ce_strike, pe_strike
 
     def _calculate_lot_quantity(self) -> int:
-        usable_capital = CAPITAL * CAPITAL_BUFFER
-        lots = max(1, int(usable_capital / MARGIN_IRON_CONDOR))
-        return lots * LOT_SIZE
+        """
+        Strict User Specification:
+        '1 lot in each leg only'
+        '65 qnty'
+        Fixes position sizing strictly to 1 lot (65 quantity) per leg.
+        """
+        return LOT_SIZE
 
     def _save_state(self):
         try:
