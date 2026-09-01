@@ -785,7 +785,7 @@ class ExecutionEngine:
 
     def _render_dashboard(self, spot: float, atm: int, indicators: dict, unrealized: float):
         try:
-            os.system('cls' if os.name == 'nt' else 'clear')
+            # We explicitly removed os.system('clear') per user request so the terminal scrolls naturally
             
             # Save external snapshot
             snap = {
