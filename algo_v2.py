@@ -601,6 +601,11 @@ class MarketData:
             
         return spot, atm, is_new_1m_bar
 
+    def get_1m_dataframe(self) -> pd.DataFrame:
+        if not self.bars_1m:
+            return pd.DataFrame(columns=["timestamp", "spot", "minute_key"])
+        return pd.DataFrame(self.bars_1m)
+
     def get_5m_dataframe(self) -> pd.DataFrame:
         if not self.bars_5m:
             return pd.DataFrame(columns=["open", "high", "low", "close"])
@@ -730,7 +735,7 @@ class Indicators:
         return current_adx, float(plus_di[-1]), float(minus_di[-1])
 
     @classmethod
-    def evaluate_all(cls, df_5m: pd.DataFrame) -> Dict[str, Any]:
+    def evaluate_all(cls, df_1m: pd.DataFrame, df_5m: pd.DataFrame) -> Dict[str, Any]:
         if df_5m.empty or len(df_5m) < 5:
             return {
                 "kama": None, "prev_kama": None, "trend": 0,
@@ -742,7 +747,12 @@ class Indicators:
         lows = df_5m["low"].to_numpy(dtype=float)
         closes = df_5m["close"].to_numpy(dtype=float)
         
-        kama, prev_kama, trend = cls.calculate_kama(closes, period=KAMA_PERIOD, fast=KAMA_FAST_EMA, slow=KAMA_SLOW_EMA)
+        # Calculate KAMA on 1-minute spot (close) prices
+        if not df_1m.empty and len(df_1m) >= KAMA_PERIOD + 1:
+            closes_1m = df_1m["spot"].to_numpy(dtype=float)
+            kama, prev_kama, trend = cls.calculate_kama(closes_1m, period=KAMA_PERIOD, fast=KAMA_FAST_EMA, slow=KAMA_SLOW_EMA)
+        else:
+            kama, prev_kama, trend = cls.calculate_kama(closes, period=KAMA_PERIOD, fast=KAMA_FAST_EMA, slow=KAMA_SLOW_EMA)
         atr = cls.calculate_atr(highs, lows, closes, period=ATR_PERIOD)
         adx, p_di, m_di = cls.calculate_adx(highs, lows, closes, period=ADX_PERIOD)
         
@@ -932,7 +942,7 @@ class ExecutionEngine:
         
         df_5m = self.market_data.get_5m_dataframe()
         if not df_5m.empty and len(df_5m) >= 5:
-            self.current_indicators = Indicators.evaluate_all(df_5m)
+            self.current_indicators = Indicators.evaluate_all(self.market_data.get_1m_dataframe(), df_5m)
             log_info(f"ExecutionEngine: Indicators pre-warmed on boot (KAMA={self.current_indicators.get('kama')}, Trend={self.current_indicators.get('trend')}, ADX={self.current_indicators.get('adx')}, ATR={self.current_indicators.get('atr')}, Regime={self.current_indicators.get('regime')})")
         
         self._ltp_cache: Dict[str, float] = {}
@@ -1857,7 +1867,7 @@ class ExecutionEngine:
 
                 # ── 2. Run KAMA & Indicators strictly on the collected 1-minute data ──
                 df_5m = self.market_data.get_5m_dataframe()
-                self.current_indicators = Indicators.evaluate_all(df_5m)
+                self.current_indicators = Indicators.evaluate_all(self.market_data.get_1m_dataframe(), df_5m)
                 
                 current_iv = 15.0
                 if self.session_em_1sd > 0:
