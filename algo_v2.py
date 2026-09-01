@@ -785,14 +785,14 @@ class RiskManager:
         self.circuit_breaker_loss_limit = -1.0 * (capital * PORTFOLIO_CIRCUIT_PCT / 100.0)
         self.circuit_breaker_triggered = False
 
-    def check_portfolio_circuit_breaker(self, unrealized_pnl: float, realized_pnl: float) -> getattr(typing, 'Tuple', tuple):
+    def check_portfolio_circuit_breaker(self, unrealized_pnl: float, realized_pnl: float) -> Tuple:
         net_mtm = realized_pnl + unrealized_pnl
         if net_mtm <= self.circuit_breaker_loss_limit:
             self.circuit_breaker_triggered = True
             return True, f"PORTFOLIO CIRCUIT BREAKER HIT: Net MTM {net_mtm:.2f} breached limit {self.circuit_breaker_loss_limit:.2f}"
         return False, ""
 
-    def init_premium_sl(self, leg: str, entry_premium: float) -> getattr(typing, 'Dict', dict):
+    def init_premium_sl(self, leg: str, entry_premium: float) -> Dict:
         """Initializes Premium Trailing Stop Loss tracker."""
         return {
             "entry_premium": round(entry_premium, 2),
@@ -801,7 +801,7 @@ class RiskManager:
             "breach_count": 0
         }
 
-    def update_premium_sl_and_check(self, leg: str, pos_data: getattr(typing, 'Dict', dict), current_premium: float, is_strangle: bool, regime: str, is_new_1m_bar: bool) -> getattr(typing, 'Tuple', tuple):
+    def update_premium_sl_and_check(self, leg: str, pos_data: Dict, current_premium: float, is_strangle: bool, regime: str, is_new_1m_bar: bool) -> Tuple:
         sl_state = pos_data.get("premium_sl_state")
         if not sl_state:
             return False, ""
