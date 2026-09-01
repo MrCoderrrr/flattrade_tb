@@ -394,7 +394,7 @@ ORDER_MAX_RETRIES       = 3           # Max retry attempts for rejected orders
 MIN_ORDER_INTERVAL_SEC  = 1.05        # 1 order in 1 sec not more (Strict pacing)
 
 # Trade Confirmation (Y/N Before Each Order)
-CONFIRM_BEFORE_TRADE    = True        # Ask Y/N before every order (set False to auto-place)
+CONFIRM_BEFORE_TRADE    = False       # Trade confirmation disabled — orders placed automatically
 CONFIRM_TIMEOUT_SEC     = 120         # Auto-reject if no response within 120 seconds
 
 # Paper Trading Mode (set by startup Y/N prompt — True = simulated, False = live orders)
