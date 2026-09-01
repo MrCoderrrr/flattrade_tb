@@ -1978,7 +1978,7 @@ class ExecutionEngine:
                                 self.square_off_all_short_legs(reason="ROLL_PE_FAILED")
 
                     # Routine Invariant Verification: Strangle or Hedges Only
-                    self.enforce_strangle_or_hedges_only(context="CYCLE_HEALTH_CHECK")
+                    # self.enforce_strangle_or_hedges_only(context="CYCLE_HEALTH_CHECK")
 
                 # ── 5. Render Live Dashboard ──
                 self._render_dashboard(spot, atm)
