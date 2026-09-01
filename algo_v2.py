@@ -1210,7 +1210,7 @@ class ExecutionEngine:
         except Exception as e:
             log_warn(f"Failed to save state: {e}")
 
-    def _get_live_exchange_positions(self) -> getattr(typing, 'Dict', dict):
+    def _get_live_exchange_positions(self) -> Dict[str, int]:
         if self.broker.paper_trading or not self.broker.api:
             return None
         try:
