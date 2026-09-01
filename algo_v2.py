@@ -1210,6 +1210,26 @@ class ExecutionEngine:
         except Exception as e:
             log_warn(f"Failed to save state: {e}")
 
+    def _get_live_exchange_positions(self) -> getattr(typing, 'Dict', dict):
+        if self.broker.paper_trading or not self.broker.api:
+            return None
+        try:
+            res = self.broker.api.get_positions()
+            if isinstance(res, list):
+                pos_map = {}
+                for p in res:
+                    if isinstance(p, dict) and "tsym" in p and "netqty" in p:
+                        try:
+                            netqty = int(p["netqty"])
+                            if netqty != 0:
+                                pos_map[p["tsym"]] = netqty
+                        except ValueError:
+                            pass
+                return pos_map
+        except Exception as e:
+            log_warn(f"Failed to fetch exchange positions: {e}")
+        return None
+
     def _load_state(self):
         if not os.path.exists(self.state_file):
             return
@@ -1242,7 +1262,22 @@ class ExecutionEngine:
                             entry_spot = float(pos.get("entry_spot", self.market_data.latest_spot))
                             atr_val = float(self.current_indicators.get("atr", DEFAULT_ATR_5M))
                             pos["spot_sl_state"] = self.risk_manager.init_spot_sl(leg, entry_spot, atr_val)
-                            
+
+                # Sync with exchange on startup
+                actual_positions = self._get_live_exchange_positions()
+                if actual_positions is not None:
+                    removed_any = False
+                    for leg in list(self.positions.keys()):
+                        tsym = self.positions[leg]["tsym"]
+                        if tsym not in actual_positions or actual_positions[tsym] == 0:
+                            log_warn(f"Startup Sync: {leg} ({tsym}) is no longer open on exchange. Removing from local state.")
+                            del self.positions[leg]
+                            removed_any = True
+                    
+                    if removed_any and not self.positions:
+                        log_info("Startup Sync: No active positions found on exchange. Resetting to fresh WAIT_DATA state.")
+                        self.mode = "WAIT_DATA"
+                        
                 log_info(f"Loaded existing session state for today ({today_str}). Realized PnL: ₹{self.realized_pnl:,.2f}")
         except Exception as e:
             log_warn(f"Failed to load state: {e}")
@@ -1483,7 +1518,15 @@ class ExecutionEngine:
         return pnl
 
     def _exit_all_positions(self, reason: str = "GLOBAL_EXIT"):
+        actual_positions = self._get_live_exchange_positions()
+        
         for leg in list(self.positions.keys()):
+            if actual_positions is not None:
+                tsym = self.positions[leg]["tsym"]
+                if tsym not in actual_positions or actual_positions[tsym] == 0:
+                    log_info(f"Skipping exit for {leg} ({tsym}): Already closed on exchange.")
+                    del self.positions[leg]
+                    continue
             self._exit_leg(leg, reason=reason)
 
     # ──────────────────────────────────────────────────────────────────────────
