@@ -1718,7 +1718,7 @@ class ExecutionEngine:
                     "adx_gate": ADX_CHOP_THRESHOLD,
                     "debounce_bars": SPOT_SL_DEBOUNCE_BARS,
                     "strangle_width": BASE_MIN_WIDTH_PTS,
-                    "hedge_dist": int(round((1.5 * getattr(self, "session_em_1sd", 0.0)) / 50.0) * 50) if getattr(self, "session_em_1sd", 0.0) > 0 else 1000,
+                    "hedge_dist": HEDGE_WIDTH_PTS,
                     "spot_sl_atr": SPOT_SL_ATR_MULT,
                     "spot_trail_pct": SPOT_SL_TRAIL_RATIO * 100.0,
                     "cooldown_min": 0
@@ -1816,7 +1816,7 @@ class ExecutionEngine:
                             self.session_em_1sd = VolatilityEngine.compute_expected_move(spot, straddle, 15.0)
                             log_info(f"Frozen Session EM_1sd: {self.session_em_1sd:.2f}")
                             
-                        hedge_width = int(round((1.5 * self.session_em_1sd) / 50.0) * 50) if self.session_em_1sd > 0 else 1000
+                        hedge_width = HEDGE_WIDTH_PTS
                         log_info(f"Market Start Time (09:18 AM) reached. Ingesting positions (Regime: {regime}, ATR: {atr:.1f}, Hedge Dist: {hedge_width})...")
                         
                         # Step 1: Buy Far-OTM Hedges
