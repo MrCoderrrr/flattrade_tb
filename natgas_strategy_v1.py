@@ -116,7 +116,11 @@ class FlattradeBroker:
             limits = self.api.get_limits()
             if not limits or not isinstance(limits, dict) or limits.get("stat") != "Ok":
                 raise RuntimeError("Token invalid or expired. Login again.")
-            log_info("Flattrade MCX session authenticated successfully.")
+            
+            cash = float(limits.get('cash', 0.0))
+            payin = float(limits.get('payin', 0.0))
+            self.live_capital = cash + payin
+            log_info(f"Flattrade MCX session authenticated successfully. (Live Capital: {self.live_capital})")
         else:
             log_warn("PAPER TRADING MODE — Fills are simulated.")
 
@@ -882,10 +886,7 @@ def prompt_user_variables():
     else:
         PAPER_TRADING_MODE = True
         
-    if not PAPER_TRADING_MODE:
-        cap_in = input(f"Enter Allocated Capital for Circuit Breaker (Default: 250000): ").strip()
-        if cap_in.isdigit():
-            CAPITAL = float(cap_in)
+
             
     print(f"\n✅ Deploying in {'PAPER' if PAPER_TRADING_MODE else 'LIVE'} Mode...\n")
 
@@ -896,6 +897,11 @@ if __name__ == "__main__":
     try:
         prompt_user_variables()
         broker = FlattradeBroker(paper_trading=PAPER_TRADING_MODE)
+        
+        if not PAPER_TRADING_MODE and hasattr(broker, 'live_capital') and broker.live_capital > 0:
+            CAPITAL = broker.live_capital
+            log_info(f"Capital auto-fetched from Flattrade: ₹{CAPITAL:,.2f}")
+            
         market_data = MarketData(broker)
         risk_manager = RiskManager(capital=CAPITAL)
         
