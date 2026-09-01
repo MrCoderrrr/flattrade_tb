@@ -1931,9 +1931,11 @@ class ExecutionEngine:
 
                 # Phase B: Active Trading Management (RUNNING, CHOP_MODE, COOLDOWN)
                 elif self.mode in ("RUNNING", "CHOP_MODE", "COOLDOWN", "HEDGES_ONLY"):
-                    if not self.positions:
-                        log_info("No active positions in RUNNING mode. Resetting to WAIT_DATA...")
+                    has_short = any(p.get("side") == "SELL" for p in self.positions.values())
+                    if not has_short:
+                        log_info("All short legs stopped out. Resetting to WAIT_DATA to re-center new Strangle...")
                         self.mode = "WAIT_DATA"
+                        self.cooldown_tracker.clear()
                         self._save_state()
                         continue
 
