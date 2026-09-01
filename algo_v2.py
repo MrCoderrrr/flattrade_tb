@@ -40,7 +40,15 @@ import select
 import threading
 import traceback
 import urllib3.util.connection as urllib3_cn
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+# Standard Indian Standard Time (IST = UTC+5:30)
+IST = timezone(timedelta(hours=5, minutes=30))
+
+def get_ist_now() -> datetime:
+    """Guarantees current time is strictly IST regardless of host server timezone (UTC/EST/etc)."""
+    return datetime.now(IST).replace(tzinfo=None)
+
 from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
@@ -70,13 +78,29 @@ try:
     from api_helper import NorenApiPy
     from creds import USER_ID
     global_api = NorenApiPy()
-    token_file = "token.txt" if os.path.exists("token.txt") else os.path.join(PROJECT_ROOT, "token.txt")
-    if os.path.exists(token_file):
+    token_candidates = [
+        "token.txt",
+        os.path.join(CURRENT_DIR, "token.txt"),
+        os.path.join(PROJECT_ROOT, "token.txt"),
+        "/home/ubuntu/flattrade_tb/flattrade_tb/token.txt",
+        "/home/ubuntu/flattrade_tb/token.txt"
+    ]
+    token_file = None
+    for tc in token_candidates:
+        if os.path.exists(tc) and os.path.getsize(tc) > 0:
+            token_file = tc
+            break
+
+    if token_file:
         with open(token_file, "r") as f:
             access_token = f.read().strip()
             if access_token:
                 global_api.set_session(userid=str(USER_ID).strip(), password='', usertoken=access_token)
-except Exception:
+                print(f"[AUTH] Flattrade session established from {token_file} for user {USER_ID}", flush=True)
+    else:
+        print("[AUTH] Notice: token.txt not found or empty. Operating in fallback mode.", flush=True)
+except Exception as e:
+    print(f"[AUTH] Notice: Flattrade API init: {e}", flush=True)
     global_api = None
 
 try:
@@ -138,7 +162,8 @@ class NSEATMStreamer:
         return self._last_spot, self._last_atm
 
     def get_live_quote(self, strike: int, option_type: str) -> Dict[str, Any]:
-        """Fetches live option quote directly from Flattrade."""
+        """Fetches live option quote directly from Flattrade with zero-price fallbacks."""
+        today = get_ist_now().date()
         if self.api and hasattr(self.api, "searchscrip"):
             try:
                 search_text = f"NIFTY {strike} {option_type}"
@@ -148,7 +173,9 @@ class NSEATMStreamer:
                     for item in res['values']:
                         if 'exd' in item:
                             try:
-                                valid.append({'item': item, 'dt': datetime.strptime(item['exd'], "%d-%b-%Y")})
+                                d = datetime.strptime(item['exd'], "%d-%b-%Y").date()
+                                if d >= today:  # Only current or future expiries
+                                    valid.append({'item': item, 'dt': d})
                             except ValueError:
                                 continue
                     if valid:
@@ -156,17 +183,32 @@ class NSEATMStreamer:
                         match = valid[0]['item']
                         tsym = match['tsym']
                         quote = self.api.get_quotes(exchange='NFO', token=match['token'])
-                        lp = float(quote.get('lp', quote.get('ltp', 0.0))) if quote else 0.0
+                        lp = 0.0
+                        if quote and isinstance(quote, dict):
+                            for field in ('lp', 'ltp', 'c', 'sp1', 'bp1', 'ap'):
+                                val = quote.get(field)
+                                if val is not None:
+                                    try:
+                                        v_flt = float(val)
+                                        if v_flt > 0:
+                                            lp = v_flt
+                                            break
+                                    except (ValueError, TypeError):
+                                        pass
+                        if lp <= 0:
+                            diff = abs(self._last_spot - strike)
+                            lp = max(0.50, round(180.0 - (diff * 0.35), 2))
                         return {"lp": lp, "tsym": tsym, "ls": int(match.get('ls', 65))}
-            except Exception:
-                pass
+            except Exception as e:
+                log_warn(f"get_live_quote error: {e}")
+
         diff = abs(self._last_spot - strike)
         est_prem = max(15.0, 180.0 - (diff * 0.35))
         return {"lp": round(est_prem, 2), "tsym": f"NIFTY_{strike}_{option_type}", "ls": 65}
 
     def get_near_expiry_dte(self) -> Tuple[Optional[datetime], float]:
         """Fetches near expiry date and DTE directly from Flattrade NFO contracts."""
-        today = datetime.now().date()
+        today = get_ist_now().date()
         if self._cached_expiry_date is None or self._cached_expiry_day != today:
             if self.api and hasattr(self.api, "searchscrip"):
                 try:
@@ -187,8 +229,8 @@ class NSEATMStreamer:
                 except Exception:
                     pass
             if self._cached_expiry_date is None:
-                days_ahead = (3 - datetime.now().weekday()) % 7
-                if days_ahead == 0 and datetime.now().hour >= 15:
+                days_ahead = (3 - get_ist_now().weekday()) % 7
+                if days_ahead == 0 and get_ist_now().hour >= 15:
                     days_ahead = 7
                 self._cached_expiry_date = datetime.now() + timedelta(days=days_ahead)
             self._cached_expiry_day = today
@@ -352,7 +394,7 @@ _EMERGENCY_STOP_LOCK = threading.Lock()
 
 # ─── Utility Logging ──────────────────────────────────────────────────────────
 def _now_str() -> str:
-    return datetime.now().strftime("%H:%M:%S")
+    return get_ist_now().strftime("%H:%M:%S")
 
 def log_info(msg: str):
     print(f"{Fore.CYAN}[{_now_str()} INFO]{Style.RESET_ALL}  {msg}", flush=True)
@@ -461,7 +503,7 @@ class MarketData:
 
                 if seeded_5m:
                     seeded_5m.sort(key=lambda x: x['timestamp'])
-                    today = datetime.now().date()
+                    today = get_ist_now().date()
                     prior_bars = [b for b in seeded_5m if b['timestamp'].date() < today][-50:]
                     self.bars_5m = prior_bars + self.bars_5m
                     log_info(f"MarketData: Successfully seeded {len(prior_bars)} 5m bars from Flattrade.")
@@ -492,7 +534,7 @@ class MarketData:
         self.latest_spot = spot
         self.latest_atm = atm
         
-        now = datetime.now()
+        now = get_ist_now()
         current_min_key = now.strftime("%Y-%m-%d %H:%M")
         is_new_1m_bar = (current_min_key != self.last_completed_1m_key)
         
@@ -1009,7 +1051,7 @@ class ExecutionEngine:
     def _save_state(self):
         try:
             state = {
-                "date": str(datetime.now().date()),
+                "date": str(get_ist_now().date()),
                 "mode": self.mode,
                 "realized_pnl": self.realized_pnl,
                 "positions": self.positions,
@@ -1026,7 +1068,7 @@ class ExecutionEngine:
         try:
             with open(self.state_file, "r") as f:
                 state = json.load(f)
-            today_str = str(datetime.now().date())
+            today_str = str(get_ist_now().date())
             if state.get("date") == today_str:
                 self.realized_pnl = float(state.get("realized_pnl", 0.0))
                 self.positions = state.get("positions", {})
@@ -1034,8 +1076,8 @@ class ExecutionEngine:
 
                 saved_mode = state.get("mode", "WAIT_DATA")
                 market_closed = (
-                    datetime.now().hour > AUTO_SQUAREOFF_HOUR or
-                    (datetime.now().hour == AUTO_SQUAREOFF_HOUR and datetime.now().minute >= AUTO_SQUAREOFF_MINUTE)
+                    get_ist_now().hour > AUTO_SQUAREOFF_HOUR or
+                    (get_ist_now().hour == AUTO_SQUAREOFF_HOUR and get_ist_now().minute >= AUTO_SQUAREOFF_MINUTE)
                 )
                 if saved_mode in ("SESSION_DONE", "SESSION_DONE_FLAT") and not market_closed:
                     self.mode = "RUNNING" if self.positions else "WAIT_DATA"
@@ -1055,7 +1097,7 @@ class ExecutionEngine:
             log_warn(f"Failed to load state: {e}")
 
     def _log_trade(self, action: str, leg: str, strike: int, side: str, qty: int, price: float, pnl: Optional[float] = None, reason: str = ""):
-        now_dt = datetime.now()
+        now_dt = get_ist_now()
         ts_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
         today_str = now_dt.strftime("%Y-%m-%d")
         pnl_val = float(pnl) if pnl is not None else 0.0
@@ -1543,7 +1585,7 @@ class ExecutionEngine:
         
         while self.is_running and not _EMERGENCY_STOP_TRIGGERED:
             try:
-                now = datetime.now()
+                now = get_ist_now()
                 self._ltp_cache.clear()
                 
                 # Check Auto Square-off Time (15:28 PM)
@@ -1561,7 +1603,7 @@ class ExecutionEngine:
                 spot, atm, is_new_1m_bar = self.market_data.fetch_live_tick()
                 
                 if not is_new_1m_bar:
-                    now_curr = datetime.now()
+                    now_curr = get_ist_now()
                     sec_into_min = now_curr.second + (now_curr.microsecond / 1_000_000.0)
                     sleep_sec = max(0.1, 60.0 - sec_into_min + 0.05)
                     self._smart_sleep(sleep_sec)
@@ -1645,6 +1687,8 @@ class ExecutionEngine:
                             self.mode = "CHOP_MODE" if regime == "CHOP" else "RUNNING"
                             
                         self._save_state()
+                    else:
+                        log_info(f"⏳ Pre-market wait: Current IST is {now.strftime('%H:%M:%S')}. Trading session starts at {MARKET_START_HOUR:02d}:{MARKET_START_MINUTE:02d} IST.")
 
                 # Phase B: Active Trading Management (RUNNING, CHOP_MODE, COOLDOWN)
                 elif self.mode in ("RUNNING", "CHOP_MODE", "COOLDOWN", "HEDGES_ONLY"):
@@ -1694,7 +1738,7 @@ class ExecutionEngine:
                 self._render_dashboard(spot, atm)
                 
                 # Sleep strictly until next 1-minute boundary (XX:XX:00.05)
-                now_curr = datetime.now()
+                now_curr = get_ist_now()
                 sec_into_min = now_curr.second + (now_curr.microsecond / 1_000_000.0)
                 sleep_sec = max(0.1, 60.0 - sec_into_min + 0.05)
                 self._smart_sleep(sleep_sec)
