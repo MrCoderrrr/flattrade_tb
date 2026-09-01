@@ -370,13 +370,13 @@ EXPIRY_NEAR_DAYS            = 2.0     # Aggressive compression starts around 2 D
 EXPIRY_NEAR_BONUS           = 0.42    # Extra curvature inside the last 2 days
 
 # Spot-Based Trailing Stop Loss
-SPOT_SL_ATR_MULT        = 0.90        # Initial Spot SL distance = 0.9 * ATR from entry spot
+SPOT_SL_ATR_MULT        = 0.90        # Initial Premium SL distance = 0.9 * ATR from entry spot
 SPOT_SL_TRAIL_RATIO     = 0.55        # Base spot trail ratio (55.0%)
 SPOT_SL_TRAIL_RATIO_STRONG = 0.72     # Stronger trail once trade is in meaningful profit
 SPOT_SL_TRAIL_RATIO_DEEP   = 0.85     # Aggressive profit protection for extended favorable moves
 SPOT_SL_BREAKEVEN_LOCK_ATR = 1.10     # Once favorable move exceeds this ATR multiple, lock at/near breakeven
 SPOT_SL_BREAKEVEN_BUFFER_PTS = 5.0    # Small buffer beyond entry to avoid scratch exits
-SPOT_SL_DEBOUNCE_BARS   = 1           # Require 1 1-min close past Spot SL to exit (Debounce = 1)
+PREM_SL_DEBOUNCE_BARS   = 1           # Require 1 1-min close past Premium SL to exit (Debounce = 1)
 
 # Anti-Whipsaw Re-entry Cooldown: 3-MIN COOLDOWN REMOVED
 COOLDOWN_MINUTES        = 0           # 3-minute cooldown removed as requested
@@ -785,111 +785,73 @@ class RiskManager:
         self.circuit_breaker_loss_limit = -1.0 * (capital * PORTFOLIO_CIRCUIT_PCT / 100.0)
         self.circuit_breaker_triggered = False
 
-    def init_spot_sl(self, leg: str, entry_spot: float, atr: float) -> Dict[str, Any]:
-        initial_distance = max(12.0, SPOT_SL_ATR_MULT * atr)
-        if leg == "CE":
-            initial_sl = entry_spot + initial_distance
-            best_spot = entry_spot
-        else:
-            initial_sl = entry_spot - initial_distance
-            best_spot = entry_spot
-            
+    def check_portfolio_circuit_breaker(self, unrealized_pnl: float, realized_pnl: float) -> getattr(typing, 'Tuple', tuple):
+        net_mtm = realized_pnl + unrealized_pnl
+        if net_mtm <= self.circuit_breaker_loss_limit:
+            self.circuit_breaker_triggered = True
+            return True, f"PORTFOLIO CIRCUIT BREAKER HIT: Net MTM {net_mtm:.2f} breached limit {self.circuit_breaker_loss_limit:.2f}"
+        return False, ""
+
+    def init_premium_sl(self, leg: str, entry_premium: float) -> getattr(typing, 'Dict', dict):
+        """Initializes Premium Trailing Stop Loss tracker."""
         return {
-            "entry_spot": round(entry_spot, 2),
-            "atr_at_entry": round(atr, 2),
-            "initial_sl": round(initial_sl, 2),
-            "current_sl": round(initial_sl, 2),
-            "best_spot": round(entry_spot, 2),
-            "trail_amount": 0.0,
+            "entry_premium": round(entry_premium, 2),
+            "best_premium": round(entry_premium, 2),
+            "current_sl": round(entry_premium * 1.05, 2),
             "breach_count": 0
         }
 
-    def update_spot_sl_and_check(self, leg: str, pos_data: Dict[str, Any], current_spot: float, is_new_1m_bar: bool) -> Tuple[bool, str]:
-        sl_state = pos_data.get("spot_sl_state")
+    def update_premium_sl_and_check(self, leg: str, pos_data: getattr(typing, 'Dict', dict), current_premium: float, is_strangle: bool, regime: str, is_new_1m_bar: bool) -> getattr(typing, 'Tuple', tuple):
+        sl_state = pos_data.get("premium_sl_state")
         if not sl_state:
             return False, ""
         
-        entry_spot = float(sl_state["entry_spot"])
-        atr_at_entry = float(sl_state.get("atr_at_entry", 0.0) or 0.0)
+        best_premium = float(sl_state.get("best_premium", pos_data["entry_price"]))
         current_sl = float(sl_state["current_sl"])
-        best_spot = float(sl_state.get("best_spot", entry_spot))
         breach_count = int(sl_state.get("breach_count", 0))
-        safe_atr = max(5.0, atr_at_entry if atr_at_entry > 0 else 1.0)
-        favorable_lock_at = safe_atr * SPOT_SL_BREAKEVEN_LOCK_ATR
-        deep_lock_at = favorable_lock_at * 1.6
-        sl_buffer = max(1.5, safe_atr * 0.08)
         
-        if leg == "CE":
-            if current_spot < best_spot:
-                best_spot = current_spot
-                sl_state["best_spot"] = round(best_spot, 2)
-            
-            favorable_move = entry_spot - best_spot
-            if favorable_move > 0:
-                trail_ratio = SPOT_SL_TRAIL_RATIO
-                if favorable_move >= deep_lock_at:
-                    trail_ratio = SPOT_SL_TRAIL_RATIO_DEEP
-                elif favorable_move >= favorable_lock_at:
-                    trail_ratio = SPOT_SL_TRAIL_RATIO_STRONG
-
-                trail_amount = favorable_move * trail_ratio
-                candidate_sl = sl_state["initial_sl"] - trail_amount
-                sl_state["current_sl"] = min(current_sl, round(candidate_sl, 2))
-                sl_state["trail_amount"] = round(trail_amount, 2)
-                
-            is_breaching = (current_spot >= (sl_state["current_sl"] - sl_buffer))
-            
+        # Determine trailing percentage based on strategy rules
+        if is_strangle:
+            tsl_pct = TSL_STRANGLE_PCT
         else:
-            if current_spot > best_spot:
-                best_spot = current_spot
-                sl_state["best_spot"] = round(best_spot, 2)
-            
-            favorable_move = best_spot - entry_spot
-            if favorable_move > 0:
-                trail_ratio = SPOT_SL_TRAIL_RATIO
-                if favorable_move >= deep_lock_at:
-                    trail_ratio = SPOT_SL_TRAIL_RATIO_DEEP
-                elif favorable_move >= favorable_lock_at:
-                    trail_ratio = SPOT_SL_TRAIL_RATIO_STRONG
-
-                trail_amount = favorable_move * trail_ratio
-                candidate_sl = sl_state["initial_sl"] + trail_amount
-                sl_state["current_sl"] = max(current_sl, round(candidate_sl, 2))
-                sl_state["trail_amount"] = round(trail_amount, 2)
+            if regime == "TREND":
+                tsl_pct = TSL_TREND_ORPHAN_PCT
+            else:
+                tsl_pct = TSL_STRANGLE_PCT
                 
-            is_breaching = (current_spot <= (sl_state["current_sl"] + sl_buffer))
-
-        if is_new_1m_bar:
-            if is_breaching:
+        # Update best premium if it dropped (favorable for sellers)
+        if current_premium < best_premium:
+            best_premium = current_premium
+            sl_state["best_premium"] = round(best_premium, 2)
+            
+        # Calculate trailing SL
+        candidate_sl = best_premium * (1.0 + tsl_pct)
+        
+        # Only tighten SL, never loosen unless pct changed (e.g. 5% to 8% expansion)
+        if is_strangle:
+            sl_state["current_sl"] = min(current_sl, round(candidate_sl, 2))
+        else:
+            sl_state["current_sl"] = round(candidate_sl, 2)
+            
+        is_breaching = (current_premium >= sl_state["current_sl"])
+        
+        if is_breaching:
+            if PREM_SL_DEBOUNCE_BARS <= 0:
+                return True, f"⛔ Premium SL Triggered for {leg} | Premium: ₹{current_premium:.2f} breached SL: ₹{sl_state['current_sl']:.2f}"
+            
+            if is_new_1m_bar:
                 breach_count += 1
                 sl_state["breach_count"] = breach_count
-            else:
-                sl_state["breach_count"] = 0
+                if breach_count >= PREM_SL_DEBOUNCE_BARS:
+                    return True, f"⛔ Premium SL Triggered for {leg} | Premium: ₹{current_premium:.2f} breached SL: ₹{sl_state['current_sl']:.2f} (Confirmed over {PREM_SL_DEBOUNCE_BARS} 1-min bars)"
+                else:
+                    log_warn(f"⚠️ {leg} Premium SL Warning: ₹{current_premium:.2f} >= ₹{sl_state['current_sl']:.2f}. Need {PREM_SL_DEBOUNCE_BARS - breach_count} more closes.")
         else:
-            if is_breaching and breach_count == 0:
-                breach_count = 1
-                sl_state["breach_count"] = 1
-            elif not is_breaching and breach_count == 1:
-                sl_state["breach_count"] = 0
-
-        if sl_state["breach_count"] >= SPOT_SL_DEBOUNCE_BARS:
-            sl_state["last_stop_reason"] = f"breach@{current_spot:.2f}/sl@{sl_state['current_sl']:.2f}"
-            msg = (f"⛔ Spot SL Triggered for {leg} | Spot: {current_spot:.2f} breached SL: {sl_state['current_sl']:.2f} "
-                   f"(Confirmed over {sl_state['breach_count']} 1-min bars | Entry Spot: {entry_spot:.2f})")
-            return True, msg
-        
+            if breach_count > 0:
+                log_info(f"🛡️ {leg} recovered. Premium SL threat cleared.")
+            sl_state["breach_count"] = 0
+            
         return False, ""
-
-    def check_portfolio_circuit_breaker(self, realized_pnl: float, unrealized_pnl: float) -> Tuple[bool, str]:
-        combined_mtm = realized_pnl + unrealized_pnl
-        if combined_mtm <= self.circuit_breaker_loss_limit:
-            self.circuit_breaker_triggered = True
-            msg = (f"🚨 PORTFOLIO CIRCUIT BREAKER HIT 🚨 Combined MTM: ₹{combined_mtm:,.2f} "
-                   f"breached -{PORTFOLIO_CIRCUIT_PCT}% limit (-₹{abs(self.circuit_breaker_loss_limit):,.2f}). "
-                   f"Triggering global emergency shutdown!")
-            return True, msg
-        return False, ""
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MODULE 4: EXECUTION STATE MACHINE & STRATEGY ENGINE
@@ -1268,10 +1230,10 @@ class ExecutionEngine:
                     # Prevents stale multi-lot qty from old sessions from firing wrong-size orders.
                     pos["qty"] = LOT_SIZE
                     if pos.get("side") == "SELL" and leg in ("CE", "PE"):
-                        if "spot_sl_state" not in pos or not pos["spot_sl_state"]:
+                        if "premium_sl_state" not in pos or not pos["premium_sl_state"]:
                             entry_spot = float(pos.get("entry_spot", self.market_data.latest_spot))
                             atr_val = float(self.current_indicators.get("atr", DEFAULT_ATR_5M))
-                            pos["spot_sl_state"] = self.risk_manager.init_spot_sl(leg, entry_spot, atr_val)
+                            pos["premium_sl_state"] = self.risk_manager.init_premium_sl(leg, float(pos.get("entry_price", 100.0)))
 
                 # Sync with exchange on startup
                 actual_positions = self._get_live_exchange_positions()
@@ -1482,7 +1444,7 @@ class ExecutionEngine:
         }
         
         if side == "SELL":
-            pos_info["spot_sl_state"] = self.risk_manager.init_spot_sl(leg, spot, atr)
+            pos_info["premium_sl_state"] = self.risk_manager.init_premium_sl(leg, ltp)
             
         self.positions[leg] = pos_info
         verb = "SOLD" if side == "SELL" else "BOUGHT"
@@ -1699,7 +1661,7 @@ class ExecutionEngine:
         
         print()
         print(TOP)
-        title_left = f"  {c_cyan}ADAPTIVE KAMA-ADX HEDGED STRANGLE (V2.0){res}  {c_dim}│{res}  {c_yellow}SPOT-TSL ACTIVE{res}  {c_dim}│{res}  {c_green}TYPE 'zxc' TO STOP{res}"
+        title_left = f"  {c_cyan}ADAPTIVE KAMA-ADX HEDGED STRANGLE (V2.0){res}  {c_dim}│{res}  {c_yellow}PREM-TSL (5%/8%) ACTIVE{res}  {c_dim}│{res}  {c_green}TYPE 'zxc' TO STOP{res}"
         title_right = f"{c_dim}{_now_str()}{res}  "
         pad = max(0, W - ansi_len(title_left) - ansi_len(title_right))
         print(f"{V}{title_left}{' ' * pad}{title_right}{V}")
@@ -1742,7 +1704,7 @@ class ExecutionEngine:
                 if sl_state and is_short:
                     entry_spot_str = f"{sl_state['entry_spot']:.1f}"
                     spot_sl_str = f"{sl_state['current_sl']:.1f}"
-                    debounce_str = f"{sl_state.get('breach_count', 0)}/{SPOT_SL_DEBOUNCE_BARS}"
+                    debounce_str = f"{sl_state.get('breach_count', 0)}/{PREM_SL_DEBOUNCE_BARS}"
                 else:
                     entry_spot_str = "—"
                     spot_sl_str = "—"
@@ -1809,7 +1771,7 @@ class ExecutionEngine:
                     "kama_min_slope": KAMA_MIN_SLOPE,
                     "adx_period": ADX_PERIOD,
                     "adx_gate": ADX_CHOP_THRESHOLD,
-                    "debounce_bars": SPOT_SL_DEBOUNCE_BARS,
+                    "debounce_bars": PREM_SL_DEBOUNCE_BARS,
                     "strangle_width": BASE_MIN_WIDTH_PTS,
                     "hedge_dist": HEDGE_WIDTH_PTS,
                     "spot_sl_atr": SPOT_SL_ATR_MULT,
@@ -1957,12 +1919,14 @@ class ExecutionEngine:
                     # Check Spot-Based Trailing Stop Losses strictly on 1-min collected data
                     for leg in ("CE", "PE"):
                         if leg in self.positions and self.positions[leg]["side"] == "SELL":
-                            is_stopped, reason = self.risk_manager.update_spot_sl_and_check(
-                                leg, self.positions[leg], spot, is_new_1m_bar
+                            is_strangle = ("CE" in self.positions and "PE" in self.positions)
+                            ltp_premium = self._get_ltp(self.positions[leg]["strike"], self.positions[leg]["base"])
+                            is_stopped, reason = self.risk_manager.update_premium_sl_and_check(
+                                leg, self.positions[leg], ltp_premium, is_strangle, regime, is_new_1m_bar
                             )
                             if is_stopped:
                                 log_alert(reason)
-                                self._exit_leg(leg, reason="SPOT_TSL_HIT")
+                                self._exit_leg(leg, reason="PREM_TSL_HIT")
                                 self._trigger_leg_cooldown(leg, spot)
 
                     # Dynamic re-entry (3m cooldown removed - checks immediately on 1m bar)
@@ -2030,7 +1994,7 @@ class ExecutionEngine:
 
 def prompt_user_variables():
     global CAPITAL, KAMA_PERIOD, KAMA_FAST_EMA, KAMA_SLOW_EMA, ADX_PERIOD, ADX_CHOP_THRESHOLD, ADX_TREND_THRESHOLD
-    global SPOT_SL_DEBOUNCE_BARS, BASE_MIN_WIDTH_PTS, BASE_MAX_WIDTH_PTS, SPOT_SL_TRAIL_RATIO
+    global PREM_SL_DEBOUNCE_BARS, BASE_MIN_WIDTH_PTS, BASE_MAX_WIDTH_PTS, TSL_STRANGLE_PCT, TSL_TREND_ORPHAN_PCT
     global PAPER_TRADING_MODE
 
     is_tty = sys.stdin and hasattr(sys.stdin, "isatty") and sys.stdin.isatty()
@@ -2099,12 +2063,11 @@ def prompt_user_variables():
         gate = ask("ADX Regime Gate", 20.0, float)
         ADX_CHOP_THRESHOLD = gate
         ADX_TREND_THRESHOLD = gate
-        SPOT_SL_DEBOUNCE_BARS = ask("Debounce Bars", 1, int)
+        PREM_SL_DEBOUNCE_BARS = ask("Debounce Bars", 1, int)
         width = ask("Strangle Width (pts)", 0, int)
         BASE_MIN_WIDTH_PTS = width
         BASE_MAX_WIDTH_PTS = width
-        tsl_pct = ask("Spot Trail % (TSL)", 55.0, float)
-        SPOT_SL_TRAIL_RATIO = tsl_pct / 100.0 if tsl_pct > 1.0 else tsl_pct
+        # TSL inputs removed to use hardcoded 5% / 8% logic
 
         mode_label = "PAPER" if PAPER_TRADING_MODE else "LIVE"
         print(f"\n{Fore.GREEN}{Style.BRIGHT}{'═'*78}")
