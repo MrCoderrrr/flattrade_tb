@@ -1594,7 +1594,7 @@ class ExecutionEngine:
             "extreme_kama": current_kama,
             "active": True
         }
-        log_alert(f"⏳ {stopped_leg} stopped out. Requiring 7.5 pt KAMA reversal from {current_kama:.2f} to re-enter.")
+        log_alert(f"⏳ {stopped_leg} stopped out. Requiring 1.0 pt KAMA reversal from {current_kama:.2f} to re-enter.")
         self.mode = "COOLDOWN"
         self._save_state()
 
@@ -1602,7 +1602,7 @@ class ExecutionEngine:
         """
         Requires KAMA to reverse by >= 7.5 points from its extreme before re-entering.
         """
-        KAMA_REVERSAL_REQUIRED = 7.5
+        KAMA_REVERSAL_REQUIRED = 1.0
         current_kama = float(self.current_indicators.get("kama", spot) or spot)
         
         for leg in ("PE", "CE"):
@@ -1633,7 +1633,7 @@ class ExecutionEngine:
                     reversal_met = True
                     
             if reversal_met:
-                log_info(f"✅ KAMA Reversal of 7.5+ pts achieved for {leg}! Extreme: {extreme:.2f}, Current: {current_kama:.2f}. Attempting re-shorting...")
+                log_info(f"✅ KAMA Reversal of 1.0+ pts achieved for {leg}! Extreme: {extreme:.2f}, Current: {current_kama:.2f}. Attempting re-shorting...")
                 ce_strike, pe_strike = self.calculate_strangle_strikes(atm, atr, regime, dte_days=dte_days)
                 target_strike = ce_strike if leg == "CE" else pe_strike
                 
