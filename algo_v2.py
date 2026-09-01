@@ -245,12 +245,14 @@ class NSEATMStreamer:
 class FlattradeBroker:
     def __init__(self, paper_trading: Optional[bool] = None):
         self.api = global_api
-        if paper_trading is None:
+        if paper_trading is not None:
+            self.paper_trading = paper_trading  # Explicit override (tests)
+        elif PAPER_TRADING_MODE:
+            self.paper_trading = True           # User chose paper at startup prompt
+        else:
             token_file = "token.txt" if os.path.exists("token.txt") else os.path.join(PROJECT_ROOT, "token.txt")
             has_token = os.path.exists(token_file) and os.path.getsize(token_file) > 0
             self.paper_trading = not (has_token and self.api is not None)
-        else:
-            self.paper_trading = paper_trading
         self.order_counter = 1000
         self.simulated_order_book: Dict[str, Dict[str, Any]] = {}
 
@@ -394,6 +396,9 @@ MIN_ORDER_INTERVAL_SEC  = 1.05        # 1 order in 1 sec not more (Strict pacing
 # Trade Confirmation (Y/N Before Each Order)
 CONFIRM_BEFORE_TRADE    = True        # Ask Y/N before every order (set False to auto-place)
 CONFIRM_TIMEOUT_SEC     = 120         # Auto-reject if no response within 120 seconds
+
+# Paper Trading Mode (set by startup Y/N prompt — True = simulated, False = live orders)
+PAPER_TRADING_MODE      = True        # Default SAFE: paper until user selects live at startup
 
 # Global Kill Switch State
 _EMERGENCY_STOP_TRIGGERED: bool = False
@@ -898,12 +903,13 @@ class ExecutionEngine:
 
         self.market_data = MarketData(self.cache_file)
         self.risk_manager = RiskManager(capital=CAPITAL)
-        is_live = (global_api is not None)
-        self.broker = FlattradeBroker(paper_trading=not is_live)
-        if is_live:
-            log_info("🚀 LIVE TRADING VIA FLATTRADE API: All order executions will route directly to Flattrade!")
+        self.broker = FlattradeBroker()  # Reads PAPER_TRADING_MODE automatically
+        if PAPER_TRADING_MODE:
+            log_warn("📝 PAPER TRADING MODE — All orders are SIMULATED. No real money at risk.")
+        elif global_api is not None:
+            log_info("🚀 LIVE TRADING VIA FLATTRADE API — Real orders will be sent to exchange!")
         else:
-            log_warn("⚠️ Flattrade API not connected. Running in paper trading fallback.")
+            log_warn("⚠️ Flattrade API not connected. Falling back to paper trading.")
         
         self.mode = "WAIT_DATA"
         self.session_em_1sd = 0.0
@@ -1931,15 +1937,55 @@ class ExecutionEngine:
 def prompt_user_variables():
     global CAPITAL, KAMA_PERIOD, KAMA_FAST_EMA, KAMA_SLOW_EMA, ADX_PERIOD, ADX_CHOP_THRESHOLD, ADX_TREND_THRESHOLD
     global SPOT_SL_DEBOUNCE_BARS, BASE_MIN_WIDTH_PTS, BASE_MAX_WIDTH_PTS, SPOT_SL_TRAIL_RATIO
-    
-    if not (sys.stdin and hasattr(sys.stdin, "isatty") and sys.stdin.isatty()):
-        return
-        
+    global PAPER_TRADING_MODE
+
+    is_tty = sys.stdin and hasattr(sys.stdin, "isatty") and sys.stdin.isatty()
+    if not is_tty:
+        return  # nohup / background: keep safe defaults (paper trading)
+
     print(f"\n{Fore.CYAN}{Style.BRIGHT}{'═'*78}")
     print(f"  🚀 V2.0 PRO (KAMA-ADX STRANGLE) — DEPLOYMENT CONFIGURATION")
     print(f"{'═'*78}{Style.RESET_ALL}")
-    print(f"{Fore.YELLOW}Press [Enter] on any parameter to accept default value in brackets.{Style.RESET_ALL}\n")
-    
+
+    # ── PAPER / LIVE SELECTION (asked FIRST, before anything else) ────────────
+    print(f"\n{Fore.YELLOW}{Style.BRIGHT}{'═'*78}")
+    print(f"  STEP 1 OF 2: PAPER TRADING OR LIVE TRADING?")
+    print(f"{'═'*78}{Style.RESET_ALL}")
+    print(f"  {Fore.GREEN}Y{Style.RESET_ALL} = Paper Trading  (SAFE — simulated fills, zero real money risk)")
+    print(f"  {Fore.RED}N{Style.RESET_ALL} = LIVE Trading   (⚠️  REAL MONEY — orders go directly to Flattrade!)\n")
+
+    try:
+        while True:
+            ans = input("  ➤ Run in Paper Trading mode? [Y/n]: ").strip().lower()
+            if ans in ("", "y", "yes"):
+                PAPER_TRADING_MODE = True
+                print(f"\n  {Fore.GREEN}{Style.BRIGHT}✅ PAPER TRADING selected. No real orders will be placed.{Style.RESET_ALL}\n")
+                break
+            elif ans in ("n", "no"):
+                print(f"\n  {Fore.RED}{Style.BRIGHT}{'─'*78}")
+                print(f"  ⚠️  WARNING: LIVE TRADING SELECTED — REAL MONEY RISK!")
+                print(f"  ─ All orders will be sent directly to Flattrade exchange.")
+                print(f"  ─ Capital at risk: Rs.{CAPITAL:,.0f}")
+                print(f"  ─ Every individual trade still requires your Y/N confirmation.")
+                print(f"  ─ ORDER: Buy hedges FIRST, then sell short legs.")
+                print(f"{'─'*78}{Style.RESET_ALL}")
+                confirm = input("\n  ➤ Type LIVE to confirm, or press Enter to go paper: ").strip()
+                if confirm == "LIVE":
+                    PAPER_TRADING_MODE = False
+                    print(f"\n  {Fore.RED}{Style.BRIGHT}🚀 LIVE TRADING CONFIRMED. Real orders will be placed!{Style.RESET_ALL}\n")
+                else:
+                    PAPER_TRADING_MODE = True
+                    print(f"  {Fore.YELLOW}Defaulting to PAPER TRADING (safe).{Style.RESET_ALL}\n")
+                break
+            else:
+                print(f"  {Fore.YELLOW}Please type Y (paper) or N (live).{Style.RESET_ALL}")
+    except (KeyboardInterrupt, EOFError):
+        PAPER_TRADING_MODE = True
+        print(f"\n  {Fore.YELLOW}Defaulting to PAPER TRADING.{Style.RESET_ALL}\n")
+
+    # ── STRATEGY PARAMETERS ───────────────────────────────────────────────────
+    print(f"{Fore.YELLOW}STEP 2 OF 2: Strategy Parameters — press Enter to accept defaults.{Style.RESET_ALL}\n")
+
     try:
         def ask(prompt_text, default, val_type=float):
             val = input(f"  ➤ {prompt_text} [{default}]: ").strip()
@@ -1951,7 +1997,7 @@ def prompt_user_variables():
                 print(f"    {Fore.RED}Invalid input. Using default: {default}{Style.RESET_ALL}")
                 return default
 
-        CAPITAL = ask("Initial Capital (₹)", 150000.0, float)
+        CAPITAL = ask("Initial Capital (Rs.)", 150000.0, float)
         KAMA_PERIOD = ask("KAMA Lookback", 13, int)
         KAMA_FAST_EMA = ask("KAMA Fast EMA", 2, int)
         KAMA_SLOW_EMA = ask("KAMA Slow EMA", 30, int)
@@ -1966,8 +2012,9 @@ def prompt_user_variables():
         tsl_pct = ask("Spot Trail % (TSL)", 55.0, float)
         SPOT_SL_TRAIL_RATIO = tsl_pct / 100.0 if tsl_pct > 1.0 else tsl_pct
 
+        mode_label = "PAPER" if PAPER_TRADING_MODE else "LIVE"
         print(f"\n{Fore.GREEN}{Style.BRIGHT}{'═'*78}")
-        print(f"  ✅ Parameters Confirmed! Deploying V2 Pro with active settings...")
+        print(f"  ✅ [{mode_label}] Parameters Confirmed — Deploying V2 Pro Strategy...")
         print(f"{'═'*78}{Style.RESET_ALL}\n")
     except (KeyboardInterrupt, EOFError):
         print(f"\n{Fore.YELLOW}Default parameters selected.{Style.RESET_ALL}\n")
