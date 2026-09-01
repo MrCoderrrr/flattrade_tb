@@ -1482,32 +1482,66 @@ class ExecutionEngine:
         return True
 
     def _exit_leg(self, leg: str, reason: str = "MANUAL") -> float:
-        """Exits an open leg with rate limiting (1 order / sec)."""
+        """Exits an open leg with rate limiting, retries, and deep verification."""
         if leg not in self.positions:
             return 0.0
         
         pos = self.positions[leg]
         base = pos["base"]
-        ltp = self._get_ltp(pos["strike"], base)
+        tsym = pos.get("tsym", f"NIFTY{pos['strike']}{base}")
         close_side = "BUY" if pos["side"] == "SELL" else "SELL"
         
         # HARD GUARD: Always cap exit qty to exactly 1 lot (65). Never more.
         close_qty = LOT_SIZE
         pos["qty"] = LOT_SIZE  # sanitize in-memory too
         
-        # Enforce rate limit
-        self._wait_order_rate_limit()
+        placed_successfully = False
+        last_reason = ""
+        MAX_EXIT_RETRIES = 5  # Aggressive retry for exits
         
-        try:
-            self.broker.place_option_order(
-                symbol=pos["tsym"],
-                transaction_type=close_side,
-                quantity=close_qty,      # Always exactly LOT_SIZE (65)
-                price=ltp
-            )
-        except Exception as e:
-            log_warn(f"Broker exit exception for {leg}: {e}")
-        
+        for attempt in range(1, MAX_EXIT_RETRIES + 1):
+            self._wait_order_rate_limit()
+            
+            # Refresh price quote before each attempt
+            self._ltp_cache.pop(f"{pos['strike']}_{base}", None)
+            ltp = self._get_ltp(pos["strike"], base)
+            
+            log_info(f"Submitting EXIT order (Attempt {attempt}/{MAX_EXIT_RETRIES}) [{close_side} {close_qty}x {tsym} @ ₹{ltp:.2f}]...")
+            
+            try:
+                res = self.broker.place_option_order(
+                    symbol=tsym,
+                    transaction_type=close_side,
+                    quantity=close_qty,
+                    price=ltp
+                )
+                
+                if res and isinstance(res, dict) and str(res.get("stat", "")).lower() in ("ok", "success"):
+                    ord_id = res.get("norenordno", res.get("order_id", "OK"))
+                    confirmed, detail = self._verify_order_status(ord_id, tsym, close_side, close_qty)
+                    if confirmed:
+                        placed_successfully = True
+                        log_info(f"✅ Exit Trade Placed & Verified [{close_side} {close_qty}x {tsym}]: {detail}")
+                        break
+                    else:
+                        last_reason = detail
+                        log_warn(f"⚠️ Exit Order {ord_id} was REJECTED by exchange: {detail}")
+                else:
+                    err_msg = res.get("emsg", str(res)) if isinstance(res, dict) else str(res)
+                    last_reason = f"Broker Exit Rejected: {err_msg}"
+                    log_warn(f"⚠️ Exit Attempt {attempt} rejected by OMS: {err_msg}")
+                    
+            except Exception as e:
+                last_reason = f"Exception: {e}"
+                log_warn(f"⚠️ Exit Attempt {attempt} threw exception: {e}")
+
+        if not placed_successfully:
+            log_alert(f"❌ CRITICAL FAILURE: EXIT ORDER FAILED for {leg} {close_side} Strike {pos['strike']} after {MAX_EXIT_RETRIES} attempts ({last_reason})!")
+            log_alert(f"⚠️ The position {leg} is STILL OPEN in the market! Manual intervention required.")
+            return 0.0
+
+        # Only reach here if placed_successfully == True
+        ltp = self._get_ltp(pos["strike"], base)
         if pos["side"] == "SELL":
             pnl = (pos["entry_price"] - ltp) * close_qty
         else:
