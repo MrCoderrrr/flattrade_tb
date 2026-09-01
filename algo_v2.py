@@ -345,7 +345,7 @@ PORTFOLIO_CIRCUIT_PCT   = 1.8         # Emergency Portfolio Halt at -1.8% combin
 KAMA_PERIOD             = 13          # KAMA Efficiency Ratio lookback
 KAMA_FAST_EMA           = 2           # KAMA Fast EMA constant
 KAMA_SLOW_EMA           = 30          # KAMA Slow EMA constant
-KAMA_MIN_SLOPE          = 1.0         # Minimum KAMA slope (pts) to flip trend
+KAMA_MIN_SLOPE          = 4.0         # Minimum KAMA slope (pts) to flip trend
 
 ADX_PERIOD              = 9           # ADX lookback period on 5m candles
 ADX_CHOP_THRESHOLD      = 20.0        # ADX < 20: CHOP REGIME
