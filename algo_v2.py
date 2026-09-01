@@ -1602,6 +1602,8 @@ class ExecutionEngine:
         """
         Requires KAMA to reverse by >= 7.5 points from its extreme before re-entering.
         """
+        if regime == "TREND":
+            return  # NEVER re-enter opposing legs while a strong trend is active!
         KAMA_REVERSAL_REQUIRED = 1.0
         current_kama = float(self.current_indicators.get("kama", spot) or spot)
         
