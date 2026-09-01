@@ -891,6 +891,11 @@ def prompt_user_variables():
     print(f"\n✅ Deploying in {'PAPER' if PAPER_TRADING_MODE else 'LIVE'} Mode...\n")
 
 if __name__ == "__main__":
+    import os
+    if os.path.exists(KILL_SWITCH_FILE):
+        try: os.remove(KILL_SWITCH_FILE)
+        except: pass
+
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
