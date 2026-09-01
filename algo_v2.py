@@ -475,7 +475,7 @@ class MarketData:
 
         try:
             log_info("MarketData: Seeding historical 5-min bars from Flattrade (Token 26000) for instant indicator readiness...")
-            end_time = datetime.now()
+            end_time = get_ist_now()
             start_time = end_time - timedelta(days=5)
 
             res = api.get_time_price_series(
