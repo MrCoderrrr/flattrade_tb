@@ -1593,7 +1593,7 @@ class ExecutionEngine:
         Evaluates immediate re-entry on 1-min candle closes without 3-minute waiting timer.
         If re-entry order fails after 3 tries -> ONLY HEDGES LEFT!
         """
-        for leg in ("CE", "PE"):
+        for leg in ("PE", "CE"):
             cd = self.cooldown_tracker.get(leg)
             if not cd or not cd.get("active", False):
                 continue
@@ -1886,10 +1886,10 @@ class ExecutionEngine:
                         
                         ce_s_ok = True
                         pe_s_ok = True
-                        if "CE" not in self.positions:
-                            ce_s_ok = self._enter_leg("CE", ce_strike, "SELL", spot, atr)
                         if "PE" not in self.positions:
                             pe_s_ok = self._enter_leg("PE", pe_strike, "SELL", spot, atr)
+                        if "CE" not in self.positions:
+                            ce_s_ok = self._enter_leg("CE", ce_strike, "SELL", spot, atr)
                             
                         # CRITICAL RULE: If either short leg failed after 3 retries, square off all short legs -> ONLY HEDGES LEFT!
                         if not (ce_s_ok and pe_s_ok):
