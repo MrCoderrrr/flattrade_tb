@@ -1504,8 +1504,9 @@ class ExecutionEngine:
         # We always allow re-entry now, regardless of regime!
         if self.strangle_resets_today >= MAX_STRANGLE_RESETS: return
         
-        reversal_req = KAMA_REVERSAL_ATR_RATIO * atr
         current_kama = float(self.current_indicators.get("kama", spot) or spot)
+        prev_kama = float(self.current_indicators.get("prev_kama", current_kama) or current_kama)
+        kama_slope = current_kama - prev_kama
         
         import time
         for leg in ("PE", "CE"):
@@ -1516,21 +1517,14 @@ class ExecutionEngine:
             if self.total_reentries_today >= MAX_REENTRIES_TOTAL: continue
             if time.time() < cd.get("next_eligible_time", 0): continue
             
-            extreme = cd.get("extreme_kama", current_kama)
             if leg == "CE":
-                if current_kama > extreme:
-                    cd["extreme_kama"] = current_kama
-                    extreme = current_kama
-                    cd["consecutive_bars"] = 0
-                if current_kama <= extreme - reversal_req:
+                # CE stopped out because market went UP. We re-enter if KAMA slope goes DOWN by > 0.25.
+                if kama_slope <= -0.25:
                     cd["consecutive_bars"] = cd.get("consecutive_bars", 0) + 1
                 else: cd["consecutive_bars"] = 0
             else:
-                if current_kama < extreme:
-                    cd["extreme_kama"] = current_kama
-                    extreme = current_kama
-                    cd["consecutive_bars"] = 0
-                if current_kama >= extreme + reversal_req:
+                # PE stopped out because market went DOWN. We re-enter if KAMA slope goes UP by > 0.25.
+                if kama_slope >= 0.25:
                     cd["consecutive_bars"] = cd.get("consecutive_bars", 0) + 1
                 else: cd["consecutive_bars"] = 0
                 
