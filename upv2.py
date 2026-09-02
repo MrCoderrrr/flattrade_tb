@@ -1518,13 +1518,13 @@ class ExecutionEngine:
             if time.time() < cd.get("next_eligible_time", 0): continue
             
             if leg == "CE":
-                # CE stopped out because market went UP. We re-enter if KAMA slope goes DOWN by > 0.25.
-                if kama_slope <= -0.25:
+                # CE stopped out because market went UP. We re-enter if KAMA slope goes DOWN by > 0.5.
+                if kama_slope <= -0.5:
                     cd["consecutive_bars"] = cd.get("consecutive_bars", 0) + 1
                 else: cd["consecutive_bars"] = 0
             else:
-                # PE stopped out because market went DOWN. We re-enter if KAMA slope goes UP by > 0.25.
-                if kama_slope >= 0.25:
+                # PE stopped out because market went DOWN. We re-enter if KAMA slope goes UP by > 0.5.
+                if kama_slope >= 0.5:
                     cd["consecutive_bars"] = cd.get("consecutive_bars", 0) + 1
                 else: cd["consecutive_bars"] = 0
                 
