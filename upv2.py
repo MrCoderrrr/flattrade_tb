@@ -829,6 +829,14 @@ class Indicators:
         lows = df_5m["low"].to_numpy(dtype=float)
         closes = df_5m["close"].to_numpy(dtype=float)
         
+        # ── DIAGNOSTIC: Print ADX input quality every 5 minutes ──
+        if not getattr(Indicators, '_adx_diag_count', None):
+            Indicators._adx_diag_count = 0
+        Indicators._adx_diag_count += 1
+        if Indicators._adx_diag_count % 5 == 1:
+            avg_hl = float(np.mean(highs - lows)) if len(highs) > 0 else 0
+            log_info(f"[ADX DIAG] 5m bars={len(df_5m)} | Avg H-L={avg_hl:.1f} pts | Last H={highs[-1]:.1f} L={lows[-1]:.1f} C={closes[-1]:.1f}")
+        
         # Calculate KAMA on 1-minute spot (close) prices
         if not df_1m.empty and len(df_1m) >= KAMA_PERIOD + 1:
             closes_1m = df_1m["spot"].to_numpy(dtype=float)
