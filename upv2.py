@@ -1558,10 +1558,10 @@ class ExecutionEngine:
                 pnl_col = c_green if pnl >= 0 else c_red
                 sign = "+" if pnl >= 0 else ""
                 
-                sl_state = pos.get("premium_sl_state")
+                sl_state = pos.get("dual_sl_state")
                 if sl_state and is_short:
-                    entry_spot_str = f"{sl_state['best_premium']:.2f}"
-                    spot_sl_str = f"{sl_state['current_sl']:.2f}"
+                    entry_spot_str = f"{sl_state.get('entry_premium', 0.0):.2f}"
+                    spot_sl_str = f"{sl_state.get('current_premium_sl', 0.0):.2f}"
                     debounce_str = f"{sl_state.get('breach_count', 0)}/{PREM_SL_DEBOUNCE_BARS}"
                 else:
                     entry_spot_str = "—"
