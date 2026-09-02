@@ -116,6 +116,8 @@ init(autoreset=True)
 
 # ─── Flattrade Core Integration & Polyfills ────────────────────────────────────
 global_api = None
+FLATTRADE_CONNECTED = False
+
 try:
     from api_helper import NorenApiPy
     from creds import USER_ID
@@ -138,12 +140,14 @@ try:
             access_token = f.read().strip()
             if access_token:
                 global_api.set_session(userid=str(USER_ID).strip(), password='', usertoken=access_token)
+                FLATTRADE_CONNECTED = True
                 print(f"[AUTH] Flattrade session established from {token_file} for user {USER_ID}", flush=True)
     else:
         print("[AUTH] Notice: token.txt not found or empty. Operating in fallback mode.", flush=True)
 except Exception as e:
     print(f"[AUTH] Notice: Flattrade API init: {e}", flush=True)
     global_api = None
+    FLATTRADE_CONNECTED = False
 
 try:
     from core.volatility_engine import VolatilityEngine
@@ -289,17 +293,9 @@ class FlattradeBroker:
         elif PAPER_TRADING_MODE:
             self.paper_trading = True
         else:
-            token_candidates = [
-                "token.txt",
-                os.path.join(CURRENT_DIR, "token.txt"),
-                os.path.join(PROJECT_ROOT, "token.txt"),
-                "/home/ubuntu/flattrade_tb/flattrade_tb/token.txt",
-                "/home/ubuntu/flattrade_tb/token.txt"
-            ]
-            has_token = any(os.path.exists(tc) and os.path.getsize(tc) > 0 for tc in token_candidates)
-            self.paper_trading = not (has_token and self.api is not None)
+            self.paper_trading = not FLATTRADE_CONNECTED
             if self.paper_trading:
-                log_warn("⚠️ Live mode selected but valid token not found. Falling back to PAPER trading.")
+                log_warn("⚠️ Live mode selected but Flattrade API did not connect successfully. Falling back to PAPER trading.")
         self.order_counter = 1000
         self.simulated_order_book: Dict[str, Dict[str, Any]] = {}
 
