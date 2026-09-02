@@ -285,13 +285,21 @@ class FlattradeBroker:
     def __init__(self, paper_trading: Optional[bool] = None):
         self.api = global_api
         if paper_trading is not None:
-            self.paper_trading = paper_trading  # Explicit override (tests)
+            self.paper_trading = paper_trading
         elif PAPER_TRADING_MODE:
-            self.paper_trading = True           # User chose paper at startup prompt
+            self.paper_trading = True
         else:
-            token_file = "token.txt" if os.path.exists("token.txt") else os.path.join(PROJECT_ROOT, "token.txt")
-            has_token = os.path.exists(token_file) and os.path.getsize(token_file) > 0
+            token_candidates = [
+                "token.txt",
+                os.path.join(CURRENT_DIR, "token.txt"),
+                os.path.join(PROJECT_ROOT, "token.txt"),
+                "/home/ubuntu/flattrade_tb/flattrade_tb/token.txt",
+                "/home/ubuntu/flattrade_tb/token.txt"
+            ]
+            has_token = any(os.path.exists(tc) and os.path.getsize(tc) > 0 for tc in token_candidates)
             self.paper_trading = not (has_token and self.api is not None)
+            if self.paper_trading:
+                log_warn("⚠️ Live mode selected but valid token not found. Falling back to PAPER trading.")
         self.order_counter = 1000
         self.simulated_order_book: Dict[str, Dict[str, Any]] = {}
 
