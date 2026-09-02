@@ -404,10 +404,11 @@ HEDGE_DISTANCE_FLOOR      = 300
 HEDGE_DISTANCE_RATIO      = 1.5
 
 # --- PREMIUM TSL (percentage of entry premium) ---
-# Initial SL: exit if premium rises X% above entry (loss protection)
-PREM_SL_INITIAL_PCT       = 0.30   # 30% above entry e.g. sold at 100 → SL at 130
-# Trailing SL: once premium falls, trail SL at X% above best (lowest) premium seen
-PREM_TSL_TRAIL_PCT        = 0.15   # 15% above best_prem e.g. best=80 → trail SL at 92
+# Initial SL: exit if premium rises 15% above entry
+PREM_SL_INITIAL_PCT       = 0.15   # 15% above entry e.g. sold at 100 → SL at 115
+# Trailing SL: dynamically tightens as more profit is captured (3% to 12%)
+PREM_TSL_MIN_PCT          = 0.03   # 3%  trail when deep in profit (>60% premium decayed)
+PREM_TSL_MAX_PCT          = 0.12   # 12% trail when just entered profit (<20% premium decayed)
 
 # --- REENTRY CAPS ---
 KAMA_REVERSAL_ATR_RATIO   = 0.15
@@ -903,16 +904,24 @@ class RiskManager:
         best_prem = sl_state.get("best_premium", entry_prem)
 
         # 2. Calculate TSL:
-        #    Phase A — Premium still above entry (position in loss): use INITIAL SL (50% above entry)
-        #    Phase B — Premium fell below entry (position in profit): trail at 30% above best
+        #    Phase A — Premium still above entry (in loss): fixed 15% initial SL
+        #    Phase B — Premium below entry (in profit): dynamic trail 12%→3% as profit grows
+        initial_sl = round(entry_prem * (1.0 + PREM_SL_INITIAL_PCT), 2)
+
         if best_prem >= entry_prem:
-            # Still at or above entry — use fixed initial SL
-            prem_sl = round(entry_prem * (1.0 + PREM_SL_INITIAL_PCT), 2)
+            # Phase A: not yet in profit — hold at initial SL
+            prem_sl = initial_sl
         else:
-            # Premium has fallen below entry — activate trailing SL
-            trail_sl = round(best_prem * (1.0 + PREM_TSL_TRAIL_PCT), 2)
-            # Never let trail SL go above the initial SL (keep best protection)
-            initial_sl = round(entry_prem * (1.0 + PREM_SL_INITIAL_PCT), 2)
+            # Phase B: in profit — compute how much of the premium has decayed
+            profit_pct = (entry_prem - best_prem) / entry_prem  # 0.0 → 1.0
+
+            # TSL tightens linearly: 12% when profit_pct=0, 3% when profit_pct>=0.60
+            # Clamp at PREM_TSL_MIN_PCT for very deep profit
+            trail_pct = PREM_TSL_MAX_PCT - (PREM_TSL_MAX_PCT - PREM_TSL_MIN_PCT) * min(profit_pct / 0.60, 1.0)
+            trail_pct = max(trail_pct, PREM_TSL_MIN_PCT)
+
+            trail_sl = round(best_prem * (1.0 + trail_pct), 2)
+            # Never let trail SL exceed initial SL
             prem_sl = min(trail_sl, initial_sl)
 
         sl_state["current_premium_sl"] = prem_sl
