@@ -623,6 +623,7 @@ class MarketData:
             seeded_5m.sort(key=lambda x: x['timestamp'])
             today = get_ist_now().date()
             prior_bars = [b for b in seeded_5m if b['timestamp'].date() < today][-50:]
+            self.historical_5m_bars = prior_bars
             self.bars_5m = prior_bars + self.bars_5m
             log_info(f"MarketData: Loaded {len(prior_bars)} historical 5m bars. Total 5m bars: {len(self.bars_5m)}. KAMA ready immediately!")
         else:
@@ -635,7 +636,7 @@ class MarketData:
         df_1m.set_index("timestamp", inplace=True)
         df_5m = df_1m["spot"].resample("5min", label="left", closed="left").ohlc().dropna()
         
-        self.bars_5m = []
+        self.bars_5m = list(getattr(self, 'historical_5m_bars', []))
         for ts, row in df_5m.iterrows():
             self.bars_5m.append({
                 "timestamp": ts,
