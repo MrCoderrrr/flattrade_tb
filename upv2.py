@@ -1501,7 +1501,7 @@ class ExecutionEngine:
         self._save_state()
 
     def _check_cooldown_and_reenter(self, spot: float, atm: int, atr: float, regime: str, trend: int, dte_days: float = 2.0):
-        if regime == "TREND": return
+        # We always allow re-entry now, regardless of regime!
         if self.strangle_resets_today >= MAX_STRANGLE_RESETS: return
         
         reversal_req = KAMA_REVERSAL_ATR_RATIO * atr
