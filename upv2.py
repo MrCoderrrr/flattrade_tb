@@ -1537,7 +1537,7 @@ class ExecutionEngine:
             msg = f"  {c_yellow}No open positions. State: {self.mode}{res}"
             print(f"{V}{msg}{' ' * max(0, W - ansi_len(msg))}{V}")
         else:
-            hdr = f"  {'LEG':<10} {VS} {'STRIKE':>7} {VS} {'SIDE':<5} {VS} {'QTY':>3} {VS} {'ENTRY':>7} {VS} {'LTP':>7} {VS} {'BEST PREM':>10} {VS} {'PREM SL':>10} {VS} {'DEBOUNCE':>8} {VS} {'PNL':>10}  "
+            hdr = f"  {'LEG':<10} {VS} {'STRIKE':>7} {VS} {'SIDE':<5} {VS} {'QTY':>3} {VS} {'ENTRY':>7} {VS} {'BEST PREM':>10} {VS} {'LTP':>7} {VS} {'TSL':>10} {VS} {'PNL':>10}  "
             print(f"{V}{hdr}{' ' * max(0, W - ansi_len(hdr))}{V}")
             print(MID_S)
 
@@ -1560,17 +1560,15 @@ class ExecutionEngine:
                 if sl_state and is_short:
                     entry_spot_str = f"{sl_state.get('best_premium', sl_state.get('entry_premium', 0.0)):.2f}"
                     spot_sl_str = f"{sl_state.get('current_premium_sl', 0.0):.2f}"
-                    debounce_str = f"{sl_state.get('breach_count', 0)}/{PREM_SL_DEBOUNCE_BARS}"
                 else:
                     entry_spot_str = "—"
                     spot_sl_str = "—"
-                    debounce_str = "—"
 
                 row = (f"  {c_white}{leg:<10}{res} {VS} {c_white}{pos['strike']:>7}{res} {VS} {side_col}{pos['side']:<5}{res} {VS} "
                        f"{c_white}{pos['qty']:>3}{res} {VS} "
-                       f"{c_white}{pos['entry_price']:>7.2f}{res} {VS} {c_yellow}{ltp:>7.2f}{res} {VS} "
-                       f"{c_dim}{entry_spot_str:>10}{res} {VS} {c_mag}{spot_sl_str:>10}{res} {VS} "
-                       f"{c_white}{debounce_str:>8}{res} {VS} {pnl_col}{sign}₹{pnl:>8,.2f}{res}  ")
+                       f"{c_white}{pos['entry_price']:>7.2f}{res} {VS} {c_dim}{entry_spot_str:>10}{res} {VS} "
+                       f"{c_yellow}{ltp:>7.2f}{res} {VS} {c_mag}{spot_sl_str:>10}{res} {VS} "
+                       f"{pnl_col}{sign}₹{pnl:>8,.2f}{res}  ")
                 print(f"{V}{row}{' ' * max(0, W - ansi_len(row))}{V}")
 
         active_cds = [f"{k} (Re-entry eligible next bar)" 
