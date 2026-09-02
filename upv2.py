@@ -405,9 +405,9 @@ HEDGE_DISTANCE_RATIO      = 1.5
 
 # --- PREMIUM TSL (percentage of entry premium) ---
 # Initial SL: exit if premium rises X% above entry (loss protection)
-PREM_SL_INITIAL_PCT       = 0.50   # 50% above entry e.g. sold at 100 → initial SL at 150
+PREM_SL_INITIAL_PCT       = 0.30   # 30% above entry e.g. sold at 100 → SL at 130
 # Trailing SL: once premium falls, trail SL at X% above best (lowest) premium seen
-PREM_TSL_TRAIL_PCT        = 0.30   # 30% above best_prem e.g. best=80 → trail SL at 104
+PREM_TSL_TRAIL_PCT        = 0.15   # 15% above best_prem e.g. best=80 → trail SL at 92
 
 # --- REENTRY CAPS ---
 KAMA_REVERSAL_ATR_RATIO   = 0.15
