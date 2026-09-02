@@ -1995,6 +1995,12 @@ def prompt_user_variables():
     global PREM_SL_DEBOUNCE_BARS, BASE_MIN_WIDTH_PTS, BASE_MAX_WIDTH_PTS, TSL_STRANGLE_PCT, TSL_TREND_ORPHAN_PCT
     global PAPER_TRADING_MODE
 
+    import sys
+    if "--live" in sys.argv:
+        PAPER_TRADING_MODE = False
+        print("\n🚀 '--live' flag detected: Bypassing prompts, starting LIVE TRADING in background!\n")
+        return
+
     is_tty = sys.stdin and hasattr(sys.stdin, "isatty") and sys.stdin.isatty()
     if not is_tty:
         return  # nohup / background: keep safe defaults (paper trading)
