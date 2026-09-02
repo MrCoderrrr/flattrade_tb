@@ -1718,8 +1718,7 @@ class ExecutionEngine:
                 now = get_ist_now()
                 import time
                 current_time = time.time()
-                if not is_stale:
-                    self.last_feed_tick = current_time
+
                 
                 # Bug 9: Feed Stale Check
                 if self.last_feed_tick > 0 and (current_time - self.last_feed_tick) > FEED_STALE_TIMEOUT_S:
