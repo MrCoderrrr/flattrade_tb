@@ -1287,6 +1287,9 @@ class ExecutionEngine:
         
         pos_info = {"strike": strike, "tsym": tsym, "side": side, "qty": qty, "entry_price": ltp, "base": leg.split("_")[0]}
         if side == "SELL":
+            current_iv = 15.0
+            if getattr(self, 'session_em_1sd', 0) > 0:
+                current_iv = (self.session_em_1sd / spot) * 19.1 * 100.0
             pos_info["dual_sl_state"] = self.risk_manager.init_dual_sl(leg, spot, strike, ltp, atr, current_iv, dte_days)
             
         self.positions[leg] = pos_info
