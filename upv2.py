@@ -621,11 +621,11 @@ class MarketData:
 
         if seeded_5m:
             seeded_5m.sort(key=lambda x: x['timestamp'])
-            today = get_ist_now().date()
-            prior_bars = [b for b in seeded_5m if b['timestamp'].date() < today][-50:]
-            self.historical_5m_bars = prior_bars
-            self.bars_5m = prior_bars + self.bars_5m
-            log_info(f"MarketData: Loaded {len(prior_bars)} historical 5m bars. Total 5m bars: {len(self.bars_5m)}. KAMA ready immediately!")
+            # Keep ALL seeded bars (including today's real OHLC from exchange)
+            all_bars = seeded_5m[-100:]
+            self.historical_5m_bars = all_bars
+            self.bars_5m = all_bars
+            log_info(f"MarketData: Loaded {len(all_bars)} seeded 5m bars (incl. today's real OHLC). ADX will be accurate!")
         else:
             log_warn("MarketData: History seeding could not load 5m bars. Indicators will warm up from live 1m Flattrade feed.")
 
@@ -634,10 +634,18 @@ class MarketData:
             return
         df_1m = pd.DataFrame(self.bars_1m)
         df_1m.set_index("timestamp", inplace=True)
-        df_5m = df_1m["spot"].resample("5min", label="left", closed="left").ohlc().dropna()
-        
-        self.bars_5m = list(getattr(self, 'historical_5m_bars', []))
-        for ts, row in df_5m.iterrows():
+        df_5m_live = df_1m["spot"].resample("5min", label="left", closed="left").ohlc().dropna()
+
+        # Get the last seeded bar timestamp so we don't duplicate real OHLC bars with synthetic ones
+        historical = getattr(self, 'historical_5m_bars', [])
+        last_seeded_ts = historical[-1]['timestamp'] if historical else None
+
+        self.bars_5m = list(historical)
+        for ts, row in df_5m_live.iterrows():
+            # Only add bars that are NEWER than the last seeded real-OHLC bar
+            # This prevents synthetic (resampled) bars from corrupting real exchange OHLC data
+            if last_seeded_ts is not None and ts <= last_seeded_ts:
+                continue
             self.bars_5m.append({
                 "timestamp": ts,
                 "open": float(row["open"]),
