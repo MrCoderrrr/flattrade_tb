@@ -622,13 +622,34 @@ class MarketData:
 
         if seeded_5m:
             seeded_5m.sort(key=lambda x: x['timestamp'])
-            # Keep ALL seeded bars (including today's real OHLC from exchange)
-            all_bars = seeded_5m[-100:]
-            self.historical_5m_bars = all_bars
-            self.bars_5m = all_bars
-            log_info(f"MarketData: Loaded {len(all_bars)} seeded 5m bars (incl. today's real OHLC). ADX will be accurate!")
+            # Normalise ALL timestamps to naive IST (strip tz-info) to avoid comparison crashes
+            IST_OFFSET = timedelta(hours=5, minutes=30)
+            clean_bars = []
+            for b in seeded_5m[-100:]:
+                ts = b['timestamp']
+                if hasattr(ts, 'tzinfo') and ts.tzinfo is not None:
+                    ts = ts.astimezone(timezone(IST_OFFSET)).replace(tzinfo=None)
+                clean_bars.append({
+                    'timestamp': ts,
+                    'open':  float(b['open']),
+                    'high':  float(b['high']),
+                    'low':   float(b['low']),
+                    'close': float(b['close']),
+                })
+            # Filter to only valid IST market-hours bars (9:15–15:30)
+            clean_bars = [b for b in clean_bars
+                          if b['high'] > 0 and b['low'] > 0
+                          and b['high'] - b['low'] > 0.5]
+            self.historical_5m_bars = clean_bars
+            self.bars_5m = list(clean_bars)
+            if clean_bars:
+                avg_hl = sum(b['high'] - b['low'] for b in clean_bars) / len(clean_bars)
+                log_info(f"MarketData: ✅ Seeded {len(clean_bars)} 5m bars | Avg H-L = {avg_hl:.1f} pts | ADX will be accurate!")
+            else:
+                log_warn("MarketData: ⚠️ Seeded bars had zero valid H-L range — seeding effectively failed!")
         else:
-            log_warn("MarketData: History seeding could not load 5m bars. Indicators will warm up from live 1m Flattrade feed.")
+            self.historical_5m_bars = []
+            log_warn("MarketData: ⚠️ History seeding FAILED. ADX will be inflated until 30+ live bars accumulate.")
 
     def _rebuild_5m_candles(self):
         if not self.bars_1m:
@@ -637,21 +658,23 @@ class MarketData:
         df_1m.set_index("timestamp", inplace=True)
         df_5m_live = df_1m["spot"].resample("5min", label="left", closed="left").ohlc().dropna()
 
-        # Get the last seeded bar timestamp so we don't duplicate real OHLC bars with synthetic ones
         historical = getattr(self, 'historical_5m_bars', [])
+        # Use naive datetime for comparison — seeded bars were already stripped of tzinfo above
         last_seeded_ts = historical[-1]['timestamp'] if historical else None
 
         self.bars_5m = list(historical)
         for ts, row in df_5m_live.iterrows():
-            # Only add bars that are NEWER than the last seeded real-OHLC bar
-            # This prevents synthetic (resampled) bars from corrupting real exchange OHLC data
+            # Make ts naive if pandas gave us a tz-aware timestamp
+            if hasattr(ts, 'tzinfo') and ts.tzinfo is not None:
+                ts = ts.replace(tzinfo=None)
+            # Only append bars strictly NEWER than last seeded real-OHLC bar
             if last_seeded_ts is not None and ts <= last_seeded_ts:
                 continue
             self.bars_5m.append({
                 "timestamp": ts,
-                "open": float(row["open"]),
-                "high": float(row["high"]),
-                "low": float(row["low"]),
+                "open":  float(row["open"]),
+                "high":  float(row["high"]),
+                "low":   float(row["low"]),
                 "close": float(row["close"]),
             })
 
