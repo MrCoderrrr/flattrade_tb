@@ -870,6 +870,7 @@ class RiskManager:
         return {
             "entry_spot": entry_spot,
             "entry_premium": entry_premium,
+            "best_premium": entry_premium,
             "atr_at_entry": atr,
             "delta_at_entry": delta,
             "current_premium_sl": 0.0,
@@ -879,32 +880,29 @@ class RiskManager:
     def update_dual_sl_and_check(self, leg: str, pos_data: dict, current_spot: float, current_premium: float, is_strangle: bool, is_new_1m_bar: bool) -> tuple:
         sl_state = pos_data.get("dual_sl_state")
         if not sl_state: return False, ""
-        spot_k = SPOT_SL_K_STRANGLE if is_strangle else SPOT_SL_K_ORPHAN
         prem_mult = PREM_SL_ATR_MULT_STRANGLE if is_strangle else PREM_SL_ATR_MULT_ORPHAN
-        strike = float(pos_data["strike"])
         atr = float(sl_state["atr_at_entry"])
-        
-        if "CE" in leg:
-            spot_sl = strike + (spot_k * atr)
-            spot_breached = current_spot >= spot_sl
-        else:
-            spot_sl = strike - (spot_k * atr)
-            spot_breached = current_spot <= spot_sl
-            
-        entry_prem = float(sl_state["entry_premium"])
         delta = abs(float(sl_state["delta_at_entry"]))
-        prem_sl = entry_prem + (delta * atr * prem_mult)
+        
+        # 1. Update Best Premium (lowest seen, since we are short)
+        if current_premium < sl_state.get("best_premium", float(sl_state["entry_premium"])):
+            sl_state["best_premium"] = current_premium
+            
+        # 2. Calculate Trailing Stop Loss from Best Premium
+        best_prem = sl_state["best_premium"]
+        prem_sl = best_prem + (delta * atr * prem_mult)
         sl_state["current_premium_sl"] = prem_sl
+        
+        # 3. Check for Breach
         prem_breached = current_premium >= prem_sl
         
-        if (spot_breached or prem_breached) and is_new_1m_bar:
+        if prem_breached and is_new_1m_bar:
             sl_state["breach_count"] = sl_state.get("breach_count", 0) + 1
         elif is_new_1m_bar:
             sl_state["breach_count"] = 0
             
         if sl_state.get("breach_count", 0) >= PREM_SL_DEBOUNCE_BARS:
-            r = "SPOT" if spot_breached else "PREM"
-            return True, f"⛔ {leg} SL Triggered! {r} | Spot: {current_spot:.2f} | Prem: {current_premium:.2f} >= {prem_sl:.2f}"
+            return True, f"⛔ {leg} TSL Triggered! PREM | Best: {best_prem:.2f} | Current: {current_premium:.2f} >= SL: {prem_sl:.2f}"
         return False, ""
 class ExecutionEngine:
     def __init__(self):
@@ -1560,7 +1558,7 @@ class ExecutionEngine:
                 
                 sl_state = pos.get("dual_sl_state")
                 if sl_state and is_short:
-                    entry_spot_str = f"{sl_state.get('entry_premium', 0.0):.2f}"
+                    entry_spot_str = f"{sl_state.get('best_premium', sl_state.get('entry_premium', 0.0)):.2f}"
                     spot_sl_str = f"{sl_state.get('current_premium_sl', 0.0):.2f}"
                     debounce_str = f"{sl_state.get('breach_count', 0)}/{PREM_SL_DEBOUNCE_BARS}"
                 else:
