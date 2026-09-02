@@ -333,6 +333,7 @@ class FlattradeBroker:
             prc_str = "50.00" if action == 'B' else "0.50"
 
         try:
+            safe_remarks = (remarks[:20] if remarks else "API_V2_PRO")
             res = self.api.place_order(
                 buy_or_sell=str(action),
                 product_type=str(product_type),
@@ -344,7 +345,7 @@ class FlattradeBroker:
                 price=prc_str,
                 trigger_price="0",
                 retention="DAY",
-                remarks=remarks or "API_V2_PRO"
+                remarks=safe_remarks
             )
             return res
         except Exception as e:
@@ -1873,58 +1874,34 @@ class ExecutionEngine:
                         # OLD (causes rejection): CE_HEDGE → PE_HEDGE → CE_SHORT → PE_SHORT
                         # NEW (margin-safe):      CE_HEDGE → CE_SHORT → PE_HEDGE → PE_SHORT
                         
-                        k_trend = self.current_indicators.get("trend", 0)
+                        # ── ALWAYS ENTER FULL STRANGLE (MARGIN-SAFE ORDER)
+                        # Pair each hedge with its short immediately so Flattrade sees a protected spread.
+                        # CE_HEDGE → CE_SHORT → PE_HEDGE → PE_SHORT
+                        
+                        log_info("Executing ALWAYS-STRANGLE entry logic (paired for margin).")
+                        ce_h_ok = True
+                        pe_h_ok = True
                         ce_s_ok = True
                         pe_s_ok = True
 
-                        if regime == "TREND":
-                            log_info(f"TREND Regime detected. Selling single directional leg. KAMA Trend: {k_trend}")
-                            if k_trend == 1:
-                                # Uptrend — sell only PE side
-                                if "PE_HEDGE" not in self.positions:
-                                    pe_h_ok = self._enter_leg("PE_HEDGE", pe_hedge, "BUY", spot, atr, dte_days)
-                                if pe_h_ok and "PE" not in self.positions:
-                                    pe_s_ok = self._enter_leg("PE", pe_strike, "SELL", spot, atr, dte_days)
-                                # Still buy CE_HEDGE for protection
-                                if "CE_HEDGE" not in self.positions:
-                                    self._enter_leg("CE_HEDGE", ce_hedge, "BUY", spot, atr, dte_days)
-                            elif k_trend == -1:
-                                # Downtrend — sell only CE side
-                                if "CE_HEDGE" not in self.positions:
-                                    ce_h_ok = self._enter_leg("CE_HEDGE", ce_hedge, "BUY", spot, atr, dte_days)
-                                if ce_h_ok and "CE" not in self.positions:
-                                    ce_s_ok = self._enter_leg("CE", ce_strike, "SELL", spot, atr, dte_days)
-                                # Still buy PE_HEDGE for protection
-                                if "PE_HEDGE" not in self.positions:
-                                    self._enter_leg("PE_HEDGE", pe_hedge, "BUY", spot, atr, dte_days)
-                            else:
-                                # KAMA flat in TREND — full strangle, paired
-                                log_info("TREND but KAMA is flat. Entering full strangle (paired).")
-                                if "CE_HEDGE" not in self.positions:
-                                    ce_h_ok = self._enter_leg("CE_HEDGE", ce_hedge, "BUY", spot, atr, dte_days)
-                                if ce_h_ok and "CE" not in self.positions:
-                                    ce_s_ok = self._enter_leg("CE", ce_strike, "SELL", spot, atr, dte_days)
-                                if "PE_HEDGE" not in self.positions:
-                                    pe_h_ok = self._enter_leg("PE_HEDGE", pe_hedge, "BUY", spot, atr, dte_days)
-                                if pe_h_ok and "PE" not in self.positions:
-                                    pe_s_ok = self._enter_leg("PE", pe_strike, "SELL", spot, atr, dte_days)
-                        else:
-                            # CHOP Regime — full strangle, paired
-                            if "CE_HEDGE" not in self.positions:
-                                ce_h_ok = self._enter_leg("CE_HEDGE", ce_hedge, "BUY", spot, atr, dte_days)
-                            if ce_h_ok and "CE" not in self.positions:
-                                ce_s_ok = self._enter_leg("CE", ce_strike, "SELL", spot, atr, dte_days)
-                            if "PE_HEDGE" not in self.positions:
-                                pe_h_ok = self._enter_leg("PE_HEDGE", pe_hedge, "BUY", spot, atr, dte_days)
-                            if pe_h_ok and "PE" not in self.positions:
-                                pe_s_ok = self._enter_leg("PE", pe_strike, "SELL", spot, atr, dte_days)
+                        # Enter CE Side (Hedge then Short)
+                        if "CE_HEDGE" not in self.positions:
+                            ce_h_ok = self._enter_leg("CE_HEDGE", ce_hedge, "BUY", spot, atr, dte_days)
+                        if ce_h_ok and "CE" not in self.positions:
+                            ce_s_ok = self._enter_leg("CE", ce_strike, "SELL", spot, atr, dte_days)
+                            
+                        # Enter PE Side (Hedge then Short)
+                        if "PE_HEDGE" not in self.positions:
+                            pe_h_ok = self._enter_leg("PE_HEDGE", pe_hedge, "BUY", spot, atr, dte_days)
+                        if pe_h_ok and "PE" not in self.positions:
+                            pe_s_ok = self._enter_leg("PE", pe_strike, "SELL", spot, atr, dte_days)
 
                         # CRITICAL RULE: If either short leg failed, square off shorts → ONLY HEDGES REMAIN
                         if not (ce_s_ok and pe_s_ok):
                             log_alert("⚠️ Short Strangle entry failed after 3 tries! Squaring off short legs so ONLY HEDGES REMAIN.")
                             self.square_off_all_short_legs(reason="STRANGLE_ENTRY_FAILED_LEAVE_HEDGES")
                         else:
-                            self.mode = "CHOP_MODE" if regime == "CHOP" else "RUNNING"
+                            self.mode = "RUNNING"
                             
                         self._save_state()
                     else:
