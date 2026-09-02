@@ -1954,87 +1954,10 @@ class ExecutionEngine:
 
 
 def prompt_user_variables():
-    global CAPITAL, KAMA_PERIOD, KAMA_FAST_EMA, KAMA_SLOW_EMA, ADX_PERIOD, ADX_CHOP_THRESHOLD, ADX_TREND_THRESHOLD
-    global PREM_SL_DEBOUNCE_BARS, BASE_MIN_WIDTH_PTS, BASE_MAX_WIDTH_PTS, TSL_STRANGLE_PCT, TSL_TREND_ORPHAN_PCT
     global PAPER_TRADING_MODE
-
-    is_tty = sys.stdin and hasattr(sys.stdin, "isatty") and sys.stdin.isatty()
-    if not is_tty:
-        return  # nohup / background: keep safe defaults (paper trading)
-
-    print(f"\n{Fore.CYAN}{Style.BRIGHT}{'═'*78}")
-    print(f"  🚀 V2.0 PRO (KAMA-ADX STRANGLE) — DEPLOYMENT CONFIGURATION")
-    print(f"{'═'*78}{Style.RESET_ALL}")
-
-    # ── PAPER / LIVE SELECTION (asked FIRST, before anything else) ────────────
-    print(f"\n{Fore.YELLOW}{Style.BRIGHT}{'═'*78}")
-    print(f"  STEP 1 OF 2: PAPER TRADING OR LIVE TRADING?")
-    print(f"{'═'*78}{Style.RESET_ALL}")
-    print(f"  {Fore.GREEN}Y{Style.RESET_ALL} = Paper Trading  (SAFE — simulated fills, zero real money risk)")
-    print(f"  {Fore.RED}N{Style.RESET_ALL} = LIVE Trading   (⚠️  REAL MONEY — orders go directly to Flattrade!)\n")
-
-    try:
-        while True:
-            ans = input("  ➤ Run in Paper Trading mode? [Y/n]: ").strip().lower()
-            if ans in ("", "y", "yes"):
-                PAPER_TRADING_MODE = True
-                print(f"\n  {Fore.GREEN}{Style.BRIGHT}✅ PAPER TRADING selected. No real orders will be placed.{Style.RESET_ALL}\n")
-                break
-            elif ans in ("n", "no"):
-                print(f"\n  {Fore.RED}{Style.BRIGHT}{'─'*78}")
-                print(f"  ⚠️  WARNING: LIVE TRADING SELECTED — REAL MONEY RISK!")
-                print(f"  ─ All orders will be sent directly to Flattrade exchange.")
-                print(f"  ─ Capital at risk: Rs.{CAPITAL:,.0f}")
-                print(f"  ─ Every individual trade still requires your Y/N confirmation.")
-                print(f"  ─ ORDER: Buy hedges FIRST, then sell short legs.")
-                print(f"{'─'*78}{Style.RESET_ALL}")
-                confirm = input("\n  ➤ Type LIVE to confirm, or press Enter to go paper: ").strip()
-                if confirm == "LIVE":
-                    PAPER_TRADING_MODE = False
-                    print(f"\n  {Fore.RED}{Style.BRIGHT}🚀 LIVE TRADING CONFIRMED. Real orders will be placed!{Style.RESET_ALL}\n")
-                else:
-                    PAPER_TRADING_MODE = True
-                    print(f"  {Fore.YELLOW}Defaulting to PAPER TRADING (safe).{Style.RESET_ALL}\n")
-                break
-            else:
-                print(f"  {Fore.YELLOW}Please type Y (paper) or N (live).{Style.RESET_ALL}")
-    except (KeyboardInterrupt, EOFError):
-        PAPER_TRADING_MODE = True
-        print(f"\n  {Fore.YELLOW}Defaulting to PAPER TRADING.{Style.RESET_ALL}\n")
-
-    # ── STRATEGY PARAMETERS ───────────────────────────────────────────────────
-    print(f"{Fore.YELLOW}STEP 2 OF 2: Strategy Parameters — press Enter to accept defaults.{Style.RESET_ALL}\n")
-
-    try:
-        def ask(prompt_text, default, val_type=float):
-            val = input(f"  ➤ {prompt_text} [{default}]: ").strip()
-            if not val:
-                return default
-            try:
-                return val_type(val)
-            except Exception:
-                print(f"    {Fore.RED}Invalid input. Using default: {default}{Style.RESET_ALL}")
-                return default
-
-        CAPITAL = ask("Initial Capital (Rs.)", 195784.0, float)
-        KAMA_PERIOD = ask("KAMA Lookback", 12, int)
-        KAMA_FAST_EMA = ask("KAMA Fast EMA", 3, int)
-        KAMA_SLOW_EMA = ask("KAMA Slow EMA", 30, int)
-        ADX_PERIOD = ask("ADX Period (5m)", 7, int)
-        gate = ask("ADX Regime Gate", 25.0, float)
-        ADX_CHOP_THRESHOLD = gate
-        ADX_TREND_THRESHOLD = gate
-        PREM_SL_DEBOUNCE_BARS = ask("Debounce Bars", 1, int)
-        width = ask("Strangle Width (pts)", 0, int)
-        BASE_MIN_WIDTH_PTS = width
-        BASE_MAX_WIDTH_PTS = width
-        
-        mode_label = "PAPER" if PAPER_TRADING_MODE else "LIVE"
-        print(f"\n{Fore.GREEN}{Style.BRIGHT}{'═'*78}")
-        print(f"  ✅ [{mode_label}] Parameters Confirmed — Deploying V2 Pro Strategy...")
-        print(f"{'═'*78}{Style.RESET_ALL}\n")
-    except (KeyboardInterrupt, EOFError):
-        print(f"\n{Fore.YELLOW}Default parameters selected.{Style.RESET_ALL}\n")
+    # Set to False by default for LIVE trading as requested. 
+    PAPER_TRADING_MODE = False
+    print(f"\n{Fore.GREEN}{Style.BRIGHT}✅ Strategy started in LIVE TRADING mode with default parameters.{Style.RESET_ALL}\n")
 
 
 if __name__ == "__main__":
