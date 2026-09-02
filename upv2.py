@@ -403,11 +403,11 @@ ATR_MULT_TREND            = 1.0
 HEDGE_DISTANCE_FLOOR      = 300
 HEDGE_DISTANCE_RATIO      = 1.5
 
-# --- DUAL TSL ---
-SPOT_SL_K_STRANGLE        = 0.5
-SPOT_SL_K_ORPHAN          = 0.85
-PREM_SL_ATR_MULT_STRANGLE = 1.0
-PREM_SL_ATR_MULT_ORPHAN   = 1.5
+# --- PREMIUM TSL (percentage of entry premium) ---
+# Initial SL: exit if premium rises X% above entry (loss protection)
+PREM_SL_INITIAL_PCT       = 0.50   # 50% above entry e.g. sold at 100 → initial SL at 150
+# Trailing SL: once premium falls, trail SL at X% above best (lowest) premium seen
+PREM_TSL_TRAIL_PCT        = 0.30   # 30% above best_prem e.g. best=80 → trail SL at 104
 
 # --- REENTRY CAPS ---
 KAMA_REVERSAL_ATR_RATIO   = 0.15
@@ -873,44 +873,52 @@ class RiskManager:
         return False, ""
 
     def init_dual_sl(self, leg: str, entry_spot: float, strike: float, entry_premium: float, atr: float, iv: float, dte_days: float) -> dict:
-        is_call = "CE" in leg
-        delta = bs_delta(entry_spot, strike, dte_days, iv, is_call)
+        initial_sl = round(entry_premium * (1.0 + PREM_SL_INITIAL_PCT), 2)
         return {
             "entry_spot": entry_spot,
             "entry_premium": entry_premium,
             "best_premium": entry_premium,
-            "atr_at_entry": atr,
-            "delta_at_entry": delta,
-            "current_premium_sl": 0.0,
+            "current_premium_sl": initial_sl,
             "breach_count": 0
         }
 
     def update_dual_sl_and_check(self, leg: str, pos_data: dict, current_spot: float, current_premium: float, is_strangle: bool, is_new_1m_bar: bool) -> tuple:
         sl_state = pos_data.get("dual_sl_state")
         if not sl_state: return False, ""
-        prem_mult = PREM_SL_ATR_MULT_STRANGLE if is_strangle else PREM_SL_ATR_MULT_ORPHAN
-        atr = float(sl_state["atr_at_entry"])
-        delta = abs(float(sl_state["delta_at_entry"]))
-        
-        # 1. Update Best Premium (lowest seen, since we are short)
-        if current_premium < sl_state.get("best_premium", float(sl_state["entry_premium"])):
+
+        entry_prem = float(sl_state.get("entry_premium", current_premium))
+
+        # 1. Update Best Premium (lowest seen since we are short = max profit point)
+        if current_premium < sl_state.get("best_premium", entry_prem):
             sl_state["best_premium"] = current_premium
-            
-        # 2. Calculate Trailing Stop Loss from Best Premium
-        best_prem = sl_state["best_premium"]
-        prem_sl = best_prem + (delta * atr * prem_mult)
+
+        best_prem = sl_state.get("best_premium", entry_prem)
+
+        # 2. Calculate TSL:
+        #    Phase A — Premium still above entry (position in loss): use INITIAL SL (50% above entry)
+        #    Phase B — Premium fell below entry (position in profit): trail at 30% above best
+        if best_prem >= entry_prem:
+            # Still at or above entry — use fixed initial SL
+            prem_sl = round(entry_prem * (1.0 + PREM_SL_INITIAL_PCT), 2)
+        else:
+            # Premium has fallen below entry — activate trailing SL
+            trail_sl = round(best_prem * (1.0 + PREM_TSL_TRAIL_PCT), 2)
+            # Never let trail SL go above the initial SL (keep best protection)
+            initial_sl = round(entry_prem * (1.0 + PREM_SL_INITIAL_PCT), 2)
+            prem_sl = min(trail_sl, initial_sl)
+
         sl_state["current_premium_sl"] = prem_sl
-        
+
         # 3. Check for Breach
         prem_breached = current_premium >= prem_sl
-        
+
         if prem_breached and is_new_1m_bar:
             sl_state["breach_count"] = sl_state.get("breach_count", 0) + 1
         elif is_new_1m_bar:
             sl_state["breach_count"] = 0
-            
+
         if sl_state.get("breach_count", 0) >= PREM_SL_DEBOUNCE_BARS:
-            return True, f"⛔ {leg} TSL Triggered! PREM | Best: {best_prem:.2f} | Current: {current_premium:.2f} >= SL: {prem_sl:.2f}"
+            return True, f"⛔ {leg} TSL Triggered! | Entry: {entry_prem:.2f} | Best: {best_prem:.2f} | Current: {current_premium:.2f} >= SL: {prem_sl:.2f}"
         return False, ""
 class ExecutionEngine:
     def __init__(self):
