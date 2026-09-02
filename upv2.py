@@ -959,14 +959,19 @@ class RiskManager:
 
         # 3. Check for Breach
         prem_breached = current_premium >= prem_sl
+        
+        if PREM_SL_DEBOUNCE_BARS <= 1:
+            if prem_breached:
+                return True, f"⛔ {leg} TSL Triggered (Tick Level)! | Entry: {entry_prem:.2f} | Best: {best_prem:.2f} | Current: {current_premium:.2f} >= SL: {prem_sl:.2f}"
+        else:
+            if prem_breached and is_new_1m_bar:
+                sl_state["breach_count"] = sl_state.get("breach_count", 0) + 1
+            elif is_new_1m_bar:
+                sl_state["breach_count"] = 0
 
-        if prem_breached and is_new_1m_bar:
-            sl_state["breach_count"] = sl_state.get("breach_count", 0) + 1
-        elif is_new_1m_bar:
-            sl_state["breach_count"] = 0
-
-        if sl_state.get("breach_count", 0) >= PREM_SL_DEBOUNCE_BARS:
-            return True, f"⛔ {leg} TSL Triggered! | Entry: {entry_prem:.2f} | Best: {best_prem:.2f} | Current: {current_premium:.2f} >= SL: {prem_sl:.2f}"
+            if sl_state.get("breach_count", 0) >= PREM_SL_DEBOUNCE_BARS:
+                return True, f"⛔ {leg} TSL Triggered ({PREM_SL_DEBOUNCE_BARS}m Debounce)! | Entry: {entry_prem:.2f} | Best: {best_prem:.2f} | Current: {current_premium:.2f} >= SL: {prem_sl:.2f}"
+                
         return False, ""
 class ExecutionEngine:
     def __init__(self):
@@ -1813,28 +1818,26 @@ class ExecutionEngine:
                 if not is_stale:
                     self.last_feed_tick = current_time
                 
-                if not is_new_1m_bar:
-                    now_curr = get_ist_now()
-                    sec_into_min = now_curr.second + (now_curr.microsecond / 1_000_000.0)
-                    sleep_sec = max(0.1, 60.0 - sec_into_min + 0.05)
-                    self._smart_sleep(sleep_sec)
+                if not is_new_1m_bar and getattr(self, "current_indicators", None) is None:
+                    self._smart_sleep(1.0)
                     continue
 
                 # ── 2. Run KAMA & Indicators strictly on the collected 1-minute data ──
-                df_5m = self.market_data.get_5m_dataframe()
-                self.current_indicators = Indicators.evaluate_all(self.market_data.get_1m_dataframe(), df_5m)
-                
-                current_iv = 15.0
-                if self.session_em_1sd > 0:
-                    current_iv = (self.session_em_1sd / spot) * 19.1 * 100.0
-                
-                rv = VolatilityEngine.calculate_realized_volatility(self.market_data.bars_1m)
-                rv_iv_ratio = VolatilityEngine.compute_rv_iv_divergence(rv, current_iv)
-                self.current_indicators["rv_iv_ratio"] = rv_iv_ratio
-                
-                if rv_iv_ratio > 1.15 and self.current_indicators["regime"] == "CHOP":
-                    self.current_indicators["regime"] = "TRANSITION"
-                    log_info(f"RV/IV Divergence {rv_iv_ratio:.2f} > 1.15. Early Trend detected. Shifting CHOP -> TRANSITION.")
+                if is_new_1m_bar or getattr(self, "current_indicators", None) is None:
+                    df_5m = self.market_data.get_5m_dataframe()
+                    self.current_indicators = Indicators.evaluate_all(self.market_data.get_1m_dataframe(), df_5m)
+                    
+                    current_iv = 15.0
+                    if self.session_em_1sd > 0:
+                        current_iv = (self.session_em_1sd / spot) * 19.1 * 100.0
+                    
+                    rv = VolatilityEngine.calculate_realized_volatility(self.market_data.bars_1m)
+                    rv_iv_ratio = VolatilityEngine.compute_rv_iv_divergence(rv, current_iv)
+                    self.current_indicators["rv_iv_ratio"] = rv_iv_ratio
+                    
+                    if rv_iv_ratio > 1.15 and self.current_indicators["regime"] == "CHOP":
+                        self.current_indicators["regime"] = "TRANSITION"
+                        log_info(f"RV/IV Divergence {rv_iv_ratio:.2f} > 1.15. Early Trend detected. Shifting CHOP -> TRANSITION.")
                 
                 atr = self.current_indicators["atr"]
                 regime = self.current_indicators["regime"]
@@ -1963,11 +1966,8 @@ class ExecutionEngine:
                 # ── 5. Render Live Dashboard ──
                 self._render_dashboard(spot, atm)
                 
-                # Sleep strictly until next 1-minute boundary (XX:XX:00.05)
-                now_curr = get_ist_now()
-                sec_into_min = now_curr.second + (now_curr.microsecond / 1_000_000.0)
-                sleep_sec = max(0.1, 60.0 - sec_into_min + 0.05)
-                self._smart_sleep(sleep_sec)
+                # Sleep 1 second for continuous tick-level TSL evaluation
+                self._smart_sleep(1.0)
 
             except KeyboardInterrupt:
                 log_alert("Algo interrupted via KeyboardInterrupt (Ctrl+C). Initiating emergency exit...")
