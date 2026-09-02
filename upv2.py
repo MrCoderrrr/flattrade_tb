@@ -1207,8 +1207,7 @@ class ExecutionEngine:
 
     @classmethod
     def calculate_hedge_strikes(cls, atm_spot: int, ce_short_strike: int, pe_short_strike: int, dte_days: float = 2.0) -> Tuple[int, int]:
-        short_dist = max(ce_short_strike - atm_spot, atm_spot - pe_short_strike)
-        hedge_dist = max(HEDGE_DISTANCE_FLOOR, int(short_dist * HEDGE_DISTANCE_RATIO))
+        hedge_dist = 1000
         return atm_spot + hedge_dist, atm_spot - hedge_dist
 
     def _log_trade(self, action: str, leg: str, strike: int, side: str, qty: int, price: float, pnl: float = None, reason: str = ""):
