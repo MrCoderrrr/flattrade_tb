@@ -409,11 +409,9 @@ HEDGE_DISTANCE_FLOOR      = 300
 HEDGE_DISTANCE_RATIO      = 1.5
 
 # --- PREMIUM TSL (percentage of entry premium) ---
-# Initial SL: exit if premium rises 15% above entry
-PREM_SL_INITIAL_PCT       = 0.15   # 15% above entry e.g. sold at 100 → SL at 115
-# Trailing SL: dynamically tightens as more profit is captured (3% to 12%)
-PREM_TSL_MIN_PCT          = 0.03   # 3%  trail when deep in profit (>60% premium decayed)
-PREM_TSL_MAX_PCT          = 0.12   # 12% trail when just entered profit (<20% premium decayed)
+PREM_SL_INITIAL_PCT       = 0.10   # 10% above entry e.g. sold at 100 → SL at 110
+PREM_TSL_MIN_PCT          = 0.05   # 5% flat trail
+PREM_TSL_MAX_PCT          = 0.05   # 5% flat trail
 
 # --- REENTRY CAPS ---
 KAMA_REVERSAL_ATR_RATIO   = 0.15
