@@ -409,9 +409,9 @@ HEDGE_DISTANCE_FLOOR      = 300
 HEDGE_DISTANCE_RATIO      = 1.5
 
 # --- PREMIUM TSL (percentage of entry premium) ---
-PREM_SL_INITIAL_PCT       = 0.10   # 10% above entry e.g. sold at 100 → SL at 110
-PREM_TSL_MIN_PCT          = 0.05   # 5% flat trail
-PREM_TSL_MAX_PCT          = 0.05   # 5% flat trail
+PREM_SL_INITIAL_PCT       = 0.05   # 5% initial SL
+PREM_TSL_MIN_PCT          = 0.09   # 9% flat trail
+PREM_TSL_MAX_PCT          = 0.09   # 9% flat trail
 
 # --- REENTRY CAPS ---
 KAMA_REVERSAL_ATR_RATIO   = 0.15
@@ -949,6 +949,11 @@ class RiskManager:
             trail_sl = round(best_prem * (1.0 + trail_pct), 2)
             # Never let trail SL exceed initial SL
             prem_sl = min(trail_sl, initial_sl)
+            
+        # STRICT RATCHET: The stop loss can NEVER move backwards (upwards).
+        # It must stay at its tightest point until TSL drags it further down.
+        if "current_premium_sl" in sl_state:
+            prem_sl = min(prem_sl, sl_state["current_premium_sl"])
 
         sl_state["current_premium_sl"] = prem_sl
 
