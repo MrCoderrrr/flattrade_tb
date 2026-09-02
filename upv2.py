@@ -1269,8 +1269,11 @@ class ExecutionEngine:
         return atm_spot + stride_50, atm_spot - stride_50
 
     @classmethod
-    def calculate_hedge_strikes(cls, atm_spot: int, ce_short_strike: int, pe_short_strike: int, dte_days: float = 2.0) -> Tuple[int, int]:
-        hedge_dist = 1000
+    def calculate_hedge_strikes(cls, atm_spot: int, ce_short_strike: int, pe_short_strike: int, regime: str, dte_days: float = 2.0) -> Tuple[int, int]:
+        if regime == "CHOP":
+            hedge_dist = 100
+        else:
+            hedge_dist = 1000
         return atm_spot + hedge_dist, atm_spot - hedge_dist
 
     def _log_trade(self, action: str, leg: str, strike: int, side: str, qty: int, price: float, pnl: float = None, reason: str = ""):
@@ -1862,7 +1865,7 @@ class ExecutionEngine:
                             log_info(f"Frozen Session EM_1sd: {self.session_em_1sd:.2f}")
                             
                         ce_strike, pe_strike = self.calculate_strangle_strikes(atm, atr, regime, dte_days=dte_days)
-                        ce_hedge, pe_hedge = self.calculate_hedge_strikes(atm, ce_strike, pe_strike, dte_days=dte_days)
+                        ce_hedge, pe_hedge = self.calculate_hedge_strikes(atm, ce_strike, pe_strike, regime, dte_days=dte_days)
                         hedge_width = ce_hedge - atm
                         log_info(f"Market Start Time (09:18 AM) reached. Ingesting positions (Regime: {regime}, ATR: {atr:.1f}, Hedge Dist: {hedge_width})...")
                         
