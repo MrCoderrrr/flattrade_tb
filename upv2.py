@@ -416,9 +416,9 @@ PREM_TSL_MAX_PCT          = 0.09   # 9% flat trail
 # --- REENTRY CAPS ---
 KAMA_REVERSAL_ATR_RATIO   = 0.15
 KAMA_CONSECUTIVE_BARS     = 2
-MAX_REENTRIES_PER_LEG     = 2
-MAX_REENTRIES_TOTAL       = 4
-MAX_STRANGLE_RESETS       = 2
+MAX_REENTRIES_PER_LEG     = 999
+MAX_REENTRIES_TOTAL       = 999
+MAX_STRANGLE_RESETS       = 999
 BACKOFF_BASE_SEC          = 60
 KAMA_PERIOD             = 12          # KAMA Efficiency Ratio lookback
 KAMA_FAST_EMA           = 3           # KAMA Fast EMA constant
@@ -1543,7 +1543,7 @@ class ExecutionEngine:
                     cd["active"] = False
                     cd["reentries_today"] = cd.get("reentries_today", 0) + 1
                     self.total_reentries_today += 1
-                    backoff = BACKOFF_BASE_SEC * (2 ** cd["reentries_today"])
+                    backoff = min(300, BACKOFF_BASE_SEC * (2 ** cd["reentries_today"]))
                     cd["next_eligible_time"] = time.time() + backoff
                     self._save_state()
     def _render_dashboard(self, spot: float, atm: int):
