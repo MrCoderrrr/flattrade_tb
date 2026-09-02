@@ -426,8 +426,8 @@ KAMA_SLOW_EMA           = 30          # KAMA Slow EMA constant
 KAMA_MIN_SLOPE          = 4.0         # Minimum KAMA slope (pts) to flip trend
 
 ADX_PERIOD              = 14          # ADX lookback period on 5m candles (14 = standard Wilder)
-ADX_CHOP_THRESHOLD      = 45.0        # ADX < 45: CHOP REGIME (sideways market)
-ADX_TREND_THRESHOLD     = 45.0        # ADX >= 45: TREND REGIME (trending market)
+ADX_CHOP_THRESHOLD      = 30.0        # ADX < 30: CHOP REGIME (sideways market)
+ADX_TREND_THRESHOLD     = 30.0        # ADX >= 30: TREND REGIME (trending market)
 
 ATR_PERIOD              = 14          # ATR lookback period on 5m candles
 DEFAULT_ATR_5M          = 35.0        # Fallback 5m ATR if warming up
@@ -2072,7 +2072,7 @@ def prompt_user_variables():
         KAMA_FAST_EMA = ask("KAMA Fast EMA", 3, int)
         KAMA_SLOW_EMA = ask("KAMA Slow EMA", 30, int)
         ADX_PERIOD = ask("ADX Period (5m)", 7, int)
-        gate = ask("ADX Regime Gate", 25.0, float)
+        gate = ask("ADX Regime Gate", 30.0, float)
         ADX_CHOP_THRESHOLD = gate
         ADX_TREND_THRESHOLD = gate
         PREM_SL_DEBOUNCE_BARS = ask("Debounce Bars", 1, int)
