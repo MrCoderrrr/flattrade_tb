@@ -422,9 +422,9 @@ KAMA_FAST_EMA           = 3           # KAMA Fast EMA constant
 KAMA_SLOW_EMA           = 30          # KAMA Slow EMA constant
 KAMA_MIN_SLOPE          = 4.0         # Minimum KAMA slope (pts) to flip trend
 
-ADX_PERIOD              = 7           # ADX lookback period on 5m candles
-ADX_CHOP_THRESHOLD      = 25.0        # ADX < 20: CHOP REGIME
-ADX_TREND_THRESHOLD     = 25.0        # ADX >= 20: TREND REGIME
+ADX_PERIOD              = 14          # ADX lookback period on 5m candles (14 = standard Wilder)
+ADX_CHOP_THRESHOLD      = 45.0        # ADX < 45: CHOP REGIME (sideways market)
+ADX_TREND_THRESHOLD     = 45.0        # ADX >= 45: TREND REGIME (trending market)
 
 ATR_PERIOD              = 14          # ATR lookback period on 5m candles
 DEFAULT_ATR_5M          = 35.0        # Fallback 5m ATR if warming up
