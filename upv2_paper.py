@@ -2003,8 +2003,13 @@ def prompt_user_variables():
     global PREM_SL_DEBOUNCE_BARS, BASE_MIN_WIDTH_PTS, BASE_MAX_WIDTH_PTS, TSL_STRANGLE_PCT, TSL_TREND_ORPHAN_PCT
     global PAPER_TRADING_MODE
 
+    import sys
     PAPER_TRADING_MODE = True
     print(f"\n{Fore.GREEN}{Style.BRIGHT}✅ PAPER TRADING ONLY. No real orders will be placed.{Style.RESET_ALL}\n")
+
+    if not sys.stdin or not hasattr(sys.stdin, "isatty") or not sys.stdin.isatty():
+        print(f"{Fore.YELLOW}Background execution detected. Using default strategy parameters.{Style.RESET_ALL}\n")
+        return
 
     # ── STRATEGY PARAMETERS ───────────────────────────────────────────────────
     print(f"{Fore.YELLOW}STEP 2 OF 2: Strategy Parameters — press Enter to accept defaults.{Style.RESET_ALL}\n")
@@ -2037,7 +2042,7 @@ def prompt_user_variables():
         print(f"\n{Fore.GREEN}{Style.BRIGHT}{'═'*78}")
         print(f"  ✅ [{mode_label}] Parameters Confirmed — Deploying V2 Pro Strategy...")
         print(f"{'═'*78}{Style.RESET_ALL}\n")
-    except (KeyboardInterrupt, EOFError):
+    except (KeyboardInterrupt, EOFError, OSError):
         print(f"\n{Fore.YELLOW}Default parameters selected.{Style.RESET_ALL}\n")
 
 
