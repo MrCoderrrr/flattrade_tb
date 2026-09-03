@@ -2007,43 +2007,12 @@ def prompt_user_variables():
     PAPER_TRADING_MODE = True
     print(f"\n{Fore.GREEN}{Style.BRIGHT}✅ PAPER TRADING ONLY. No real orders will be placed.{Style.RESET_ALL}\n")
 
-    if not sys.stdin or not hasattr(sys.stdin, "isatty") or not sys.stdin.isatty():
-        print(f"{Fore.YELLOW}Background execution detected. Using default strategy parameters.{Style.RESET_ALL}\n")
-        return
+
 
     # ── STRATEGY PARAMETERS ───────────────────────────────────────────────────
-    print(f"{Fore.YELLOW}STEP 2 OF 2: Strategy Parameters — press Enter to accept defaults.{Style.RESET_ALL}\n")
-
-    try:
-        def ask(prompt_text, default, val_type=float):
-            val = input(f"  ➤ {prompt_text} [{default}]: ").strip()
-            if not val:
-                return default
-            try:
-                return val_type(val)
-            except Exception:
-                print(f"    {Fore.RED}Invalid input. Using default: {default}{Style.RESET_ALL}")
-                return default
-
-        CAPITAL = ask("Initial Capital (Rs.)", 195784.0, float)
-        KAMA_PERIOD = ask("KAMA Lookback", 12, int)
-        KAMA_FAST_EMA = ask("KAMA Fast EMA", 3, int)
-        KAMA_SLOW_EMA = ask("KAMA Slow EMA", 30, int)
-        ADX_PERIOD = ask("ADX Period (5m)", 7, int)
-        gate = ask("ADX Regime Gate", 30.0, float)
-        ADX_CHOP_THRESHOLD = gate
-        ADX_TREND_THRESHOLD = gate
-        PREM_SL_DEBOUNCE_BARS = ask("Debounce Bars", 1, int)
-        width = ask("Strangle Width (pts)", 0, int)
-        BASE_MIN_WIDTH_PTS = width
-        BASE_MAX_WIDTH_PTS = width
-        
-        mode_label = "PAPER" if PAPER_TRADING_MODE else "LIVE"
-        print(f"\n{Fore.GREEN}{Style.BRIGHT}{'═'*78}")
-        print(f"  ✅ [{mode_label}] Parameters Confirmed — Deploying V2 Pro Strategy...")
-        print(f"{'═'*78}{Style.RESET_ALL}\n")
-    except (KeyboardInterrupt, EOFError, OSError):
-        print(f"\n{Fore.YELLOW}Default parameters selected.{Style.RESET_ALL}\n")
+    print(f"\n{Fore.GREEN}{Style.BRIGHT}{'═'*78}")
+    print(f"  ✅ [PAPER] Initializing with default strategy parameters...")
+    print(f"{'═'*78}{Style.RESET_ALL}\n")
 
 
 if __name__ == "__main__":
