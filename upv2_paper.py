@@ -388,7 +388,7 @@ PORTFOLIO_CIRCUIT_PCT   = 1.8
 # --- REAL-MONEY SAFETY & GOVERNANCE ---
 TELEGRAM_BOT_TOKEN        = ""
 TELEGRAM_CHAT_ID          = ""
-KILL_SWITCH_FILE          = os.path.join(CURRENT_DIR, "kill_switch.txt")
+KILL_SWITCH_FILE          = os.path.join(CURRENT_DIR, "kill_switch_paper.txt")
 CAPITAL_FRACTION_LIVE     = 0.40
 MAX_LOTS_PER_LEG          = 1
 MAX_CONCURRENT_SHORT_LEGS = 2
