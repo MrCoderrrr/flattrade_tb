@@ -49,9 +49,9 @@ LOT_SIZE                = 1250
 STRIKE_STEP             = 5.0
 
 # Premium Trailing Stop-Loss config
-INITIAL_SL_PCT          = 0.20  # 20% initial hard stop
-TRAIL_ACTIVATION_PCT    = 0.25  # Arms at -25%
-TRAIL_DISTANCE_PCT      = 0.15  # Trails at +15% from bottom
+INITIAL_SL_PCT          = 0.10  # 10% initial hard stop when both legs exist
+ORPHAN_SL_PCT           = 0.15  # 15% stop loss when only one leg is open
+TRAIL_ACTIVATION_PCT    = 0.25  # Arms at -25% (profit)
 REENTRY_SL_PCT          = 0.10  # 10% tighter stop for re-entries
 PREM_SL_DEBOUNCE_BARS   = 1
 
@@ -404,7 +404,7 @@ class RiskManager:
             return True, f"Global Circuit Breaker Hit! PnL {total_pnl:.2f} <= Limit {self.circuit_breaker_loss_limit:.2f}"
         return False, ""
 
-    def update_premium_tsl(self, current_state: dict, live_premium: float, is_reentry: bool) -> dict:
+    def update_premium_tsl(self, current_state: dict, live_premium: float, is_reentry: bool, is_straddle: bool) -> dict:
         lowest_seen = min(current_state.get("lowest_premium_seen", live_premium), live_premium)
         entry_prem = current_state["entry_premium"]
 
@@ -414,20 +414,35 @@ class RiskManager:
             if lowest_seen <= entry_prem * (1 - TRAIL_ACTIVATION_PCT):
                 armed = True
 
-        # Calculate active stop
-        if armed:
-            active_stop = lowest_seen * (1 + TRAIL_DISTANCE_PCT)
+        # SL/TSL Percentage logic
+        if not is_straddle:
+            base_sl_pct = ORPHAN_SL_PCT
         else:
-            sl_pct = REENTRY_SL_PCT if is_reentry else INITIAL_SL_PCT
-            active_stop = entry_prem * (1 + sl_pct)
+            base_sl_pct = REENTRY_SL_PCT if is_reentry else INITIAL_SL_PCT
+
+        # Calculate new stop
+        if armed:
+            new_stop = lowest_seen * (1 + base_sl_pct)
+        else:
+            new_stop = entry_prem * (1 + base_sl_pct)
+
+        # Strict ratchet: never let the stop loss move backwards (upwards)
+        # However, if it transitions to an orphan leg, we permit the SL to widen to the orphan SL% 
+        # so it doesn't get immediately stopped out by a tight straddle SL if we wanted it wider.
+        # But for safety, we generally want it to only ratchet downwards.
+        old_stop = current_state.get("active_stop")
+        if old_stop and is_straddle == current_state.get("was_straddle", is_straddle):
+            # Only enforce ratchet if the state hasn't just changed to orphan
+            new_stop = min(new_stop, old_stop)
 
         return {
             "entry_premium": entry_prem,
             "lowest_premium_seen": lowest_seen,
             "is_armed": armed,
-            "active_stop": active_stop,
+            "active_stop": new_stop,
             "breach_count": current_state.get("breach_count", 0),
-            "is_reentry": is_reentry
+            "is_reentry": is_reentry,
+            "was_straddle": is_straddle
         }
 
 
@@ -635,7 +650,8 @@ class ExecutionEngine:
                 "is_armed": False,
                 "active_stop": current_ltp * (1 + (REENTRY_SL_PCT if is_reentry else INITIAL_SL_PCT)),
                 "breach_count": 0,
-                "is_reentry": is_reentry
+                "is_reentry": is_reentry,
+                "was_straddle": False
             }
         }
         self.positions[leg] = pos_info
@@ -816,7 +832,8 @@ class ExecutionEngine:
                         ltp = self._get_ltp(p["strike"], leg)
 
                         tsl_state = p["tsl_state"]
-                        new_tsl = self.risk_manager.update_premium_tsl(tsl_state, ltp, tsl_state.get("is_reentry", False))
+                        is_straddle = ("CE" in self.positions and "PE" in self.positions)
+                        new_tsl = self.risk_manager.update_premium_tsl(tsl_state, ltp, tsl_state.get("is_reentry", False), is_straddle)
 
                         if PREM_SL_DEBOUNCE_BARS <= 1:
                             if ltp >= new_tsl["active_stop"]:
