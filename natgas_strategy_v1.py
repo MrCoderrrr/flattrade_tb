@@ -17,7 +17,7 @@ FIX NOTES (v1.1):
 """
 import sys, os, time, math, signal, json, threading, datetime, select
 from typing import Dict, Any, Tuple, Optional, List
-from datetime import datetime as dt_module, timedelta
+from datetime import datetime as dt_module, timedelta, timezone
 from colorama import init, Fore, Style
 
 # Third-party for dashboard/math
@@ -87,7 +87,7 @@ PAPER_TRADING_MODE = True
 CAPITAL = 250_000 # Example placeholder for paper mode, user is prompted in live
 
 def get_ist_now() -> dt_module:
-    return dt_module.utcnow() + timedelta(hours=5, minutes=30)
+    return dt_module.now(timezone.utc) + timedelta(hours=5, minutes=30)
 
 def log_info(msg: str):
     print(f"[{get_ist_now().strftime('%H:%M:%S')} INFO]  {msg}")
@@ -890,8 +890,6 @@ class ExecutionEngine:
 
     def _render_dashboard(self, spot: float, atm: int, indicators: dict, unrealized: float):
         try:
-            # We explicitly removed os.system('clear') per user request so the terminal scrolls naturally
-
             # Save external snapshot
             snap = {
                 "date": str(get_ist_now().date()),
@@ -906,52 +904,88 @@ class ExecutionEngine:
             with open(LIVE_SNAP_FILE, "w") as sf:
                 json.dump(snap, sf)
 
+            import re
+            def ansi_len(s): return len(re.sub(r"\x1b\[[0-9;]*m", "", s))
+            
             W = 114
-            TOP = f"{Fore.GREEN}╔{'═' * W}╗{Style.RESET_ALL}"
-            MID = f"{Fore.GREEN}╠{'═' * W}╣{Style.RESET_ALL}"
-            BOT = f"{Fore.GREEN}╚{'═' * W}╝{Style.RESET_ALL}"
-            V = f"{Fore.GREEN}║{Style.RESET_ALL}"
+            c_cyan   = f"{Fore.CYAN}{Style.BRIGHT}"
+            c_white  = f"{Fore.WHITE}{Style.BRIGHT}"
+            c_dim    = f"{Fore.WHITE}{Style.DIM}"
+            c_yellow = f"{Fore.YELLOW}{Style.BRIGHT}"
+            c_green  = f"{Fore.GREEN}{Style.BRIGHT}"
+            c_red    = f"{Fore.RED}{Style.BRIGHT}"
+            c_mag    = f"{Fore.MAGENTA}{Style.BRIGHT}"
+            res      = Style.RESET_ALL
 
-            c_cyan = Fore.CYAN + Style.BRIGHT
-            c_yellow = Fore.YELLOW
-            res = Style.RESET_ALL
+            TOP   = f"{c_dim}╔{'═'*W}╗{res}"
+            BOT   = f"{c_dim}╚{'═'*W}╝{res}"
+            MID   = f"{c_dim}╠{'═'*W}╣{res}"
+            MID_S = f"{c_dim}╟{'─'*W}╢{res}"
+            V     = f"{c_dim}║{res}"
+            VS    = f"{c_dim}│{res}"
 
-            title = f"  {c_cyan}MCX NATURAL GAS STRADDLE (V1.1){res}  {c_yellow}NAKED SHORT{res}  {Fore.GREEN}TYPE 'zxc' TO STOP{res}"
-            time_str = get_ist_now().strftime("%H:%M:%S")
-            title_pad = W - len(title) + 12 - len(time_str) - 2
+            trend_str = "▲ UP" if indicators.get("kama_trend") == 1 else ("▼ DOWN" if indicators.get("kama_trend") == -1 else "━ FLAT")
+            trend_col = c_green if indicators.get("kama_trend") == 1 else (c_red if indicators.get("kama_trend") == -1 else c_yellow)
+            kama_str = f"{indicators.get('kama'):.2f}" if indicators.get("kama") else "WARMUP"
+            
+            print()
             print(TOP)
-            print(f"{V}{title}{' ' * max(0, title_pad)}{time_str}  {V}")
-            print(MID)
-
-            kama_val = indicators.get("kama")
-            k_str = f"{kama_val:.1f}" if kama_val else "WARMUP"
-            tr = indicators.get("kama_trend", 0)
-            tr_str = "UP" if tr == 1 else ("DOWN" if tr == -1 else "FLAT")
-
             feed_str = "LIVE" if getattr(self.broker, "authenticated", False) else "SIMULATED"
-            metrics = f"  SPOT: {spot:.1f}  ATM: {atm}  KAMA(1m): {k_str} ({tr_str})  FEED: {feed_str}  CAPITAL: ₹{self.risk_manager.capital:,.0f}"
-            print(f"{V}{metrics}{' ' * max(0, W - len(metrics))} {V}")
+            title_left = f"  {c_cyan}MCX NATURAL GAS STRADDLE (V1.1){res}  {c_dim}│{res}  {c_yellow}NAKED SHORT{res}  {c_dim}│{res}  {c_green}TYPE 'zxc' TO STOP{res}"
+            title_right = f"{c_dim}{get_ist_now().strftime('%H:%M:%S')}{res}  "
+            pad = max(0, W - ansi_len(title_left) - ansi_len(title_right))
+            print(f"{V}{title_left}{' ' * pad}{title_right}{V}")
+            
+            ind_bar = (f"  {c_dim}SPOT:{res} {c_white}{spot:>6.1f}{res}  {c_dim}ATM:{res} {c_yellow}{atm:<5}{res}  "
+                       f"{c_dim}KAMA(1m):{res} {c_white}{kama_str:>8}{res} {trend_col}{trend_str}{res}  "
+                       f"{c_dim}FEED:{res} {c_white}{feed_str}{res}  "
+                       f"{c_dim}CAPITAL:{res} {c_white}₹{self.risk_manager.capital:,.0f}{res}")
+            pad_ind = max(0, W - ansi_len(ind_bar))
+            print(MID)
+            print(f"{V}{ind_bar}{' ' * pad_ind}{V}")
             print(MID)
 
             if not self.positions:
-                st = f"  No open positions. State: {self.mode}"
-                print(f"{V}{st}{' ' * max(0, W - len(st))} {V}")
+                msg = f"  {c_yellow}No open positions. State: {self.mode}{res}"
+                print(f"{V}{msg}{' ' * max(0, W - ansi_len(msg))}{V}")
             else:
+                hdr = f"  {'LEG':<5} {VS} {'STRIKE':>7} {VS} {'SIDE':<5} {VS} {'QTY':>3} {VS} {'ENTRY':>7} {VS} {'LTP':>7} {VS} {'TSL':>10} {VS} {'PNL':>10}  "
+                print(f"{V}{hdr}{' ' * max(0, W - ansi_len(hdr))}{V}")
+                print(MID_S)
+
                 for leg, p in self.positions.items():
-                    tsl = p["tsl_state"]
-                    armed_str = "ARMED" if tsl["is_armed"] else "UNARMED"
                     ltp = self._get_ltp(p["strike"], leg)
                     pnl = (p["entry_price"] - ltp) * p["qty"]
-                    row = f"  {leg} {p['strike']} | Entry: {p['entry_price']:.1f} | Live: {ltp:.1f} | Stop: {tsl['active_stop']:.1f} ({armed_str}) | PnL: ₹{pnl:,.1f}"
-                    print(f"{V}{row}{' ' * max(0, W - len(row))} {V}")
+                    tsl = p["tsl_state"]
+                    
+                    side_col = c_red if p["side"] == "SELL" else c_green
+                    pnl_col = c_green if pnl >= 0 else c_red
+                    sign = "+" if pnl >= 0 else ""
+                    armed_str = "ARMED" if tsl["is_armed"] else "UNARMED"
+                    tsl_disp = f"{tsl['active_stop']:.1f} ({armed_str})"
+                    
+                    row = (f"  {c_white}{leg:<5}{res} {VS} {c_white}{p['strike']:>7}{res} {VS} {side_col}{p['side']:<5}{res} {VS} "
+                           f"{c_white}{p['qty']:>3}{res} {VS} "
+                           f"{c_white}{p['entry_price']:>7.2f}{res} {VS} "
+                           f"{c_yellow}{ltp:>7.2f}{res} {VS} {c_mag}{tsl_disp:>10}{res} {VS} "
+                           f"{pnl_col}{sign}₹{pnl:>8,.2f}{res}  ")
+                    print(f"{V}{row}{' ' * max(0, W - ansi_len(row))}{V}")
 
             print(MID)
             tot = self.realized_pnl + unrealized
             cb = self.risk_manager.circuit_breaker_loss_limit
-            summary = f"  REALIZED: ₹{self.realized_pnl:,.1f}  UNREAL: ₹{unrealized:,.1f}  NET: ₹{tot:,.1f}  CB LIMIT: ₹{cb:,.1f}"
-            print(f"{V}{summary}{' ' * max(0, W - len(summary))} {V}")
+            
+            pnl_r_col = c_green if self.realized_pnl >= 0 else c_red
+            pnl_u_col = c_green if unrealized >= 0 else c_red
+            pnl_t_col = c_green if tot >= 0 else c_red
+            
+            pnl_str = (f"  {c_dim}REALIZED:{res} {pnl_r_col}₹{self.realized_pnl:,.1f}{res}  {c_dim}│{res}  "
+                       f"{c_dim}UNREAL:{res} {pnl_u_col}₹{unrealized:,.1f}{res}  {c_dim}│{res}  "
+                       f"{c_dim}NET:{res} {pnl_t_col}₹{tot:,.1f}{res}  {c_dim}│{res}  "
+                       f"{c_dim}CB LIMIT:{res} {c_red}₹{cb:,.1f}{res}")
+            print(f"{V}{pnl_str}{' ' * max(0, W - ansi_len(pnl_str))}{V}")
             print(BOT)
-
+            
         except Exception as e:
             log_warn(f"Dashboard snap fail: {e}")
 
