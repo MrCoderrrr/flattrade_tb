@@ -745,16 +745,17 @@ class ExecutionEngine:
                     self.trigger_emergency_shutdown(reason="CIRCUIT_BREAKER_HALT")
                     break
 
-                if not is_new_1m_bar:
-                    now_curr = get_ist_now()
-                    sec_into_min = now_curr.second + (now_curr.microsecond / 1_000_000.0)
-                    sleep_sec = max(0.1, 60.0 - sec_into_min + 0.05)
-                    time.sleep(min(sleep_sec, 0.5))
+                if not is_new_1m_bar and getattr(self, "current_indicators", None) is None:
+                    time.sleep(1.0)
                     continue
 
-                # 1-min Evaluation Cycle Starts (Trading decisions)
+                # ── TICK-LEVEL CYCLE (TSL) & 1-MIN CYCLE (KAMA) ──
                 self._ltp_cache.clear()
-                indicators = self.market_data.compute_indicators()
+
+                if is_new_1m_bar or getattr(self, "current_indicators", None) is None:
+                    self.current_indicators = self.market_data.compute_indicators()
+
+                indicators = self.current_indicators
                 kama_val = indicators.get("kama")
                 kama_trend = indicators.get("kama_trend")
 
@@ -801,14 +802,20 @@ class ExecutionEngine:
                         tsl_state = p["tsl_state"]
                         new_tsl = self.risk_manager.update_premium_tsl(tsl_state, ltp, tsl_state.get("is_reentry", False))
 
-                        if ltp >= new_tsl["active_stop"]:
-                            new_tsl["breach_count"] += 1
+                        if PREM_SL_DEBOUNCE_BARS <= 1:
+                            if ltp >= new_tsl["active_stop"]:
+                                new_tsl["breach_count"] = PREM_SL_DEBOUNCE_BARS
+                            else:
+                                new_tsl["breach_count"] = 0
                         else:
-                            new_tsl["breach_count"] = 0
+                            if ltp >= new_tsl["active_stop"] and is_new_1m_bar:
+                                new_tsl["breach_count"] += 1
+                            elif is_new_1m_bar:
+                                new_tsl["breach_count"] = 0
 
                         p["tsl_state"] = new_tsl
 
-                        if new_tsl["breach_count"] >= PREM_SL_DEBOUNCE_BARS:
+                        if new_tsl["breach_count"] >= max(1, PREM_SL_DEBOUNCE_BARS):
                             reason = "TRAIL_SL_HIT" if new_tsl["is_armed"] else "INITIAL_SL_HIT"
                             log_alert(f"🛑 {leg} stop triggered ({reason}) at {ltp:.2f} (Stop: {new_tsl['active_stop']:.2f}). Exiting leg.")
                             if self._exit_leg(leg, reason=reason):
@@ -845,7 +852,8 @@ class ExecutionEngine:
                         elif leg == "PE":
                             if kama_trend == 1 and kama_diff >= KAMA_MIN_REVERSAL_PTS: is_reversal = True
 
-                        cd["consecutive_reversal_bars"] = cd.get("consecutive_reversal_bars", 0) + 1 if is_reversal else 0
+                        if is_new_1m_bar:
+                            cd["consecutive_reversal_bars"] = cd.get("consecutive_reversal_bars", 0) + 1 if is_reversal else 0
 
                         if cd["consecutive_reversal_bars"] >= KAMA_CONSECUTIVE_BARS:
                             log_info(f"🔄 KAMA Reversal Confirmed for {leg}! Re-entering...")
@@ -857,6 +865,8 @@ class ExecutionEngine:
                                 self._save_state()
 
                 self._render_dashboard(spot, atm, indicators, unrealized)
+                # Sleep 1 second for continuous tick-level TSL evaluation
+                time.sleep(1.0)
 
             except Exception as e:
                 log_warn(f"Exception in main loop: {e}")
