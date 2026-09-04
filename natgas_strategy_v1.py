@@ -949,7 +949,7 @@ class ExecutionEngine:
                 msg = f"  {c_yellow}No open positions. State: {self.mode}{res}"
                 print(f"{V}{msg}{' ' * max(0, W - ansi_len(msg))}{V}")
             else:
-                hdr = f"  {'LEG':<5} {VS} {'STRIKE':>7} {VS} {'SIDE':<5} {VS} {'QTY':>3} {VS} {'ENTRY':>7} {VS} {'LTP':>7} {VS} {'TSL':>10} {VS} {'PNL':>10}  "
+                hdr = f"  {'LEG':<5} {VS} {'STRIKE':>7} {VS} {'SIDE':<5} {VS} {'QTY':>4} {VS} {'ENTRY':>7} {VS} {'LTP':>7} {VS} {'TSL':>10} {VS} {'PNL':>10}  "
                 print(f"{V}{hdr}{' ' * max(0, W - ansi_len(hdr))}{V}")
                 print(MID_S)
 
@@ -965,7 +965,7 @@ class ExecutionEngine:
                     tsl_disp = f"{tsl['active_stop']:.1f} ({armed_str})"
                     
                     row = (f"  {c_white}{leg:<5}{res} {VS} {c_white}{p['strike']:>7}{res} {VS} {side_col}{p['side']:<5}{res} {VS} "
-                           f"{c_white}{p['qty']:>3}{res} {VS} "
+                           f"{c_white}{p['qty']:>4}{res} {VS} "
                            f"{c_white}{p['entry_price']:>7.2f}{res} {VS} "
                            f"{c_yellow}{ltp:>7.2f}{res} {VS} {c_mag}{tsl_disp:>10}{res} {VS} "
                            f"{pnl_col}{sign}₹{pnl:>8,.2f}{res}  ")
