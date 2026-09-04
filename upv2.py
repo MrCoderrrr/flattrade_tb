@@ -1507,7 +1507,7 @@ class ExecutionEngine:
             "extreme_kama": current_kama,
             "active": True
         }
-        log_alert(f"⏳ {stopped_leg} stopped out. Requiring 1.0 pt KAMA reversal from {current_kama:.2f} to re-enter.")
+        log_alert(f"⏳ {stopped_leg} stopped out. Requiring 0.25 pt KAMA reversal to re-enter.")
         self.mode = "COOLDOWN"
         self._save_state()
 
@@ -1529,20 +1529,20 @@ class ExecutionEngine:
             if time.time() < cd.get("next_eligible_time", 0): continue
             
             if leg == "CE":
-                # CE stopped out because market went UP. We re-enter if KAMA slope goes DOWN by > 0.5.
-                if kama_slope <= -0.5:
+                # CE stopped out because market went UP. We re-enter if KAMA slope goes DOWN by >= 0.25.
+                if kama_slope <= -0.25:
                     cd["consecutive_bars"] = cd.get("consecutive_bars", 0) + 1
                 else: cd["consecutive_bars"] = 0
             else:
-                # PE stopped out because market went DOWN. We re-enter if KAMA slope goes UP by > 0.5.
-                if kama_slope >= 0.5:
+                # PE stopped out because market went DOWN. We re-enter if KAMA slope goes UP by >= 0.25.
+                if kama_slope >= 0.25:
                     cd["consecutive_bars"] = cd.get("consecutive_bars", 0) + 1
                 else: cd["consecutive_bars"] = 0
                 
-            if cd.get("consecutive_bars", 0) >= KAMA_CONSECUTIVE_BARS:
-                mult = ATR_MULT_CHOP if regime == "CHOP" else ATR_MULT_TREND
-                width = int(round((atr * mult) / 50.0) * 50)
-                strike = atm + width if leg == "CE" else atm - width
+            # Instant re-entry on 0.25 reversal (1 bar)
+            if cd.get("consecutive_bars", 0) >= 1:
+                # User explicitly requested: "the short leg should reenter at that atm"
+                strike = atm
                 
                 has_short = sum(1 for p in self.positions.values() if p.get("side") == "SELL")
                 if has_short >= MAX_CONCURRENT_SHORT_LEGS: continue
