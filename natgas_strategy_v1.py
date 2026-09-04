@@ -211,59 +211,67 @@ class MarketData:
         self.kama_history = []
         self._init_spot_token()
 
+    def _get_mcx_master(self) -> pd.DataFrame:
+        if hasattr(self, '_mcx_master_df'):
+            return self._mcx_master_df
+        
+        today = get_ist_now().strftime("%Y-%m-%d")
+        cache_file = os.path.join(PROJECT_ROOT, f"MCX_symbols_{today}.csv")
+        
+        import urllib.request, zipfile, io, pandas as pd
+        if not os.path.exists(cache_file):
+            try:
+                log_info("Downloading latest MCX Symbol Master from exchange network...")
+                url = "https://api.shoonya.com/MCX_symbols.txt.zip"
+                response = urllib.request.urlopen(url)
+                with zipfile.ZipFile(io.BytesIO(response.read())) as z:
+                    with z.open("MCX_symbols.txt") as f:
+                        df = pd.read_csv(f)
+                        df.to_csv(cache_file, index=False)
+            except Exception as e:
+                log_warn(f"Failed to download MCX master: {e}")
+                return pd.DataFrame()
+        
+        try:
+            self._mcx_master_df = pd.read_csv(cache_file)
+            return self._mcx_master_df
+        except Exception:
+            return pd.DataFrame()
+
     def _init_spot_token(self):
-        # FIX: check broker.authenticated, not "is self.broker.api truthy". An api object
-        # can exist without a valid session (missing/invalid token in paper mode).
+        # FIX: check broker.authenticated, not "is self.broker.api truthy".
         if not getattr(self.broker, 'authenticated', False):
             self.spot_token = "SIMULATED"
-            self.latest_spot = 220.0 # Example
+            self.latest_spot = 220.0
             self.latest_atm = 220
             log_warn("MarketData: broker not authenticated -> using SIMULATED price feed.")
             return
 
         try:
-            res = self.broker.api.searchscrip(exchange="MCX", searchtext="NATURALGAS")
-            if res:
-                if isinstance(res, dict) and res.get("stat") == "Ok":
-                    res = res.get("values", [])
-                
-                if isinstance(res, list):
-                    candidates = []
-                    import re
-                    for item in res:
-                        tsym = str(item.get("tsym", "")).upper()
-                        # Future symbol usually has no strike price at the end.
-                        # It should not end with C/P followed by digits (e.g., C280, P280)
-                        if "NATURALGAS" in tsym and "MINI" not in tsym:
-                            if not re.search(r'[CP]\d+(\.\d+)?$', tsym):
-                                exd = item.get("exd")
-                                if exd:
-                                    try:
-                                        dt = datetime.datetime.strptime(exd, "%d-%b-%Y")
-                                        candidates.append((dt, item))
-                                    except ValueError:
-                                        pass
-                    if candidates:
-                        candidates.sort(key=lambda x: x[0])
-                        now_date = get_ist_now().date()
-                        valid_cands = [c for c in candidates if c[0].date() >= now_date]
-                        best_cand = valid_cands[0][1] if valid_cands else candidates[-1][1]
-                        self.spot_token = best_cand.get("token")
-                        self.spot_tsym = str(best_cand.get("tsym", "")).upper()
-                        log_info(f"Resolved Spot Symbol (Nearest Expiry {best_cand.get('exd')}): {self.spot_tsym} (Token: {self.spot_token})")
+            df = self._get_mcx_master()
+            if not df.empty:
+                # Find Futures (FUTCOM) for NATURALGAS
+                fut_df = df[(df['Symbol'] == 'NATURALGAS') & (df['Instrument'] == 'FUTCOM')]
+                if not fut_df.empty:
+                    # Sort by expiry to get nearest
+                    fut_df = fut_df.copy()
+                    fut_df['ExpiryDate'] = pd.to_datetime(fut_df['Expiry'], format='%d-%b-%Y')
+                    fut_df = fut_df[fut_df['ExpiryDate'].dt.date >= get_ist_now().date()]
+                    fut_df = fut_df.sort_values('ExpiryDate')
+                    
+                    if not fut_df.empty:
+                        best_cand = fut_df.iloc[0]
+                        self.spot_token = str(best_cand['Token'])
+                        self.spot_tsym = str(best_cand['TradingSymbol']).upper()
+                        log_info(f"Resolved Spot Symbol (Nearest Expiry {best_cand['Expiry']}): {self.spot_tsym} (Token: {self.spot_token})")
                     else:
-                        first_few = [str(x.get("tsym")) for x in res[:5]] if isinstance(res, list) else []
-                        log_warn(f"Failed to find any matching futures token. Search API returned: {first_few}")
-                else:
-                    log_warn(f"searchscrip returned no usable results for NATURALGAS: {res}")
+                        log_warn("No valid unexpired futures found for NATURALGAS in master.")
+            else:
+                log_warn("MCX master dataframe is empty. Cannot resolve spot token.")
         except Exception as e:
-            log_warn(f"Failed to resolve Natural Gas token: {e}")
+            log_warn(f"Failed to resolve Natural Gas spot token via master: {e}")
 
-        # FIX: if we're authenticated but still couldn't resolve a token (search failed,
-        # empty result, exchange down, etc.), fall back to simulated data instead of
-        # silently leaving spot_token=None -> which used to make get_spot_and_atm return
-        # latest_spot=0.0 / is_stale=True forever.
-        if not self.spot_token:
+        if not getattr(self, 'spot_token', None):
             log_warn("Could not resolve a live spot token even though authenticated -> falling back to SIMULATED price feed.")
             self.spot_token = "SIMULATED"
             self.latest_spot = 220.0
@@ -352,26 +360,34 @@ class MarketData:
 
         # Actual searchscrip cache could be added here, but searchscrip is heavy.
         # MCX tokens format: Use searchscrip to find token precisely.
+        # MCX tokens format: Use downloaded master file instead of searchscrip
         try:
-            # Map CE -> C, PE -> P
-            opt_letter = "C" if option_type.upper() == "CE" else "P"
-            strike_str = str(int(strike))
-            # Just searching NATURALGAS returns a lot, but is safer than assuming spaces exist
-            res = self.broker.api.searchscrip(exchange="MCX", searchtext="NATURALGAS")
-            if res:
-                if isinstance(res, dict) and res.get("stat") == "Ok":
-                    res = res.get("values", [])
+            opt_letter = "CE" if option_type.upper() == "CE" else "PE" # In OptionType col, it's CE or PE
+            
+            df = self._get_mcx_master()
+            if not df.empty:
+                # Filter for NATURALGAS options matching the strike and option type
+                opt_df = df[(df['Symbol'] == 'NATURALGAS') & 
+                            (df['Instrument'] == 'OPTFUT') & 
+                            (df['OptionType'] == opt_letter) & 
+                            (df['StrikePrice'] == float(strike))]
+                
+                if not opt_df.empty:
+                    # Sort by expiry to get nearest
+                    opt_df = opt_df.copy()
+                    opt_df['ExpiryDate'] = pd.to_datetime(opt_df['Expiry'], format='%d-%b-%Y')
+                    opt_df = opt_df[opt_df['ExpiryDate'].dt.date >= get_ist_now().date()]
+                    opt_df = opt_df.sort_values('ExpiryDate')
                     
-                if isinstance(res, list):
-                    for item in res:
-                        tsym = str(item.get("tsym", "")).upper()
-                        # We want it to end with P280 or C280
-                        target_suffix = f"{opt_letter}{strike_str}"
-                        if "MINI" not in tsym and "NATURALGAS" in tsym and tsym.endswith(target_suffix):
-                            q = self.broker.api.get_quotes(exchange="MCX", token=item.get("token"))
-                            if q:
-                                lp = float(q.get("lp", q.get("ltp", 0.0)))
-                                return {"tsym": tsym, "lp": lp}
+                    if not opt_df.empty:
+                        best_cand = opt_df.iloc[0]
+                        token = str(best_cand['Token'])
+                        tsym = str(best_cand['TradingSymbol']).upper()
+                        
+                        q = self.broker.api.get_quotes(exchange="MCX", token=token)
+                        if q:
+                            lp = float(q.get("lp", q.get("ltp", 0.0)))
+                            return {"tsym": tsym, "lp": lp}
         except Exception as e:
             log_warn(f"Quote fetch error for {strike} {option_type}: {e}")
         return {}
