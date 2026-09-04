@@ -51,7 +51,6 @@ STRIKE_STEP             = 5.0
 # Premium Trailing Stop-Loss config
 INITIAL_SL_PCT          = 0.10  # 10% initial hard stop when both legs exist
 ORPHAN_SL_PCT           = 0.15  # 15% stop loss when only one leg is open
-TRAIL_ACTIVATION_PCT    = 0.25  # Arms at -25% (profit)
 REENTRY_SL_PCT          = 0.10  # 10% tighter stop for re-entries
 PREM_SL_DEBOUNCE_BARS   = 1
 
@@ -408,23 +407,23 @@ class RiskManager:
         lowest_seen = min(current_state.get("lowest_premium_seen", live_premium), live_premium)
         entry_prem = current_state["entry_premium"]
 
-        # Determine activation
-        armed = current_state.get("is_armed", False)
-        if not armed:
-            if lowest_seen <= entry_prem * (1 - TRAIL_ACTIVATION_PCT):
-                armed = True
-
         # SL/TSL Percentage logic
         if not is_straddle:
             base_sl_pct = ORPHAN_SL_PCT
         else:
             base_sl_pct = REENTRY_SL_PCT if is_reentry else INITIAL_SL_PCT
 
-        # Calculate new stop
-        if armed:
-            new_stop = lowest_seen * (1 + base_sl_pct)
+        # Calculate initial stop based on entry price
+        initial_sl = entry_prem * (1 + base_sl_pct)
+
+        # Continuous trailing: as soon as premium goes into profit (drops below entry), trail it
+        if lowest_seen >= entry_prem:
+            new_stop = initial_sl
+            armed = False
         else:
-            new_stop = entry_prem * (1 + base_sl_pct)
+            trail_sl = lowest_seen * (1 + base_sl_pct)
+            new_stop = min(trail_sl, initial_sl)
+            armed = True
 
         # Strict ratchet: never let the stop loss move backwards (upwards)
         # However, if it transitions to an orphan leg, we permit the SL to widen to the orphan SL% 
