@@ -949,7 +949,7 @@ class ExecutionEngine:
                 msg = f"  {c_yellow}No open positions. State: {self.mode}{res}"
                 print(f"{V}{msg}{' ' * max(0, W - ansi_len(msg))}{V}")
             else:
-                hdr = f"  {'LEG':<5} {VS} {'STRIKE':>7} {VS} {'SIDE':<5} {VS} {'QTY':>4} {VS} {'ENTRY':>7} {VS} {'LTP':>7} {VS} {'TSL':>10} {VS} {'PNL':>10}  "
+                hdr = f"  {'LEG':<5} {VS} {'STRIKE':>7} {VS} {'SIDE':<5} {VS} {'QTY':>4} {VS} {'ENTRY':>7} {VS} {'BEST PREM':>10} {VS} {'LTP':>7} {VS} {'TSL':>10} {VS} {'PNL':>10}  "
                 print(f"{V}{hdr}{' ' * max(0, W - ansi_len(hdr))}{V}")
                 print(MID_S)
 
@@ -964,9 +964,12 @@ class ExecutionEngine:
                     armed_str = "ARMED" if tsl["is_armed"] else "UNARMED"
                     tsl_disp = f"{tsl['active_stop']:.1f} ({armed_str})"
                     
+                    best_prem = tsl.get("lowest_premium_seen", p["entry_price"])
+                    best_prem_str = f"{best_prem:.1f}"
+                    
                     row = (f"  {c_white}{leg:<5}{res} {VS} {c_white}{p['strike']:>7}{res} {VS} {side_col}{p['side']:<5}{res} {VS} "
                            f"{c_white}{p['qty']:>4}{res} {VS} "
-                           f"{c_white}{p['entry_price']:>7.2f}{res} {VS} "
+                           f"{c_white}{p['entry_price']:>7.2f}{res} {VS} {c_dim}{best_prem_str:>10}{res} {VS} "
                            f"{c_yellow}{ltp:>7.2f}{res} {VS} {c_mag}{tsl_disp:>10}{res} {VS} "
                            f"{pnl_col}{sign}₹{pnl:>8,.2f}{res}  ")
                     print(f"{V}{row}{' ' * max(0, W - ansi_len(row))}{V}")
@@ -1020,7 +1023,9 @@ def prompt_user_variables():
     print(f"\n{Fore.CYAN}=== MCX NATURAL GAS STRADDLE v1.1 ==={Style.RESET_ALL}")
     print(f"{Fore.YELLOW}WARNING: This is a NAKED short options strategy. Risk is technically undefined.{Style.RESET_ALL}")
 
-    print(f"\n{Fore.GREEN}✅ LIVE TRADING DISABLED FOR NOW. Forcing PAPER TRADING mode...{Style.RESET_ALL}\n")
+    print(f"\n{Fore.GREEN}{Style.BRIGHT}✅ PAPER TRADING ENFORCED GLOBALLY")
+    print(f"  ─ Live execution is currently disabled for this session.")
+    print(f"  ─ All trades will be simulated with zero real-money risk.{Style.RESET_ALL}\n")
     PAPER_TRADING_MODE = True
 
 if __name__ == "__main__":

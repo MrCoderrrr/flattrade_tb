@@ -1953,11 +1953,12 @@ def prompt_user_variables():
     print(f"{'═'*78}{Style.RESET_ALL}")
 
     # ── PAPER / LIVE SELECTION (asked FIRST, before anything else) ────────────
-    print(f"\n{Fore.YELLOW}{Style.BRIGHT}{'═'*78}")
-    print(f"  LIVE TRADING DISABLED BY USER. FORCING PAPER TRADING MODE.")
-    print(f"{'═'*78}{Style.RESET_ALL}")
+    print(f"\n{Fore.GREEN}{Style.BRIGHT}{'═'*78}")
+    print(f"  ✅ PAPER TRADING ENFORCED GLOBALLY")
+    print(f"  ─ Live execution is currently disabled for this session.")
+    print(f"  ─ All trades will be simulated with zero real-money risk.")
+    print(f"{'═'*78}{Style.RESET_ALL}\n")
     PAPER_TRADING_MODE = True
-    print(f"\n  {Fore.GREEN}{Style.BRIGHT}✅ PAPER TRADING selected. No real orders will be placed.{Style.RESET_ALL}\n")
 
     # ── STRATEGY PARAMETERS ───────────────────────────────────────────────────
     print(f"{Fore.YELLOW}STEP 2 OF 2: Strategy Parameters — press Enter to accept defaults.{Style.RESET_ALL}\n")
