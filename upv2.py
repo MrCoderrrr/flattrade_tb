@@ -2019,39 +2019,10 @@ def prompt_user_variables():
 
     # ── PAPER / LIVE SELECTION (asked FIRST, before anything else) ────────────
     print(f"\n{Fore.YELLOW}{Style.BRIGHT}{'═'*78}")
-    print(f"  STEP 1 OF 2: PAPER TRADING OR LIVE TRADING?")
+    print(f"  LIVE TRADING DISABLED BY USER. FORCING PAPER TRADING MODE.")
     print(f"{'═'*78}{Style.RESET_ALL}")
-    print(f"  {Fore.GREEN}Y{Style.RESET_ALL} = Paper Trading  (SAFE — simulated fills, zero real money risk)")
-    print(f"  {Fore.RED}N{Style.RESET_ALL} = LIVE Trading   (⚠️  REAL MONEY — orders go directly to Flattrade!)\n")
-
-    try:
-        while True:
-            ans = input("  ➤ Run in Paper Trading mode? [Y/n]: ").strip().lower()
-            if ans in ("", "y", "yes"):
-                PAPER_TRADING_MODE = True
-                print(f"\n  {Fore.GREEN}{Style.BRIGHT}✅ PAPER TRADING selected. No real orders will be placed.{Style.RESET_ALL}\n")
-                break
-            elif ans in ("n", "no"):
-                print(f"\n  {Fore.RED}{Style.BRIGHT}{'─'*78}")
-                print(f"  ⚠️  WARNING: LIVE TRADING SELECTED — REAL MONEY RISK!")
-                print(f"  ─ All orders will be sent directly to Flattrade exchange.")
-                print(f"  ─ Capital at risk: Rs.{CAPITAL:,.0f}")
-                print(f"  ─ Every individual trade still requires your Y/N confirmation.")
-                print(f"  ─ ORDER: Buy hedges FIRST, then sell short legs.")
-                print(f"{'─'*78}{Style.RESET_ALL}")
-                confirm = input("\n  ➤ Type LIVE to confirm, or press Enter to go paper: ").strip()
-                if confirm == "LIVE":
-                    PAPER_TRADING_MODE = False
-                    print(f"\n  {Fore.RED}{Style.BRIGHT}🚀 LIVE TRADING CONFIRMED. Real orders will be placed!{Style.RESET_ALL}\n")
-                else:
-                    PAPER_TRADING_MODE = True
-                    print(f"  {Fore.YELLOW}Defaulting to PAPER TRADING (safe).{Style.RESET_ALL}\n")
-                break
-            else:
-                print(f"  {Fore.YELLOW}Please type Y (paper) or N (live).{Style.RESET_ALL}")
-    except (KeyboardInterrupt, EOFError):
-        PAPER_TRADING_MODE = True
-        print(f"\n  {Fore.YELLOW}Defaulting to PAPER TRADING.{Style.RESET_ALL}\n")
+    PAPER_TRADING_MODE = True
+    print(f"\n  {Fore.GREEN}{Style.BRIGHT}✅ PAPER TRADING selected. No real orders will be placed.{Style.RESET_ALL}\n")
 
     # ── STRATEGY PARAMETERS ───────────────────────────────────────────────────
     print(f"{Fore.YELLOW}STEP 2 OF 2: Strategy Parameters — press Enter to accept defaults.{Style.RESET_ALL}\n")

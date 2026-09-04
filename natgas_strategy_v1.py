@@ -1017,23 +1017,11 @@ def signal_handler(sig, frame):
 def prompt_user_variables():
     global PAPER_TRADING_MODE, CAPITAL
 
-    if not sys.stdin.isatty():
-        log_info("Non-interactive mode detected. Proceeding with PAPER mode defaults.")
-        PAPER_TRADING_MODE = True
-        return
-
     print(f"\n{Fore.CYAN}=== MCX NATURAL GAS STRADDLE v1.1 ==={Style.RESET_ALL}")
     print(f"{Fore.YELLOW}WARNING: This is a NAKED short options strategy. Risk is technically undefined.{Style.RESET_ALL}")
 
-    mode_in = input(f"Select Mode [PAPER/LIVE] (Default: PAPER): ").strip().upper()
-    if mode_in == "LIVE":
-        PAPER_TRADING_MODE = False
-    else:
-        PAPER_TRADING_MODE = True
-
-
-
-    print(f"\n✅ Deploying in {'PAPER' if PAPER_TRADING_MODE else 'LIVE'} Mode...\n")
+    print(f"\n{Fore.GREEN}✅ LIVE TRADING DISABLED FOR NOW. Forcing PAPER TRADING mode...{Style.RESET_ALL}\n")
+    PAPER_TRADING_MODE = True
 
 if __name__ == "__main__":
     import os
