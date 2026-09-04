@@ -223,32 +223,39 @@ class MarketData:
 
         try:
             res = self.broker.api.searchscrip(exchange="MCX", searchtext="NATURALGAS")
-            if res and isinstance(res, list):
-                candidates = []
-                for item in res:
-                    tsym = str(item.get("tsym", "")).upper()
-                    # MCX Futures symbols don't always contain "FUT", but they do lack "CE" and "PE"
-                    if "NATURALGAS" in tsym and "MINI" not in tsym and "CE" not in tsym and "PE" not in tsym:
-                        exd = item.get("exd")
-                        if exd:
-                            try:
-                                dt = datetime.datetime.strptime(exd, "%d-%b-%Y")
-                                candidates.append((dt, item))
-                            except ValueError:
-                                pass
-                if candidates:
-                    candidates.sort(key=lambda x: x[0])
-                    now_date = get_ist_now().date()
-                    valid_cands = [c for c in candidates if c[0].date() >= now_date]
-                    best_cand = valid_cands[0][1] if valid_cands else candidates[-1][1]
-                    self.spot_token = best_cand.get("token")
-                    self.spot_tsym = str(best_cand.get("tsym", "")).upper()
-                    log_info(f"Resolved Spot Symbol (Nearest Expiry {best_cand.get('exd')}): {self.spot_tsym} (Token: {self.spot_token})")
+            if res:
+                if isinstance(res, dict) and res.get("stat") == "Ok":
+                    res = res.get("values", [])
+                
+                if isinstance(res, list):
+                    candidates = []
+                    import re
+                    for item in res:
+                        tsym = str(item.get("tsym", "")).upper()
+                        # Future symbol usually has no strike price at the end.
+                        # It should not end with C/P followed by digits (e.g., C280, P280)
+                        if "NATURALGAS" in tsym and "MINI" not in tsym:
+                            if not re.search(r'[CP]\d+(\.\d+)?$', tsym):
+                                exd = item.get("exd")
+                                if exd:
+                                    try:
+                                        dt = datetime.datetime.strptime(exd, "%d-%b-%Y")
+                                        candidates.append((dt, item))
+                                    except ValueError:
+                                        pass
+                    if candidates:
+                        candidates.sort(key=lambda x: x[0])
+                        now_date = get_ist_now().date()
+                        valid_cands = [c for c in candidates if c[0].date() >= now_date]
+                        best_cand = valid_cands[0][1] if valid_cands else candidates[-1][1]
+                        self.spot_token = best_cand.get("token")
+                        self.spot_tsym = str(best_cand.get("tsym", "")).upper()
+                        log_info(f"Resolved Spot Symbol (Nearest Expiry {best_cand.get('exd')}): {self.spot_tsym} (Token: {self.spot_token})")
+                    else:
+                        first_few = [str(x.get("tsym")) for x in res[:5]] if isinstance(res, list) else []
+                        log_warn(f"Failed to find any matching futures token. Search API returned: {first_few}")
                 else:
-                    first_few = [str(x.get("tsym")) for x in res[:5]] if isinstance(res, list) else []
-                    log_warn(f"Failed to find any matching futures token. Search API returned: {first_few}")
-            else:
-                log_warn(f"searchscrip returned no usable results for NATURALGAS: {res}")
+                    log_warn(f"searchscrip returned no usable results for NATURALGAS: {res}")
         except Exception as e:
             log_warn(f"Failed to resolve Natural Gas token: {e}")
 
@@ -346,15 +353,25 @@ class MarketData:
         # Actual searchscrip cache could be added here, but searchscrip is heavy.
         # MCX tokens format: Use searchscrip to find token precisely.
         try:
-            res = self.broker.api.searchscrip(exchange="MCX", searchtext=f"NATURALGAS {strike} {option_type}")
-            if res and isinstance(res, list):
-                for item in res:
-                    tsym = str(item.get("tsym", "")).upper()
-                    if "MINI" not in tsym and str(int(strike)) in tsym and option_type in tsym: # Bug 1: Correct strike/type matching
-                        q = self.broker.api.get_quotes(exchange="MCX", token=item.get("token"))
-                        if q:
-                            lp = float(q.get("lp", q.get("ltp", 0.0)))
-                            return {"tsym": tsym, "lp": lp}
+            # Map CE -> C, PE -> P
+            opt_letter = "C" if option_type.upper() == "CE" else "P"
+            strike_str = str(int(strike))
+            # Just searching NATURALGAS returns a lot, but is safer than assuming spaces exist
+            res = self.broker.api.searchscrip(exchange="MCX", searchtext="NATURALGAS")
+            if res:
+                if isinstance(res, dict) and res.get("stat") == "Ok":
+                    res = res.get("values", [])
+                    
+                if isinstance(res, list):
+                    for item in res:
+                        tsym = str(item.get("tsym", "")).upper()
+                        # We want it to end with P280 or C280
+                        target_suffix = f"{opt_letter}{strike_str}"
+                        if "MINI" not in tsym and "NATURALGAS" in tsym and tsym.endswith(target_suffix):
+                            q = self.broker.api.get_quotes(exchange="MCX", token=item.get("token"))
+                            if q:
+                                lp = float(q.get("lp", q.get("ltp", 0.0)))
+                                return {"tsym": tsym, "lp": lp}
         except Exception as e:
             log_warn(f"Quote fetch error for {strike} {option_type}: {e}")
         return {}

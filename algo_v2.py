@@ -454,7 +454,7 @@ COOLDOWN_SPOT_PCT       = 0.0010      # 0.10% spot movement (~24 pts) resets coo
 MARKET_START_HOUR       = 9
 MARKET_START_MINUTE     = 18          # Start trading / place hedges at 09:18 AM
 AUTO_SQUAREOFF_HOUR     = 15
-AUTO_SQUAREOFF_MINUTE   = 28          # Auto square-off at 15:28 PM
+AUTO_SQUAREOFF_MINUTE   = 34          # Auto square-off at 15:34 PM
 REFRESH_INTERVAL_SEC    = 60          # 1-minute evaluation cadence
 
 # Order Execution Safeguards & Rate Limiting
@@ -1743,7 +1743,7 @@ class ExecutionEngine:
                                 del self.positions[l]
                 self._ltp_cache.clear()
                 
-                # Check Auto Square-off Time (15:28 PM)
+                # Check Auto Square-off Time (15:34 PM)
                 if now.hour > AUTO_SQUAREOFF_HOUR or (now.hour == AUTO_SQUAREOFF_HOUR and now.minute >= AUTO_SQUAREOFF_MINUTE):
                     log_alert(f"🕒 Auto Square-Off Time Reached ({AUTO_SQUAREOFF_HOUR}:{AUTO_SQUAREOFF_MINUTE:02d}). Liquidating all positions...")
                     self._exit_all_positions(reason="SESSION_END")
