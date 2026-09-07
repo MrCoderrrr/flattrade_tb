@@ -386,8 +386,8 @@ MARGIN_IRON_CONDOR      = 95_000
 PORTFOLIO_CIRCUIT_PCT   = 1.8
 
 # --- REAL-MONEY SAFETY & GOVERNANCE ---
-TELEGRAM_BOT_TOKEN        = ""
-TELEGRAM_CHAT_ID          = ""
+TELEGRAM_BOT_TOKEN        = "8850507396:AAFwFm2_WxPdSM52JcCpJUj8V1rz9x3G-kE"
+TELEGRAM_CHAT_ID          = "6307066850"
 KILL_SWITCH_FILE          = os.path.join(CURRENT_DIR, "kill_switch_paper.txt")
 CAPITAL_FRACTION_LIVE     = 0.40
 MAX_LOTS_PER_LEG          = 1
@@ -481,6 +481,19 @@ _EMERGENCY_STOP_LOCK = threading.Lock()
 def _now_str() -> str:
     return get_ist_now().strftime("%H:%M:%S")
 
+def _tg_send(msg: str, parse_mode: str = "Markdown"):
+    """Core silent Telegram sender — never raises."""
+    try:
+        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+            import requests
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                data={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": parse_mode},
+                timeout=3
+            )
+    except Exception:
+        pass
+
 def log_info(msg: str):
     print(f"{Fore.CYAN}[{_now_str()} INFO]{Style.RESET_ALL}  {msg}", flush=True)
 
@@ -488,15 +501,70 @@ def log_warn(msg: str):
     print(f"{Fore.YELLOW}[{_now_str()} WARN]{Style.RESET_ALL}  {msg}", flush=True)
 
 def log_alert(msg: str):
-    try:
-        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-            import requests
-            requests.post(f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage', json={'chat_id': TELEGRAM_CHAT_ID, 'text': f'[Algo v2] {msg}'}, timeout=2)
-    except: pass
+    _tg_send(f"⚠️ *NIFTY ALERT*\n`{msg}`")
     print(f"{Fore.RED}{Style.BRIGHT}[{_now_str()} ALERT]{Style.RESET_ALL} {msg}", flush=True)
 
 def log_trade(msg: str):
+    # Detect entry vs exit from message content for icon selection
+    icon = "🟢" if ("ENTRY" in msg.upper() or "ENTERED" in msg.upper()) else "🔴"
+    _tg_send(f"{icon} *NIFTY TRADE*\n`{msg}`")
     print(f"{Fore.MAGENTA}{Style.BRIGHT}[{_now_str()} TRADE]{Style.RESET_ALL} {msg}", flush=True)
+
+def send_telegram_nifty_dashboard(spot: float, atm: int, mode: str, positions: dict,
+                                   realized_pnl: float, unrealized_pnl: float,
+                                   ind: dict, total_cap: float, mtd_pnl: float, ytd_pnl: float):
+    """Sends a rich, Samsung S25-Ultra-optimised Nifty dashboard message to Telegram every 3s."""
+    try:
+        now_s = _now_str()
+        regime = ind.get("regime", "?")
+        trend  = ind.get("trend", 0)
+        adx    = ind.get("adx", 0.0)
+        kama   = ind.get("kama", 0.0)
+        atr    = ind.get("atr", 0.0)
+
+        trend_icon  = "📈" if trend == 1 else ("📉" if trend == -1 else "➡️")
+        regime_icon = "🌪️" if regime == "CHOP" else "🚀"
+        total_pnl   = realized_pnl + unrealized_pnl
+        pnl_icon    = "🟢" if total_pnl >= 0 else "🔴"
+
+        lines = [
+            f"📊 *NIFTY STRANGLE v2* `{now_s}`",
+            f"",
+            f"💹 *Spot:* `{spot:.2f}`  |  *ATM:* `{atm}`  |  *Mode:* `{mode}`",
+            f"{regime_icon} *Regime:* `{regime}`  |  *ADX:* `{adx:.1f}`",
+            f"{trend_icon} *KAMA:* `{kama:.2f}`  |  *ATR:* `{atr:.1f} pts`",
+            f"",
+        ]
+
+        if positions:
+            lines.append("*── POSITIONS ──*")
+            for leg, pos in positions.items():
+                side   = pos.get("side", "?")
+                strike = pos.get("strike", 0)
+                entry  = pos.get("entry_price", 0.0)
+                ltp    = pos.get("ltp", entry)
+                pnl    = pos.get("pnl", 0.0)
+                p_icon = "🟢" if pnl >= 0 else "🔴"
+                side_icon = "🔽 SELL" if side == "SELL" else "🔼 BUY"
+                lines.append(
+                    f"{p_icon} `{leg:<10}` {side_icon} `{strike}` | E:`{entry:.2f}` → `{ltp:.2f}` | *₹{pnl:+.0f}*"
+                )
+            lines.append("")
+
+        lines += [
+            f"*── PnL SUMMARY ──*",
+            f"{pnl_icon} *Realized:* `₹{realized_pnl:+,.2f}`",
+            f"📌 *Unrealized:* `₹{unrealized_pnl:+,.2f}`",
+            f"💰 *Net MTM:* `₹{total_pnl:+,.2f}`",
+            f"📅 *MTD:* `₹{mtd_pnl:+,.2f}`  |  *YTD:* `₹{ytd_pnl:+,.2f}`",
+            f"🏦 *Capital:* `₹{total_cap:,.2f}`",
+        ]
+
+        _tg_send("\n".join(lines))
+    except Exception as e:
+        log_warn(f"Telegram dashboard failed: {e}")
+
+
 
 def round_to_strike(price: float, strike_step: int = 50) -> int:
     return int(round(price / float(strike_step)) * strike_step)
@@ -1713,6 +1781,25 @@ class ExecutionEngine:
                 json.dump(snap, sf)
         except Exception as e:
             log_warn(f"Dashboard snap fail: {e}")
+
+        # Send Telegram dashboard every 3 seconds
+        try:
+            db_stats  = db.get_strategy_pnl_summary("v2", base_capital=CAPITAL)
+            uncommitted = (self.realized_pnl - db_stats.get("today_pnl", 0.0))
+            uncommitted = uncommitted if abs(uncommitted) > 0.01 else 0.0
+            send_telegram_nifty_dashboard(
+                spot=spot, atm=atm, mode=self.mode,
+                positions=snap_positions,
+                realized_pnl=self.realized_pnl,
+                unrealized_pnl=unrealized,
+                ind=ind,
+                total_cap=db_stats.get("current_capital", CAPITAL) + uncommitted,
+                mtd_pnl=db_stats.get("mtd_pnl", 0.0) + uncommitted,
+                ytd_pnl=db_stats.get("ytd_pnl", 0.0) + uncommitted,
+            )
+        except Exception as e:
+            log_warn(f"Telegram dashboard dispatch failed: {e}")
+
 
 
     def _calculate_lot_quantity(self) -> int:

@@ -259,16 +259,52 @@ class NaturalGasPaperBot:
         return False, ""
         
     def _print_dashboard(self, spot: float, atm: float):
-        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] SPOT: {spot:.2f} | ATM: {atm} | OPEN LEGS: {len(self.positions)} | REALIZED PNL: Rs{self.total_realized_pnl:.2f}")
+        """Prints local dashboard and sends rich Telegram update optimised for Samsung S25 Ultra."""
+        now_s = datetime.now().strftime("%H:%M:%S")
+        total_unrealized = 0.0
+        leg_lines = []
+
         for leg, pos in self.positions.items():
             match = self.find_option_symbol(pos["strike"], "CE" if leg == "CE" else "PE")
             live_ltp = float(match.get("lp", pos["entry_price"])) if match else pos["entry_price"]
-            
             pnl = (pos["entry_price"] - live_ltp) * pos["qty"] if pos["side"] == "SELL" else (live_ltp - pos["entry_price"]) * pos["qty"]
+            total_unrealized += pnl
             state = pos.get("premium_sl_state", {})
             tsl = state.get("tsl", 0.0)
+            p_icon = "🟢" if pnl >= 0 else "🔴"
+            leg_lines.append(
+                f"{p_icon} `{leg:<4}` 🔽SELL `{int(pos['strike'])}` | E:`{pos['entry_price']:.2f}` → `{live_ltp:.2f}` | TSL:`{tsl:.2f}` | *₹{pnl:+.0f}*"
+            )
+            # Also print local console
             print(f" -> {leg:2} | {pos['side']} {pos['qty']}x {pos['strike']} | Entry: Rs{pos['entry_price']:.2f} | LTP: Rs{live_ltp:.2f} | TSL: Rs{tsl:.2f} | Unrealized: Rs{pnl:.2f}")
+
+        total_pnl = self.total_realized_pnl + total_unrealized
+        pnl_icon  = "🟢" if total_pnl >= 0 else "🔴"
+        print(f"\n[{now_s}] SPOT: {spot:.2f} | ATM: {atm} | OPEN LEGS: {len(self.positions)} | REALIZED PNL: Rs{self.total_realized_pnl:.2f}")
         print("-" * 80)
+
+        # --- Build Telegram message ---
+        lines = [
+            f"⛽ *MCX NATGAS PAPER* `{now_s}`",
+            f"",
+            f"💹 *Spot:* `{spot:.2f}`  |  *ATM:* `{int(atm)}`",
+            f"📋 *Open Legs:* `{len(self.positions)}`",
+            f"",
+        ]
+        if leg_lines:
+            lines.append("*── POSITIONS ──*")
+            lines.extend(leg_lines)
+            lines.append("")
+
+        lines += [
+            f"*── PnL ──*",
+            f"✅ *Realized:* `₹{self.total_realized_pnl:+,.2f}`",
+            f"📌 *Unrealized:* `₹{total_unrealized:+,.2f}`",
+            f"{pnl_icon} *Net MTM:* `₹{total_pnl:+,.2f}`",
+        ]
+        send_telegram("\n".join(lines))
+
+
 
     def _kama_reversal_confirmed(self, current_kama: float, prev_kama: float):
         if current_kama is None or prev_kama is None:
@@ -374,8 +410,8 @@ class NaturalGasPaperBot:
                             self._close_leg(leg, reason)
                             break
                             
-                # Print dashboard every 10 seconds
-                if time.time() - last_dash_ts >= 10:
+                # Send Telegram dashboard every 3 seconds
+                if time.time() - last_dash_ts >= 3:
                     self._print_dashboard(spot, atm)
                     last_dash_ts = time.time()
 
