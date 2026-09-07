@@ -370,7 +370,7 @@ class NaturalGasPaperBot:
                 hist.append(spot)
                 trend = 0
                 if len(hist) >= 12:
-                    current_kama, prev_kama, delta, trend = KAMA.compute(hist, period=10, fast=3, slow=30)
+                    current_kama, prev_kama, delta, trend = KAMA.compute(hist, period=10, fast=4, slow=30)
                     if current_kama is not None and prev_kama is not None:
                         reversal = self._kama_reversal_confirmed(current_kama, prev_kama)
                     else:
@@ -382,8 +382,8 @@ class NaturalGasPaperBot:
                 if not self.positions:
                     if now.hour >= 18:
                         # Straddle Entry (Sell CE and PE at ATM)
-                        self._enter_leg("CE", atm, "SELL", 0.10, 0.05)
-                        self._enter_leg("PE", atm, "SELL", 0.10, 0.05)
+                        self._enter_leg("CE", atm, "SELL", 0.10, 0.12)
+                        self._enter_leg("PE", atm, "SELL", 0.10, 0.12)
                         print(f"[INIT] ATM straddle opened at {atm}")
                 else:
                     # We have a position.
@@ -393,7 +393,7 @@ class NaturalGasPaperBot:
                             pass
                         else:
                             missing_leg = "CE" if "PE" in short_legs else "PE"
-                            self._enter_leg(missing_leg, atm, "SELL", 0.02, 0.02)
+                            self._enter_leg(missing_leg, atm, "SELL", 0.10, 0.12)
                             self.last_reentry_ts = time.time()
                             print(f"[REENTRY] KAMA reversal triggered, re-entered {missing_leg} at {atm} to form Straddle")
 
