@@ -482,13 +482,15 @@ def _now_str() -> str:
     return get_ist_now().strftime("%H:%M:%S")
 
 def _tg_send(msg: str, parse_mode: str = "Markdown"):
-    """Core silent Telegram sender — never raises."""
+    """Core silent Telegram sender — never raises. Strips ANSI codes first."""
+    import re
+    clean_msg = re.sub(r"\x1b\[[0-9;]*m", "", msg)
     try:
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
             import requests
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                data={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": parse_mode},
+                data={"chat_id": TELEGRAM_CHAT_ID, "text": clean_msg, "parse_mode": parse_mode},
                 timeout=3
             )
     except Exception:
@@ -500,14 +502,20 @@ def log_info(msg: str):
 def log_warn(msg: str):
     print(f"{Fore.YELLOW}[{_now_str()} WARN]{Style.RESET_ALL}  {msg}", flush=True)
 
+def _wrap_box(title: str, msg: str) -> str:
+    import re
+    msg = re.sub(r"\x1b\[[0-9;]*m", "", msg)
+    lines = msg.split(" | ") if " | " in msg else [msg]
+    formatted = "\n".join([f"│ {line[:26]:<26} │" for line in lines])
+    return f"```text\n┌────────────────────────────┐\n│ {title:^26} │\n├────────────────────────────┤\n{formatted}\n└────────────────────────────┘\n```"
+
 def log_alert(msg: str):
-    _tg_send(f"⚠️ *NIFTY ALERT*\n`{msg}`")
+    _tg_send(_wrap_box("NIFTY SYSTEM ALERT", msg))
     print(f"{Fore.RED}{Style.BRIGHT}[{_now_str()} ALERT]{Style.RESET_ALL} {msg}", flush=True)
 
 def log_trade(msg: str):
-    # Detect entry vs exit from message content for icon selection
-    icon = "🟢" if ("ENTRY" in msg.upper() or "ENTERED" in msg.upper()) else "🔴"
-    _tg_send(f"{icon} *NIFTY TRADE*\n`{msg}`")
+    title = "TRADE EXECUTED" if ("ENTRY" in msg.upper() or "ENTERED" in msg.upper()) else "TRADE CLOSED"
+    _tg_send(_wrap_box(title, msg))
     print(f"{Fore.MAGENTA}{Style.BRIGHT}[{_now_str()} TRADE]{Style.RESET_ALL} {msg}", flush=True)
 
 def send_telegram_nifty_dashboard(spot: float, atm: int, mode: str, positions: dict,

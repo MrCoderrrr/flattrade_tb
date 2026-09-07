@@ -194,8 +194,19 @@ class NaturalGasPaperBot:
                 "imported_at": time.time(),
             },
         }
-        self.positions[leg] = pos
-        msg = f"🟢 *PAPER ENTRY* ({leg})\n`{side} {qty}x {tsym}` @ ₹{ltp:.2f}\n*SL:* {loss_stop_pct * 100:.0f}% | *TSL:* {tsl_pct * 100:.0f}%"
+        sl_price = ltp * (1 + loss_stop_pct)
+        msg = f"""```text
+┌────────────────────────────┐
+│      TRADE EXECUTED        │
+├────────────────────────────┤
+│ Action : {side:<17} │
+│ Leg    : {leg} ({int(strike)}){' '*(15-len(leg)-len(str(int(strike))))} │
+│ Symbol : {tsym:<17} │
+│ Price  : {ltp:<17.2f} │
+│ SL     : {loss_stop_pct*100:.0f}% ({sl_price:.2f}){' '*(11-len(str(int(loss_stop_pct*100)))-len(f'{sl_price:.2f}'))} │
+│ TSL    : {tsl_pct*100:.0f}%{' '*(15-len(str(int(tsl_pct*100))))} │
+└────────────────────────────┘
+```"""
         print(f"[PAPER ENTRY] {side} {leg} {tsym} @ Rs{ltp:.2f} | SL={loss_stop_pct * 100:.0f}% | TSL={tsl_pct * 100:.0f}%")
         send_telegram(msg)
         return pos
@@ -225,8 +236,18 @@ class NaturalGasPaperBot:
             
         self.total_realized_pnl += pnl
         
-        icon = "🔴" if pnl < 0 else "🟢"
-        msg = f"{icon} *PAPER EXIT* ({leg})\n`{trade_side} {pos['qty']}x {tsym}` @ ₹{ltp:.2f}\n*PnL:* ₹{pnl:.2f}\n*Reason:* {reason}"
+        sign = "+" if pnl >= 0 else ""
+        msg = f"""```text
+┌────────────────────────────┐
+│       TRADE CLOSED         │
+├────────────────────────────┤
+│ Leg    : {leg} ({int(pos['strike'])}){' '*(15-len(leg)-len(str(int(pos['strike']))))} │
+│ Reason : {reason[:17]:<17} │
+│ Entry  : {pos['entry_price']:<17.2f} │
+│ Exit   : {ltp:<17.2f} │
+│ PnL    : {sign}{pnl:<16,.0f} │
+└────────────────────────────┘
+```"""
         
         print(f"[PAPER EXIT] Closed {trade_side} {pos['qty']}x {tsym} @ Rs{ltp:.2f} | PnL: Rs{pnl:.2f} | Reason: {reason}")
         send_telegram(msg)
@@ -333,7 +354,17 @@ class NaturalGasPaperBot:
         print("="*80)
         print(" NATURAL GAS PAPER TRADING BOT STARTED ")
         print("="*80)
-        send_telegram("✅ *Natural Gas Paper Trading Bot Started*")
+        
+        msg = """```text
+┌────────────────────────────┐
+│       SYSTEM ONLINE        │
+├────────────────────────────┤
+│ Bot    : MCX NATGAS        │
+│ Mode   : PAPER TRADING     │
+│ Status : Active            │
+└────────────────────────────┘
+```"""
+        send_telegram(msg)
 
         hist: List[float] = []
         current_kama = None
