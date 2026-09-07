@@ -262,8 +262,9 @@ class NaturalGasPaperBot:
         """Prints local dashboard and sends rich Telegram update optimised for Samsung S25 Ultra."""
         now_s = datetime.now().strftime("%H:%M:%S")
         total_unrealized = 0.0
-        leg_lines = []
-
+        
+        # Console printing first
+        print(f"\n[{now_s}] SPOT: {spot:.2f} | ATM: {atm} | OPEN LEGS: {len(self.positions)} | REALIZED PNL: Rs{self.total_realized_pnl:.2f}")
         for leg, pos in self.positions.items():
             match = self.find_option_symbol(pos["strike"], "CE" if leg == "CE" else "PE")
             live_ltp = float(match.get("lp", pos["entry_price"])) if match else pos["entry_price"]
@@ -271,38 +272,42 @@ class NaturalGasPaperBot:
             total_unrealized += pnl
             state = pos.get("premium_sl_state", {})
             tsl = state.get("tsl", 0.0)
-            p_icon = "🟢" if pnl >= 0 else "🔴"
-            leg_lines.append(
-                f"{p_icon} `{leg:<4}` 🔽SELL `{int(pos['strike'])}` | E:`{pos['entry_price']:.2f}` → `{live_ltp:.2f}` | TSL:`{tsl:.2f}` | *₹{pnl:+.0f}*"
-            )
-            # Also print local console
             print(f" -> {leg:2} | {pos['side']} {pos['qty']}x {pos['strike']} | Entry: Rs{pos['entry_price']:.2f} | LTP: Rs{live_ltp:.2f} | TSL: Rs{tsl:.2f} | Unrealized: Rs{pnl:.2f}")
-
-        total_pnl = self.total_realized_pnl + total_unrealized
-        pnl_icon  = "🟢" if total_pnl >= 0 else "🔴"
-        print(f"\n[{now_s}] SPOT: {spot:.2f} | ATM: {atm} | OPEN LEGS: {len(self.positions)} | REALIZED PNL: Rs{self.total_realized_pnl:.2f}")
         print("-" * 80)
 
-        # --- Build Telegram message ---
-        lines = [
-            f"⛽ *MCX NATGAS PAPER* `{now_s}`",
-            f"",
-            f"💹 *Spot:* `{spot:.2f}`  |  *ATM:* `{int(atm)}`",
-            f"📋 *Open Legs:* `{len(self.positions)}`",
-            f"",
-        ]
-        if leg_lines:
-            lines.append("*── POSITIONS ──*")
-            lines.extend(leg_lines)
-            lines.append("")
-
-        lines += [
-            f"*── PnL ──*",
-            f"✅ *Realized:* `₹{self.total_realized_pnl:+,.2f}`",
-            f"📌 *Unrealized:* `₹{total_unrealized:+,.2f}`",
-            f"{pnl_icon} *Net MTM:* `₹{total_pnl:+,.2f}`",
-        ]
-        send_telegram("\n".join(lines))
+        # Telegram Table Formatting (Fixed width monospace)
+        total_pnl = self.total_realized_pnl + total_unrealized
+        
+        msg = "```text\n"
+        msg += "┌──────────────────────────────┐\n"
+        msg += "│  MCX NATURAL GAS PORTFOLIO   │\n"
+        msg += "└──────────────────────────────┘\n"
+        msg += f"Spot : {spot:<8.2f}    ATM : {int(atm)}\n"
+        msg += f"Legs : {len(self.positions)}\n\n"
+        
+        if self.positions:
+            msg += "◆ POSITIONS\n"
+            msg += "───────────\n"
+            for leg, pos in self.positions.items():
+                match = self.find_option_symbol(pos["strike"], "CE" if leg == "CE" else "PE")
+                live_ltp = float(match.get("lp", pos["entry_price"])) if match else pos["entry_price"]
+                pnl = (pos["entry_price"] - live_ltp) * pos["qty"] if pos["side"] == "SELL" else (live_ltp - pos["entry_price"]) * pos["qty"]
+                state = pos.get("premium_sl_state", {})
+                tsl = state.get("tsl", 0.0)
+                
+                sign = "+" if pnl >= 0 else ""
+                msg += f" {leg:<2} | SELL {int(pos['strike'])} | PnL: {sign}{pnl:,.0f}\n"
+                msg += f"    | E: {pos['entry_price']:<6.2f} | LTP: {live_ltp:<6.2f}\n"
+                msg += f"    | TSL: {tsl:<4.2f}\n\n"
+                
+        msg += "◆ P&L SUMMARY\n"
+        msg += "───────────\n"
+        msg += f" Realized   : {('+' if self.total_realized_pnl>=0 else '') + f'{self.total_realized_pnl:,.0f}'}\n"
+        msg += f" Unrealized : {('+' if total_unrealized>=0 else '') + f'{total_unrealized:,.0f}'}\n"
+        msg += f" Net MTM    : {('+' if total_pnl>=0 else '') + f'{total_pnl:,.0f}'}\n"
+        msg += "```"
+        
+        send_telegram(msg)
 
 
 

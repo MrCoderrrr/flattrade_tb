@@ -527,40 +527,38 @@ def send_telegram_nifty_dashboard(spot: float, atm: int, mode: str, positions: d
         total_pnl   = realized_pnl + unrealized_pnl
         pnl_icon    = "🟢" if total_pnl >= 0 else "🔴"
 
-        lines = [
-            f"📊 *NIFTY STRANGLE v2* `{now_s}`",
-            f"",
-            f"💹 *Spot:* `{spot:.2f}`  |  *ATM:* `{atm}`  |  *Mode:* `{mode}`",
-            f"{regime_icon} *Regime:* `{regime}`  |  *ADX:* `{adx:.1f}`",
-            f"{trend_icon} *KAMA:* `{kama:.2f}`  |  *ATR:* `{atr:.1f} pts`",
-            f"",
-        ]
+        msg = "```text\n"
+        msg += "┌──────────────────────────────┐\n"
+        msg += f"│  NIFTY STRANGLE v2 ({mode[:7]:<7}) │\n"
+        msg += "└──────────────────────────────┘\n"
+        msg += f"Spot  : {spot:<8.2f}   ATM : {atm}\n"
+        msg += f"Regime: {regime:<6} ({adx:.1f}) KAMA: {kama:.0f}\n\n"
 
         if positions:
-            lines.append("*── POSITIONS ──*")
+            msg += "◆ POSITIONS\n"
+            msg += "───────────\n"
             for leg, pos in positions.items():
-                side   = pos.get("side", "?")
+                side = "SELL" if pos.get("side") == "SELL" else "BUY "
                 strike = pos.get("strike", 0)
-                entry  = pos.get("entry_price", 0.0)
-                ltp    = pos.get("ltp", entry)
-                pnl    = pos.get("pnl", 0.0)
-                p_icon = "🟢" if pnl >= 0 else "🔴"
-                side_icon = "🔽 SELL" if side == "SELL" else "🔼 BUY"
-                lines.append(
-                    f"{p_icon} `{leg:<10}` {side_icon} `{strike}` | E:`{entry:.2f}` → `{ltp:.2f}` | *₹{pnl:+.0f}*"
-                )
-            lines.append("")
+                entry = pos.get("entry_price", 0.0)
+                ltp = pos.get("ltp", entry)
+                pnl = pos.get("pnl", 0.0)
+                
+                sign = "+" if pnl >= 0 else ""
+                
+                msg += f" {leg:<8} | {side} {strike}\n"
+                msg += f" PnL: {sign}{pnl:<7,.0f} | E: {entry:<5.2f} | L: {ltp:<5.2f}\n\n"
 
-        lines += [
-            f"*── PnL SUMMARY ──*",
-            f"{pnl_icon} *Realized:* `₹{realized_pnl:+,.2f}`",
-            f"📌 *Unrealized:* `₹{unrealized_pnl:+,.2f}`",
-            f"💰 *Net MTM:* `₹{total_pnl:+,.2f}`",
-            f"📅 *MTD:* `₹{mtd_pnl:+,.2f}`  |  *YTD:* `₹{ytd_pnl:+,.2f}`",
-            f"🏦 *Capital:* `₹{total_cap:,.2f}`",
-        ]
+        msg += "◆ P&L SUMMARY\n"
+        msg += "───────────\n"
+        msg += f" Realized   : {('+' if realized_pnl>=0 else '')}{realized_pnl:,.0f}\n"
+        msg += f" Unrealized : {('+' if unrealized_pnl>=0 else '')}{unrealized_pnl:,.0f}\n"
+        msg += f" Net MTM    : {('+' if total_pnl>=0 else '')}{total_pnl:,.0f}\n\n"
+        msg += f" MTD: {('+' if mtd_pnl>=0 else '')}{mtd_pnl:,.0f} | YTD: {('+' if ytd_pnl>=0 else '')}{ytd_pnl:,.0f}\n"
+        msg += f" Cap: {total_cap:,.0f}\n"
+        msg += "```"
 
-        _tg_send("\n".join(lines))
+        _tg_send(msg)
     except Exception as e:
         log_warn(f"Telegram dashboard failed: {e}")
 
