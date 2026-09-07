@@ -99,22 +99,53 @@ class NaturalGasPaperBot:
         return 0.0
 
     def find_option_symbol(self, strike: float, option_type: str) -> Optional[Dict]:
-        """Find a matching MCX NATURALGAS option contract for the strike."""
+        """Find a matching MCX NATURALGAS option contract for the strike using master CSV."""
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        csv_file = f"MCX_symbols_{today_str}.csv"
+        
+        if not os.path.exists(csv_file):
+            print(f"[WARN] {csv_file} missing. Run download_mcx.py first.")
+            return None
+            
         try:
-            search_text = f"NATURALGAS {int(strike)} {option_type}"
-            res = self.api.searchscrip(exchange="MCX", searchtext=search_text)
-            if not res or not isinstance(res, dict) or not res.get("values"):
+            import pandas as pd
+            if getattr(self, '_mcx_master', None) is None:
+                df = pd.read_csv(csv_file)
+                # Convert Expiry to datetime for sorting
+                df['ExpiryDate'] = pd.to_datetime(df['Expiry'], format='%d-%b-%Y', errors='coerce')
+                self._mcx_master = df
+                
+            df = self._mcx_master
+            # Filter for Natgas Options matching strike and type
+            opt_df = df[
+                (df['Symbol'] == 'NATURALGAS') & 
+                (df['Instrument'] == 'OPTFUT') & 
+                (df['OptionType'] == option_type) & 
+                (df['StrikePrice'] == strike)
+            ]
+            
+            if opt_df.empty:
                 return None
-
-            for item in res["values"]:
-                tsym = str(item.get("tsym", "")).upper()
-                if str(int(strike)) in tsym and option_type in tsym and "MINI" not in tsym:
-                    q = self.api.get_quotes(exchange="MCX", token=item.get("token"))
-                    lp = float(q.get("lp", q.get("ltp", 0.0))) if q else 0.0
-                    return {"tsym": item.get("tsym"), "lp": lp, "ls": int(item.get("ls", 1)), "token": item.get("token")}
-        except Exception:
-            pass
-        return None
+                
+            # Filter out expired contracts and find the nearest expiry
+            today = pd.Timestamp.now().normalize()
+            future_opts = opt_df[opt_df['ExpiryDate'] >= today]
+            if future_opts.empty:
+                future_opts = opt_df # Fallback to any if all are technically expired today
+                
+            nearest = future_opts.sort_values('ExpiryDate').iloc[0]
+            token = str(nearest['Token'])
+            tsym = str(nearest['TradingSymbol'])
+            
+            # Get live quote to ensure we have LTP
+            q = self.api.get_quotes(exchange="MCX", token=token)
+            lp = float(q.get("lp", q.get("ltp", 0.0))) if q else 0.0
+            
+            return {"tsym": tsym, "lp": lp, "ls": 1250, "token": token}
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to resolve option symbol: {e}")
+            return None
 
     def _enter_leg(self, leg: str, strike: float, side: str, loss_stop_pct: float, tsl_pct: float):
         option_type = "CE" if leg == "CE" else "PE"
