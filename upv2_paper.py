@@ -481,17 +481,17 @@ _EMERGENCY_STOP_LOCK = threading.Lock()
 def _now_str() -> str:
     return get_ist_now().strftime("%H:%M:%S")
 
-def _tg_send(msg: str, parse_mode: str = "Markdown"):
-    """Core silent Telegram sender — never raises. Strips ANSI codes first."""
+def _tg_send(msg: str):
+    """Core silent Telegram sender — HTML mode, strips ANSI codes."""
     import re
-    clean_msg = re.sub(r"\x1b\[[0-9;]*m", "", msg)
+    clean = re.sub(r"\x1b\[[0-9;]*m", "", msg)
     try:
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
             import requests
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                data={"chat_id": TELEGRAM_CHAT_ID, "text": clean_msg, "parse_mode": parse_mode},
-                timeout=3
+                data={"chat_id": TELEGRAM_CHAT_ID, "text": clean, "parse_mode": "HTML"},
+                timeout=5
             )
     except Exception:
         pass
@@ -502,71 +502,58 @@ def log_info(msg: str):
 def log_warn(msg: str):
     print(f"{Fore.YELLOW}[{_now_str()} WARN]{Style.RESET_ALL}  {msg}", flush=True)
 
-def _wrap_box(title: str, msg: str) -> str:
-    import re
-    msg = re.sub(r"\x1b\[[0-9;]*m", "", msg)
-    lines = msg.split(" | ") if " | " in msg else [msg]
-    formatted = "\n".join([f"│ {line[:26]:<26} │" for line in lines])
-    return f"```text\n┌────────────────────────────┐\n│ {title:^26} │\n├────────────────────────────┤\n{formatted}\n└────────────────────────────┘\n```"
-
 def log_alert(msg: str):
-    _tg_send(_wrap_box("NIFTY SYSTEM ALERT", msg))
+    import re
+    clean = re.sub(r"\x1b\[[0-9;]*m", "", msg)
+    _tg_send(f"<pre>NIFTY ALERT\n{clean}</pre>")
     print(f"{Fore.RED}{Style.BRIGHT}[{_now_str()} ALERT]{Style.RESET_ALL} {msg}", flush=True)
 
 def log_trade(msg: str):
-    title = "TRADE EXECUTED" if ("ENTRY" in msg.upper() or "ENTERED" in msg.upper()) else "TRADE CLOSED"
-    _tg_send(_wrap_box(title, msg))
+    import re
+    clean = re.sub(r"\x1b\[[0-9;]*m", "", msg)
+    _tg_send(f"<pre>{clean}</pre>")
     print(f"{Fore.MAGENTA}{Style.BRIGHT}[{_now_str()} TRADE]{Style.RESET_ALL} {msg}", flush=True)
 
 def send_telegram_nifty_dashboard(spot: float, atm: int, mode: str, positions: dict,
                                    realized_pnl: float, unrealized_pnl: float,
                                    ind: dict, total_cap: float, mtd_pnl: float, ytd_pnl: float):
-    """Sends a rich, Samsung S25-Ultra-optimised Nifty dashboard message to Telegram every 3s."""
+    """Sends a clean Nifty dashboard to Telegram."""
     try:
-        now_s = _now_str()
         regime = ind.get("regime", "?")
-        trend  = ind.get("trend", 0)
         adx    = ind.get("adx", 0.0)
         kama   = ind.get("kama", 0.0)
-        atr    = ind.get("atr", 0.0)
+        total_pnl = realized_pnl + unrealized_pnl
 
-        trend_icon  = "📈" if trend == 1 else ("📉" if trend == -1 else "➡️")
-        regime_icon = "🌪️" if regime == "CHOP" else "🚀"
-        total_pnl   = realized_pnl + unrealized_pnl
-        pnl_icon    = "🟢" if total_pnl >= 0 else "🔴"
-
-        msg = "```text\n"
-        msg += "┌──────────────────────────────┐\n"
-        msg += f"│  NIFTY STRANGLE v2 ({mode[:7]:<7}) │\n"
-        msg += "└──────────────────────────────┘\n"
-        msg += f"Spot  : {spot:<8.2f}   ATM : {atm}\n"
-        msg += f"Regime: {regime:<6} ({adx:.1f}) KAMA: {kama:.0f}\n\n"
+        t = "<pre>"
+        t += "NIFTY STRANGLE v2\n"
+        t += f"Spot {spot:.2f}  ATM {atm}  {mode}\n"
+        t += f"{regime} ({adx:.1f})  KAMA {kama:.0f}\n"
+        t += "─────────────────────\n"
 
         if positions:
-            msg += "◆ POSITIONS\n"
-            msg += "───────────\n"
             for leg, pos in positions.items():
-                side = "SELL" if pos.get("side") == "SELL" else "BUY "
+                side = "SELL" if pos.get("side") == "SELL" else "BUY"
                 strike = pos.get("strike", 0)
                 entry = pos.get("entry_price", 0.0)
                 ltp = pos.get("ltp", entry)
                 pnl = pos.get("pnl", 0.0)
-                
                 sign = "+" if pnl >= 0 else ""
-                
-                msg += f" {leg:<8} | {side} {strike}\n"
-                msg += f" PnL: {sign}{pnl:<7,.0f} | E: {entry:<5.2f} | L: {ltp:<5.2f}\n\n"
 
-        msg += "◆ P&L SUMMARY\n"
-        msg += "───────────\n"
-        msg += f" Realized   : {('+' if realized_pnl>=0 else '')}{realized_pnl:,.0f}\n"
-        msg += f" Unrealized : {('+' if unrealized_pnl>=0 else '')}{unrealized_pnl:,.0f}\n"
-        msg += f" Net MTM    : {('+' if total_pnl>=0 else '')}{total_pnl:,.0f}\n\n"
-        msg += f" MTD: {('+' if mtd_pnl>=0 else '')}{mtd_pnl:,.0f} | YTD: {('+' if ytd_pnl>=0 else '')}{ytd_pnl:,.0f}\n"
-        msg += f" Cap: {total_cap:,.0f}\n"
-        msg += "```"
+                t += f"{leg:<8} {side:>4} {strike}\n"
+                t += f"  E {entry:>7.2f}  L {ltp:>7.2f}\n"
+                t += f"  PnL {sign}{pnl:>9,.0f}\n"
 
-        _tg_send(msg)
+        t += "─────────────────────\n"
+        t += f"Realized {'+' if realized_pnl >= 0 else ''}{realized_pnl:>10,.0f}\n"
+        t += f"Unreal   {'+' if unrealized_pnl >= 0 else ''}{unrealized_pnl:>10,.0f}\n"
+        t += f"Net MTM  {'+' if total_pnl >= 0 else ''}{total_pnl:>10,.0f}\n"
+        t += "─────────────────────\n"
+        t += f"MTD {'+' if mtd_pnl >= 0 else ''}{mtd_pnl:>8,.0f}"
+        t += f"  YTD {'+' if ytd_pnl >= 0 else ''}{ytd_pnl:>8,.0f}\n"
+        t += f"Capital {total_cap:>12,.0f}"
+        t += "</pre>"
+
+        _tg_send(t)
     except Exception as e:
         log_warn(f"Telegram dashboard failed: {e}")
 

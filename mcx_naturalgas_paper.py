@@ -28,9 +28,9 @@ CHAT_ID = "6307066850"
 def send_telegram(msg):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=3)
-    except Exception as e:
-        print(f"[WARN] Failed to send Telegram message: {e}")
+        requests.post(url, data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"}, timeout=5)
+    except Exception:
+        pass
 
 def round_to_price(value: float, step: float = STRIKE_STEP) -> float:
     return round(math.floor(value / step + 0.5) * step, 2)
@@ -194,21 +194,25 @@ class NaturalGasPaperBot:
                 "imported_at": time.time(),
             },
         }
-        sl_price = ltp * (1 + loss_stop_pct)
-        msg = f"""```text
-┌────────────────────────────┐
-│      TRADE EXECUTED        │
-├────────────────────────────┤
-│ Action : {side:<17} │
-│ Leg    : {leg} ({int(strike)}){' '*(15-len(leg)-len(str(int(strike))))} │
-│ Symbol : {tsym:<17} │
-│ Price  : {ltp:<17.2f} │
-│ SL     : {loss_stop_pct*100:.0f}% ({sl_price:.2f}){' '*(11-len(str(int(loss_stop_pct*100)))-len(f'{sl_price:.2f}'))} │
-│ TSL    : {tsl_pct*100:.0f}%{' '*(15-len(str(int(tsl_pct*100))))} │
-└────────────────────────────┘
-```"""
-        print(f"[PAPER ENTRY] {side} {leg} {tsym} @ Rs{ltp:.2f} | SL={loss_stop_pct * 100:.0f}% | TSL={tsl_pct * 100:.0f}%")
-        send_telegram(msg)
+        self.positions[leg] = pos
+
+        sl_val = ltp * (1 + loss_stop_pct)
+        tsl_val = ltp * (1 + tsl_pct)
+        tg = (
+            f"<pre>"
+            f"━━━ TRADE OPENED ━━━\n"
+            f"\n"
+            f"  {leg} {int(strike)}  SELL @ {ltp:.2f}\n"
+            f"\n"
+            f"  SL   {loss_stop_pct*100:.0f}%  →  {sl_val:.2f}\n"
+            f"  TSL  {tsl_pct*100:.0f}%  →  {tsl_val:.2f}\n"
+            f"  Qty  {qty}\n"
+            f"\n"
+            f"  {tsym}"
+            f"</pre>"
+        )
+        print(f"[PAPER ENTRY] {side} {leg} {tsym} @ Rs{ltp:.2f}")
+        send_telegram(tg)
         return pos
 
     def _close_leg(self, leg: str, reason: str):
@@ -235,22 +239,23 @@ class NaturalGasPaperBot:
             pnl = (ltp - pos["entry_price"]) * pos["qty"]
             
         self.total_realized_pnl += pnl
-        
+
         sign = "+" if pnl >= 0 else ""
-        msg = f"""```text
-┌────────────────────────────┐
-│       TRADE CLOSED         │
-├────────────────────────────┤
-│ Leg    : {leg} ({int(pos['strike'])}){' '*(15-len(leg)-len(str(int(pos['strike']))))} │
-│ Reason : {reason[:17]:<17} │
-│ Entry  : {pos['entry_price']:<17.2f} │
-│ Exit   : {ltp:<17.2f} │
-│ PnL    : {sign}{pnl:<16,.0f} │
-└────────────────────────────┘
-```"""
-        
-        print(f"[PAPER EXIT] Closed {trade_side} {pos['qty']}x {tsym} @ Rs{ltp:.2f} | PnL: Rs{pnl:.2f} | Reason: {reason}")
-        send_telegram(msg)
+        tg = (
+            f"<pre>"
+            f"━━━ TRADE CLOSED ━━━\n"
+            f"\n"
+            f"  {leg} {int(pos['strike'])}  {reason}\n"
+            f"\n"
+            f"  Entry  {pos['entry_price']:.2f}\n"
+            f"  Exit   {ltp:.2f}\n"
+            f"  PnL    {sign}{pnl:,.0f}\n"
+            f"\n"
+            f"  Total  {'+' if self.total_realized_pnl >= 0 else ''}{self.total_realized_pnl:,.0f}"
+            f"</pre>"
+        )
+        print(f"[PAPER EXIT] {trade_side} {pos['qty']}x {tsym} @ Rs{ltp:.2f} | PnL: Rs{pnl:.2f} | {reason}")
+        send_telegram(tg)
         del self.positions[leg]
 
     def _close_all(self, reason: str):
@@ -280,55 +285,48 @@ class NaturalGasPaperBot:
         return False, ""
         
     def _print_dashboard(self, spot: float, atm: float):
-        """Prints local dashboard and sends rich Telegram update optimised for Samsung S25 Ultra."""
         now_s = datetime.now().strftime("%H:%M:%S")
         total_unrealized = 0.0
-        
-        # Console printing first
-        print(f"\n[{now_s}] SPOT: {spot:.2f} | ATM: {atm} | OPEN LEGS: {len(self.positions)} | REALIZED PNL: Rs{self.total_realized_pnl:.2f}")
+
+        # Console
+        print(f"\n[{now_s}] SPOT: {spot:.2f} | ATM: {atm} | LEGS: {len(self.positions)} | REAL PNL: Rs{self.total_realized_pnl:.2f}")
+
+        # Collect leg data
+        leg_data = []
         for leg, pos in self.positions.items():
             match = self.find_option_symbol(pos["strike"], "CE" if leg == "CE" else "PE")
-            live_ltp = float(match.get("lp", pos["entry_price"])) if match else pos["entry_price"]
-            pnl = (pos["entry_price"] - live_ltp) * pos["qty"] if pos["side"] == "SELL" else (live_ltp - pos["entry_price"]) * pos["qty"]
+            ltp = float(match.get("lp", pos["entry_price"])) if match else pos["entry_price"]
+            pnl = (pos["entry_price"] - ltp) * pos["qty"] if pos["side"] == "SELL" else (ltp - pos["entry_price"]) * pos["qty"]
             total_unrealized += pnl
             state = pos.get("premium_sl_state", {})
             tsl = state.get("tsl", 0.0)
-            print(f" -> {leg:2} | {pos['side']} {pos['qty']}x {pos['strike']} | Entry: Rs{pos['entry_price']:.2f} | LTP: Rs{live_ltp:.2f} | TSL: Rs{tsl:.2f} | Unrealized: Rs{pnl:.2f}")
-        print("-" * 80)
+            leg_data.append((leg, pos, ltp, pnl, tsl))
+            print(f"  {leg:2} | {pos['side']} {int(pos['strike'])} | E:{pos['entry_price']:.2f} LTP:{ltp:.2f} TSL:{tsl:.2f} PnL:{pnl:.0f}")
+        print("-" * 60)
 
-        # Telegram Table Formatting (Fixed width monospace)
         total_pnl = self.total_realized_pnl + total_unrealized
-        
-        msg = "```text\n"
-        msg += "┌──────────────────────────────┐\n"
-        msg += "│  MCX NATURAL GAS PORTFOLIO   │\n"
-        msg += "└──────────────────────────────┘\n"
-        msg += f"Spot : {spot:<8.2f}    ATM : {int(atm)}\n"
-        msg += f"Legs : {len(self.positions)}\n\n"
-        
-        if self.positions:
-            msg += "◆ POSITIONS\n"
-            msg += "───────────\n"
-            for leg, pos in self.positions.items():
-                match = self.find_option_symbol(pos["strike"], "CE" if leg == "CE" else "PE")
-                live_ltp = float(match.get("lp", pos["entry_price"])) if match else pos["entry_price"]
-                pnl = (pos["entry_price"] - live_ltp) * pos["qty"] if pos["side"] == "SELL" else (live_ltp - pos["entry_price"]) * pos["qty"]
-                state = pos.get("premium_sl_state", {})
-                tsl = state.get("tsl", 0.0)
-                
-                sign = "+" if pnl >= 0 else ""
-                msg += f" {leg:<2} | SELL {int(pos['strike'])} | PnL: {sign}{pnl:,.0f}\n"
-                msg += f"    | E: {pos['entry_price']:<6.2f} | LTP: {live_ltp:<6.2f}\n"
-                msg += f"    | TSL: {tsl:<4.2f}\n\n"
-                
-        msg += "◆ P&L SUMMARY\n"
-        msg += "───────────\n"
-        msg += f" Realized   : {('+' if self.total_realized_pnl>=0 else '') + f'{self.total_realized_pnl:,.0f}'}\n"
-        msg += f" Unrealized : {('+' if total_unrealized>=0 else '') + f'{total_unrealized:,.0f}'}\n"
-        msg += f" Net MTM    : {('+' if total_pnl>=0 else '') + f'{total_pnl:,.0f}'}\n"
-        msg += "```"
-        
-        send_telegram(msg)
+
+        # Telegram
+        t = "<pre>"
+        t += "MCX NATURAL GAS\n"
+        t += f"Spot {spot:.2f}   ATM {int(atm)}\n"
+        t += "─────────────────────\n"
+
+        for leg, pos, ltp, pnl, tsl in leg_data:
+            sign = "+" if pnl >= 0 else ""
+            t += f"{leg:2} SELL {int(pos['strike']):>3}"
+            t += f"  {sign}{pnl:>7,.0f}\n"
+            t += f"   E {pos['entry_price']:>6.2f}"
+            t += f"  L {ltp:>6.2f}\n"
+            t += f"   TSL {tsl:>6.2f}\n"
+
+        t += "─────────────────────\n"
+        t += f"Realized  {'+' if self.total_realized_pnl >= 0 else ''}{self.total_realized_pnl:>9,.0f}\n"
+        t += f"Unreal    {'+' if total_unrealized >= 0 else ''}{total_unrealized:>9,.0f}\n"
+        t += f"Net MTM   {'+' if total_pnl >= 0 else ''}{total_pnl:>9,.0f}"
+        t += "</pre>"
+
+        send_telegram(t)
 
 
 
@@ -355,16 +353,7 @@ class NaturalGasPaperBot:
         print(" NATURAL GAS PAPER TRADING BOT STARTED ")
         print("="*80)
         
-        msg = """```text
-┌────────────────────────────┐
-│       SYSTEM ONLINE        │
-├────────────────────────────┤
-│ Bot    : MCX NATGAS        │
-│ Mode   : PAPER TRADING     │
-│ Status : Active            │
-└────────────────────────────┘
-```"""
-        send_telegram(msg)
+        send_telegram("<pre>MCX NATURAL GAS\nPaper Trading Online</pre>")
 
         hist: List[float] = []
         current_kama = None
