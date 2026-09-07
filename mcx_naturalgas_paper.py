@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import math
+import requests
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -20,6 +21,16 @@ STRIKE_STEP = 5.0
 ENTRY_TIME = "18:00"
 EXIT_TIME = "11:24"
 
+# --- Telegram Configuration ---
+TELEGRAM_TOKEN = "8850507396:AAFwFm2_WxPdSM52JcCpJUj8V1rz9x3G-kE"
+CHAT_ID = "6307066850"
+
+def send_telegram(msg):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=3)
+    except Exception as e:
+        print(f"[WARN] Failed to send Telegram message: {e}")
 
 def round_to_price(value: float, step: float = STRIKE_STEP) -> float:
     return round(math.floor(value / step + 0.5) * step, 2)
@@ -184,7 +195,9 @@ class NaturalGasPaperBot:
             },
         }
         self.positions[leg] = pos
+        msg = f"🟢 *PAPER ENTRY* ({leg})\n`{side} {qty}x {tsym}` @ ₹{ltp:.2f}\n*SL:* {loss_stop_pct * 100:.0f}% | *TSL:* {tsl_pct * 100:.0f}%"
         print(f"[PAPER ENTRY] {side} {leg} {tsym} @ Rs{ltp:.2f} | SL={loss_stop_pct * 100:.0f}% | TSL={tsl_pct * 100:.0f}%")
+        send_telegram(msg)
         return pos
 
     def _close_leg(self, leg: str, reason: str):
@@ -211,7 +224,12 @@ class NaturalGasPaperBot:
             pnl = (ltp - pos["entry_price"]) * pos["qty"]
             
         self.total_realized_pnl += pnl
+        
+        icon = "🔴" if pnl < 0 else "🟢"
+        msg = f"{icon} *PAPER EXIT* ({leg})\n`{trade_side} {pos['qty']}x {tsym}` @ ₹{ltp:.2f}\n*PnL:* ₹{pnl:.2f}\n*Reason:* {reason}"
+        
         print(f"[PAPER EXIT] Closed {trade_side} {pos['qty']}x {tsym} @ Rs{ltp:.2f} | PnL: Rs{pnl:.2f} | Reason: {reason}")
+        send_telegram(msg)
         del self.positions[leg]
 
     def _close_all(self, reason: str):
@@ -274,6 +292,7 @@ class NaturalGasPaperBot:
         print("="*80)
         print(" NATURAL GAS PAPER TRADING BOT STARTED ")
         print("="*80)
+        send_telegram("✅ *Natural Gas Paper Trading Bot Started*")
 
         hist: List[float] = []
         current_kama = None
