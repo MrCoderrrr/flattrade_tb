@@ -179,42 +179,48 @@ except ImportError:
             self.filename = filename
             self.data = self._load()
             
+        def _get_ist_str(self):
+            from datetime import datetime, timezone, timedelta
+            return datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime("%Y-%m-%d")
+            
         def _load(self):
             import json, os
             if os.path.exists(self.filename):
                 try:
                     with open(self.filename, 'r') as f: return json.load(f)
                 except: pass
-            return {"mtd_pnl": 0.0, "ytd_pnl": 0.0, "current_capital": globals().get("CAPITAL", 195784.0), "last_date": ""}
+            # NOTE: CAPITAL is defined LATER in the file. Use 195784.0 as the safe default here.
+            return {"mtd_pnl": 0.0, "ytd_pnl": 0.0, "current_capital": 195784.0, "today_pnl": 0.0, "last_date": "", "intraday_date": ""}
             
         def _save(self):
             import json
             with open(self.filename, 'w') as f: json.dump(self.data, f)
             
         def commit_daily_pnl(self, realized_pnl: float):
-            import datetime
-            today_str = datetime.datetime.now().strftime("%Y-%m-%d")
-            if self.data.get("last_date") == today_str: return # already committed today
+            today_str = self._get_ist_str()
+            if self.data.get("last_date") == today_str: return  # already committed today
             
-            # Simple assumption: if month changes, reset mtd. if year changes, reset ytd.
             last_date_str = self.data.get("last_date", "")
             if last_date_str:
-                last_dt = datetime.datetime.strptime(last_date_str, "%Y-%m-%d")
-                now_dt = datetime.datetime.now()
-                if last_dt.month != now_dt.month: self.data["mtd_pnl"] = 0.0
-                if last_dt.year != now_dt.year: self.data["ytd_pnl"] = 0.0
+                try:
+                    from datetime import datetime
+                    last_dt = datetime.strptime(last_date_str, "%Y-%m-%d")
+                    now_dt = datetime.strptime(today_str, "%Y-%m-%d")
+                    if last_dt.month != now_dt.month: self.data["mtd_pnl"] = 0.0
+                    if last_dt.year != now_dt.year: self.data["ytd_pnl"] = 0.0
+                except: pass
                 
-            self.data["mtd_pnl"] += realized_pnl
-            self.data["ytd_pnl"] += realized_pnl
-            self.data["current_capital"] += realized_pnl
+            self.data["mtd_pnl"] = self.data.get("mtd_pnl", 0.0) + realized_pnl
+            self.data["ytd_pnl"] = self.data.get("ytd_pnl", 0.0) + realized_pnl
+            self.data["current_capital"] = self.data.get("current_capital", 195784.0) + realized_pnl
             self.data["last_date"] = today_str
+            self.data["today_pnl"] = 0.0  # reset for next day
             self._save()
             
         def update_intraday_pnl(self, realized_pnl: float):
-            import datetime
-            today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+            today_str = self._get_ist_str()
             
-            # If a new day started and we didn't commit yesterday, commit yesterday's intraday automatically
+            # Auto-commit previous day if we rolled over
             if self.data.get("intraday_date") and self.data.get("intraday_date") != today_str:
                 if self.data.get("last_date") != self.data.get("intraday_date"):
                     self.commit_daily_pnl(self.data.get("today_pnl", 0.0))
@@ -226,11 +232,13 @@ except ImportError:
         def record_trade(self, *args, **kwargs): pass
         
         def get_strategy_pnl_summary(self, *args, **kwargs):
+            # Late-bind CAPITAL here so we always get the real configured value
+            base = kwargs.get("base_capital", globals().get("CAPITAL", 195784.0))
             return {
                 "today_pnl": self.data.get("today_pnl", 0.0),
                 "mtd_pnl": self.data.get("mtd_pnl", 0.0),
                 "ytd_pnl": self.data.get("ytd_pnl", 0.0),
-                "current_capital": self.data.get("current_capital", kwargs.get("base_capital", globals().get("CAPITAL", 195784.0)))
+                "current_capital": self.data.get("current_capital", base)
             }
             
     db = DBManager()
@@ -436,7 +444,8 @@ class FlattradeBroker:
 
 # Capital & Allocation
 CAPITAL                 = 195784.0
-LOT_SIZE                = 65
+LOT_SIZE                = 25          # NIFTY 50 lot size is 25 (exchange standard)
+TRADE_LOG_FILE          = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "logs", "trade_book", "trades_v2_paper.csv")
 CAPITAL_BUFFER          = 0.95
 MARGIN_IRON_CONDOR      = 95_000
 PORTFOLIO_CIRCUIT_PCT   = 1.8
@@ -570,20 +579,36 @@ def log_trade(msg: str):
     _tg_send(f"<pre>{clean}</pre>")
     print(f"{Fore.MAGENTA}{Style.BRIGHT}[{_now_str()} TRADE]{Style.RESET_ALL} {msg}", flush=True)
 
+_last_tg_dashboard_ts: float = 0.0  # Rate-limits Telegram dashboard to once per 60s
+
 def send_telegram_nifty_dashboard(spot: float, atm: int, mode: str, positions: dict,
                                    realized_pnl: float, unrealized_pnl: float,
                                    ind: dict, total_cap: float, mtd_pnl: float, ytd_pnl: float):
-    """Sends a clean Nifty dashboard to Telegram."""
+    """Sends a clean Nifty dashboard to Telegram (max once per 60 seconds)."""
+    global _last_tg_dashboard_ts
+    now_ts = time.time()
+    
+    # Check if it's end of day for final summary (after 15:34)
+    now_ist = get_ist_now()
+    is_eod = (now_ist.hour > 15 or (now_ist.hour == 15 and now_ist.minute >= 34))
+    
+    # Only send if 60 seconds have elapsed OR it's end-of-day
+    if not is_eod and (now_ts - _last_tg_dashboard_ts) < 60.0:
+        return
+    _last_tg_dashboard_ts = now_ts
+
     try:
         regime = ind.get("regime", "?")
-        adx    = ind.get("adx", 0.0)
-        kama   = ind.get("kama", 0.0)
+        adx    = ind.get("adx", 0.0) or 0.0
+        # BUG 6 FIX: Guard against None KAMA during warmup
+        kama_raw = ind.get("kama")
+        kama_str = f"{kama_raw:.0f}" if kama_raw is not None else "WARMUP"
         total_pnl = realized_pnl + unrealized_pnl
 
         t = "<pre>"
         t += "NIFTY STRANGLE v2\n"
         t += f"Spot {spot:.2f}  ATM {atm}  {mode}\n"
-        t += f"{regime} ({adx:.1f})  KAMA {kama:.0f}\n"
+        t += f"{regime} ({adx:.1f})  KAMA {kama_str}\n"
         t += "─────────────────────\n"
 
         if positions:
@@ -608,9 +633,8 @@ def send_telegram_nifty_dashboard(spot: float, atm: int, mode: str, positions: d
         t += f"Unreal   {'+' if unrealized_pnl >= 0 else ''}{unrealized_pnl:>10,.0f}\n"
         t += f"Net MTM  {'+' if total_pnl >= 0 else ''}{total_pnl:>10,.0f}\n"
         
-        # Only show MTD/YTD/Capital at the end of the day (after 15:34)
-        now = get_ist_now()
-        if now.hour > 15 or (now.hour == 15 and now.minute >= 34):
+        # Only show MTD/YTD/Capital at end of day
+        if is_eod:
             t += "─────────────────────\n"
             t += f"MTD {'+' if mtd_pnl >= 0 else ''}{mtd_pnl:>8,.0f}"
             t += f"  YTD {'+' if ytd_pnl >= 0 else ''}{ytd_pnl:>8,.0f}\n"
@@ -1184,7 +1208,7 @@ class ExecutionEngine:
             with open(pid_file, "w") as f:
                 f.write(str(os.getpid()))
         except Exception as e:
-            log_warn(f"Dashboard snap fail: {e}")
+            log_warn(f"PID write failed: {e}")
 
     def _remove_pid(self):
         try:
@@ -1192,7 +1216,7 @@ class ExecutionEngine:
             if os.path.exists(pid_file):
                 os.remove(pid_file)
         except Exception as e:
-            log_warn(f"Dashboard snap fail: {e}")
+            log_warn(f"PID remove failed: {e}")
 
     def _setup_signal_handlers(self):
         def handler(sig, frame):
@@ -1203,7 +1227,7 @@ class ExecutionEngine:
             signal.signal(signal.SIGINT, handler)
             signal.signal(signal.SIGTERM, handler)
         except Exception as e:
-            log_warn(f"Dashboard snap fail: {e}")
+            log_warn(f"Signal handler setup failed: {e}")
 
     def _start_kill_switch_listener(self):
         def listener():
@@ -1390,19 +1414,25 @@ class ExecutionEngine:
 
     @classmethod
     def calculate_strangle_strikes(cls, atm_spot: int, atr: float, regime: str, dte_days: float = 2.0) -> Tuple[int, int]:
+        # Always at least ATM±50 so we never produce a zero-width straddle
+        MIN_STRIDE = 50
+        
         if regime == 'CHOP':
-            return atm_spot + 50, atm_spot - 50
+            return atm_spot + MIN_STRIDE, atm_spot - MIN_STRIDE
             
         mult = ATR_MULT_TREND
         width = atr * mult
-        if dte_days <= 1.0: return atm_spot, atm_spot
+        
+        # On expiry day, use minimum stride — never return exact ATM (would be straddle)
+        if dte_days <= 1.0:
+            return atm_spot + MIN_STRIDE, atm_spot - MIN_STRIDE
+        
         expiry_curve = cls._expiry_width_multiplier(dte_days)
-        expiry_floor = 0 
-        compressed_width = max(expiry_floor, round(width * (1.0 - 0.65 * expiry_curve)))
+        compressed_width = round(width * (1.0 - 0.65 * expiry_curve))
         stride_50 = int(round(compressed_width / 50.0) * 50)
         
-        # Cap the distance to max 50 points so it doesn't go 100-150 pts away and lose premium
-        stride_50 = min(stride_50, 50)
+        # Clamp: never below MIN_STRIDE, never above 50 pts (keep premium tight)
+        stride_50 = max(MIN_STRIDE, min(stride_50, 50))
         
         return atm_spot + stride_50, atm_spot - stride_50
 
@@ -1578,11 +1608,14 @@ class ExecutionEngine:
         actual_positions = self._get_live_exchange_positions()
         
         for leg in list(self.positions.keys()):
+            if leg not in self.positions:
+                continue
             if actual_positions is not None:
-                tsym = self.positions[leg]["tsym"]
+                tsym = self.positions[leg].get("tsym", "")
                 if tsym not in actual_positions or actual_positions[tsym] == 0:
                     log_info(f"Skipping exit for {leg} ({tsym}): Already closed on exchange.")
-                    del self.positions[leg]
+                    if leg in self.positions:
+                        del self.positions[leg]
                     continue
             self._exit_leg(leg, reason=reason)
 
@@ -1642,14 +1675,12 @@ class ExecutionEngine:
         self._save_state()
 
     def _check_cooldown_and_reenter(self, spot: float, atm: int, atr: float, regime: str, trend: int, dte_days: float = 2.0):
-        # We always allow re-entry now, regardless of regime!
         if self.strangle_resets_today >= MAX_STRANGLE_RESETS: return
         
         current_kama = float(self.current_indicators.get("kama", spot) or spot)
         prev_kama = float(self.current_indicators.get("prev_kama", current_kama) or current_kama)
         kama_slope = current_kama - prev_kama
         
-        import time
         for leg in ("PE", "CE"):
             cd = self.cooldown_tracker.get(leg)
             if not cd or not cd.get("active", False): continue
@@ -1659,25 +1690,31 @@ class ExecutionEngine:
             if time.time() < cd.get("next_eligible_time", 0): continue
             
             if leg == "CE":
-                # CE stopped out because market went UP. We re-enter if KAMA slope goes DOWN by >= 0.25.
+                # CE stopped out because market went UP. Re-enter if KAMA slope turns DOWN.
                 if kama_slope <= -0.25:
                     cd["consecutive_bars"] = cd.get("consecutive_bars", 0) + 1
-                else: cd["consecutive_bars"] = 0
+                else:
+                    cd["consecutive_bars"] = 0
             else:
-                # PE stopped out because market went DOWN. We re-enter if KAMA slope goes UP by >= 0.25.
+                # PE stopped out because market went DOWN. Re-enter if KAMA slope turns UP.
                 if kama_slope >= 0.25:
                     cd["consecutive_bars"] = cd.get("consecutive_bars", 0) + 1
-                else: cd["consecutive_bars"] = 0
+                else:
+                    cd["consecutive_bars"] = 0
                 
-            # Instant re-entry on 0.25 reversal (1 bar)
             if cd.get("consecutive_bars", 0) >= 1:
-                # Calculate distance based on the surviving opposite leg
+                # BUG 5 FIX: Calculate distance from surviving opposite leg, with a hard cap
                 opposite_leg = "PE" if leg == "CE" else "CE"
+                MAX_REENTRY_DIST = 50  # Never re-enter more than 50 pts away from ATM
+                
                 if opposite_leg in self.positions and self.positions[opposite_leg].get("side") == "SELL":
-                    dist = abs(self.positions[opposite_leg]["strike"] - atm)
+                    opp_strike = self.positions[opposite_leg]["strike"]
+                    dist = abs(opp_strike - atm)
+                    # Cap the distance: if surviving leg has drifted far from ATM, don't mirror it blindly
+                    dist = min(dist, MAX_REENTRY_DIST)
                     strike = atm + dist if leg == "CE" else atm - dist
                 else:
-                    # If opposite leg is also missing, fallback to standard regime strike
+                    # Fallback: use standard regime strike
                     ce_strike, pe_strike = self.calculate_strangle_strikes(atm, atr, regime, dte_days=dte_days)
                     strike = ce_strike if leg == "CE" else pe_strike
                 
@@ -1688,8 +1725,10 @@ class ExecutionEngine:
                     cd["active"] = False
                     cd["reentries_today"] = cd.get("reentries_today", 0) + 1
                     self.total_reentries_today += 1
-                    backoff = min(300, BACKOFF_BASE_SEC * (2 ** cd["reentries_today"]))
-                    cd["next_eligible_time"] = time.time() + backoff
+                    # BUG 10 FIX: Flat 30s backoff instead of exponential (KAMA condition already gates re-entry)
+                    cd["next_eligible_time"] = time.time() + 30
+                    # BUG 2+3 FIX: Restore RUNNING mode after successful re-entry
+                    self.mode = "RUNNING"
                     self._save_state()
     def _render_dashboard(self, spot: float, atm: int):
         import re
@@ -1964,7 +2003,9 @@ class ExecutionEngine:
                             if p['tsym'] not in actual_pos or actual_pos[p['tsym']] == 0:
                                 log_alert(f'⚠️ RECONCILIATION MISMATCH: {l} closed on exchange!')
                                 del self.positions[l]
-                self._ltp_cache.clear()
+                
+                # BUG 12 FIX: Only clear LTP cache on a new 1-minute bar (was clearing every second = API overload)
+                # Cache is populated per-tick below; this just ensures stale per-second reads don't accumulate
                 
                 # Check Auto Square-off Time (15:34 PM)
                 if now.hour > AUTO_SQUAREOFF_HOUR or (now.hour == AUTO_SQUAREOFF_HOUR and now.minute >= AUTO_SQUAREOFF_MINUTE):
@@ -1993,6 +2034,7 @@ class ExecutionEngine:
 
                 # ── 2. Run KAMA & Indicators strictly on the collected 1-minute data ──
                 if is_new_1m_bar or getattr(self, "current_indicators", None) is None:
+                    self._ltp_cache.clear()  # Clear price cache only on new bar boundary
                     df_5m = self.market_data.get_5m_dataframe()
                     self.current_indicators = Indicators.evaluate_all(self.market_data.get_1m_dataframe(), df_5m)
                     
@@ -2080,7 +2122,7 @@ class ExecutionEngine:
                         log_info(f"⏳ Pre-market wait: Current IST is {now.strftime('%H:%M:%S')}. Trading session starts at {MARKET_START_HOUR:02d}:{MARKET_START_MINUTE:02d} IST.")
 
                 # Phase B: Active Trading Management (RUNNING, CHOP_MODE, COOLDOWN)
-                elif self.mode in ("RUNNING", "CHOP_MODE", "COOLDOWN", "HEDGES_ONLY"):
+                elif self.mode in ("RUNNING", "CHOP_MODE", "COOLDOWN"):
                     has_short = any(p.get("side") == "SELL" for p in self.positions.values())
                     if not has_short:
                         log_info("All short legs stopped out. Resetting to WAIT_DATA to re-center new Strangle...")
@@ -2094,7 +2136,10 @@ class ExecutionEngine:
                         self._save_state()
                         continue
 
-                    # Check Spot-Based Trailing Stop Losses strictly on 1-min collected data
+                    # BUG 11 FIX: Protect against orphan short legs (one side without the other)
+                    self.enforce_strangle_or_hedges_only(context="CYCLE_HEALTH_CHECK")
+
+                    # Check Premium TSL strictly on 1-min collected data
                     for leg in ("CE", "PE"):
                         if leg in self.positions and self.positions[leg]["side"] == "SELL":
                             is_strangle = ("CE" in self.positions and "PE" in self.positions)
@@ -2107,16 +2152,13 @@ class ExecutionEngine:
                                 self._exit_leg(leg, reason="PREM_TSL_HIT")
                                 self._trigger_leg_cooldown(leg, spot)
 
-                    # Dynamic re-entry (3m cooldown removed - checks immediately on 1m bar)
+                    # Dynamic re-entry (KAMA reversal triggers next 1m bar)
                     self._check_cooldown_and_reenter(spot, atm, atr, regime, trend, dte_days=dte_days)
 
-                    # Dynamic Chop Regime Strike Adjustment disabled per user request.
-                    # We no longer square off or roll open legs just because regime changes.
-                    # if regime == "CHOP" and self.mode != "HEDGES_ONLY":
-                    #     ...
-
-                    # Routine Invariant Verification: Strangle or Hedges Only
-                    # self.enforce_strangle_or_hedges_only(context="CYCLE_HEALTH_CHECK")
+                # BUG 2 FIX: HEDGES_ONLY is a safe holding mode — don't reset to WAIT_DATA from here.
+                # Hedges hold as protection. The user can manually restart or the next day starts fresh.
+                elif self.mode == "HEDGES_ONLY":
+                    log_info("🛡️ HEDGES_ONLY mode: Holding protective hedges. No new short entries today.")
 
                 # ── 5. Render Live Dashboard ──
                 self._render_dashboard(spot, atm)
@@ -2155,14 +2197,12 @@ class ExecutionEngine:
 
 def prompt_user_variables():
     global CAPITAL, KAMA_PERIOD, KAMA_FAST_EMA, KAMA_SLOW_EMA, ADX_PERIOD, ADX_CHOP_THRESHOLD, ADX_TREND_THRESHOLD
-    global PREM_SL_DEBOUNCE_BARS, BASE_MIN_WIDTH_PTS, BASE_MAX_WIDTH_PTS, TSL_STRANGLE_PCT, TSL_TREND_ORPHAN_PCT
+    global PREM_SL_DEBOUNCE_BARS, BASE_MIN_WIDTH_PTS, BASE_MAX_WIDTH_PTS
     global PAPER_TRADING_MODE
 
     import sys
     PAPER_TRADING_MODE = True
     print(f"\n{Fore.GREEN}{Style.BRIGHT}✅ PAPER TRADING ONLY. No real orders will be placed.{Style.RESET_ALL}\n")
-
-
 
     # ── STRATEGY PARAMETERS ───────────────────────────────────────────────────
     print(f"\n{Fore.GREEN}{Style.BRIGHT}{'═'*78}")

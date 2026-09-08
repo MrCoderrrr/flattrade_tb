@@ -1,46 +1,60 @@
+# Complete script
+"""mcx_naturalgas_paper.py"""
 import os
 import sys
 import time
 import math
+import glob
+import urllib.request
+import zipfile
+import io
 import requests
+from collections import deque
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 
 try:
     from creds import USER_ID
 except Exception:
-    USER_ID = os.getenv("USER_ID", "")
+    USER_ID = os.getenv('USER_ID', '')
 
 try:
     from api_helper import NorenApiPy
 except Exception:
     NorenApiPy = None
 
-TOKEN_FILE = "token.txt"
+# Standard Indian Standard Time (IST = UTC+5:30)
+IST = timezone(timedelta(hours=5, minutes=30))
+
+def get_ist_now() -> datetime:
+    return datetime.now(IST)
+
+TOKEN_FILE = 'token.txt'
 STRIKE_STEP = 5.0
-ENTRY_TIME = "18:00"
-EXIT_TIME = "11:24"
+MCX_ENTRY_HOUR   = 18     # 18:00 IST (6:00 PM)
+MCX_EXIT_HOUR    = 23     # 23:24 IST (11:24 PM auto square-off)
+MCX_EXIT_MINUTE  = 24
+LOT_SIZE         = 1250   # 1 Lot of Natural Gas = 1250 units
+MAX_DAILY_TRADES = 10     # Safeguard against runaway re-entries
 
-# --- Telegram Configuration ---
-TELEGRAM_TOKEN = "8850507396:AAFwFm2_WxPdSM52JcCpJUj8V1rz9x3G-kE"
-CHAT_ID = "6307066850"
+TELEGRAM_TOKEN = '8850507396:AAFwFm2_WxPdSM52JcCpJUj8V1rz9x3G-kE'
+CHAT_ID = '6307066850'
 
-def send_telegram(msg):
+def send_telegram(msg: str):
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"}, timeout=5)
+        url = f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage'
+        requests.post(url, data={'chat_id': CHAT_ID, 'text': msg, 'parse_mode': 'HTML'}, timeout=5)
     except Exception:
         pass
 
 def round_to_price(value: float, step: float = STRIKE_STEP) -> float:
     return round(math.floor(value / step + 0.5) * step, 2)
 
-
 class KAMA:
     @staticmethod
     def compute(closes: List[float], period: int = 10, fast: int = 3, slow: int = 30):
         if len(closes) < period + 1:
-            return None, None, 0.0, 0.0
+            return None, None, 0.0, 0
 
         kama = [0.0] * len(closes)
         kama[period - 1] = sum(closes[:period]) / period
@@ -66,7 +80,6 @@ class KAMA:
             trend = 0
         return current, previous, delta, trend
 
-
 class NaturalGasPaperBot:
     def __init__(self):
         self.api = NorenApiPy() if NorenApiPy else None
@@ -74,144 +87,248 @@ class NaturalGasPaperBot:
         self.kama_prev_delta = 0.0
         self.last_reentry_ts = 0.0
         self.total_realized_pnl = 0.0
+        self.trades_today = 0
+        self._mcx_master = None
+        self._spot_cache = {'ts': 0.0, 'val': 0.0}
+        self._last_tg_dash_ts = 0.0
+        self._last_console_dash_ts = 0.0
+        self.front_month_futs_token: Optional[str] = None
+        self.front_month_futs_symbol: Optional[str] = None
 
     def authenticate(self):
         if not self.api:
-            raise RuntimeError("NorenApiPy is not available. Make sure api_helper.py is present.")
+            raise RuntimeError('NorenApiPy is not available. Make sure api_helper.py is present.')
 
-        if not os.path.exists(TOKEN_FILE):
-            raise FileNotFoundError(f"{TOKEN_FILE} missing. Run login.py first.")
+        candidates = [
+            TOKEN_FILE,
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), TOKEN_FILE),
+            '/home/ubuntu/flattrade_tb/flattrade_tb/token.txt',
+            '/home/ubuntu/flattrade_tb/token.txt'
+        ]
+        token_path = None
+        for c in candidates:
+            if os.path.exists(c) and os.path.getsize(c) > 0:
+                token_path = c
+                break
 
-        with open(TOKEN_FILE, "r") as f:
+        if not token_path:
+            raise FileNotFoundError(f'{TOKEN_FILE} missing or empty. Run login.py first.')
+
+        with open(token_path, 'r') as f:
             access_token = f.read().strip()
 
-        self.api.set_session(userid=str(USER_ID).strip(), password="", usertoken=access_token)
-        limits = self.api.get_limits()
-        if not limits or not isinstance(limits, dict) or limits.get("stat") != "Ok":
-            raise RuntimeError("Token invalid or expired.")
+        self.api.set_session(userid=str(USER_ID).strip(), password='', usertoken=access_token)
 
-        print("[OK] Natural Gas PAPER TRADING bot authenticated.")
+        try:
+            limits = self.api.get_limits()
+            if not limits or not isinstance(limits, dict) or limits.get('stat') != 'Ok':
+                print('[WARN] Token validation notice: get_limits did not return Ok, proceeding in paper mode.')
+        except Exception as e:
+            print(f'[WARN] Flattrade session warning: {e}. Proceeding in paper mode.')
+
+        print(f'[OK] Natural Gas PAPER TRADING bot authenticated from {token_path}.')
+
+    def _get_mcx_csv(self):
+        if self._mcx_master is not None:
+            return self._mcx_master
+
+        import pandas as pd
+        today_ist = get_ist_now().strftime('%Y-%m-%d')
+        csv_file = f'MCX_symbols_{today_ist}.csv'
+
+        if not os.path.exists(csv_file):
+            print(f'[INFO] {csv_file} not found locally. Attempting automatic download from Shoonya...')
+            try:
+                url = 'https://api.shoonya.com/MCX_symbols.txt.zip'
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=12) as response:
+                    with zipfile.ZipFile(io.BytesIO(response.read())) as z:
+                        with z.open('MCX_symbols.txt') as f:
+                            df = pd.read_csv(f)
+                            df.to_csv(csv_file, index=False)
+                            print(f'[OK] Downloaded and cached {csv_file}')
+            except Exception as e:
+                print(f'[WARN] Could not auto-download {csv_file}: {e}')
+
+        if not os.path.exists(csv_file):
+            existing = sorted(glob.glob('MCX_symbols_*.csv'), reverse=True)
+            if existing:
+                csv_file = existing[0]
+                print(f'[INFO] Using most recent available MCX symbol file: {csv_file}')
+            else:
+                print('[ERROR] No MCX_symbols_*.csv file found in directory!')
+                return None
+
+        try:
+            df = pd.read_csv(csv_file)
+            df['ExpiryDate'] = pd.to_datetime(df['Expiry'], format='%d-%b-%Y', errors='coerce')
+            self._mcx_master = df
+
+            futs = df[(df['Symbol'] == 'NATURALGAS') & (df['Instrument'] == 'FUTCOM')]
+            today_ts = pd.Timestamp(get_ist_now().date())
+            future_futs = futs[futs['ExpiryDate'] >= today_ts]
+            if future_futs.empty:
+                future_futs = futs
+
+            if not future_futs.empty:
+                nearest_fut = future_futs.sort_values('ExpiryDate').iloc[0]
+                self.front_month_futs_token = str(nearest_fut['Token'])
+                self.front_month_futs_symbol = str(nearest_fut['TradingSymbol'])
+                print(f'[INFO] Resolved front-month Natural Gas Future: {self.front_month_futs_symbol} (Token: {self.front_month_futs_token})')
+
+            return self._mcx_master
+        except Exception as e:
+            print(f'[ERROR] Failed loading {csv_file}: {e}')
+            return None
 
     def get_spot(self) -> float:
-        try:
-            res = self.api.searchscrip(exchange="MCX", searchtext="NATURALGAS")
-            if not res or not isinstance(res, dict) or not res.get("values"):
-                return 0.0
-            for item in res["values"]:
-                tsym = str(item.get("tsym", "")).upper()
-                if "NATURALGAS" in tsym and "MINI" not in tsym:
-                    q = self.api.get_quotes(exchange="MCX", token=item.get("token"))
-                    if q and isinstance(q, dict):
-                        val = q.get("lp", q.get("ltp", 0.0))
-                        if val:
-                            return float(val)
-        except Exception:
-            pass
-        return 0.0
+        now_ts = time.time()
+        if now_ts - self._spot_cache['ts'] < 3.0 and self._spot_cache['val'] > 0:
+            return self._spot_cache['val']
+
+        if not self.front_month_futs_token:
+            self._get_mcx_csv()
+
+        if self.front_month_futs_token and self.api and hasattr(self.api, 'get_quotes'):
+            try:
+                q = self.api.get_quotes(exchange='MCX', token=self.front_month_futs_token)
+                if q and isinstance(q, dict):
+                    val = float(q.get('lp', q.get('ltp', 0.0)) or 0.0)
+                    if val > 50.0:
+                        self._spot_cache = {'ts': now_ts, 'val': val}
+                        return val
+            except Exception:
+                pass
+
+        if self.api and hasattr(self.api, 'searchscrip'):
+            try:
+                res = self.api.searchscrip(exchange='MCX', searchtext='NATURALGAS')
+                if res and isinstance(res, dict) and res.get('values'):
+                    for item in res['values']:
+                        tsym = str(item.get('tsym', '')).upper()
+                        if 'NATURALGAS' in tsym and 'MINI' not in tsym and not tsym.endswith('CE') and not tsym.endswith('PE'):
+                            token = item.get('token')
+                            q = self.api.get_quotes(exchange='MCX', token=token)
+                            if q and isinstance(q, dict):
+                                val = float(q.get('lp', q.get('ltp', 0.0)) or 0.0)
+                                if val > 50.0:
+                                    self._spot_cache = {'ts': now_ts, 'val': val}
+                                    return val
+            except Exception:
+                pass
+
+        return self._spot_cache['val']
 
     def find_option_symbol(self, strike: float, option_type: str) -> Optional[Dict]:
-        """Find a matching MCX NATURALGAS option contract for the strike using master CSV."""
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        csv_file = f"MCX_symbols_{today_str}.csv"
-        
-        if not os.path.exists(csv_file):
-            print(f"[WARN] {csv_file} missing. Run download_mcx.py first.")
+        import pandas as pd
+        df = self._get_mcx_csv()
+        if df is None:
             return None
-            
+
         try:
-            import pandas as pd
-            if getattr(self, '_mcx_master', None) is None:
-                df = pd.read_csv(csv_file)
-                # Convert Expiry to datetime for sorting
-                df['ExpiryDate'] = pd.to_datetime(df['Expiry'], format='%d-%b-%Y', errors='coerce')
-                self._mcx_master = df
-                
-            df = self._mcx_master
-            # Filter for Natgas Options matching strike and type
+            today_ts = pd.Timestamp(get_ist_now().date())
             opt_df = df[
-                (df['Symbol'] == 'NATURALGAS') & 
-                (df['Instrument'] == 'OPTFUT') & 
-                (df['OptionType'] == option_type) & 
-                (df['StrikePrice'] == strike)
+                (df['Symbol'] == 'NATURALGAS') &
+                (df['Instrument'] == 'OPTFUT') &
+                (df['OptionType'] == option_type) &
+                (df['StrikePrice'] == float(strike))
             ]
-            
+
             if opt_df.empty:
                 return None
-                
-            # Filter out expired contracts and find the nearest expiry
-            today = pd.Timestamp.now().normalize()
-            future_opts = opt_df[opt_df['ExpiryDate'] >= today]
+
+            future_opts = opt_df[opt_df['ExpiryDate'] >= today_ts]
             if future_opts.empty:
-                future_opts = opt_df # Fallback to any if all are technically expired today
-                
+                future_opts = opt_df
+
             nearest = future_opts.sort_values('ExpiryDate').iloc[0]
             token = str(nearest['Token'])
             tsym = str(nearest['TradingSymbol'])
-            
-            # Get live quote to ensure we have LTP
-            q = self.api.get_quotes(exchange="MCX", token=token)
-            lp = float(q.get("lp", q.get("ltp", 0.0))) if q else 0.0
-            
-            return {"tsym": tsym, "lp": lp, "ls": 1250, "token": token}
-            
+
+            lp = 0.0
+            if self.api and hasattr(self.api, 'get_quotes'):
+                try:
+                    q = self.api.get_quotes(exchange='MCX', token=token)
+                    if q and isinstance(q, dict):
+                        lp = float(q.get('lp', q.get('ltp', 0.0)) or 0.0)
+                except Exception:
+                    pass
+
+            return {'tsym': tsym, 'lp': lp, 'ls': LOT_SIZE, 'token': token}
         except Exception as e:
-            print(f"[ERROR] Failed to resolve option symbol: {e}")
+            print(f'[ERROR] Failed resolving option {strike} {option_type}: {e}')
             return None
 
-    def _enter_leg(self, leg: str, strike: float, side: str, loss_stop_pct: float, tsl_pct: float):
-        option_type = "CE" if leg == "CE" else "PE"
+    def _get_leg_ltp(self, pos: dict) -> float:
+        token = pos.get('token')
+        if token and self.api and hasattr(self.api, 'get_quotes'):
+            try:
+                q = self.api.get_quotes(exchange='MCX', token=token)
+                if q and isinstance(q, dict):
+                    val = float(q.get('lp', q.get('ltp', 0.0)) or 0.0)
+                    if val > 0:
+                        pos['_last_ltp'] = val
+                        return val
+            except Exception:
+                pass
+        return pos.get('_last_ltp', pos['entry_price'])
+
+    def _enter_leg(self, leg: str, strike: float, side: str, loss_stop_pct: float = 0.15, tsl_pct: float = 0.15):
+        if self.trades_today >= MAX_DAILY_TRADES:
+            print(f'[GUARD] Max daily trades limit ({MAX_DAILY_TRADES}) reached. Skipping entry.')
+            return None
+
+        option_type = 'CE' if leg == 'CE' else 'PE'
         match = self.find_option_symbol(strike, option_type)
         if not match:
-            print(f"[WARN] Could not resolve {leg} strike={strike}.")
+            print(f'[WARN] Could not resolve contract for {leg} Strike {strike}.')
             return None
 
-        tsym = match["tsym"]
-        ltp = float(match.get("lp", 0.0))
+        tsym = match['tsym']
+        ltp = float(match.get('lp', 0.0))
         if ltp <= 0:
-            print(f"[WARN] LTP is 0 or invalid for {tsym}. Cannot simulate paper trade.")
+            print(f'[WARN] LTP is 0 for {tsym}. Skipping entry.')
             return None
-            
-        qty = 1250 # 1 Lot of Natgas
 
-        # ---- PAPER TRADING (No API Order) ----
-        print(f"[PAPER FILL] Entered {side} {qty}x {tsym} @ Rs{ltp:.2f}")
+        qty = LOT_SIZE
+        initial_sl = round(ltp * (1.0 + loss_stop_pct), 2)
+        initial_tsl = round(ltp * (1.0 + tsl_pct), 2)
 
         pos = {
-            "leg": leg,
-            "tsym": tsym,
-            "strike": strike,
-            "side": side,
-            "qty": qty,
-            "entry_price": ltp,
-            "loss_stop_pct": loss_stop_pct,
-            "tsl_pct": tsl_pct,
-            "premium_sl_state": {
-                "lowest_ltp": ltp,
-                "loss_stop_pct": loss_stop_pct,
-                "tsl_pct": tsl_pct,
-                "loss_stop": ltp * (1 + loss_stop_pct),
-                "tsl": ltp * (1 + tsl_pct),
-                "imported_at": time.time(),
-            },
+            'leg': leg,
+            'tsym': tsym,
+            'token': match.get('token', ''),
+            'strike': strike,
+            'side': side,
+            'qty': qty,
+            'entry_price': ltp,
+            '_last_ltp': ltp,
+            'loss_stop_pct': loss_stop_pct,
+            'tsl_pct': tsl_pct,
+            'sl_state': {
+                'lowest_ltp': ltp,
+                'current_sl': initial_sl,
+                'loss_stop_pct': loss_stop_pct,
+                'tsl_pct': tsl_pct
+            }
         }
         self.positions[leg] = pos
+        self.trades_today += 1
 
-        sl_val = ltp * (1 + loss_stop_pct)
-        tsl_val = ltp * (1 + tsl_pct)
-        tg = (
-            f"<pre>"
-            f"━━━ TRADE OPENED ━━━\n"
-            f"\n"
-            f"  {leg} {int(strike)}  SELL @ {ltp:.2f}\n"
-            f"\n"
-            f"  SL   {loss_stop_pct*100:.0f}%  →  {sl_val:.2f}\n"
-            f"  TSL  {tsl_pct*100:.0f}%  →  {tsl_val:.2f}\n"
-            f"  Qty  {qty}\n"
-            f"\n"
-            f"  {tsym}"
-            f"</pre>"
-        )
-        print(f"[PAPER ENTRY] {side} {leg} {tsym} @ Rs{ltp:.2f}")
+        lines = [
+            '<pre>',
+            '━━━ MCX TRADE OPENED ━━━',
+            '',
+            f'  {leg:<4} {int(strike):<5} {side} @ {ltp:.2f}',
+            f'  SL   {loss_stop_pct*100:.0f}%  →  {initial_sl:.2f}',
+            f'  TSL  {tsl_pct*100:.0f}%  →  {initial_tsl:.2f}',
+            f'  Qty  {qty}',
+            '',
+            f'  {tsym}',
+            '</pre>'
+        ]
+        tg = chr(10).join(lines)
+        print(f'[PAPER ENTRY] {side} {qty}x {leg} Strike {int(strike)} ({tsym}) @ Rs{ltp:.2f}')
         send_telegram(tg)
         return pos
 
@@ -219,42 +336,32 @@ class NaturalGasPaperBot:
         pos = self.positions.get(leg)
         if not pos:
             return
-        tsym = pos["tsym"]
-        trade_side = "BUY" if pos["side"] == "SELL" else "SELL"
-        ltp = pos["entry_price"]
-        
-        try:
-            match = self.find_option_symbol(pos["strike"], "CE" if leg == "CE" else "PE")
-            if match:
-                quote = self.api.get_quotes(exchange="MCX", token=match.get("token", ""))
-                if quote:
-                    ltp = float(quote.get("lp", quote.get("ltp", ltp)))
-        except Exception:
-            pass
+        tsym = pos['tsym']
+        trade_side = 'BUY' if pos['side'] == 'SELL' else 'SELL'
+        ltp = self._get_leg_ltp(pos)
 
-        # ---- PAPER TRADING (No API Order) ----
-        if pos["side"] == "SELL":
-            pnl = (pos["entry_price"] - ltp) * pos["qty"]
+        if pos['side'] == 'SELL':
+            pnl = (pos['entry_price'] - ltp) * pos['qty']
         else:
-            pnl = (ltp - pos["entry_price"]) * pos["qty"]
-            
-        self.total_realized_pnl += pnl
+            pnl = (ltp - pos['entry_price']) * pos['qty']
 
-        sign = "+" if pnl >= 0 else ""
-        tg = (
-            f"<pre>"
-            f"━━━ TRADE CLOSED ━━━\n"
-            f"\n"
-            f"  {leg} {int(pos['strike'])}  {reason}\n"
-            f"\n"
-            f"  Entry  {pos['entry_price']:.2f}\n"
-            f"  Exit   {ltp:.2f}\n"
-            f"  PnL    {sign}{pnl:,.0f}\n"
-            f"\n"
-            f"  Total  {'+' if self.total_realized_pnl >= 0 else ''}{self.total_realized_pnl:,.0f}"
-            f"</pre>"
-        )
-        print(f"[PAPER EXIT] {trade_side} {pos['qty']}x {tsym} @ Rs{ltp:.2f} | PnL: Rs{pnl:.2f} | {reason}")
+        self.total_realized_pnl += pnl
+        sign = '+' if pnl >= 0 else ''
+
+        lines = [
+            '<pre>',
+            '━━━ MCX TRADE CLOSED ━━━',
+            '',
+            f'  {leg:<4} {int(pos["strike"]):<5} {reason}',
+            f'  Entry  {pos["entry_price"]:.2f}',
+            f'  Exit   {ltp:.2f}',
+            f'  PnL    {sign}{pnl:,.0f}',
+            '',
+            f'  Total Realized: {"+" if self.total_realized_pnl >= 0 else ""}{self.total_realized_pnl:,.0f}',
+            '</pre>'
+        ]
+        tg = chr(10).join(lines)
+        print(f'[PAPER EXIT] {trade_side} {pos["qty"]}x {tsym} @ Rs{ltp:.2f} | PnL: Rs{pnl:,.2f} | {reason}')
         send_telegram(tg)
         del self.positions[leg]
 
@@ -262,75 +369,89 @@ class NaturalGasPaperBot:
         for leg in list(self.positions.keys()):
             self._close_leg(leg, reason)
 
-    def _update_leg(self, leg: str, live_ltp: float):
+    def _update_leg(self, leg: str, live_ltp: float) -> Tuple[bool, str]:
         pos = self.positions.get(leg)
-        if not pos or pos["side"] != "SELL":
-            return False, ""
+        if not pos or pos['side'] != 'SELL':
+            return False, ''
+        if live_ltp <= 0:
+            return False, ''
 
-        state = pos["premium_sl_state"]
-        lowest = float(state.get("lowest_ltp", pos["entry_price"]))
+        state = pos['sl_state']
+        lowest = float(state.get('lowest_ltp', pos['entry_price']))
         if live_ltp < lowest:
             lowest = live_ltp
-        state["lowest_ltp"] = round(lowest, 2)
+            state['lowest_ltp'] = round(lowest, 2)
 
-        loss_stop = lowest * (1.0 + pos["loss_stop_pct"])
-        tsl_stop = lowest * (1.0 + pos["tsl_pct"])
-        state["loss_stop"] = round(loss_stop, 2)
-        state["tsl"] = round(tsl_stop, 2)
+        entry_prem = pos['entry_price']
+        initial_sl = round(entry_prem * (1.0 + pos['loss_stop_pct']), 2)
+        trail_sl = round(lowest * (1.0 + pos['tsl_pct']), 2)
+        target_sl = min(trail_sl, initial_sl)
 
-        if live_ltp >= loss_stop:
-            return True, f"Stop loss hit on {leg} at {live_ltp:.2f} >= {loss_stop:.2f}"
-        if live_ltp >= tsl_stop:
-            return True, f"TSL hit on {leg} at {live_ltp:.2f} >= {tsl_stop:.2f}"
-        return False, ""
-        
+        if 'current_sl' in state:
+            current_sl = min(target_sl, state['current_sl'])
+        else:
+            current_sl = target_sl
+        state['current_sl'] = current_sl
+
+        if live_ltp >= current_sl:
+            if current_sl < initial_sl:
+                return True, f'TSL Hit on {leg} ({live_ltp:.2f} >= {current_sl:.2f})'
+            else:
+                return True, f'SL Hit on {leg} ({live_ltp:.2f} >= {current_sl:.2f})'
+
+        return False, ''
+
     def _print_dashboard(self, spot: float, atm: float):
-        now_s = datetime.now().strftime("%H:%M:%S")
-        total_unrealized = 0.0
+        now = get_ist_now()
+        now_ts = time.time()
+        now_s = now.strftime('%H:%M:%S IST')
 
-        # Console
-        print(f"\n[{now_s}] SPOT: {spot:.2f} | ATM: {atm} | LEGS: {len(self.positions)} | REAL PNL: Rs{self.total_realized_pnl:.2f}")
+        if now_ts - self._last_console_dash_ts >= 10.0:
+            self._last_console_dash_ts = now_ts
+            total_unrealized = 0.0
+            print(f"[{now_s}] SPOT: {spot:.2f} | ATM: {int(atm)} | LEGS: {len(self.positions)} | REAL PNL: Rs{self.total_realized_pnl:,.2f}")
+            for leg, pos in self.positions.items():
+                ltp = self._get_leg_ltp(pos)
+                pnl = (pos['entry_price'] - ltp) * pos['qty']
+                total_unrealized += pnl
+                tsl = pos.get('sl_state', {}).get('current_sl', 0.0)
+                print(f'  {leg:2} | {pos["side"]} {int(pos["strike"])} | Entry:{pos["entry_price"]:.2f} LTP:{ltp:.2f} TSL:{tsl:.2f} PnL:Rs{pnl:,.0f}')
+            print('-' * 65)
 
-        # Collect leg data
-        leg_data = []
-        for leg, pos in self.positions.items():
-            match = self.find_option_symbol(pos["strike"], "CE" if leg == "CE" else "PE")
-            ltp = float(match.get("lp", pos["entry_price"])) if match else pos["entry_price"]
-            pnl = (pos["entry_price"] - ltp) * pos["qty"] if pos["side"] == "SELL" else (ltp - pos["entry_price"]) * pos["qty"]
-            total_unrealized += pnl
-            state = pos.get("premium_sl_state", {})
-            tsl = state.get("tsl", 0.0)
-            leg_data.append((leg, pos, ltp, pnl, tsl))
-            print(f"  {leg:2} | {pos['side']} {int(pos['strike'])} | E:{pos['entry_price']:.2f} LTP:{ltp:.2f} TSL:{tsl:.2f} PnL:{pnl:.0f}")
-        print("-" * 60)
+        if now_ts - self._last_tg_dash_ts >= 60.0:
+            self._last_tg_dash_ts = now_ts
+            total_unrealized = 0.0
+            leg_data = []
+            for leg, pos in self.positions.items():
+                ltp = self._get_leg_ltp(pos)
+                pnl = (pos['entry_price'] - ltp) * pos['qty']
+                total_unrealized += pnl
+                tsl = pos.get('sl_state', {}).get('current_sl', 0.0)
+                leg_data.append((leg, pos, ltp, pnl, tsl))
 
-        total_pnl = self.total_realized_pnl + total_unrealized
+            total_pnl = self.total_realized_pnl + total_unrealized
+            lines = [
+                '<pre>',
+                'MCX NATURAL GAS (PAPER)',
+                f'Spot {spot:.2f}   ATM {int(atm)}',
+                '─────────────────────'
+            ]
+            if leg_data:
+                for leg, pos, ltp, pnl, tsl in leg_data:
+                    sign = '+' if pnl >= 0 else ''
+                    lines.append(f'{leg:2} SELL {int(pos["strike"]):<4} {sign}{pnl:>7,.0f}')
+                    lines.append(f'  E {pos["entry_price"]:>6.2f}  L {ltp:>6.2f}  TSL {tsl:>6.2f}')
+            else:
+                lines.append('  No Open Positions')
 
-        # Telegram
-        t = "<pre>"
-        t += "MCX NATURAL GAS\n"
-        t += f"Spot {spot:.2f}   ATM {int(atm)}\n"
-        t += "─────────────────────\n"
+            lines.append('─────────────────────')
+            lines.append(f'Realized  {'+' if self.total_realized_pnl >= 0 else ''}{self.total_realized_pnl:>9,.0f}')
+            lines.append(f'Unreal    {'+' if total_unrealized >= 0 else ''}{total_unrealized:>9,.0f}')
+            lines.append(f'Net MTM   {'+' if total_pnl >= 0 else ''}{total_pnl:>9,.0f}')
+            lines.append('</pre>')
+            send_telegram(chr(10).join(lines))
 
-        for leg, pos, ltp, pnl, tsl in leg_data:
-            sign = "+" if pnl >= 0 else ""
-            t += f"{leg:2} SELL {int(pos['strike']):>3}"
-            t += f"  {sign}{pnl:>7,.0f}\n"
-            t += f"   E {pos['entry_price']:>6.2f}"
-            t += f"  L {ltp:>6.2f}\n"
-            t += f"   TSL {tsl:>6.2f}\n"
-
-        t += "─────────────────────\n"
-        t += f"Realized  {'+' if self.total_realized_pnl >= 0 else ''}{self.total_realized_pnl:>9,.0f}\n"
-        t += f"Unreal    {'+' if total_unrealized >= 0 else ''}{total_unrealized:>9,.0f}\n"
-        t += f"Net MTM   {'+' if total_pnl >= 0 else ''}{total_pnl:>9,.0f}"
-        t += "</pre>"
-
-        send_telegram(t)
-
-
-
-    def _kama_reversal_confirmed(self, current_kama: float, prev_kama: float):
+    def _kama_reversal_confirmed(self, current_kama: float, prev_kama: float) -> bool:
         if current_kama is None or prev_kama is None:
             return False
         delta = current_kama - prev_kama
@@ -349,112 +470,106 @@ class NaturalGasPaperBot:
 
     def run(self):
         self.authenticate()
-        print("="*80)
-        print(" NATURAL GAS PAPER TRADING BOT STARTED ")
-        print("="*80)
-        
-        send_telegram("<pre>MCX NATURAL GAS\nPaper Trading Online</pre>")
+        print('=' * 80)
+        print(' NATURAL GAS PAPER TRADING BOT STARTED (18:00 - 23:24 IST) ')
+        print('=' * 80)
+        send_telegram("<pre>MCX NATURAL GAS\nPaper Trading Bot Online</pre>")
 
-        hist: List[float] = []
-        current_kama = None
-        prev_kama = None
-        last_dash_ts = 0
+        hist: deque = deque(maxlen=300)
+        last_wait_msg_ts = 0.0
 
         while True:
             try:
-                IST = timezone(timedelta(hours=5, minutes=30))
-                now = datetime.now(IST)
-                
-                # Check weekends
-                if now.weekday() >= 5:
-                    print("Weekend. Exit.")
-                    self._close_all("WEEKEND")
+                now = get_ist_now()
+
+                if now.weekday() == 6:
+                    print(f'[{now.strftime("%H:%M:%S")}] Sunday. Markets closed.')
+                    time.sleep(60)
+                    continue
+                if now.weekday() == 5 and now.hour >= 17:
+                    print(f'[{now.strftime("%H:%M:%S")}] Saturday post-17:00 IST. MCX closed.')
+                    self._close_all('SATURDAY_CLOSE')
+                    time.sleep(60)
+                    continue
+
+                if now.hour > MCX_EXIT_HOUR or (now.hour == MCX_EXIT_HOUR and now.minute >= MCX_EXIT_MINUTE):
+                    print(f'[AUTO] Exit time reached ({MCX_EXIT_HOUR}:{MCX_EXIT_MINUTE:02d} IST). Liquidating positions...')
+                    self._close_all('SESSION_END')
+                    send_telegram(f"<pre>MCX Session Completed\nFinal Realized PnL: Rs {self.total_realized_pnl:,.2f}</pre>")
                     break
 
-                # Auto-square off at 11:24 PM (23:24 IST)
-                if now.hour > 23 or (now.hour == 23 and now.minute >= 24):
-                    print("[AUTO] Exit time reached (11:24 PM IST). Closing all positions.")
-                    self._close_all("SESSION_END")
-                    break
-
-                # Pre-market wait until 6:00 PM
-                if now.hour < 18:
-                    if time.time() - last_dash_ts > 60:
-                        print(f"Waiting for market open (18:00 IST). Current time: {now.strftime('%H:%M:%S')}")
-                        last_dash_ts = time.time()
-                    time.sleep(5)
+                if now.hour < MCX_ENTRY_HOUR:
+                    if time.time() - last_wait_msg_ts > 60.0:
+                        last_wait_msg_ts = time.time()
+                        print(f'Waiting for market open ({MCX_ENTRY_HOUR}:00 IST). Current IST: {now.strftime("%H:%M:%S")}')
+                    time.sleep(10)
                     continue
 
                 spot = self.get_spot()
-                if spot <= 0:
-                    time.sleep(5)
+                if spot <= 50.0:
+                    time.sleep(3)
                     continue
-                    
-                atm = self.find_atm_strike(spot)
 
+                atm = self.find_atm_strike(spot)
                 hist.append(spot)
-                trend = 0
+
+                reversal = False
                 if len(hist) >= 12:
-                    current_kama, prev_kama, delta, trend = KAMA.compute(hist, period=10, fast=4, slow=30)
+                    current_kama, prev_kama, delta, trend = KAMA.compute(list(hist), period=10, fast=4, slow=30)
                     if current_kama is not None and prev_kama is not None:
                         reversal = self._kama_reversal_confirmed(current_kama, prev_kama)
-                    else:
-                        reversal = False
-                else:
-                    reversal = False
 
-                # If we have no positions, start with a Straddle
                 if not self.positions:
-                    if now.hour >= 18:
-                        # Straddle Entry (Sell CE and PE at ATM)
-                        self._enter_leg("CE", atm, "SELL", 0.10, 0.12)
-                        self._enter_leg("PE", atm, "SELL", 0.10, 0.12)
-                        print(f"[INIT] ATM straddle opened at {atm}")
+                    if now.hour >= MCX_ENTRY_HOUR and self.trades_today < MAX_DAILY_TRADES:
+                        print(f'[INIT] Opening Initial ATM Straddle at Strike {int(atm)}...')
+                        self._enter_leg('CE', atm, 'SELL', loss_stop_pct=0.15, tsl_pct=0.15)
+                        self._enter_leg('PE', atm, 'SELL', loss_stop_pct=0.15, tsl_pct=0.15)
                 else:
-                    # We have a position.
-                    short_legs = [leg for leg in self.positions if self.positions[leg]["side"] == "SELL"]
+                    short_legs = [leg for leg in self.positions if self.positions[leg]['side'] == 'SELL']
+
                     if len(short_legs) == 1 and reversal:
-                        if time.time() - self.last_reentry_ts < 60:
-                            pass
-                        else:
-                            missing_leg = "CE" if "PE" in short_legs else "PE"
-                            self._enter_leg(missing_leg, atm, "SELL", 0.10, 0.12)
-                            self.last_reentry_ts = time.time()
-                            print(f"[REENTRY] KAMA reversal triggered, re-entered {missing_leg} at {atm} to form Straddle")
+                        if time.time() - self.last_reentry_ts >= 60.0:
+                            missing_leg = 'CE' if 'PE' in short_legs else 'PE'
+                            surviving_leg = short_legs[0]
+                            surviving_strike = self.positions[surviving_leg]['strike']
+
+                            dist = min(abs(surviving_strike - atm), 25.0)
+                            if missing_leg == 'CE':
+                                reentry_strike = round_to_price(atm + dist, STRIKE_STEP)
+                            else:
+                                reentry_strike = round_to_price(atm - dist, STRIKE_STEP)
+
+                            print(f'[REENTRY] KAMA reversal detected! Re-entering {missing_leg} at Strike {int(reentry_strike)} (Surviving: {surviving_leg} {int(surviving_strike)})...')
+                            if self._enter_leg(missing_leg, reentry_strike, 'SELL', loss_stop_pct=0.15, tsl_pct=0.15):
+                                self.last_reentry_ts = time.time()
 
                     for leg in list(self.positions.keys()):
-                        pos = self.positions[leg]
-                        if pos["side"] != "SELL":
+                        pos = self.positions.get(leg)
+                        if not pos or pos['side'] != 'SELL':
                             continue
-                        match = self.find_option_symbol(pos["strike"], "CE" if leg == "CE" else "PE")
-                        live_ltp = float(match.get("lp", pos["entry_price"])) if match else pos["entry_price"]
-                        
+                        live_ltp = self._get_leg_ltp(pos)
                         hit, reason = self._update_leg(leg, live_ltp)
                         if hit:
-                            print(f"[HIT] {reason}")
+                            print(f'[ALERT] {reason}')
                             self._close_leg(leg, reason)
                             break
-                            
-                # Send Telegram dashboard every 3 seconds
-                if time.time() - last_dash_ts >= 3:
-                    self._print_dashboard(spot, atm)
-                    last_dash_ts = time.time()
 
-                time.sleep(3)
+                self._print_dashboard(spot, atm)
+                time.sleep(1.0)
 
             except KeyboardInterrupt:
-                print("\nKeyboard interrupt. Closing all positions.")
-                self._close_all("MANUAL_STOP")
+                print("\n[STOP] KeyboardInterrupt received. Squaring off all positions...")
+                self._close_all('KEYBOARD_INTERRUPT')
                 break
             except Exception as e:
-                print(f"[ERROR] {e}")
-                time.sleep(5)
+                print(f'[ERROR] Execution loop exception: {e}')
+                time.sleep(3.0)
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     try:
         bot = NaturalGasPaperBot()
         bot.run()
     except Exception as e:
-        print(f"[FATAL] {e}")
+        print(f'[FATAL] {e}')
+        send_telegram(f'<pre>MCX Bot Fatal Error: {e}</pre>')
         sys.exit(1)
