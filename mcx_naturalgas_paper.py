@@ -18,10 +18,12 @@ try:
 except Exception:
     USER_ID = os.getenv('USER_ID', '')
 
+_noren_import_error = ""
 try:
     from api_helper import NorenApiPy
-except Exception:
+except Exception as e:
     NorenApiPy = None
+    _noren_import_error = str(e)
 
 # Standard Indian Standard Time (IST = UTC+5:30)
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -97,7 +99,8 @@ class NaturalGasPaperBot:
 
     def authenticate(self):
         if not self.api:
-            raise RuntimeError('NorenApiPy is not available. Make sure api_helper.py is present.')
+            err_detail = f" ({_noren_import_error})" if _noren_import_error else ""
+            raise RuntimeError(f"NorenApiPy is not available{err_detail}. Make sure your venv is activated: source venv/bin/activate")
 
         candidates = [
             TOKEN_FILE,

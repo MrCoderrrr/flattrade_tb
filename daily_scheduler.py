@@ -11,14 +11,30 @@ IST = timezone(timedelta(hours=5, minutes=30))
 process_upv2 = None
 process_mcx = None
 
+def get_python_exec():
+    # Detect virtual environment python
+    candidates = [
+        os.path.abspath("venv/bin/python3"),
+        os.path.abspath("../venv/bin/python3"),
+        "/home/ubuntu/flattrade_tb/venv/bin/python3",
+        "/home/ubuntu/flattrade_tb/flattrade_tb/venv/bin/python3",
+        "/home/ubuntu/venv/bin/python3",
+        sys.executable
+    ]
+    for c in candidates:
+        if c and os.path.exists(c) and os.access(c, os.X_OK):
+            return c
+    return "python3"
+
 def start_upv2():
     global process_upv2
     # Start if not running
     if process_upv2 is None or process_upv2.poll() is not None:
-        print(f"[{datetime.now(IST)}] Starting upv2_paper.py")
+        py_bin = get_python_exec()
+        print(f"[{datetime.now(IST)}] Starting upv2_paper.py using {py_bin}")
         with open("paper.log", "a") as out:
             process_upv2 = subprocess.Popen(
-                ["python3", "-u", "upv2_paper.py"],
+                [py_bin, "-u", "upv2_paper.py"],
                 stdout=out,
                 stderr=subprocess.STDOUT
             )
@@ -39,10 +55,11 @@ def start_mcx():
     global process_mcx
     # Start if not running
     if process_mcx is None or process_mcx.poll() is not None:
-        print(f"[{datetime.now(IST)}] Starting mcx_naturalgas_paper.py")
+        py_bin = get_python_exec()
+        print(f"[{datetime.now(IST)}] Starting mcx_naturalgas_paper.py using {py_bin}")
         with open("natgas_paper.log", "a") as out:
             process_mcx = subprocess.Popen(
-                ["python3", "-u", "mcx_naturalgas_paper.py"],
+                [py_bin, "-u", "mcx_naturalgas_paper.py"],
                 stdout=out,
                 stderr=subprocess.STDOUT
             )
