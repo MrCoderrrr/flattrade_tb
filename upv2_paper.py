@@ -594,9 +594,9 @@ def send_telegram_nifty_dashboard(spot: float, atm: int, mode: str, positions: d
                 ltp = pos.get("ltp", entry)
                 pnl = pos.get("pnl", 0.0)
                 sign = "+" if pnl >= 0 else ""
-                
-                # Fetch TSL if available
-                tsl = pos.get("dual_sl_state", {}).get("current_premium_sl", 0.0)
+                # Fetch TSL if available safely
+                sl_state = pos.get("dual_sl_state") or {}
+                tsl = sl_state.get("current_premium_sl", 0.0)
                 tsl_str = f"  TSL {tsl:>5.2f}" if tsl > 0 else ""
 
                 t += f"{leg:<8} {side:>4} {strike}\n"
@@ -609,8 +609,7 @@ def send_telegram_nifty_dashboard(spot: float, atm: int, mode: str, positions: d
         t += f"Net MTM  {'+' if total_pnl >= 0 else ''}{total_pnl:>10,.0f}\n"
         
         # Only show MTD/YTD/Capital at the end of the day (after 15:34)
-        import datetime
-        now = datetime.datetime.now()
+        now = get_ist_now()
         if now.hour > 15 or (now.hour == 15 and now.minute >= 34):
             t += "─────────────────────\n"
             t += f"MTD {'+' if mtd_pnl >= 0 else ''}{mtd_pnl:>8,.0f}"
