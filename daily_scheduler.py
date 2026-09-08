@@ -1,8 +1,11 @@
 import subprocess
 import time
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import os
 import signal
+
+# Define IST timezone
+IST = timezone(timedelta(hours=5, minutes=30))
 
 # Define process variables
 process_upv2 = None
@@ -12,7 +15,7 @@ def start_upv2():
     global process_upv2
     # Start if not running
     if process_upv2 is None or process_upv2.poll() is not None:
-        print(f"[{datetime.now()}] Starting upv2_paper.py")
+        print(f"[{datetime.now(IST)}] Starting upv2_paper.py")
         with open("paper.log", "a") as out:
             process_upv2 = subprocess.Popen(
                 ["python3", "-u", "upv2_paper.py"],
@@ -24,7 +27,7 @@ def stop_upv2():
     global process_upv2
     # Stop if running
     if process_upv2 is not None and process_upv2.poll() is None:
-        print(f"[{datetime.now()}] Stopping upv2_paper.py")
+        print(f"[{datetime.now(IST)}] Stopping upv2_paper.py")
         process_upv2.terminate()
         try:
             process_upv2.wait(timeout=5)
@@ -36,7 +39,7 @@ def start_mcx():
     global process_mcx
     # Start if not running
     if process_mcx is None or process_mcx.poll() is not None:
-        print(f"[{datetime.now()}] Starting mcx_naturalgas_paper.py")
+        print(f"[{datetime.now(IST)}] Starting mcx_naturalgas_paper.py")
         with open("natgas_paper.log", "a") as out:
             process_mcx = subprocess.Popen(
                 ["python3", "-u", "mcx_naturalgas_paper.py"],
@@ -48,7 +51,7 @@ def stop_mcx():
     global process_mcx
     # Stop if running
     if process_mcx is not None and process_mcx.poll() is None:
-        print(f"[{datetime.now()}] Stopping mcx_naturalgas_paper.py")
+        print(f"[{datetime.now(IST)}] Stopping mcx_naturalgas_paper.py")
         process_mcx.terminate()
         try:
             process_mcx.wait(timeout=5)
@@ -57,10 +60,10 @@ def stop_mcx():
         process_mcx = None
 
 def main():
-    print(f"[{datetime.now()}] Scheduler started...")
+    print(f"[{datetime.now(IST)}] Scheduler started...")
     try:
         while True:
-            now = datetime.now()
+            now = datetime.now(IST)
             current_time = now.strftime("%H:%M")
             
             # Check if it's a weekday (Monday=0, Sunday=6)
@@ -83,7 +86,7 @@ def main():
             time.sleep(30)
             
     except KeyboardInterrupt:
-        print(f"[{datetime.now()}] Scheduler stopping... shutting down active processes.")
+        print(f"[{datetime.now(IST)}] Scheduler stopping... shutting down active processes.")
         stop_upv2()
         stop_mcx()
         print("Done.")
