@@ -185,7 +185,7 @@ except ImportError:
                 try:
                     with open(self.filename, 'r') as f: return json.load(f)
                 except: pass
-            return {"mtd_pnl": 0.0, "ytd_pnl": 0.0, "current_capital": CAPITAL, "last_date": ""}
+            return {"mtd_pnl": 0.0, "ytd_pnl": 0.0, "current_capital": globals().get("CAPITAL", 195784.0), "last_date": ""}
             
         def _save(self):
             import json
@@ -217,7 +217,7 @@ except ImportError:
                 "today_pnl": 0.0,
                 "mtd_pnl": self.data.get("mtd_pnl", 0.0),
                 "ytd_pnl": self.data.get("ytd_pnl", 0.0),
-                "current_capital": self.data.get("current_capital", kwargs.get("base_capital", CAPITAL))
+                "current_capital": self.data.get("current_capital", kwargs.get("base_capital", globals().get("CAPITAL", 195784.0)))
             }
             
     db = DBManager()
