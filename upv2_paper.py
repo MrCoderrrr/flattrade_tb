@@ -175,8 +175,51 @@ except ImportError:
             return round(spot * (iv / 100.0) / np.sqrt(252), 2)
 
     class DBManager:
+        def __init__(self, filename="pnl_tracker.json"):
+            self.filename = filename
+            self.data = self._load()
+            
+        def _load(self):
+            import json, os
+            if os.path.exists(self.filename):
+                try:
+                    with open(self.filename, 'r') as f: return json.load(f)
+                except: pass
+            return {"mtd_pnl": 0.0, "ytd_pnl": 0.0, "current_capital": CAPITAL, "last_date": ""}
+            
+        def _save(self):
+            import json
+            with open(self.filename, 'w') as f: json.dump(self.data, f)
+            
+        def commit_daily_pnl(self, realized_pnl: float):
+            import datetime
+            today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+            if self.data.get("last_date") == today_str: return # already committed today
+            
+            # Simple assumption: if month changes, reset mtd. if year changes, reset ytd.
+            last_date_str = self.data.get("last_date", "")
+            if last_date_str:
+                last_dt = datetime.datetime.strptime(last_date_str, "%Y-%m-%d")
+                now_dt = datetime.datetime.now()
+                if last_dt.month != now_dt.month: self.data["mtd_pnl"] = 0.0
+                if last_dt.year != now_dt.year: self.data["ytd_pnl"] = 0.0
+                
+            self.data["mtd_pnl"] += realized_pnl
+            self.data["ytd_pnl"] += realized_pnl
+            self.data["current_capital"] += realized_pnl
+            self.data["last_date"] = today_str
+            self._save()
+            
         def record_trade(self, *args, **kwargs): pass
-        def get_strategy_pnl_summary(self, *args, **kwargs): return {"today_pnl": 0.0, "mtd_pnl": 0.0, "ytd_pnl": 0.0, "current_capital": kwargs.get("base_capital", 195784.0)}
+        
+        def get_strategy_pnl_summary(self, *args, **kwargs):
+            return {
+                "today_pnl": 0.0,
+                "mtd_pnl": self.data.get("mtd_pnl", 0.0),
+                "ytd_pnl": self.data.get("ytd_pnl", 0.0),
+                "current_capital": self.data.get("current_capital", kwargs.get("base_capital", CAPITAL))
+            }
+            
     db = DBManager()
 
 
@@ -409,9 +452,9 @@ HEDGE_DISTANCE_FLOOR      = 300
 HEDGE_DISTANCE_RATIO      = 1.5
 
 # --- PREMIUM TSL (percentage of entry premium) ---
-PREM_SL_INITIAL_PCT       = 0.05   # 5% initial SL
-PREM_TSL_MIN_PCT          = 0.09   # 9% flat trail
-PREM_TSL_MAX_PCT          = 0.09   # 9% flat trail
+PREM_SL_INITIAL_PCT       = 0.15   # 15% initial SL
+PREM_TSL_MIN_PCT          = 0.15   # 15% flat trail
+PREM_TSL_MAX_PCT          = 0.15   # 15% flat trail
 
 # --- REENTRY CAPS ---
 KAMA_REVERSAL_ATR_RATIO   = 0.15
@@ -538,19 +581,29 @@ def send_telegram_nifty_dashboard(spot: float, atm: int, mode: str, positions: d
                 ltp = pos.get("ltp", entry)
                 pnl = pos.get("pnl", 0.0)
                 sign = "+" if pnl >= 0 else ""
+                
+                # Fetch TSL if available
+                tsl = pos.get("dual_sl_state", {}).get("current_premium_sl", 0.0)
+                tsl_str = f"  TSL {tsl:>5.2f}" if tsl > 0 else ""
 
                 t += f"{leg:<8} {side:>4} {strike}\n"
-                t += f"  E {entry:>7.2f}  L {ltp:>7.2f}\n"
+                t += f"  E {entry:>7.2f}  L {ltp:>7.2f}{tsl_str}\n"
                 t += f"  PnL {sign}{pnl:>9,.0f}\n"
 
         t += "─────────────────────\n"
         t += f"Realized {'+' if realized_pnl >= 0 else ''}{realized_pnl:>10,.0f}\n"
         t += f"Unreal   {'+' if unrealized_pnl >= 0 else ''}{unrealized_pnl:>10,.0f}\n"
         t += f"Net MTM  {'+' if total_pnl >= 0 else ''}{total_pnl:>10,.0f}\n"
-        t += "─────────────────────\n"
-        t += f"MTD {'+' if mtd_pnl >= 0 else ''}{mtd_pnl:>8,.0f}"
-        t += f"  YTD {'+' if ytd_pnl >= 0 else ''}{ytd_pnl:>8,.0f}\n"
-        t += f"Capital {total_cap:>12,.0f}"
+        
+        # Only show MTD/YTD/Capital at the end of the day (after 15:34)
+        import datetime
+        now = datetime.datetime.now()
+        if now.hour > 15 or (now.hour == 15 and now.minute >= 34):
+            t += "─────────────────────\n"
+            t += f"MTD {'+' if mtd_pnl >= 0 else ''}{mtd_pnl:>8,.0f}"
+            t += f"  YTD {'+' if ytd_pnl >= 0 else ''}{ytd_pnl:>8,.0f}\n"
+            t += f"Capital {total_cap:>12,.0f}\n"
+            
         t += "</pre>"
 
         _tg_send(t)
@@ -1339,7 +1392,7 @@ class ExecutionEngine:
 
     @classmethod
     def calculate_hedge_strikes(cls, atm_spot: int, ce_short_strike: int, pe_short_strike: int, dte_days: float = 2.0) -> Tuple[int, int]:
-        hedge_dist = 1000
+        hedge_dist = 150
         return atm_spot + hedge_dist, atm_spot - hedge_dist
 
     def _log_trade(self, action: str, leg: str, strike: int, side: str, qty: int, price: float, pnl: float = None, reason: str = ""):
@@ -1602,8 +1655,15 @@ class ExecutionEngine:
                 
             # Instant re-entry on 0.25 reversal (1 bar)
             if cd.get("consecutive_bars", 0) >= 1:
-                # User explicitly requested: "the short leg should reenter at that atm"
-                strike = atm
+                # Calculate distance based on the surviving opposite leg
+                opposite_leg = "PE" if leg == "CE" else "CE"
+                if opposite_leg in self.positions and self.positions[opposite_leg].get("side") == "SELL":
+                    dist = abs(self.positions[opposite_leg]["strike"] - atm)
+                    strike = atm + dist if leg == "CE" else atm - dist
+                else:
+                    # If opposite leg is also missing, fallback to standard regime strike
+                    ce_strike, pe_strike = self.calculate_strangle_strikes(atm, atr, regime, dte_days=dte_days)
+                    strike = ce_strike if leg == "CE" else pe_strike
                 
                 has_short = sum(1 for p in self.positions.values() if p.get("side") == "SELL")
                 if has_short >= MAX_CONCURRENT_SHORT_LEGS: continue
@@ -1888,6 +1948,11 @@ class ExecutionEngine:
                     self._exit_all_positions(reason="SESSION_END")
                     self.mode = "SESSION_DONE"
                     self._save_state()
+                    try:
+                        db.commit_daily_pnl(self.realized_pnl)
+                        log_info(f"Committed Daily PnL: ₹{self.realized_pnl:,.2f} to tracker.")
+                    except Exception as e:
+                        log_warn(f"Failed to commit PnL: {e}")
                     self._render_dashboard(self.market_data.latest_spot, self.market_data.latest_atm)
                     print(f"\n{Fore.GREEN}✅ Session Completed Successfully. Final Realized PnL: ₹{self.realized_pnl:,.2f}{Style.RESET_ALL}\n")
                     self._remove_pid()
@@ -2021,24 +2086,10 @@ class ExecutionEngine:
                     # Dynamic re-entry (3m cooldown removed - checks immediately on 1m bar)
                     self._check_cooldown_and_reenter(spot, atm, atr, regime, trend, dte_days=dte_days)
 
-                    # Dynamic Chop Regime Strike Adjustment (Only when in active trading, not HEDGES_ONLY)
-                    if regime == "CHOP" and self.mode != "HEDGES_ONLY":
-                        chop_ce, chop_pe = self.calculate_strangle_strikes(atm, atr, "CHOP", dte_days=dte_days)
-                        if "CE" in self.positions and self.positions["CE"]["strike"] < chop_ce:
-                            log_info(f"🌪️ ADX < 20 (CHOP). Rolling CE from {self.positions['CE']['strike']} further OTM to {chop_ce}...")
-                            self._exit_leg("CE", reason="CHOP_ROLL_OUT")
-                            success = self._enter_leg("CE", chop_ce, "SELL", spot, atr)
-                            if not success:
-                                # Roll failed after 3 tries -> ONLY HEDGES LEFT!
-                                self.square_off_all_short_legs(reason="ROLL_CE_FAILED")
-
-                        if "PE" in self.positions and self.positions["PE"]["strike"] > chop_pe:
-                            log_info(f"🌪️ ADX < 20 (CHOP). Rolling PE from {self.positions['PE']['strike']} further OTM to {chop_pe}...")
-                            self._exit_leg("PE", reason="CHOP_ROLL_OUT")
-                            success = self._enter_leg("PE", chop_pe, "SELL", spot, atr)
-                            if not success:
-                                # Roll failed after 3 tries -> ONLY HEDGES LEFT!
-                                self.square_off_all_short_legs(reason="ROLL_PE_FAILED")
+                    # Dynamic Chop Regime Strike Adjustment disabled per user request.
+                    # We no longer square off or roll open legs just because regime changes.
+                    # if regime == "CHOP" and self.mode != "HEDGES_ONLY":
+                    #     ...
 
                     # Routine Invariant Verification: Strangle or Hedges Only
                     # self.enforce_strangle_or_hedges_only(context="CYCLE_HEALTH_CHECK")
