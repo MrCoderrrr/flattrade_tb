@@ -3,6 +3,7 @@ import time
 from datetime import datetime, timezone, timedelta
 import os
 import signal
+import sys
 
 # Define IST timezone
 IST = timezone(timedelta(hours=5, minutes=30))
