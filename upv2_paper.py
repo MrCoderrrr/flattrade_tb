@@ -210,11 +210,24 @@ except ImportError:
             self.data["last_date"] = today_str
             self._save()
             
+        def update_intraday_pnl(self, realized_pnl: float):
+            import datetime
+            today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+            
+            # If a new day started and we didn't commit yesterday, commit yesterday's intraday automatically
+            if self.data.get("intraday_date") and self.data.get("intraday_date") != today_str:
+                if self.data.get("last_date") != self.data.get("intraday_date"):
+                    self.commit_daily_pnl(self.data.get("today_pnl", 0.0))
+                    
+            self.data["today_pnl"] = realized_pnl
+            self.data["intraday_date"] = today_str
+            self._save()
+            
         def record_trade(self, *args, **kwargs): pass
         
         def get_strategy_pnl_summary(self, *args, **kwargs):
             return {
-                "today_pnl": 0.0,
+                "today_pnl": self.data.get("today_pnl", 0.0),
                 "mtd_pnl": self.data.get("mtd_pnl", 0.0),
                 "ytd_pnl": self.data.get("ytd_pnl", 0.0),
                 "current_capital": self.data.get("current_capital", kwargs.get("base_capital", globals().get("CAPITAL", 195784.0)))
@@ -1392,7 +1405,7 @@ class ExecutionEngine:
 
     @classmethod
     def calculate_hedge_strikes(cls, atm_spot: int, ce_short_strike: int, pe_short_strike: int, dte_days: float = 2.0) -> Tuple[int, int]:
-        hedge_dist = 150
+        hedge_dist = 1000
         return atm_spot + hedge_dist, atm_spot - hedge_dist
 
     def _log_trade(self, action: str, leg: str, strike: int, side: str, qty: int, price: float, pnl: float = None, reason: str = ""):
@@ -1890,6 +1903,9 @@ class ExecutionEngine:
             with open(self.state_file, "w") as sf:
                 import json
                 json.dump(state, sf)
+            try:
+                db.update_intraday_pnl(self.realized_pnl)
+            except: pass
         except Exception as e:
             pass
 
@@ -1911,6 +1927,11 @@ class ExecutionEngine:
                         self.mode = "RUNNING"
             except Exception:
                 pass
+        else:
+            # Try to recover intraday PNL from db if state file was deleted manually
+            import datetime
+            if db.data.get("intraday_date") == datetime.datetime.now().strftime("%Y-%m-%d"):
+                self.realized_pnl = db.data.get("today_pnl", 0.0)
 
     def run(self):
         log_info("Starting Adaptive KAMA-ADX Hedged Strangle Strategy (v2.0)...")
