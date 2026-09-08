@@ -1392,15 +1392,19 @@ class ExecutionEngine:
     @classmethod
     def calculate_strangle_strikes(cls, atm_spot: int, atr: float, regime: str, dte_days: float = 2.0) -> Tuple[int, int]:
         if regime == 'CHOP':
-            return atm_spot + 100, atm_spot - 100
+            return atm_spot + 50, atm_spot - 50
             
         mult = ATR_MULT_TREND
         width = atr * mult
         if dte_days <= 1.0: return atm_spot, atm_spot
         expiry_curve = cls._expiry_width_multiplier(dte_days)
-        expiry_floor = 50 if dte_days <= EXPIRY_NEAR_DAYS else 0
+        expiry_floor = 0 
         compressed_width = max(expiry_floor, round(width * (1.0 - 0.65 * expiry_curve)))
         stride_50 = int(round(compressed_width / 50.0) * 50)
+        
+        # Cap the distance to max 50 points so it doesn't go 100-150 pts away and lose premium
+        stride_50 = min(stride_50, 50)
+        
         return atm_spot + stride_50, atm_spot - stride_50
 
     @classmethod
