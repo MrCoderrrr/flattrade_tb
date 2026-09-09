@@ -42,10 +42,17 @@ MAX_DAILY_TRADES = 10     # Safeguard against runaway re-entries
 TELEGRAM_TOKEN = '8850507396:AAFwFm2_WxPdSM52JcCpJUj8V1rz9x3G-kE'
 CHAT_ID = '6307066850'
 
+_last_tg_dash_msg_id: Optional[int] = None
+_last_tg_dash_new_msg_ts: float = 0.0
+_last_tg_dash_edit_ts: float = 0.0
+
 def send_telegram(msg: str):
+    global _last_tg_dash_msg_id
     try:
         url = f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage'
         requests.post(url, data={'chat_id': CHAT_ID, 'text': msg, 'parse_mode': 'HTML'}, timeout=5)
+        # Reset dashboard message ID so next 1-sec tick posts fresh dashboard below the alert
+        _last_tg_dash_msg_id = None
     except Exception:
         pass
 
@@ -223,7 +230,7 @@ class NaturalGasPaperBot:
 
     def get_spot(self) -> float:
         now_ts = time.time()
-        if now_ts - self._spot_cache['ts'] < 3.0 and self._spot_cache['val'] > 0:
+        if now_ts - self._spot_cache['ts'] < 0.95 and self._spot_cache['val'] > 0:
             return self._spot_cache['val']
 
         if not self.front_month_futs_token:
@@ -452,6 +459,7 @@ class NaturalGasPaperBot:
         return False, ''
 
     def _print_dashboard(self, spot: float, atm: float):
+        global _last_tg_dash_msg_id, _last_tg_dash_new_msg_ts, _last_tg_dash_edit_ts
         now = get_ist_now()
         now_ts = time.time()
         now_s = now.strftime('%H:%M:%S IST')
@@ -468,8 +476,9 @@ class NaturalGasPaperBot:
                 print(f'  {leg:2} | {pos["side"]} {int(pos["strike"])} | Entry:{pos["entry_price"]:.2f} LTP:{ltp:.2f} TSL:{tsl:.2f} PnL:Rs{pnl:,.0f}')
             print('-' * 65)
 
-        if now_ts - self._last_tg_dash_ts >= 60.0:
-            self._last_tg_dash_ts = now_ts
+        # Telegram Live Dashboard every 1 second
+        if now_ts - _last_tg_dash_edit_ts >= 0.95:
+            _last_tg_dash_edit_ts = now_ts
             total_unrealized = 0.0
             leg_data = []
             for leg, pos in self.positions.items():
@@ -482,7 +491,7 @@ class NaturalGasPaperBot:
             total_pnl = self.total_realized_pnl + total_unrealized
             lines = [
                 '<pre>',
-                'MCX NATURAL GAS (PAPER)',
+                f'MCX NATURAL GAS  [{now.strftime("%H:%M:%S")}]',
                 f'Spot {spot:.2f}   ATM {int(atm)}',
                 '─────────────────────'
             ]
@@ -495,11 +504,39 @@ class NaturalGasPaperBot:
                 lines.append('  No Open Positions')
 
             lines.append('─────────────────────')
-            lines.append(f'Realized  {'+' if self.total_realized_pnl >= 0 else ''}{self.total_realized_pnl:>9,.0f}')
-            lines.append(f'Unreal    {'+' if total_unrealized >= 0 else ''}{total_unrealized:>9,.0f}')
-            lines.append(f'Net MTM   {'+' if total_pnl >= 0 else ''}{total_pnl:>9,.0f}')
+            lines.append(f'Realized  {"+" if self.total_realized_pnl >= 0 else ""}{self.total_realized_pnl:>9,.0f}')
+            lines.append(f'Unreal    {"+" if total_unrealized >= 0 else ""}{total_unrealized:>9,.0f}')
+            lines.append(f'Net MTM   {"+" if total_pnl >= 0 else ""}{total_pnl:>9,.0f}')
             lines.append('</pre>')
-            send_telegram(chr(10).join(lines))
+            t = chr(10).join(lines)
+
+            # Edit existing message in-place every 1s
+            if _last_tg_dash_msg_id is not None and (now_ts - _last_tg_dash_new_msg_ts) < 60.0:
+                try:
+                    edit_resp = requests.post(
+                        f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText',
+                        json={'chat_id': CHAT_ID, 'message_id': _last_tg_dash_msg_id, 'text': t, 'parse_mode': 'HTML'},
+                        timeout=3
+                    )
+                    if edit_resp.status_code == 200 and edit_resp.json().get('ok'):
+                        return
+                except Exception:
+                    pass
+
+            # Send a fresh message every 60s or if edit failed
+            try:
+                send_resp = requests.post(
+                    f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage',
+                    data={'chat_id': CHAT_ID, 'text': t, 'parse_mode': 'HTML'},
+                    timeout=4
+                )
+                if send_resp.status_code == 200:
+                    rjson = send_resp.json()
+                    if rjson.get('ok'):
+                        _last_tg_dash_msg_id = rjson.get('result', {}).get('message_id')
+                        _last_tg_dash_new_msg_ts = now_ts
+            except Exception:
+                pass
 
     def _kama_reversal_confirmed(self, current_kama: float, prev_kama: float) -> bool:
         if current_kama is None or prev_kama is None:

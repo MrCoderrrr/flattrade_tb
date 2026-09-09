@@ -251,10 +251,11 @@ class NSEATMStreamer:
         self._cached_expiry_day: Optional[Any] = None
         self._last_spot: float = 24000.0
         self._last_atm: int = 24000
+        self._token_cache: Dict[str, Dict[str, Any]] = {}
 
     def get_spot_and_atm(self) -> Tuple[float, int, bool]:
         """
-        Fetches live NIFTY 50 Spot price directly from Flattrade every minute (Token 26000 on NSE).
+        Fetches live NIFTY 50 Spot price directly from Flattrade every second (Token 26000 on NSE).
         No dependency on yfinance.
         Returns: (spot, atm, is_stale)
         """
@@ -273,7 +274,34 @@ class NSEATMStreamer:
         return self._last_spot, self._last_atm, True
 
     def get_live_quote(self, strike: int, option_type: str) -> Dict[str, Any]:
-        """Fetches live option quote directly from Flattrade with zero-price fallbacks."""
+        """Fetches live option quote directly from Flattrade with token caching and fallback."""
+        cache_key = f"{strike}_{option_type}"
+        
+        # 1. Fast Path: If token is already cached, directly call get_quotes (15-20ms)
+        cached = self._token_cache.get(cache_key)
+        if cached and self.api and hasattr(self.api, "get_quotes"):
+            try:
+                quote = self.api.get_quotes(exchange='NFO', token=cached['token'])
+                lp = 0.0
+                if quote and isinstance(quote, dict):
+                    for field in ('lp', 'ltp', 'c', 'sp1', 'bp1', 'ap'):
+                        val = quote.get(field)
+                        if val is not None:
+                            try:
+                                v_flt = float(val)
+                                if v_flt > 0:
+                                    lp = v_flt
+                                    break
+                            except (ValueError, TypeError):
+                                pass
+                if lp <= 0:
+                    diff = abs(self._last_spot - strike)
+                    lp = max(0.50, round(180.0 - (diff * 0.35), 2))
+                return {"lp": lp, "tsym": cached['tsym'], "ls": cached.get('ls', LOT_SIZE)}
+            except Exception as e:
+                log_warn(f"Fast get_quotes error for {cache_key}: {e}")
+
+        # 2. Slow Path: Search scrip once and cache the contract token
         today = get_ist_now().date()
         if self.api and hasattr(self.api, "searchscrip"):
             try:
@@ -297,7 +325,12 @@ class NSEATMStreamer:
                         valid.sort(key=lambda x: x['dt'])
                         match = valid[0]['item']
                         tsym = match['tsym']
-                        quote = self.api.get_quotes(exchange='NFO', token=match['token'])
+                        token = str(match['token'])
+                        ls = int(match.get('ls', LOT_SIZE))
+                        # Cache for all subsequent 1-second ticks
+                        self._token_cache[cache_key] = {'token': token, 'tsym': tsym, 'ls': ls}
+
+                        quote = self.api.get_quotes(exchange='NFO', token=token)
                         lp = 0.0
                         if quote and isinstance(quote, dict):
                             for field in ('lp', 'ltp', 'c', 'sp1', 'bp1', 'ap'):
@@ -313,9 +346,9 @@ class NSEATMStreamer:
                         if lp <= 0:
                             diff = abs(self._last_spot - strike)
                             lp = max(0.50, round(180.0 - (diff * 0.35), 2))
-                        return {"lp": lp, "tsym": tsym, "ls": int(match.get('ls', LOT_SIZE))}
+                        return {"lp": lp, "tsym": tsym, "ls": ls}
             except Exception as e:
-                log_warn(f"get_live_quote error: {e}")
+                log_warn(f"get_live_quote searchscrip error: {e}")
 
         diff = abs(self._last_spot - strike)
         est_prem = max(0.50, round(180.0 - (diff * 0.35), 2))
@@ -556,6 +589,7 @@ def _now_str() -> str:
 
 def _tg_send(msg: str):
     """Core silent Telegram sender — HTML mode, strips ANSI codes."""
+    global _last_tg_dashboard_msg_id
     import re
     clean = re.sub(r"\x1b\[[0-9;]*m", "", msg)
     try:
@@ -566,6 +600,8 @@ def _tg_send(msg: str):
                 data={"chat_id": TELEGRAM_CHAT_ID, "text": clean, "parse_mode": "HTML"},
                 timeout=5
             )
+            # Reset dashboard message ID so next 1-sec tick posts fresh dashboard below the alert
+            _last_tg_dashboard_msg_id = None
     except Exception:
         pass
 
@@ -587,34 +623,42 @@ def log_trade(msg: str):
     _tg_send(f"<pre>{clean}</pre>")
     print(f"{Fore.MAGENTA}{Style.BRIGHT}[{_now_str()} TRADE]{Style.RESET_ALL} {msg}", flush=True)
 
-_last_tg_dashboard_ts: float = 0.0  # Rate-limits Telegram dashboard to once per 60s
+_last_tg_dashboard_msg_id: Optional[int] = None
+_last_tg_dashboard_new_msg_ts: float = 0.0
+_last_tg_dashboard_edit_ts: float = 0.0
 
 def send_telegram_nifty_dashboard(spot: float, atm: int, mode: str, positions: dict,
                                    realized_pnl: float, unrealized_pnl: float,
                                    ind: dict, total_cap: float, mtd_pnl: float, ytd_pnl: float):
-    """Sends a clean Nifty dashboard to Telegram (max once per 60 seconds)."""
-    global _last_tg_dashboard_ts
+    """
+    Updates live Nifty dashboard in Telegram every 1 second.
+    Uses editMessageText for 1-second live ticker updates without spamming chat.
+    Sends a fresh message every 60s (or on alert/EOD) to maintain chat history.
+    """
+    global _last_tg_dashboard_msg_id, _last_tg_dashboard_new_msg_ts, _last_tg_dashboard_edit_ts
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        return
+
     now_ts = time.time()
-    
-    # Check if it's end of day for final summary (after 15:34)
     now_ist = get_ist_now()
     is_eod = (now_ist.hour > 15 or (now_ist.hour == 15 and now_ist.minute >= 34))
-    
-    # Only send if 60 seconds have elapsed OR it's end-of-day
-    if not is_eod and (now_ts - _last_tg_dashboard_ts) < 60.0:
+
+    # Throttle edits to at most once per 0.95s
+    if (now_ts - _last_tg_dashboard_edit_ts) < 0.95:
         return
-    _last_tg_dashboard_ts = now_ts
+    _last_tg_dashboard_edit_ts = now_ts
 
     try:
+        import requests
         regime = ind.get("regime", "?")
         adx    = ind.get("adx", 0.0) or 0.0
-        # BUG 6 FIX: Guard against None KAMA during warmup
+        # Guard against None KAMA during warmup
         kama_raw = ind.get("kama")
         kama_str = f"{kama_raw:.0f}" if kama_raw is not None else "WARMUP"
         total_pnl = realized_pnl + unrealized_pnl
 
         t = "<pre>"
-        t += "NIFTY STRANGLE v2\n"
+        t += f"NIFTY STRANGLE v2  [{now_ist.strftime('%H:%M:%S')}]\n"
         t += f"Spot {spot:.2f}  ATM {atm}  {mode}\n"
         t += f"{regime} ({adx:.1f})  KAMA {kama_str}\n"
         t += "─────────────────────\n"
@@ -635,6 +679,8 @@ def send_telegram_nifty_dashboard(spot: float, atm: int, mode: str, positions: d
                 t += f"{leg:<8} {side:>4} {strike}\n"
                 t += f"  E {entry:>7.2f}  L {ltp:>7.2f}{tsl_str}\n"
                 t += f"  PnL {sign}{pnl:>9,.0f}\n"
+        else:
+            t += "  No Open Positions\n"
 
         t += "─────────────────────\n"
         t += f"Realized {'+' if realized_pnl >= 0 else ''}{realized_pnl:>10,.0f}\n"
@@ -650,7 +696,30 @@ def send_telegram_nifty_dashboard(spot: float, atm: int, mode: str, positions: d
             
         t += "</pre>"
 
-        _tg_send(t)
+        # If an active message exists and is less than 60s old, edit it live in-place
+        if _last_tg_dashboard_msg_id is not None and (now_ts - _last_tg_dashboard_new_msg_ts) < 60.0 and not is_eod:
+            try:
+                edit_resp = requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText",
+                    json={"chat_id": TELEGRAM_CHAT_ID, "message_id": _last_tg_dashboard_msg_id, "text": t, "parse_mode": "HTML"},
+                    timeout=3
+                )
+                if edit_resp.status_code == 200 and edit_resp.json().get("ok"):
+                    return
+            except Exception:
+                pass
+
+        # Send a fresh message (every 60s, or after alert, or when edit fails)
+        send_resp = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": t, "parse_mode": "HTML"},
+            timeout=4
+        )
+        if send_resp.status_code == 200:
+            rjson = send_resp.json()
+            if rjson.get("ok"):
+                _last_tg_dashboard_msg_id = rjson.get("result", {}).get("message_id")
+                _last_tg_dashboard_new_msg_ts = now_ts
     except Exception as e:
         log_warn(f"Telegram dashboard failed: {e}")
 
@@ -2042,10 +2111,13 @@ class ExecutionEngine:
                     self._remove_pid()
                     sys.exit(0)
 
-                # ── 1. STRICT 1-MINUTE EXECUTION CADENCE ──
+                # ── 1. STRICT 1-SECOND DATA FETCH & TICK CADENCE ──
                 spot, atm, is_new_1m_bar, is_stale = self.market_data.fetch_live_tick()
                 if not is_stale:
                     self.last_feed_tick = current_time
+
+                # Clear tick cache on every 1-sec tick so Flattrade API is queried live every 1 second
+                self._ltp_cache.clear()
                 
                 if not is_new_1m_bar and getattr(self, "current_indicators", None) is None:
                     self._smart_sleep(1.0)
@@ -2053,7 +2125,6 @@ class ExecutionEngine:
 
                 # ── 2. Run KAMA & Indicators strictly on the collected 1-minute data ──
                 if is_new_1m_bar or getattr(self, "current_indicators", None) is None:
-                    self._ltp_cache.clear()  # Clear price cache only on new bar boundary
                     df_5m = self.market_data.get_5m_dataframe()
                     self.current_indicators = Indicators.evaluate_all(self.market_data.get_1m_dataframe(), df_5m)
                     
@@ -2163,9 +2234,10 @@ class ExecutionEngine:
                                 self._exit_leg(leg, reason="PREM_TSL_HIT")
                                 self._trigger_leg_cooldown(leg, spot)
 
-                    # Dynamic re-entry for missing leg (KAMA reversal or regime check)
+                    # Dynamic re-entry for missing leg (KAMA reversal or regime check on 1m bar close)
                     # When one leg stops out, surviving leg stays open and missing leg re-enters on reversal!
-                    self._check_cooldown_and_reenter(spot, atm, atr, regime, trend, dte_days=dte_days)
+                    if is_new_1m_bar:
+                        self._check_cooldown_and_reenter(spot, atm, atr, regime, trend, dte_days=dte_days)
 
                 # Phase C: HEDGES_ONLY mode (holding protective hedges)
                 # User rule: Regime is given priority when ONLY hedges are open!
