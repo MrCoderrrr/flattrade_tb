@@ -1542,6 +1542,8 @@ class ExecutionEngine:
         return self._ltp_cache[key]
 
     def _verify_order_status(self, ord_id: str, tsym: str, side: str, qty: int) -> tuple:
+        if getattr(self.broker, "paper_trading", False):
+            return True, "Paper fill confirmed"
         api = getattr(self.broker, "api", self.broker)
         is_live = not getattr(self.broker, "paper_trading", False)
         import time
@@ -1559,7 +1561,6 @@ class ExecutionEngine:
                             if check_attempt == 3 or not is_live: return True, "OPEN"
                             continue
                 except: pass
-        if getattr(self.broker, "paper_trading", False): return True, f"Paper fill confirmed"
         return False, "INCONCLUSIVE_IN_LIVE_MODE"
 
     def _enter_leg(self, leg: str, strike: int, side: str, spot: float, atr: float, dte_days: float = 2.0) -> bool:
@@ -2056,8 +2057,16 @@ class ExecutionEngine:
                         and (now_ist.hour < AUTO_SQUAREOFF_HOUR or (now_ist.hour == AUTO_SQUAREOFF_HOUR and now_ist.minute < AUTO_SQUAREOFF_MINUTE))
                     )
 
-                    if self.positions:
-                        self.mode = saved_mode if saved_mode in ("RUNNING", "COOLDOWN", "HEDGES_ONLY") else "RUNNING"
+                    has_short = any(p.get("side") == "SELL" for p in self.positions.values())
+                    if not has_short and is_market_open and not cb_hit:
+                        # If no short positions exist (or only orphan hedges remain), wipe them and enter all 4 legs
+                        log_info("🔄 Incomplete/orphan positions detected on startup. Resetting to WAIT_DATA to enter all 4 legs...")
+                        self.positions = {}
+                        self.mode = "WAIT_DATA"
+                        self.cooldown_tracker.clear()
+                        self._save_state()
+                    elif self.positions:
+                        self.mode = saved_mode if saved_mode in ("RUNNING", "COOLDOWN") else "RUNNING"
                     elif is_market_open and not cb_hit:
                         # If market is open and no positions are open, resume trading in WAIT_DATA
                         self.mode = "WAIT_DATA"
@@ -2239,9 +2248,10 @@ class ExecutionEngine:
                 elif self.mode in ("RUNNING", "CHOP_MODE", "COOLDOWN"):
                     has_short = any(p.get("side") == "SELL" for p in self.positions.values())
                     if not has_short:
-                        log_info("🛡️ All short legs stopped out. Switching to HEDGES_ONLY mode (protective hedges held).")
-                        self.mode = "HEDGES_ONLY"
-                        self._last_all_stop_ts = time.time()
+                        log_info("🔄 No active short legs found. Clearing orphan hedges and resetting to WAIT_DATA to enter full 4-leg Strangle...")
+                        self._exit_all_positions(reason="RECENTER_4_LEGS")
+                        self.mode = "WAIT_DATA"
+                        self.cooldown_tracker.clear()
                         self._save_state()
                         continue
 
@@ -2263,21 +2273,14 @@ class ExecutionEngine:
                     if is_new_1m_bar:
                         self._check_cooldown_and_reenter(spot, atm, atr, regime, trend, dte_days=dte_days)
 
-                # Phase C: HEDGES_ONLY mode (holding protective hedges)
-                # User rule: Regime is given priority when ONLY hedges are open!
+                # Phase C: HEDGES_ONLY mode (auto-recenter to full 4-leg Strangle)
                 elif self.mode == "HEDGES_ONLY":
-                    # Allow re-centering new short strangle when regime is CHOP or market stabilizes
-                    last_stop = getattr(self, "_last_all_stop_ts", 0.0)
-                    time_elapsed = time.time() - last_stop
-                    if time_elapsed >= 180.0 and regime == "CHOP":
-                        if self.strangle_resets_today < MAX_STRANGLE_RESETS:
-                            log_info(f"🔄 HEDGES_ONLY: CHOP regime confirmed ({time_elapsed:.0f}s elapsed). Resetting to WAIT_DATA to re-center Strangle at ATM {atm}...")
-                            self.strangle_resets_today += 1
-                            self.mode = "WAIT_DATA"
-                            self.cooldown_tracker.clear()
-                            self._save_state()
-                        else:
-                            log_alert(f"🛑 MAX STRANGLE RESETS ({MAX_STRANGLE_RESETS}) reached today. Holding hedges only until EOD.")
+                    log_info(f"🔄 HEDGES_ONLY detected: Re-centering full 4-leg Strangle at ATM {atm}...")
+                    self._exit_all_positions(reason="RECENTER_4_LEGS")
+                    self.mode = "WAIT_DATA"
+                    self.cooldown_tracker.clear()
+                    self._save_state()
+                    continue
 
                 # ── 5. Render Live Dashboard ──
                 self._render_dashboard(spot, atm)
