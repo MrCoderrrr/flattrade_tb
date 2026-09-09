@@ -1356,7 +1356,8 @@ class ExecutionEngine:
         log_alert(f"🛑 EXECUTING GLOBAL EMERGENCY LIQUIDATION (Reason: {reason})! Closing all positions...")
         try:
             self._exit_all_positions(reason=reason)
-            self.mode = "SESSION_DONE"
+            # If shutdown was caused by SIGTERM / pkill during code restart, save WAIT_DATA so reboot resumes trading
+            self.mode = "WAIT_DATA" if reason.startswith("SIGNAL_") else "SESSION_DONE"
             self._save_state()
             self._remove_pid()
             print(f"\n{Fore.GREEN}✅ All positions successfully squared off. Strategy halted cleanly.{Style.RESET_ALL}\n", flush=True)
@@ -2048,10 +2049,19 @@ class ExecutionEngine:
                     self.total_reentries_today = int(state.get("total_reentries_today", 0))
                     self.strangle_resets_today = int(state.get("strangle_resets_today", 0))
                     saved_mode = state.get("mode", "WAIT_DATA")
-                    if saved_mode == "SESSION_DONE":
-                        self.mode = "SESSION_DONE"
-                    elif self.positions:
+                    cb_hit = self.realized_pnl <= -CAPITAL * (PORTFOLIO_CIRCUIT_PCT / 100.0)
+                    now_ist = get_ist_now()
+                    is_market_open = (
+                        (now_ist.hour > MARKET_START_HOUR or (now_ist.hour == MARKET_START_HOUR and now_ist.minute >= MARKET_START_MINUTE))
+                        and (now_ist.hour < AUTO_SQUAREOFF_HOUR or (now_ist.hour == AUTO_SQUAREOFF_HOUR and now_ist.minute < AUTO_SQUAREOFF_MINUTE))
+                    )
+
+                    if self.positions:
                         self.mode = saved_mode if saved_mode in ("RUNNING", "COOLDOWN", "HEDGES_ONLY") else "RUNNING"
+                    elif is_market_open and not cb_hit:
+                        # If market is open and no positions are open, resume trading in WAIT_DATA
+                        self.mode = "WAIT_DATA"
+                        self.cooldown_tracker.clear()
                     else:
                         self.mode = saved_mode
                     log_info(f"State loaded: Mode={self.mode}, Open Positions={len(self.positions)}, Today's Realized PnL=₹{self.realized_pnl:,.2f}")
@@ -2158,6 +2168,19 @@ class ExecutionEngine:
 
                 # ── 4. State Machine Transitions ──
                 
+                # Auto-recovery if stuck in SESSION_DONE during active market hours
+                if self.mode == "SESSION_DONE":
+                    is_market_open = (
+                        (now.hour > MARKET_START_HOUR or (now.hour == MARKET_START_HOUR and now.minute >= MARKET_START_MINUTE))
+                        and (now.hour < AUTO_SQUAREOFF_HOUR or (now.hour == AUTO_SQUAREOFF_HOUR and now.minute < AUTO_SQUAREOFF_MINUTE))
+                    )
+                    cb_hit = self.realized_pnl <= -CAPITAL * (PORTFOLIO_CIRCUIT_PCT / 100.0)
+                    if is_market_open and not cb_hit:
+                        log_info(f"🔄 Active market hours ({now.strftime('%H:%M:%S')} IST) detected while in SESSION_DONE. Resetting to WAIT_DATA to resume trading...")
+                        self.mode = "WAIT_DATA"
+                        self.cooldown_tracker.clear()
+                        self._save_state()
+
                 # Phase A: Wait for data & 09:18 AM session start
                 if self.mode == "WAIT_DATA":
                     if now.hour > MARKET_START_HOUR or (now.hour == MARKET_START_HOUR and now.minute >= MARKET_START_MINUTE):
@@ -2206,6 +2229,7 @@ class ExecutionEngine:
                             self.square_off_all_short_legs(reason="STRANGLE_ENTRY_FAILED_LEAVE_HEDGES")
                         else:
                             self.mode = "RUNNING"
+                            self.cooldown_tracker.clear()
                             
                         self._save_state()
                     else:
