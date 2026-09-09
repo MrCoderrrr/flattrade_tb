@@ -282,6 +282,10 @@ class NSEATMStreamer:
                 if res and isinstance(res, dict) and res.get('stat') == 'Ok' and res.get('values'):
                     valid = []
                     for item in res['values']:
+                        tsym = str(item.get('tsym', '')).upper()
+                        # Strictly match NIFTY 50, exclude BANKNIFTY, FINNIFTY, MIDCPNIFTY
+                        if not tsym.startswith('NIFTY') or tsym.startswith(('BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY')):
+                            continue
                         if 'exd' in item:
                             try:
                                 d = datetime.strptime(item['exd'], "%d-%b-%Y").date()
@@ -309,13 +313,13 @@ class NSEATMStreamer:
                         if lp <= 0:
                             diff = abs(self._last_spot - strike)
                             lp = max(0.50, round(180.0 - (diff * 0.35), 2))
-                        return {"lp": lp, "tsym": tsym, "ls": int(match.get('ls', 65))}
+                        return {"lp": lp, "tsym": tsym, "ls": int(match.get('ls', LOT_SIZE))}
             except Exception as e:
                 log_warn(f"get_live_quote error: {e}")
 
         diff = abs(self._last_spot - strike)
-        est_prem = max(15.0, 180.0 - (diff * 0.35))
-        return {"lp": round(est_prem, 2), "tsym": f"NIFTY_{strike}_{option_type}", "ls": 65}
+        est_prem = max(0.50, round(180.0 - (diff * 0.35), 2))
+        return {"lp": round(est_prem, 2), "tsym": f"NIFTY{strike}{option_type}", "ls": LOT_SIZE}
 
     def get_near_expiry_dte(self) -> Tuple[Optional[datetime], float]:
         """Fetches near expiry date and DTE directly from Flattrade NFO contracts."""
@@ -327,6 +331,10 @@ class NSEATMStreamer:
                     candidates = []
                     if res and isinstance(res, dict) and res.get('stat') == 'Ok' and res.get('values'):
                         for item in res['values']:
+                            tsym = str(item.get('tsym', '')).upper()
+                            # Strictly match NIFTY 50 (Thursday expiry), exclude other indices
+                            if not tsym.startswith('NIFTY') or tsym.startswith(('BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY')):
+                                continue
                             if 'exd' in item:
                                 try:
                                     candidates.append(datetime.strptime(item['exd'], "%d-%b-%Y"))
@@ -343,9 +351,9 @@ class NSEATMStreamer:
                 days_ahead = (3 - get_ist_now().weekday()) % 7
                 if days_ahead == 0 and get_ist_now().hour >= 15:
                     days_ahead = 7
-                self._cached_expiry_date = datetime.now() + timedelta(days=days_ahead)
+                self._cached_expiry_date = get_ist_now() + timedelta(days=days_ahead)
             self._cached_expiry_day = today
-        dte = max(0.01, (self._cached_expiry_date - datetime.now()).total_seconds() / 86400.0)
+        dte = max(0.01, (self._cached_expiry_date - get_ist_now()).total_seconds() / 86400.0)
         return self._cached_expiry_date, dte
 
 
@@ -1181,21 +1189,24 @@ class ExecutionEngine:
         self._ltp_cache: Dict[str, float] = {}
         self._load_state()
         
-        # Bug 13: Startup Reconciliation
-        log_info("Performing Startup Reconciliation against Broker...")
-        actual_pos = self._get_live_exchange_positions()
-        if actual_pos is not None:
-            mismatch = False
-            for leg, p in list(self.positions.items()):
-                if p["tsym"] not in actual_pos or actual_pos[p["tsym"]] == 0:
-                    log_alert(f"⚠️ RECONCILIATION: {leg} is missing on exchange! Removing from local state.")
-                    del self.positions[leg]
-                    mismatch = True
-            if mismatch:
-                self._save_state()
-                log_info("State reconciled with Broker.")
+        # Startup Reconciliation against Broker (Live mode only)
+        if not PAPER_TRADING_MODE:
+            log_info("Performing Startup Reconciliation against Broker...")
+            actual_pos = self._get_live_exchange_positions()
+            if actual_pos is not None:
+                mismatch = False
+                for leg, p in list(self.positions.items()):
+                    if p["tsym"] not in actual_pos or actual_pos[p["tsym"]] == 0:
+                        log_alert(f"⚠️ RECONCILIATION: {leg} is missing on exchange! Removing from local state.")
+                        del self.positions[leg]
+                        mismatch = True
+                if mismatch:
+                    self._save_state()
+                    log_info("State reconciled with Broker.")
+            else:
+                log_warn("Startup reconciliation failed to fetch live positions. Proceeding with local state.")
         else:
-            log_warn("Startup reconciliation failed to fetch live positions. Proceeding with local state.")
+            log_info("Paper Trading Mode active: Skipped live broker position reconciliation.")
         self._write_pid()
         
         self._start_kill_switch_listener()
@@ -1935,6 +1946,7 @@ class ExecutionEngine:
         try:
             state = {
                 "date": str(get_ist_now().date()),
+                "mode": self.mode,
                 "realized_pnl": self.realized_pnl,
                 "positions": self.positions,
                 "cooldown_tracker": self.cooldown_tracker,
@@ -1944,7 +1956,7 @@ class ExecutionEngine:
             }
             with open(self.state_file, "w") as sf:
                 import json
-                json.dump(state, sf)
+                json.dump(state, sf, indent=2)
             try:
                 db.update_intraday_pnl(self.realized_pnl)
             except: pass
@@ -1953,27 +1965,34 @@ class ExecutionEngine:
 
     def _load_state(self):
         import os
+        today_str = str(get_ist_now().date())
         if os.path.exists(self.state_file):
             try:
                 with open(self.state_file, "r") as sf:
                     import json
                     state = json.load(sf)
-                if state.get("date") == str(get_ist_now().date()):
-                    self.realized_pnl = state.get("realized_pnl", 0.0)
+                if state.get("date") == today_str:
+                    self.realized_pnl = float(state.get("realized_pnl", 0.0))
                     self.positions = state.get("positions", {})
                     self.cooldown_tracker = state.get("cooldown_tracker", {})
-                    self.session_em_1sd = state.get("session_em_1sd", 0.0)
-                    self.total_reentries_today = state.get("total_reentries_today", 0)
-                    self.strangle_resets_today = state.get("strangle_resets_today", 0)
-                    if self.positions:
-                        self.mode = "RUNNING"
-            except Exception:
-                pass
+                    self.session_em_1sd = float(state.get("session_em_1sd", 0.0))
+                    self.total_reentries_today = int(state.get("total_reentries_today", 0))
+                    self.strangle_resets_today = int(state.get("strangle_resets_today", 0))
+                    saved_mode = state.get("mode", "WAIT_DATA")
+                    if saved_mode == "SESSION_DONE":
+                        self.mode = "SESSION_DONE"
+                    elif self.positions:
+                        self.mode = saved_mode if saved_mode in ("RUNNING", "COOLDOWN", "HEDGES_ONLY") else "RUNNING"
+                    else:
+                        self.mode = saved_mode
+                    log_info(f"State loaded: Mode={self.mode}, Open Positions={len(self.positions)}, Today's Realized PnL=₹{self.realized_pnl:,.2f}")
+            except Exception as e:
+                log_warn(f"Error loading state: {e}")
         else:
-            # Try to recover intraday PNL from db if state file was deleted manually
-            import datetime
-            if db.data.get("intraday_date") == datetime.datetime.now().strftime("%Y-%m-%d"):
-                self.realized_pnl = db.data.get("today_pnl", 0.0)
+            # Recover intraday PNL from db if state file was missing
+            if db.data.get("intraday_date") == today_str:
+                self.realized_pnl = float(db.data.get("today_pnl", 0.0))
+                log_info(f"Recovered intraday PnL from DB: ₹{self.realized_pnl:,.2f}")
 
     def run(self):
         log_info("Starting Adaptive KAMA-ADX Hedged Strangle Strategy (v2.0)...")
@@ -2125,19 +2144,11 @@ class ExecutionEngine:
                 elif self.mode in ("RUNNING", "CHOP_MODE", "COOLDOWN"):
                     has_short = any(p.get("side") == "SELL" for p in self.positions.values())
                     if not has_short:
-                        log_info("All short legs stopped out. Resetting to WAIT_DATA to re-center new Strangle...")
-                        self.strangle_resets_today += 1
-                        if self.strangle_resets_today >= MAX_STRANGLE_RESETS:
-                            log_alert(f"🛑 MAX STRANGLE RESETS ({MAX_STRANGLE_RESETS}) REACHED! Halting new entries.")
-                            self.mode = "HALTED"
-                            break
-                        self.mode = "WAIT_DATA"
-                        self.cooldown_tracker.clear()
+                        log_info("🛡️ All short legs stopped out. Switching to HEDGES_ONLY mode (protective hedges held).")
+                        self.mode = "HEDGES_ONLY"
+                        self._last_all_stop_ts = time.time()
                         self._save_state()
                         continue
-
-                    # BUG 11 FIX: Protect against orphan short legs (one side without the other)
-                    self.enforce_strangle_or_hedges_only(context="CYCLE_HEALTH_CHECK")
 
                     # Check Premium TSL strictly on 1-min collected data
                     for leg in ("CE", "PE"):
@@ -2152,13 +2163,25 @@ class ExecutionEngine:
                                 self._exit_leg(leg, reason="PREM_TSL_HIT")
                                 self._trigger_leg_cooldown(leg, spot)
 
-                    # Dynamic re-entry (KAMA reversal triggers next 1m bar)
+                    # Dynamic re-entry for missing leg (KAMA reversal or regime check)
+                    # When one leg stops out, surviving leg stays open and missing leg re-enters on reversal!
                     self._check_cooldown_and_reenter(spot, atm, atr, regime, trend, dte_days=dte_days)
 
-                # BUG 2 FIX: HEDGES_ONLY is a safe holding mode — don't reset to WAIT_DATA from here.
-                # Hedges hold as protection. The user can manually restart or the next day starts fresh.
+                # Phase C: HEDGES_ONLY mode (holding protective hedges)
+                # User rule: Regime is given priority when ONLY hedges are open!
                 elif self.mode == "HEDGES_ONLY":
-                    log_info("🛡️ HEDGES_ONLY mode: Holding protective hedges. No new short entries today.")
+                    # Allow re-centering new short strangle when regime is CHOP or market stabilizes
+                    last_stop = getattr(self, "_last_all_stop_ts", 0.0)
+                    time_elapsed = time.time() - last_stop
+                    if time_elapsed >= 180.0 and regime == "CHOP":
+                        if self.strangle_resets_today < MAX_STRANGLE_RESETS:
+                            log_info(f"🔄 HEDGES_ONLY: CHOP regime confirmed ({time_elapsed:.0f}s elapsed). Resetting to WAIT_DATA to re-center Strangle at ATM {atm}...")
+                            self.strangle_resets_today += 1
+                            self.mode = "WAIT_DATA"
+                            self.cooldown_tracker.clear()
+                            self._save_state()
+                        else:
+                            log_alert(f"🛑 MAX STRANGLE RESETS ({MAX_STRANGLE_RESETS}) reached today. Holding hedges only until EOD.")
 
                 # ── 5. Render Live Dashboard ──
                 self._render_dashboard(spot, atm)

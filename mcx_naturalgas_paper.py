@@ -88,14 +88,51 @@ class NaturalGasPaperBot:
         self.positions: Dict[str, Dict] = {}
         self.kama_prev_delta = 0.0
         self.last_reentry_ts = 0.0
+        self.last_double_stop_ts = 0.0
         self.total_realized_pnl = 0.0
         self.trades_today = 0
+        self.state_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcx_state_paper.json")
         self._mcx_master = None
         self._spot_cache = {'ts': 0.0, 'val': 0.0}
         self._last_tg_dash_ts = 0.0
         self._last_console_dash_ts = 0.0
         self.front_month_futs_token: Optional[str] = None
         self.front_month_futs_symbol: Optional[str] = None
+        self._load_state()
+
+    def _save_state(self):
+        try:
+            import json
+            state = {
+                "date": get_ist_now().strftime("%Y-%m-%d"),
+                "positions": self.positions,
+                "total_realized_pnl": self.total_realized_pnl,
+                "trades_today": self.trades_today,
+                "last_reentry_ts": self.last_reentry_ts,
+                "last_double_stop_ts": self.last_double_stop_ts
+            }
+            with open(self.state_file, "w") as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            print(f"[WARN] Failed saving MCX state: {e}")
+
+    def _load_state(self):
+        import json
+        if not os.path.exists(self.state_file):
+            return
+        try:
+            today_str = get_ist_now().strftime("%Y-%m-%d")
+            with open(self.state_file, "r") as f:
+                state = json.load(f)
+            if state.get("date") == today_str:
+                self.positions = state.get("positions", {})
+                self.total_realized_pnl = float(state.get("total_realized_pnl", 0.0))
+                self.trades_today = int(state.get("trades_today", 0))
+                self.last_reentry_ts = float(state.get("last_reentry_ts", 0.0))
+                self.last_double_stop_ts = float(state.get("last_double_stop_ts", 0.0))
+                print(f"[STATE] Restored MCX state: {len(self.positions)} open legs, Realized PnL: Rs {self.total_realized_pnl:,.2f}, Trades: {self.trades_today}")
+        except Exception as e:
+            print(f"[WARN] Error loading MCX state: {e}")
 
     def authenticate(self):
         if not self.api:
@@ -268,10 +305,16 @@ class NaturalGasPaperBot:
             try:
                 q = self.api.get_quotes(exchange='MCX', token=token)
                 if q and isinstance(q, dict):
-                    val = float(q.get('lp', q.get('ltp', 0.0)) or 0.0)
-                    if val > 0:
-                        pos['_last_ltp'] = val
-                        return val
+                    for field in ('lp', 'ltp', 'c', 'sp1', 'bp1'):
+                        val_raw = q.get(field)
+                        if val_raw is not None:
+                            try:
+                                val = float(val_raw)
+                                if val > 0:
+                                    pos['_last_ltp'] = val
+                                    return val
+                            except (ValueError, TypeError):
+                                pass
             except Exception:
                 pass
         return pos.get('_last_ltp', pos['entry_price'])
@@ -317,6 +360,7 @@ class NaturalGasPaperBot:
         }
         self.positions[leg] = pos
         self.trades_today += 1
+        self._save_state()
 
         lines = [
             '<pre>',
@@ -367,6 +411,9 @@ class NaturalGasPaperBot:
         print(f'[PAPER EXIT] {trade_side} {pos["qty"]}x {tsym} @ Rs{ltp:.2f} | PnL: Rs{pnl:,.2f} | {reason}')
         send_telegram(tg)
         del self.positions[leg]
+        if len(self.positions) == 0:
+            self.last_double_stop_ts = time.time()
+        self._save_state()
 
     def _close_all(self, reason: str):
         for leg in list(self.positions.keys()):
@@ -524,9 +571,15 @@ class NaturalGasPaperBot:
 
                 if not self.positions:
                     if now.hour >= MCX_ENTRY_HOUR and self.trades_today < MAX_DAILY_TRADES:
-                        print(f'[INIT] Opening Initial ATM Straddle at Strike {int(atm)}...')
-                        self._enter_leg('CE', atm, 'SELL', loss_stop_pct=0.15, tsl_pct=0.15)
-                        self._enter_leg('PE', atm, 'SELL', loss_stop_pct=0.15, tsl_pct=0.15)
+                        # Require at least 5 minutes stabilization after a double stop-out
+                        time_since_stop = time.time() - getattr(self, "last_double_stop_ts", 0.0)
+                        if getattr(self, "last_double_stop_ts", 0.0) == 0.0 or time_since_stop >= 300.0:
+                            print(f'[INIT] Opening ATM Straddle at Strike {int(atm)} (Trades today: {self.trades_today}/{MAX_DAILY_TRADES})...')
+                            self._enter_leg('CE', atm, 'SELL', loss_stop_pct=0.15, tsl_pct=0.15)
+                            self._enter_leg('PE', atm, 'SELL', loss_stop_pct=0.15, tsl_pct=0.15)
+                        else:
+                            if int(time_since_stop) % 30 == 0:
+                                print(f'[WAIT] Double stop cooldown active. Resuming in {int(300 - time_since_stop)}s...')
                 else:
                     short_legs = [leg for leg in self.positions if self.positions[leg]['side'] == 'SELL']
 
