@@ -515,9 +515,9 @@ HEDGE_DISTANCE_FLOOR      = 300
 HEDGE_DISTANCE_RATIO      = 1.5
 
 # --- PREMIUM TSL (percentage of entry premium) ---
-PREM_SL_INITIAL_PCT       = 0.15   # 15% initial SL
-PREM_TSL_MIN_PCT          = 0.15   # 15% flat trail
-PREM_TSL_MAX_PCT          = 0.15   # 15% flat trail
+PREM_SL_INITIAL_PCT       = 0.10   # 10% initial SL
+PREM_TSL_MIN_PCT          = 0.07   # 7% flat trail
+PREM_TSL_MAX_PCT          = 0.07   # 7% flat trail
 
 # --- REENTRY CAPS ---
 KAMA_REVERSAL_ATR_RATIO   = 0.15

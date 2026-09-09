@@ -38,6 +38,8 @@ MCX_EXIT_HOUR    = 23     # 23:24 IST (11:24 PM auto square-off)
 MCX_EXIT_MINUTE  = 24
 LOT_SIZE         = 1250   # 1 Lot of Natural Gas = 1250 units
 MAX_DAILY_TRADES = 10     # Safeguard against runaway re-entries
+DEFAULT_SL_PCT   = 0.10   # 10% Stop Loss
+DEFAULT_TSL_PCT  = 0.07   # 7% Trailing Stop Loss
 
 TELEGRAM_TOKEN = '8850507396:AAFwFm2_WxPdSM52JcCpJUj8V1rz9x3G-kE'
 CHAT_ID = '6307066850'
@@ -326,7 +328,7 @@ class NaturalGasPaperBot:
                 pass
         return pos.get('_last_ltp', pos['entry_price'])
 
-    def _enter_leg(self, leg: str, strike: float, side: str, loss_stop_pct: float = 0.15, tsl_pct: float = 0.15):
+    def _enter_leg(self, leg: str, strike: float, side: str, loss_stop_pct: float = DEFAULT_SL_PCT, tsl_pct: float = DEFAULT_TSL_PCT):
         if self.trades_today >= MAX_DAILY_TRADES:
             print(f'[GUARD] Max daily trades limit ({MAX_DAILY_TRADES}) reached. Skipping entry.')
             return None
@@ -612,8 +614,8 @@ class NaturalGasPaperBot:
                         time_since_stop = time.time() - getattr(self, "last_double_stop_ts", 0.0)
                         if getattr(self, "last_double_stop_ts", 0.0) == 0.0 or time_since_stop >= 300.0:
                             print(f'[INIT] Opening ATM Straddle at Strike {int(atm)} (Trades today: {self.trades_today}/{MAX_DAILY_TRADES})...')
-                            self._enter_leg('CE', atm, 'SELL', loss_stop_pct=0.15, tsl_pct=0.15)
-                            self._enter_leg('PE', atm, 'SELL', loss_stop_pct=0.15, tsl_pct=0.15)
+                            self._enter_leg('CE', atm, 'SELL', loss_stop_pct=DEFAULT_SL_PCT, tsl_pct=DEFAULT_TSL_PCT)
+                            self._enter_leg('PE', atm, 'SELL', loss_stop_pct=DEFAULT_SL_PCT, tsl_pct=DEFAULT_TSL_PCT)
                         else:
                             if int(time_since_stop) % 30 == 0:
                                 print(f'[WAIT] Double stop cooldown active. Resuming in {int(300 - time_since_stop)}s...')
@@ -633,7 +635,7 @@ class NaturalGasPaperBot:
                                 reentry_strike = round_to_price(atm - dist, STRIKE_STEP)
 
                             print(f'[REENTRY] KAMA reversal detected! Re-entering {missing_leg} at Strike {int(reentry_strike)} (Surviving: {surviving_leg} {int(surviving_strike)})...')
-                            if self._enter_leg(missing_leg, reentry_strike, 'SELL', loss_stop_pct=0.15, tsl_pct=0.15):
+                            if self._enter_leg(missing_leg, reentry_strike, 'SELL', loss_stop_pct=DEFAULT_SL_PCT, tsl_pct=DEFAULT_TSL_PCT):
                                 self.last_reentry_ts = time.time()
 
                     for leg in list(self.positions.keys()):
