@@ -617,6 +617,22 @@ PREM_SL_DEBOUNCE_BARS   = 1
 COOLDOWN_MINUTES        = 0           # 3-minute cooldown removed as requested
 COOLDOWN_SPOT_PCT       = 0.0010      # 0.10% spot movement (~24 pts) resets cooldown early
 
+# --- REVERSION DETECTOR (Multi-Indicator Confluence) ---
+# Signals a reversal when 2 of 3 indicators agree
+REVERSAL_KAMA_SLOPE_THRESHOLD  = 0.50  # min |KAMA slope| for reversal signal (faster response)
+REVERSAL_ADX_MIN               = 20.0  # min ADX for the reversal to be meaningful
+REVERSAL_DI_GAP_MIN            = 2.0   # min gap between +DI and -DI to confirm direction
+
+# --- PROACTIVE (EARLY) LEG EXIT ---
+# When a leg is losing AND market is trending strongly against it, exit early
+PROACTIVE_EXIT_ENABLED         = True
+PROACTIVE_EXIT_TREND_ADX       = 28.0  # ADX above this = strong trend (exit early)
+PROACTIVE_EXIT_LOSS_PCT        = 0.07  # 7% loss threshold: if LTP > entry*(1+this), check early exit
+PROACTIVE_EXIT_DI_GAP_MIN      = 5.0   # min DI gap for proactive exit (avoid noise)
+
+# --- ALWAYS-ON 1-LEG RULE ---
+MIN_LEGS_ALWAYS_OPEN           = 1     # At least 1 short leg must be open at all times
+
 # Session Timing
 MARKET_START_HOUR       = 9
 MARKET_START_MINUTE     = 18          # Start trading / place hedges at 09:18 AM
@@ -1177,6 +1193,176 @@ class Indicators:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# MODULE 2B: REVERSION DETECTOR (Multi-Indicator Confluence Reversal Engine)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ReversionDetector:
+    """
+    Detects market reversals using 2-of-3 indicator confluence:
+      1. KAMA Slope  (1m adaptive momentum)
+      2. +DI / -DI crossover (ADX directional strength on 5m)
+      3. ATR volatility gate (move must be meaningful, not noise)
+
+    Also detects PROACTIVE EXIT conditions: when trend is strongly against a
+    short leg and we should exit early instead of waiting for the full SL.
+
+    Core Rule:
+      - CE reversion  = market turning DOWN  = good time to re-enter CE SELL
+      - PE reversion  = market turning UP    = good time to re-enter PE SELL
+    """
+
+    @staticmethod
+    def _score(indicators: dict) -> dict:
+        """Compute a direction-tagged score tuple for the current bar."""
+        kama        = float(indicators.get("kama")      or 0.0)
+        prev_kama   = float(indicators.get("prev_kama") or kama)
+        kama_slope  = kama - prev_kama
+
+        adx         = float(indicators.get("adx",      18.0))
+        plus_di     = float(indicators.get("plus_di",  20.0))
+        minus_di    = float(indicators.get("minus_di", 20.0))
+        atr         = float(indicators.get("atr",      DEFAULT_ATR_5M))
+        di_gap      = plus_di - minus_di   # >0 = bullish DI, <0 = bearish DI
+
+        return {
+            "kama_slope": kama_slope,
+            "adx": adx,
+            "plus_di": plus_di,
+            "minus_di": minus_di,
+            "di_gap": di_gap,
+            "atr": atr,
+        }
+
+    @classmethod
+    def is_reversal_for_ce(cls, indicators: dict) -> tuple:
+        """
+        Returns (signal: bool, confidence: int, reason: str)
+        CE reversal = market turning DOWN → safe to re-enter SELL CE
+        Needs 2 of 3:
+          1. KAMA slope <= -REVERSAL_KAMA_SLOPE_THRESHOLD
+          2. -DI > +DI with gap >= REVERSAL_DI_GAP_MIN  (bearish DI cross)
+          3. ADX >= REVERSAL_ADX_MIN (not a noise wiggle)
+        """
+        s = cls._score(indicators)
+        hits = 0
+        reasons = []
+
+        if s["kama_slope"] <= -REVERSAL_KAMA_SLOPE_THRESHOLD:
+            hits += 1
+            reasons.append(f"KAMA↓{s['kama_slope']:.2f}")
+
+        if s["minus_di"] > s["plus_di"] and abs(s["di_gap"]) >= REVERSAL_DI_GAP_MIN:
+            hits += 1
+            reasons.append(f"-DI({s['minus_di']:.1f})>+DI({s['plus_di']:.1f})")
+
+        if s["adx"] >= REVERSAL_ADX_MIN:
+            hits += 1
+            reasons.append(f"ADX{s['adx']:.1f}")
+
+        signal = (hits >= 2)
+        reason = "CE_REVERSAL[" + ",".join(reasons) + f"](score:{hits}/3)" if signal else ""
+        return signal, hits, reason
+
+    @classmethod
+    def is_reversal_for_pe(cls, indicators: dict) -> tuple:
+        """
+        Returns (signal: bool, confidence: int, reason: str)
+        PE reversal = market turning UP → safe to re-enter SELL PE
+        Needs 2 of 3:
+          1. KAMA slope >= +REVERSAL_KAMA_SLOPE_THRESHOLD
+          2. +DI > -DI with gap >= REVERSAL_DI_GAP_MIN  (bullish DI cross)
+          3. ADX >= REVERSAL_ADX_MIN
+        """
+        s = cls._score(indicators)
+        hits = 0
+        reasons = []
+
+        if s["kama_slope"] >= REVERSAL_KAMA_SLOPE_THRESHOLD:
+            hits += 1
+            reasons.append(f"KAMA↑{s['kama_slope']:.2f}")
+
+        if s["plus_di"] > s["minus_di"] and abs(s["di_gap"]) >= REVERSAL_DI_GAP_MIN:
+            hits += 1
+            reasons.append(f"+DI({s['plus_di']:.1f})>-DI({s['minus_di']:.1f})")
+
+        if s["adx"] >= REVERSAL_ADX_MIN:
+            hits += 1
+            reasons.append(f"ADX{s['adx']:.1f}")
+
+        signal = (hits >= 2)
+        reason = "PE_REVERSAL[" + ",".join(reasons) + f"](score:{hits}/3)" if signal else ""
+        return signal, hits, reason
+
+    @classmethod
+    def is_trend_strongly_against(cls, leg: str, indicators: dict) -> tuple:
+        """
+        Returns (should_exit_early: bool, reason: str)
+        Detects if market is trending STRONGLY against a short leg.
+        Used for PROACTIVE EARLY EXIT before the full SL is hit.
+
+        CE short is hurt when market goes UP (bullish trend):
+          - +DI > -DI with gap >= PROACTIVE_EXIT_DI_GAP_MIN
+          - ADX >= PROACTIVE_EXIT_TREND_ADX (strong trend, not choppy)
+          - KAMA slope >= +REVERSAL_KAMA_SLOPE_THRESHOLD (upward momentum)
+
+        PE short is hurt when market goes DOWN (bearish trend):
+          - -DI > +DI with gap >= PROACTIVE_EXIT_DI_GAP_MIN
+          - ADX >= PROACTIVE_EXIT_TREND_ADX
+          - KAMA slope <= -REVERSAL_KAMA_SLOPE_THRESHOLD (downward momentum)
+        """
+        if not PROACTIVE_EXIT_ENABLED:
+            return False, ""
+
+        s = cls._score(indicators)
+        hits = 0
+        reasons = []
+
+        if leg == "CE":
+            # CE is hurt by UP moves
+            if s["kama_slope"] >= REVERSAL_KAMA_SLOPE_THRESHOLD:
+                hits += 1
+                reasons.append(f"KAMA↑{s['kama_slope']:.2f}")
+            if s["plus_di"] > s["minus_di"] and abs(s["di_gap"]) >= PROACTIVE_EXIT_DI_GAP_MIN:
+                hits += 1
+                reasons.append(f"+DI({s['plus_di']:.1f})>>-DI({s['minus_di']:.1f})")
+            if s["adx"] >= PROACTIVE_EXIT_TREND_ADX:
+                hits += 1
+                reasons.append(f"ADX{s['adx']:.1f}(STRONG)")
+        elif leg == "PE":
+            # PE is hurt by DOWN moves
+            if s["kama_slope"] <= -REVERSAL_KAMA_SLOPE_THRESHOLD:
+                hits += 1
+                reasons.append(f"KAMA↓{s['kama_slope']:.2f}")
+            if s["minus_di"] > s["plus_di"] and abs(s["di_gap"]) >= PROACTIVE_EXIT_DI_GAP_MIN:
+                hits += 1
+                reasons.append(f"-DI({s['minus_di']:.1f})>>+DI({s['plus_di']:.1f})")
+            if s["adx"] >= PROACTIVE_EXIT_TREND_ADX:
+                hits += 1
+                reasons.append(f"ADX{s['adx']:.1f}(STRONG)")
+
+        # Need all 3 for proactive exit (high conviction required)
+        should_exit = (hits >= 3)
+        reason = f"PROACTIVE_EXIT_{leg}[" + ",".join(reasons) + "]" if should_exit else ""
+        return should_exit, reason
+
+    @classmethod
+    def safest_leg_to_enter(cls, indicators: dict) -> str:
+        """
+        When recovering from 0 legs open, determine which single leg is safest.
+        Returns 'CE', 'PE', or 'BOTH' based on current market direction.
+        """
+        s = cls._score(indicators)
+        # In strong uptrend: sell PE (market going up, put decays)
+        if s["kama_slope"] >= REVERSAL_KAMA_SLOPE_THRESHOLD and s["plus_di"] > s["minus_di"]:
+            return "PE"
+        # In strong downtrend: sell CE (market going down, call decays)
+        if s["kama_slope"] <= -REVERSAL_KAMA_SLOPE_THRESHOLD and s["minus_di"] > s["plus_di"]:
+            return "CE"
+        # Choppy/neutral: enter both
+        return "BOTH"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MODULE 3: DUAL-LAYER RISK MANAGEMENT (SPOT-BASED TSL & CIRCUIT BREAKER)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1255,7 +1441,34 @@ class RiskManager:
 
             if sl_state.get("breach_count", 0) >= PREM_SL_DEBOUNCE_BARS:
                 return True, f"⛔ {leg} TSL Triggered ({PREM_SL_DEBOUNCE_BARS}m Debounce)! | Entry: {entry_prem:.2f} | Best: {best_prem:.2f} | Current: {current_premium:.2f} >= SL: {prem_sl:.2f}"
-                
+
+        return False, ""
+
+    def check_proactive_exit(self, leg: str, pos_data: dict, current_premium: float, indicators: dict) -> tuple:
+        """
+        Proactive early exit: exit a short leg BEFORE SL is hit when:
+          1. The leg is in loss >= PROACTIVE_EXIT_LOSS_PCT (7%)
+          2. The market is trending strongly against it (all 3 indicators confirm)
+        Returns (should_exit: bool, reason: str)
+        """
+        sl_state = pos_data.get("dual_sl_state")
+        if not sl_state:
+            return False, ""
+
+        entry_prem = float(sl_state.get("entry_premium", current_premium))
+        if entry_prem <= 0:
+            return False, ""
+
+        loss_pct = (current_premium - entry_prem) / entry_prem
+        if loss_pct < PROACTIVE_EXIT_LOSS_PCT:
+            # Not in enough loss yet — don't trigger proactive exit
+            return False, ""
+
+        # Check if market is strongly trending against this leg
+        trend_against, trend_reason = ReversionDetector.is_trend_strongly_against(leg, indicators)
+        if trend_against:
+            return True, f"🔻 PROACTIVE_EXIT {leg} | Loss:{loss_pct*100:.1f}% > {PROACTIVE_EXIT_LOSS_PCT*100:.0f}% | {trend_reason}"
+
         return False, ""
 class ExecutionEngine:
     def __init__(self):
@@ -1781,80 +1994,165 @@ class ExecutionEngine:
             self._exit_leg("PE", reason=f"ORPHAN_SQUAREOFF_{context}")
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Anti-Whipsaw Re-entry (Zero 3-Minute Cooldown Delay)
+    # Always-On 1-Leg Rule: Reversal-Gated Re-Entry Engine
     # ──────────────────────────────────────────────────────────────────────────
 
-    def _trigger_leg_cooldown(self, stopped_leg: str, current_spot: float):
+    def _trigger_leg_cooldown(self, stopped_leg: str, current_spot: float, reason: str = "TSL"):
         """
-        Enters cooldown tracker.
-        Requires a strict KAMA reversal of 7.5 points to re-enter.
+        Marks a stopped leg as awaiting re-entry.
+        Re-entry is gated on ReversionDetector 2/3 confluence (not just KAMA slope).
+        The surviving leg stays open — NEVER close it when this is triggered.
         """
         current_kama = float(self.current_indicators.get("kama", current_spot) or current_spot)
         self.cooldown_tracker[stopped_leg] = {
             "stopped_time": time.time(),
             "stopped_spot": current_spot,
-            "extreme_kama": current_kama,
-            "active": True
+            "stopped_kama": current_kama,
+            "active": True,
+            "stop_reason": reason,
+            "reentries_today": self.cooldown_tracker.get(stopped_leg, {}).get("reentries_today", 0),
+            "next_eligible_time": time.time() + 5,  # 5s minimum before any re-entry attempt
         }
-        log_alert(f"⏳ {stopped_leg} stopped out. Requiring 0.25 pt KAMA reversal to re-enter.")
-        self.mode = "COOLDOWN"
+        surviving = "PE" if stopped_leg == "CE" else "CE"
+        surviving_open = (surviving in self.positions and self.positions[surviving].get("side") == "SELL")
+        log_alert(
+            f"⏳ {stopped_leg} stopped ({reason}). Awaiting reversal signal (2/3 indicators). "
+            f"Surviving {surviving}: {'✅ OPEN' if surviving_open else '⚠️ ALSO CLOSED'}."
+        )
+        if surviving_open:
+            self.mode = "COOLDOWN"   # 1 leg open → COOLDOWN
+        else:
+            self.mode = "RUNNING"    # Will be handled by always-on rule in run()
         self._save_state()
 
     def _check_cooldown_and_reenter(self, spot: float, atm: int, atr: float, regime: str, trend: int, dte_days: float = 2.0):
-        if self.strangle_resets_today >= MAX_STRANGLE_RESETS: return
-        
-        current_kama = float(self.current_indicators.get("kama", spot) or spot)
-        prev_kama = float(self.current_indicators.get("prev_kama", current_kama) or current_kama)
-        kama_slope = current_kama - prev_kama
-        
+        """
+        Runs EVERY TICK (1 second). Checks ReversionDetector 2/3 confluence for each
+        stopped leg and re-enters at ATM when signal fires.
+        This is the heart of the Always-On 1-Leg Rule.
+        """
+        if self.strangle_resets_today >= MAX_STRANGLE_RESETS:
+            return
+
+        indicators = self.current_indicators
+
         for leg in ("PE", "CE"):
             cd = self.cooldown_tracker.get(leg)
-            if not cd or not cd.get("active", False): continue
-            
-            if cd.get("reentries_today", 0) >= MAX_REENTRIES_PER_LEG: continue
-            if self.total_reentries_today >= MAX_REENTRIES_TOTAL: continue
-            if time.time() < cd.get("next_eligible_time", 0): continue
-            
-            if leg == "CE":
-                # CE stopped out because market went UP. Re-enter if KAMA slope turns DOWN.
-                if kama_slope <= -0.25:
-                    cd["consecutive_bars"] = cd.get("consecutive_bars", 0) + 1
-                else:
-                    cd["consecutive_bars"] = 0
-            else:
-                # PE stopped out because market went DOWN. Re-enter if KAMA slope turns UP.
-                if kama_slope >= 0.25:
-                    cd["consecutive_bars"] = cd.get("consecutive_bars", 0) + 1
-                else:
-                    cd["consecutive_bars"] = 0
-                
-            if cd.get("consecutive_bars", 0) >= 1:
-                # Re-entry short strike is directly on ATM (0 pts away, removing 50pts away logic)
-                strike = atm
-                
-                has_short = sum(1 for p in self.positions.values() if p.get("side") == "SELL")
-                if has_short >= MAX_CONCURRENT_SHORT_LEGS: continue
-                
-                # Ensure hedge is active before entering short leg for margin protection
-                hedge_leg = f"{leg}_HEDGE"
-                if hedge_leg not in self.positions:
-                    hedge_dist = 1000
-                    hedge_strike = atm + hedge_dist if leg == "CE" else atm - hedge_dist
-                    self._enter_leg(hedge_leg, hedge_strike, "BUY", spot, atr, dte_days)
+            if not cd or not cd.get("active", False):
+                continue
 
-                if self._enter_leg(leg, strike, "SELL", spot, atr, dte_days):
-                    cd["active"] = False
-                    cd["reentries_today"] = cd.get("reentries_today", 0) + 1
-                    self.total_reentries_today += 1
-                    # BUG 10 FIX: Flat 30s backoff instead of exponential (KAMA condition already gates re-entry)
-                    cd["next_eligible_time"] = time.time() + 30
-                    # BUG 2+3 FIX: Restore RUNNING mode after successful re-entry
-                    self.mode = "RUNNING"
-                    self._save_state()
+            if cd.get("reentries_today", 0) >= MAX_REENTRIES_PER_LEG:
+                continue
+            if self.total_reentries_today >= MAX_REENTRIES_TOTAL:
+                continue
+            if time.time() < cd.get("next_eligible_time", 0):
+                continue
+
+            # ── Check reversal signal using 2/3 confluence ──
+            if leg == "CE":
+                # CE stopped because market went UP → re-enter when market turns DOWN
+                signal, confidence, reason = ReversionDetector.is_reversal_for_ce(indicators)
+            else:
+                # PE stopped because market went DOWN → re-enter when market turns UP
+                signal, confidence, reason = ReversionDetector.is_reversal_for_pe(indicators)
+
+            if not signal:
+                continue
+
+            # ── Signal confirmed: attempt re-entry at ATM ──
+            has_short = sum(1 for p in self.positions.values() if p.get("side") == "SELL")
+            if has_short >= MAX_CONCURRENT_SHORT_LEGS:
+                continue
+
+            strike = atm
+            log_info(f"✅ {leg} reversal confirmed ({reason}). Re-entering at ATM {strike}...")
+
+            # Ensure hedge is active before short leg (margin protection)
+            hedge_leg = f"{leg}_HEDGE"
+            if hedge_leg not in self.positions:
+                hedge_dist = 1000
+                hedge_strike = atm + hedge_dist if leg == "CE" else atm - hedge_dist
+                log_info(f"  → Re-entering {hedge_leg} at {hedge_strike} first (margin protection)...")
+                self._enter_leg(hedge_leg, hedge_strike, "BUY", spot, atr, dte_days)
+
+            if self._enter_leg(leg, strike, "SELL", spot, atr, dte_days):
+                cd["active"] = False
+                cd["reentries_today"] = cd.get("reentries_today", 0) + 1
+                self.total_reentries_today += 1
+                cd["next_eligible_time"] = time.time() + 30  # 30s cooldown between re-entries
+                self.mode = "RUNNING"
+                log_info(f"✅ {leg} re-entered at ATM {strike}. Mode → RUNNING. Total re-entries today: {self.total_reentries_today}")
+                self._save_state()
+
+    def _ensure_always_one_leg_open(self, spot: float, atm: int, atr: float, dte_days: float):
+        """
+        Core 'Always-On 1-Leg' safety net.
+        Called when no short legs are found open. Instead of waiting 10 seconds,
+        immediately determines the safest leg to enter based on current market direction
+        and enters it right away, then waits for reversal to add the second leg.
+        """
+        indicators = self.current_indicators
+        safest = ReversionDetector.safest_leg_to_enter(indicators)
+        regime = indicators.get("regime", "CHOP")
+
+        log_alert(
+            f"⚠️ NO ACTIVE SHORT LEGS! Applying Always-On rule: regime={regime}, safest={safest}. "
+            f"Entering immediately..."
+        )
+
+        legs_to_enter = []
+        if safest == "BOTH" or regime == "CHOP":
+            legs_to_enter = ["CE", "PE"]
+        elif safest == "PE":
+            legs_to_enter = ["PE"]
+            # Mark CE as needing reversal-gated re-entry
+            if not self.cooldown_tracker.get("CE", {}).get("active"):
+                self.cooldown_tracker["CE"] = {
+                    "stopped_time": time.time(),
+                    "stopped_spot": spot,
+                    "stopped_kama": float(indicators.get("kama", spot) or spot),
+                    "active": True,
+                    "stop_reason": "ALWAYS_ON_DEFERRED",
+                    "reentries_today": self.cooldown_tracker.get("CE", {}).get("reentries_today", 0),
+                    "next_eligible_time": time.time() + 30,
+                }
+        elif safest == "CE":
+            legs_to_enter = ["CE"]
+            # Mark PE as needing reversal-gated re-entry
+            if not self.cooldown_tracker.get("PE", {}).get("active"):
+                self.cooldown_tracker["PE"] = {
+                    "stopped_time": time.time(),
+                    "stopped_spot": spot,
+                    "stopped_kama": float(indicators.get("kama", spot) or spot),
+                    "active": True,
+                    "stop_reason": "ALWAYS_ON_DEFERRED",
+                    "reentries_today": self.cooldown_tracker.get("PE", {}).get("reentries_today", 0),
+                    "next_eligible_time": time.time() + 30,
+                }
+
+        entered_any = False
+        for leg in legs_to_enter:
+            if leg in self.positions and self.positions[leg].get("side") == "SELL":
+                continue  # already open
+            hedge_leg = f"{leg}_HEDGE"
+            if hedge_leg not in self.positions:
+                hedge_dist = 1000
+                hedge_strike = atm + hedge_dist if leg == "CE" else atm - hedge_dist
+                self._enter_leg(hedge_leg, hedge_strike, "BUY", spot, atr, dte_days)
+            if self._enter_leg(leg, atm, "SELL", spot, atr, dte_days):
+                entered_any = True
+                log_info(f"✅ Always-On: Entered {leg} SELL at ATM {atm}.")
+
+        if entered_any:
+            self.mode = "RUNNING"
+            self._save_state()
+        else:
+            log_warn("⚠️ Always-On rule: Could not enter any leg. Will retry next tick.")
+
     def _render_dashboard(self, spot: float, atm: int):
         import re
         def ansi_len(s): return len(re.sub(r"\x1b\[[0-9;]*m", "", s))
-        
+
         W = 114
         c_cyan   = f"{Fore.CYAN}{Style.BRIGHT}"
         c_white  = f"{Fore.WHITE}{Style.BRIGHT}"
@@ -2289,29 +2587,31 @@ class ExecutionEngine:
                                 # Market moved > 20 pts: start with 1 leg
                                 if move_0915_0918 > 20.0:
                                     # Bullish move (+20 pts): Sell PE at ATM (Put writing on bull move), defer CE
-                                    log_info(f"🚀 Bullish move detected (+{move_0915_0918:.2f} pts > +20 pts). Starting with 1 leg: SELL PE at ATM ({atm}). CE leg deferred until KAMA reversal.")
+                                    log_info(f"🚀 Bullish move detected (+{move_0915_0918:.2f} pts > +20 pts). Starting with 1 leg: SELL PE at ATM ({atm}). CE leg deferred until reversal signal.")
                                     enter_ce = False
                                     enter_pe = True
                                     self.cooldown_tracker["CE"] = {
                                         "stopped_time": time.time(),
                                         "stopped_spot": spot,
+                                        "stopped_kama": float(self.current_indicators.get("kama", spot) or spot),
                                         "active": True,
-                                        "consecutive_bars": 0,
+                                        "stop_reason": "BULLISH_OPEN_DEFERRED",
                                         "reentries_today": 0,
-                                        "next_eligible_time": time.time() + 10
+                                        "next_eligible_time": time.time() + 60  # 60s before first re-entry attempt
                                     }
                                 else:
                                     # Bearish move (-20 pts): Sell CE at ATM (Call writing on bear move), defer PE
-                                    log_info(f"🔻 Bearish move detected ({move_0915_0918:.2f} pts < -20 pts). Starting with 1 leg: SELL CE at ATM ({atm}). PE leg deferred until KAMA reversal.")
+                                    log_info(f"🔻 Bearish move detected ({move_0915_0918:.2f} pts < -20 pts). Starting with 1 leg: SELL CE at ATM ({atm}). PE leg deferred until reversal signal.")
                                     enter_ce = True
                                     enter_pe = False
                                     self.cooldown_tracker["PE"] = {
                                         "stopped_time": time.time(),
                                         "stopped_spot": spot,
+                                        "stopped_kama": float(self.current_indicators.get("kama", spot) or spot),
                                         "active": True,
-                                        "consecutive_bars": 0,
+                                        "stop_reason": "BEARISH_OPEN_DEFERRED",
                                         "reentries_today": 0,
-                                        "next_eligible_time": time.time() + 10
+                                        "next_eligible_time": time.time() + 60  # 60s before first re-entry attempt
                                     }
                             else:
                                 # Choppy market (<= 20 pts): start with 2 legs at ATM
@@ -2360,65 +2660,70 @@ class ExecutionEngine:
 
                 # Phase B: Active Trading Management (RUNNING, CHOP_MODE, COOLDOWN)
                 elif self.mode in ("RUNNING", "CHOP_MODE", "COOLDOWN"):
-                    has_short = any(p.get("side") == "SELL" for p in self.positions.values())
-                    if not has_short:
-                        if self._both_legs_closed_ts is None:
-                            self._both_legs_closed_ts = time.time()
-                            log_info("🛑 Both short legs closed! Waiting 10 seconds before re-entering fresh ATM Strangle...")
+                    # ── Always-On Safety Check: ensure ≥1 short leg always open ──
+                    active_shorts = [leg for leg in ("CE", "PE")
+                                     if leg in self.positions and self.positions[leg].get("side") == "SELL"]
 
-                        elapsed = time.time() - self._both_legs_closed_ts
-                        if elapsed < 10.0:
-                            log_info(f"⏳ Waiting to re-enter ATM Strangle: {10.0 - elapsed:.1f}s remaining...")
-                            self._render_dashboard(spot, atm)
-                            self._smart_sleep(1.0)
-                            continue
-                        else:
-                            log_info("🔄 10-second wait elapsed after both legs closed. Clearing orphan hedges and re-entering fresh ATM Strangle...")
-                            self._both_legs_closed_ts = None
-                            self._exit_all_positions(reason="REENTER_ATM_STRANGLE_10S")
-                            self.mode = "WAIT_DATA"
-                            self.cooldown_tracker.clear()
-                            self._save_state()
-                            continue
-                    else:
-                        self._both_legs_closed_ts = None
-
-                    # Check Premium TSL strictly on 1-min collected data
-                    for leg in ("CE", "PE"):
-                        if leg in self.positions and self.positions[leg]["side"] == "SELL":
-                            is_strangle = ("CE" in self.positions and "PE" in self.positions)
-                            ltp_premium = self._get_ltp(self.positions[leg]["strike"], self.positions[leg]["base"])
-                            is_stopped, reason = self.risk_manager.update_dual_sl_and_check(
-                                leg, self.positions[leg], spot, ltp_premium, is_strangle, is_new_1m_bar
-                            )
-                            if is_stopped:
-                                log_alert(reason)
-                                self._exit_leg(leg, reason="PREM_TSL_HIT")
-                                self._trigger_leg_cooldown(leg, spot)
-
-                    # Dynamic re-entry for missing leg (continuous KAMA reversal or regime check)
-                    self._check_cooldown_and_reenter(spot, atm, atr, regime, trend, dte_days=dte_days)
-
-                # Phase C: HEDGES_ONLY mode (auto-recenter to fresh ATM Strangle after 10 seconds)
-                elif self.mode == "HEDGES_ONLY":
-                    if self._both_legs_closed_ts is None:
-                        self._both_legs_closed_ts = time.time()
-                        log_info("🛑 HEDGES_ONLY mode detected: Waiting 10 seconds before re-entering fresh ATM Strangle...")
-
-                    elapsed = time.time() - self._both_legs_closed_ts
-                    if elapsed < 10.0:
-                        log_info(f"⏳ Waiting to re-enter ATM Strangle: {10.0 - elapsed:.1f}s remaining...")
+                    if not active_shorts:
+                        # NO short legs open → invoke Always-On rule immediately
+                        # (replaces the old 10-second wait entirely)
+                        self._both_legs_closed_ts = None  # reset any old timer
+                        self._ensure_always_one_leg_open(spot, atm, atr, dte_days)
                         self._render_dashboard(spot, atm)
                         self._smart_sleep(1.0)
                         continue
                     else:
-                        log_info(f"🔄 10-second wait elapsed. Re-entering fresh ATM Strangle at ATM {atm}...")
-                        self._both_legs_closed_ts = None
-                        self._exit_all_positions(reason="REENTER_ATM_STRANGLE_10S")
-                        self.mode = "WAIT_DATA"
-                        self.cooldown_tracker.clear()
-                        self._save_state()
-                        continue
+                        self._both_legs_closed_ts = None  # reset if we have legs again
+
+                    # ── Proactive Early Exit + Standard TSL Check (every tick) ──
+                    for leg in ("CE", "PE"):
+                        if leg not in self.positions or self.positions[leg].get("side") != "SELL":
+                            continue
+
+                        is_strangle = ("CE" in self.positions and "PE" in self.positions
+                                       and self.positions["CE"].get("side") == "SELL"
+                                       and self.positions["PE"].get("side") == "SELL")
+                        ltp_premium = self._get_ltp(self.positions[leg]["strike"], self.positions[leg]["base"])
+
+                        # ── Proactive Exit: exit early if trend is strongly against leg ──
+                        # (only check if the OTHER leg is still open — never exit the last leg proactively)
+                        other_leg = "PE" if leg == "CE" else "CE"
+                        other_open = (other_leg in self.positions and
+                                      self.positions[other_leg].get("side") == "SELL")
+
+                        if other_open:
+                            # Safe to proactively exit this leg — the other will stay open
+                            p_exit, p_reason = self.risk_manager.check_proactive_exit(
+                                leg, self.positions[leg], ltp_premium, self.current_indicators
+                            )
+                            if p_exit:
+                                log_alert(p_reason)
+                                self._exit_leg(leg, reason="PROACTIVE_TREND_EXIT")
+                                self._trigger_leg_cooldown(leg, spot, reason="PROACTIVE_TREND_EXIT")
+                                continue  # next leg check
+
+                        # ── Standard TSL Check ──
+                        is_stopped, reason = self.risk_manager.update_dual_sl_and_check(
+                            leg, self.positions[leg], spot, ltp_premium, is_strangle, is_new_1m_bar
+                        )
+                        if is_stopped:
+                            log_alert(reason)
+                            # Check if this is the LAST open leg — if so, we CANNOT exit without re-entering first
+                            # Instead: widen the SL temporarily by marking this tick as not breached
+                            # Actually for TSL: always allow exit — Always-On rule kicks in next tick
+                            self._exit_leg(leg, reason="PREM_TSL_HIT")
+                            self._trigger_leg_cooldown(leg, spot, reason="PREM_TSL_HIT")
+
+                    # ── Reversal-Gated Re-Entry for Stopped Legs ──
+                    self._check_cooldown_and_reenter(spot, atm, atr, regime, trend, dte_days=dte_days)
+
+                # Phase C: HEDGES_ONLY mode → treat same as no-short-legs → use Always-On rule
+                elif self.mode == "HEDGES_ONLY":
+                    # Clear any old 10s timer (removed)
+                    self._both_legs_closed_ts = None
+                    log_info("🔁 HEDGES_ONLY mode: Applying Always-On rule to re-enter short legs immediately...")
+                    self._ensure_always_one_leg_open(spot, atm, atr, dte_days)
+
 
                 # ── 5. Render Live Dashboard ──
                 self._render_dashboard(spot, atm)
