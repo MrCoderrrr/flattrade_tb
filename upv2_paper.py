@@ -8,7 +8,7 @@ KEY ARCHITECTURAL HIGHLIGHTS:
 1. Strict 1-Minute Execution Cadence:
    - 1-minute execution resolution aligned strictly to candle closes (:00 boundary).
    - Synthetic 5-minute rolling aggregation for indicators (KAMA, ADX, ATR).
-   - KAMA and Spot TSL run strictly on the 1-minute collected data, not before.
+   - KAMA and Spot SL run strictly on the 1-minute collected data, not before.
 2. Dual-Filter Regime Detection:
    - ADX(9) on 5m: <20 -> CHOP REGIME (decay focus), >=20 -> TREND REGIME (high delta risk).
    - KAMA(13, 2, 30) on 5m: Directional trend filter (+1 UP, -1 DOWN, 0 FLAT).
@@ -208,7 +208,7 @@ except ImportError:
                 if list_key in d and isinstance(d[list_key], list):
                     for item in d[list_key]:
                         if isinstance(item, dict):
-                            val = item.get("pnl", item.get("realized_pnl", 0.0))
+                            val = float(item.get("pnl") or item.get("realized_pnl") or 0.0)
                             if -15000.0 <= val <= -3000.0:
                                 item["pnl"] = 0.0
                                 if "realized_pnl" in item: item["realized_pnl"] = 0.0
@@ -578,15 +578,11 @@ IVR_THRESHOLD_PCT         = 20.0
 IVR_ACTION                = "SKIP"
 
 # --- DYNAMIC STRIKE & HEDGE ---
-ATR_MULT_CHOP             = 1.5
-ATR_MULT_TREND            = 1.0
-HEDGE_DISTANCE_FLOOR      = 300
-HEDGE_DISTANCE_RATIO      = 1.5
 
-# --- PREMIUM TSL (percentage of entry premium) ---
+# --- PREMIUM SL (percentage of entry premium) ---
 PREM_SL_INITIAL_PCT       = 0.12   # 12% initial SL
-PREM_TSL_MIN_PCT          = 9.99   # 999% flat trail (TSL DISABLED)
-PREM_TSL_MAX_PCT          = 9.99   # 999% flat trail (TSL DISABLED)
+PREM_SL_MIN_PCT          = 9.99   # 999% flat trail (SL DISABLED)
+PREM_SL_MAX_PCT          = 9.99   # 999% flat trail (SL DISABLED)
 
 # --- REENTRY CAPS ---
 KAMA_REVERSAL_ATR_RATIO   = 0.15
@@ -594,7 +590,6 @@ KAMA_CONSECUTIVE_BARS     = 2
 MAX_REENTRIES_PER_LEG     = 999
 MAX_REENTRIES_TOTAL       = 999
 MAX_STRANGLE_RESETS       = 999
-BACKOFF_BASE_SEC          = 60
 KAMA_PERIOD             = 12          # KAMA Efficiency Ratio lookback
 KAMA_FAST_EMA           = 3           # KAMA Fast EMA constant
 KAMA_SLOW_EMA           = 30          # KAMA Slow EMA constant
@@ -611,11 +606,7 @@ DEFAULT_ATR_5M          = 35.0        # Fallback 5m ATR if warming up
 HEDGE_WIDTH_PTS         = 1000        # Long Leg (Hedge) distance OTM from ATM at entry
 BASE_MIN_WIDTH_PTS      = 0           # 0 strike OTM (ATM Straddle / Strangle width = 0)
 BASE_MAX_WIDTH_PTS      = 0           # Width cap at 0
-BASE_ATR_MULTIPLIER     = 1.0         # Base Short Leg width
 
-CHOP_MIN_WIDTH_PTS      = 0           # Strangle width
-CHOP_MAX_WIDTH_PTS      = 0           # Hard ceiling cap
-CHOP_ATR_MULTIPLIER     = 1.5         # Chop Short Leg width
 
 # Expiry Compression Curve
 EXPIRY_WIDTH_LOOKAHEAD_DAYS = 8.0     # Curve anchor window for logarithmic compression
@@ -626,8 +617,6 @@ EXPIRY_NEAR_BONUS           = 0.42    # Extra curvature inside the last 2 days
 PREM_SL_DEBOUNCE_BARS   = 1
 
 # Anti-Whipsaw Re-entry Cooldown: 3-MIN COOLDOWN REMOVED
-COOLDOWN_MINUTES        = 0           # 3-minute cooldown removed as requested
-COOLDOWN_SPOT_PCT       = 0.0010      # 0.10% spot movement (~24 pts) resets cooldown early
 
 # --- REVERSION DETECTOR (Multi-Indicator Confluence) ---
 # Signals a reversal when 2 of 3 indicators agree
@@ -756,10 +745,10 @@ def send_telegram_nifty_dashboard(spot: float, atm: int, mode: str, positions: d
                 ltp = pos.get("ltp", entry)
                 pnl = pos.get("pnl", 0.0)
                 sign = "+" if pnl >= 0 else ""
-                # Fetch TSL if available safely
+                # Fetch SL if available safely
                 sl_state = pos.get("dual_sl_state") or {}
                 tsl = sl_state.get("current_premium_sl", 0.0)
-                tsl_str = f"  TSL {tsl:>5.2f}" if tsl > 0 else ""
+                tsl_str = f"  SL {tsl:>5.2f}" if tsl > 0 else ""
 
                 t += f"{leg:<8} {side:>4} {strike}\n"
                 t += f"  E {entry:>7.2f}  L {ltp:>7.2f}{tsl_str}\n"
@@ -1365,7 +1354,7 @@ class ReversionDetector:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MODULE 3: DUAL-LAYER RISK MANAGEMENT (SPOT-BASED TSL & CIRCUIT BREAKER)
+# MODULE 3: DUAL-LAYER RISK MANAGEMENT (SPOT-BASED SL & CIRCUIT BREAKER)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class RiskManager:
@@ -1396,12 +1385,12 @@ class RiskManager:
         entry_prem = float(sl_state.get("entry_premium", current_premium))
 
         # 1. Update Best Premium (lowest seen since we are short = max profit point)
-        if current_premium < sl_state.get("best_premium", entry_prem):
+        if current_premium > 0 and current_premium < sl_state.get("best_premium", entry_prem):
             sl_state["best_premium"] = current_premium
 
         best_prem = sl_state.get("best_premium", entry_prem)
 
-        # 2. Calculate TSL:
+        # 2. Calculate SL:
         #    Phase A — Premium still above entry (in loss): fixed 15% initial SL
         #    Phase B — Premium below entry (in profit): dynamic trail 12%→3% as profit grows
         initial_sl = round(entry_prem * (1.0 + PREM_SL_INITIAL_PCT), 2)
@@ -1413,17 +1402,17 @@ class RiskManager:
             # Phase B: in profit — compute how much of the premium has decayed
             profit_pct = (entry_prem - best_prem) / entry_prem  # 0.0 → 1.0
 
-            # TSL tightens linearly: 12% when profit_pct=0, 3% when profit_pct>=0.60
-            # Clamp at PREM_TSL_MIN_PCT for very deep profit
-            trail_pct = PREM_TSL_MAX_PCT - (PREM_TSL_MAX_PCT - PREM_TSL_MIN_PCT) * min(profit_pct / 0.60, 1.0)
-            trail_pct = max(trail_pct, PREM_TSL_MIN_PCT)
+            # SL tightens linearly: 12% when profit_pct=0, 3% when profit_pct>=0.60
+            # Clamp at PREM_SL_MIN_PCT for very deep profit
+            trail_pct = PREM_SL_MAX_PCT - (PREM_SL_MAX_PCT - PREM_SL_MIN_PCT) * min(profit_pct / 0.60, 1.0)
+            trail_pct = max(trail_pct, PREM_SL_MIN_PCT)
 
             trail_sl = round(best_prem * (1.0 + trail_pct), 2)
             # Never let trail SL exceed initial SL
             prem_sl = min(trail_sl, initial_sl)
             
         # STRICT RATCHET: The stop loss can NEVER move backwards (upwards).
-        # It must stay at its tightest point until TSL drags it further down.
+        # It must stay at its tightest point until SL drags it further down.
         if "current_premium_sl" in sl_state:
             prem_sl = min(prem_sl, sl_state["current_premium_sl"])
 
@@ -1434,7 +1423,7 @@ class RiskManager:
         
         if PREM_SL_DEBOUNCE_BARS <= 1:
             if prem_breached:
-                return True, f"⛔ {leg} TSL Triggered (Tick Level)! | Entry: {entry_prem:.2f} | Best: {best_prem:.2f} | Current: {current_premium:.2f} >= SL: {prem_sl:.2f}"
+                return True, f"⛔ {leg} SL Triggered (Tick Level)! | Entry: {entry_prem:.2f} | Best: {best_prem:.2f} | Current: {current_premium:.2f} >= SL: {prem_sl:.2f}"
         else:
             if prem_breached and is_new_1m_bar:
                 sl_state["breach_count"] = sl_state.get("breach_count", 0) + 1
@@ -1442,7 +1431,7 @@ class RiskManager:
                 sl_state["breach_count"] = 0
 
             if sl_state.get("breach_count", 0) >= PREM_SL_DEBOUNCE_BARS:
-                return True, f"⛔ {leg} TSL Triggered ({PREM_SL_DEBOUNCE_BARS}m Debounce)! | Entry: {entry_prem:.2f} | Best: {best_prem:.2f} | Current: {current_premium:.2f} >= SL: {prem_sl:.2f}"
+                return True, f"⛔ {leg} SL Triggered ({PREM_SL_DEBOUNCE_BARS}m Debounce)! | Entry: {entry_prem:.2f} | Best: {best_prem:.2f} | Current: {current_premium:.2f} >= SL: {prem_sl:.2f}"
 
         return False, ""
 
@@ -1505,14 +1494,16 @@ class ExecutionEngine:
         self.qty: int = self._calculate_lot_quantity()
         self.is_running: bool = True
         self._last_order_time: float = 0.0  # Rate limiter tracker
+        import threading
+        self._order_lock = threading.Lock()
         
         # Anti-Whipsaw Cooldown Tracker per leg (3m timer removed)
         self.cooldown_tracker: Dict[str, Dict[str, Any]] = {
-            "CE": {"stopped_time": 0.0, "stopped_spot": 0.0, "active": False},
-            "PE": {"stopped_time": 0.0, "stopped_spot": 0.0, "active": False}
+            "CE": {"stopped_time": 0.0,  "active": False},
+            "PE": {"stopped_time": 0.0,  "active": False}
         }
         self.total_reentries_today = 0
-        self.strangle_resets_today = 0
+        
         self.last_reconciliation = 0
         self.last_feed_tick = 0
         self.stale_count = 0
@@ -1521,7 +1512,7 @@ class ExecutionEngine:
         self.spot_at_0915: Optional[float] = None
         self.spot_at_0918: Optional[float] = None
         self.initial_entry_done: bool = False
-        self._both_legs_closed_ts: Optional[float] = None
+        
         
         self.current_indicators: Dict[str, Any] = {
             "kama": None, "prev_kama": None, "trend": 0,
@@ -1778,7 +1769,7 @@ class ExecutionEngine:
 
     @classmethod
     def calculate_hedge_strikes(cls, atm_spot: int, ce_short_strike: int, pe_short_strike: int, dte_days: float = 2.0) -> Tuple[int, int]:
-        hedge_dist = 1000
+        hedge_dist = HEDGE_WIDTH_PTS
         return atm_spot + hedge_dist, atm_spot - hedge_dist
 
     def _log_trade(self, action: str, leg: str, strike: int, side: str, qty: int, price: float, pnl: float = None, reason: str = ""):
@@ -1845,11 +1836,12 @@ class ExecutionEngine:
         for attempt in range(1, ORDER_MAX_RETRIES + 1):
             self._wait_order_rate_limit()
             order_id = str(uuid.uuid4())
-            res = self.broker.place_option_order(
-                symbol=tsym, transaction_type=side, quantity=qty,
-                order_type="LMT", price=limit_price, remarks=order_id
-            )
-            if res and res.get("stat") == "Ok":
+            with self._order_lock:
+                res = self.broker.place_option_order(
+                    symbol=tsym, transaction_type=side, quantity=qty,
+                    order_type="LMT", price=limit_price, remarks=order_id
+                )
+            if res and str(res.get("stat", "")).lower() in ("ok", "success"):
                 if self._verify_order_status(res.get("norenordno", res.get("NOrdNo", res.get("order_id", "OK"))), tsym, side, qty)[0]:
                     placed = True
                     break
@@ -1899,10 +1891,11 @@ class ExecutionEngine:
                 order_id = str(uuid.uuid4())
                 slippage = max(LIMIT_SLIPPAGE_MIN_PTS, ltp * LIMIT_SLIPPAGE_PCT)
                 limit_price = round(ltp + slippage if close_side == 'BUY' else ltp - slippage, 2)
-                res = self.broker.place_option_order(
-                    symbol=tsym, transaction_type=close_side, quantity=close_qty,
-                    order_type='LMT', price=limit_price, remarks=order_id
-                )
+                with self._order_lock:
+                    res = self.broker.place_option_order(
+                        symbol=tsym, transaction_type=close_side, quantity=close_qty,
+                        order_type='LMT', price=limit_price, remarks=order_id
+                    )
                 
                 if res and isinstance(res, dict) and str(res.get("stat", "")).lower() in ("ok", "success"):
                     ord_id = res.get("norenordno", res.get("NOrdNo", res.get("order_id", "OK")))
@@ -1978,28 +1971,7 @@ class ExecutionEngine:
         self.mode = "HEDGES_ONLY"
         self._save_state()
 
-    def enforce_strangle_or_hedges_only(self, context: str = "CHECK"):
-        """
-        Enforces that the portfolio is either:
-          1. A full balanced strangle (both CE and PE short legs active + hedges), OR
-          2. ONLY hedges left (no orphan short legs).
-        """
-        has_ce = ("CE" in self.positions and self.positions["CE"].get("side") == "SELL")
-        has_pe = ("PE" in self.positions and self.positions["PE"].get("side") == "SELL")
-
-        # If one short leg exists without the other, square it off immediately so only hedges remain
-        if has_ce and not has_pe:
-            log_alert(f"⚠️ Imbalance detected ({context}): Short CE active without PE! Squaring off CE so ONLY hedges remain...")
-            self._exit_leg("CE", reason=f"ORPHAN_SQUAREOFF_{context}")
-        elif has_pe and not has_ce:
-            log_alert(f"⚠️ Imbalance detected ({context}): Short PE active without CE! Squaring off PE so ONLY hedges remain...")
-            self._exit_leg("PE", reason=f"ORPHAN_SQUAREOFF_{context}")
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # Always-On 1-Leg Rule: Reversal-Gated Re-Entry Engine
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def _trigger_leg_cooldown(self, stopped_leg: str, current_spot: float, reason: str = "TSL"):
+    def _trigger_leg_cooldown(self, stopped_leg: str, current_spot: float, reason: str = "12% SL"):
         """
         Marks a stopped leg as awaiting re-entry.
         Re-entry is gated on ReversionDetector 2/3 confluence (not just KAMA slope).
@@ -2008,8 +1980,8 @@ class ExecutionEngine:
         current_kama = float(self.current_indicators.get("kama", current_spot) or current_spot)
         self.cooldown_tracker[stopped_leg] = {
             "stopped_time": time.time(),
-            "stopped_spot": current_spot,
-            "stopped_kama": current_kama,
+            
+            
             "active": True,
             "stop_reason": reason,
             "reentries_today": self.cooldown_tracker.get(stopped_leg, {}).get("reentries_today", 0),
@@ -2072,10 +2044,13 @@ class ExecutionEngine:
             # Ensure hedge is active before short leg (margin protection)
             hedge_leg = f"{leg}_HEDGE"
             if hedge_leg not in self.positions:
-                hedge_dist = 1000
+                hedge_dist = HEDGE_WIDTH_PTS
                 hedge_strike = atm + hedge_dist if leg == "CE" else atm - hedge_dist
                 log_info(f"  → Re-entering {hedge_leg} at {hedge_strike} first (margin protection)...")
-                self._enter_leg(hedge_leg, hedge_strike, "BUY", spot, atr, dte_days)
+                hedge_ok = self._enter_leg(hedge_leg, hedge_strike, "BUY", spot, atr, dte_days)
+                if not hedge_ok:
+                    log_warn(f"⚠️ Hedge entry failed for {hedge_leg}, aborting short entry.")
+                    continue
 
             if self._enter_leg(leg, strike, "SELL", spot, atr, dte_days):
                 cd["active"] = False
@@ -2121,8 +2096,7 @@ class ExecutionEngine:
             if not self.cooldown_tracker.get("CE", {}).get("active"):
                 self.cooldown_tracker["CE"] = {
                     "stopped_time": time.time(),
-                    "stopped_spot": spot,
-                    "stopped_kama": float(indicators.get("kama", spot) or spot),
+                    
                     "active": True,
                     "stop_reason": "ALWAYS_ON_DEFERRED",
                     "reentries_today": self.cooldown_tracker.get("CE", {}).get("reentries_today", 0),
@@ -2134,8 +2108,7 @@ class ExecutionEngine:
             if not self.cooldown_tracker.get("PE", {}).get("active"):
                 self.cooldown_tracker["PE"] = {
                     "stopped_time": time.time(),
-                    "stopped_spot": spot,
-                    "stopped_kama": float(indicators.get("kama", spot) or spot),
+                    
                     "active": True,
                     "stop_reason": "ALWAYS_ON_DEFERRED",
                     "reentries_today": self.cooldown_tracker.get("PE", {}).get("reentries_today", 0),
@@ -2148,15 +2121,21 @@ class ExecutionEngine:
                 continue  # already open
             hedge_leg = f"{leg}_HEDGE"
             if hedge_leg not in self.positions:
-                hedge_dist = 1000
+                hedge_dist = HEDGE_WIDTH_PTS
                 hedge_strike = atm + hedge_dist if leg == "CE" else atm - hedge_dist
-                self._enter_leg(hedge_leg, hedge_strike, "BUY", spot, atr, dte_days)
+                hedge_ok = self._enter_leg(hedge_leg, hedge_strike, "BUY", spot, atr, dte_days)
+                if not hedge_ok:
+                    log_warn(f"⚠️ Hedge entry failed for {hedge_leg}, aborting short entry.")
+                    continue
             if self._enter_leg(leg, atm, "SELL", spot, atr, dte_days):
                 entered_any = True
+                if leg in self.cooldown_tracker:
+                    self.cooldown_tracker[leg]["active"] = False
                 log_info(f"✅ Always-On: Entered {leg} SELL at ATM {atm}.")
 
         if entered_any:
             self.mode = "RUNNING"
+            self._hedges_only_logged = False
             self._save_state()
         else:
             log_warn("⚠️ Always-On rule: Could not enter any leg. Will retry next tick.")
@@ -2190,7 +2169,7 @@ class ExecutionEngine:
         
         print()
         print(TOP)
-        title_left = f"  {c_cyan}ADAPTIVE KAMA-ADX HEDGED STRANGLE (V2.0){res}  {c_dim}│{res}  {c_yellow}DUAL-TSL (SPOT+PREM) ACTIVE{res}  {c_dim}│{res}  {c_green}TYPE 'zxc' TO STOP{res}"
+        title_left = f"  {c_cyan}ADAPTIVE KAMA-ADX HEDGED STRANGLE (V2.0){res}  {c_dim}│{res}  {c_yellow}DUAL-SL (SPOT+PREM) ACTIVE{res}  {c_dim}│{res}  {c_green}TYPE 'zxc' TO STOP{res}"
         title_right = f"{c_dim}{_now_str()}{res}  "
         pad = max(0, W - ansi_len(title_left) - ansi_len(title_right))
         print(f"{V}{title_left}{' ' * pad}{title_right}{V}")
@@ -2210,7 +2189,7 @@ class ExecutionEngine:
             msg = f"  {c_yellow}No open positions. State: {self.mode}{res}"
             print(f"{V}{msg}{' ' * max(0, W - ansi_len(msg))}{V}")
         else:
-            hdr = f"  {'LEG':<10} {VS} {'STRIKE':>7} {VS} {'SIDE':<5} {VS} {'QTY':>3} {VS} {'ENTRY':>7} {VS} {'BEST PREM':>10} {VS} {'LTP':>7} {VS} {'TSL':>10} {VS} {'PNL':>10}  "
+            hdr = f"  {'LEG':<10} {VS} {'STRIKE':>7} {VS} {'SIDE':<5} {VS} {'QTY':>3} {VS} {'ENTRY':>7} {VS} {'BEST PREM':>10} {VS} {'LTP':>7} {VS} {'SL':>10} {VS} {'PNL':>10}  "
             print(f"{V}{hdr}{' ' * max(0, W - ansi_len(hdr))}{V}")
             print(MID_S)
 
@@ -2397,7 +2376,7 @@ class ExecutionEngine:
                 if state.get("date") == today_str:
                     self.realized_pnl = float(state.get("realized_pnl", 0.0))
                     # Auto-sanitize ~10k testing bug error
-                    if (-15000.0 <= self.realized_pnl <= -3000.0) or (abs(self.realized_pnl - (-10340.85)) < 500):
+                    if abs(self.realized_pnl - (-10340.85)) < 50:
                         log_warn(f"🔧 Resetting erroneous realized PnL ({self.realized_pnl:.2f}) from bug to 0.0")
                         self.realized_pnl = 0.0
                     self.positions = state.get("positions", {})
@@ -2441,7 +2420,7 @@ class ExecutionEngine:
             # Recover intraday PNL from db if state file was missing
             if db.data.get("intraday_date") == today_str:
                 self.realized_pnl = float(db.data.get("today_pnl", 0.0))
-                if (-15000.0 <= self.realized_pnl <= -7000.0) or (abs(self.realized_pnl - (-10340.85)) < 500):
+                if abs(self.realized_pnl - (-10340.85)) < 50:
                     self.realized_pnl = 0.0
                 log_info(f"Recovered intraday PnL from DB: ₹{self.realized_pnl:,.2f}")
 
@@ -2604,8 +2583,7 @@ class ExecutionEngine:
                                     enter_pe = True
                                     self.cooldown_tracker["CE"] = {
                                         "stopped_time": time.time(),
-                                        "stopped_spot": spot,
-                                        "stopped_kama": float(self.current_indicators.get("kama", spot) or spot),
+                                        
                                         "active": True,
                                         "stop_reason": "BULLISH_OPEN_DEFERRED",
                                         "reentries_today": 0,
@@ -2618,8 +2596,7 @@ class ExecutionEngine:
                                     enter_pe = False
                                     self.cooldown_tracker["PE"] = {
                                         "stopped_time": time.time(),
-                                        "stopped_spot": spot,
-                                        "stopped_kama": float(self.current_indicators.get("kama", spot) or spot),
+                                        
                                         "active": True,
                                         "stop_reason": "BEARISH_OPEN_DEFERRED",
                                         "reentries_today": 0,
@@ -2635,10 +2612,10 @@ class ExecutionEngine:
                             enter_ce = True
                             enter_pe = True
 
-                        ce_h_ok = True
-                        pe_h_ok = True
-                        ce_s_ok = True
-                        pe_s_ok = True
+                        ce_h_ok = False
+                        pe_h_ok = False
+                        ce_s_ok = False
+                        pe_s_ok = False
 
                         # Enter CE Side if selected (Hedge then Short)
                         if enter_ce:
@@ -2661,7 +2638,7 @@ class ExecutionEngine:
                         else:
                             self.mode = "RUNNING"
                             self.initial_entry_done = True
-                            self._both_legs_closed_ts = None
+                            
                             if enter_ce and enter_pe:
                                 self.cooldown_tracker.clear()
                             
@@ -2679,15 +2656,13 @@ class ExecutionEngine:
                     if not active_shorts:
                         # NO short legs open → invoke Always-On rule immediately
                         # (replaces the old 10-second wait entirely)
-                        self._both_legs_closed_ts = None  # reset any old timer
+                          # reset any old timer
                         self._ensure_always_one_leg_open(spot, atm, atr, dte_days)
                         self._render_dashboard(spot, atm)
                         self._smart_sleep(1.0)
                         continue
-                    else:
-                        self._both_legs_closed_ts = None  # reset if we have legs again
 
-                    # ── Proactive Early Exit + Standard TSL Check (every tick) ──
+                    # ── Proactive Early Exit + Standard SL Check (every tick) ──
                     for leg in ("CE", "PE"):
                         if leg not in self.positions or self.positions[leg].get("side") != "SELL":
                             continue
@@ -2714,7 +2689,7 @@ class ExecutionEngine:
                                 self._trigger_leg_cooldown(leg, spot, reason="PROACTIVE_TREND_EXIT")
                                 continue  # next leg check
 
-                        # ── Standard TSL Check ──
+                        # ── Standard SL Check ──
                         is_stopped, reason = self.risk_manager.update_dual_sl_and_check(
                             leg, self.positions[leg], spot, ltp_premium, is_strangle, is_new_1m_bar
                         )
@@ -2722,9 +2697,16 @@ class ExecutionEngine:
                             log_alert(reason)
                             # Check if this is the LAST open leg — if so, we CANNOT exit without re-entering first
                             # Instead: widen the SL temporarily by marking this tick as not breached
-                            # Actually for TSL: always allow exit — Always-On rule kicks in next tick
-                            self._exit_leg(leg, reason="PREM_TSL_HIT")
-                            self._trigger_leg_cooldown(leg, spot, reason="PREM_TSL_HIT")
+                            # Actually for SL: always allow exit — Always-On rule kicks in next tick
+                            self._exit_leg(leg, reason="PREM_SL_HIT")
+                            self._trigger_leg_cooldown(leg, spot, reason="PREM_SL_HIT")
+                            continue
+
+                    # ── POST-SL-CHECK: Re-verify active_shorts ──
+                    active_shorts_after = [l for l in ("CE", "PE") if l in self.positions and self.positions[l].get("side") == "SELL"]
+                    if not active_shorts_after:
+                        
+                        self._ensure_always_one_leg_open(spot, atm, atr, dte_days)
 
                     # ── Reversal-Gated Re-Entry for Stopped Legs ──
                     self._check_cooldown_and_reenter(spot, atm, atr, regime, trend, dte_days=dte_days)
@@ -2732,15 +2714,17 @@ class ExecutionEngine:
                 # Phase C: HEDGES_ONLY mode → treat same as no-short-legs → use Always-On rule
                 elif self.mode == "HEDGES_ONLY":
                     # Clear any old 10s timer (removed)
-                    self._both_legs_closed_ts = None
-                    log_info("🔁 HEDGES_ONLY mode: Applying Always-On rule to re-enter short legs immediately...")
+                    
+                    if not getattr(self, "_hedges_only_logged", False):
+                        log_info("🔁 HEDGES_ONLY mode: Applying Always-On rule to re-enter short legs immediately...")
+                        self._hedges_only_logged = True
                     self._ensure_always_one_leg_open(spot, atm, atr, dte_days)
 
 
                 # ── 5. Render Live Dashboard ──
                 self._render_dashboard(spot, atm)
                 
-                # Sleep 1 second for continuous tick-level TSL evaluation
+                # Sleep 1 second for continuous tick-level SL evaluation
                 self._smart_sleep(1.0)
 
             except KeyboardInterrupt:
