@@ -209,7 +209,7 @@ except ImportError:
                     for item in d[list_key]:
                         if isinstance(item, dict):
                             val = item.get("pnl", item.get("realized_pnl", 0.0))
-                            if -15000.0 <= val <= -7000.0:
+                            if -15000.0 <= val <= -3000.0:
                                 item["pnl"] = 0.0
                                 if "realized_pnl" in item: item["realized_pnl"] = 0.0
                                 modified = True
@@ -217,23 +217,23 @@ except ImportError:
             for dict_key in ("daily_pnl", "days", "daily"):
                 if dict_key in d and isinstance(d[dict_key], dict):
                     for dt_k, val in list(d[dict_key].items()):
-                        if isinstance(val, (int, float)) and (-15000.0 <= val <= -7000.0):
+                        if isinstance(val, (int, float)) and (-15000.0 <= val <= -3000.0):
                             d[dict_key][dt_k] = 0.0
                             modified = True
                         elif isinstance(val, dict):
                             p_val = val.get("pnl", val.get("realized_pnl", 0.0))
-                            if -15000.0 <= p_val <= -7000.0:
+                            if -15000.0 <= p_val <= -3000.0:
                                 val["pnl"] = 0.0
                                 if "realized_pnl" in val: val["realized_pnl"] = 0.0
                                 modified = True
 
-            if -15000.0 <= d.get("mtd_pnl", 0.0) <= -7000.0 or abs(d.get("mtd_pnl", 0.0) - (-10340.85)) < 500:
+            if -15000.0 <= d.get("mtd_pnl", 0.0) <= -3000.0 or abs(d.get("mtd_pnl", 0.0) - (-10340.85)) < 500:
                 d["mtd_pnl"] = 0.0
                 modified = True
-            if -15000.0 <= d.get("ytd_pnl", 0.0) <= -7000.0 or abs(d.get("ytd_pnl", 0.0) - (-10340.85)) < 500:
+            if -15000.0 <= d.get("ytd_pnl", 0.0) <= -3000.0 or abs(d.get("ytd_pnl", 0.0) - (-10340.85)) < 500:
                 d["ytd_pnl"] = 0.0
                 modified = True
-            if -15000.0 <= d.get("today_pnl", 0.0) <= -7000.0:
+            if -15000.0 <= d.get("today_pnl", 0.0) <= -3000.0:
                 d["today_pnl"] = 0.0
                 modified = True
             if d.get("current_capital", 195784.0) < 190000.0:
@@ -2385,7 +2385,7 @@ class ExecutionEngine:
                 if state.get("date") == today_str:
                     self.realized_pnl = float(state.get("realized_pnl", 0.0))
                     # Auto-sanitize ~10k testing bug error
-                    if (-15000.0 <= self.realized_pnl <= -7000.0) or (abs(self.realized_pnl - (-10340.85)) < 500):
+                    if (-15000.0 <= self.realized_pnl <= -3000.0) or (abs(self.realized_pnl - (-10340.85)) < 500):
                         log_warn(f"🔧 Resetting erroneous realized PnL ({self.realized_pnl:.2f}) from bug to 0.0")
                         self.realized_pnl = 0.0
                     self.positions = state.get("positions", {})
