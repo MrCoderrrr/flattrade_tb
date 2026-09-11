@@ -573,8 +573,8 @@ HEDGE_DISTANCE_RATIO      = 1.5
 
 # --- PREMIUM TSL (percentage of entry premium) ---
 PREM_SL_INITIAL_PCT       = 0.12   # 12% initial SL
-PREM_TSL_MIN_PCT          = 0.07   # 7% flat trail
-PREM_TSL_MAX_PCT          = 0.07   # 7% flat trail
+PREM_TSL_MIN_PCT          = 9.99   # 999% flat trail (TSL DISABLED)
+PREM_TSL_MAX_PCT          = 9.99   # 999% flat trail (TSL DISABLED)
 
 # --- REENTRY CAPS ---
 KAMA_REVERSAL_ATR_RATIO   = 0.15
@@ -1238,60 +1238,43 @@ class ReversionDetector:
         """
         Returns (signal: bool, confidence: int, reason: str)
         CE reversal = market turning DOWN → safe to re-enter SELL CE
-        Needs 2 of 3:
-          1. KAMA slope <= -REVERSAL_KAMA_SLOPE_THRESHOLD
-          2. -DI > +DI with gap >= REVERSAL_DI_GAP_MIN  (bearish DI cross)
-          3. ADX >= REVERSAL_ADX_MIN (not a noise wiggle)
         """
         s = cls._score(indicators)
-        hits = 0
-        reasons = []
-
+        hits = 0; reasons = []
+        kama_ok = False
         if s["kama_slope"] <= -REVERSAL_KAMA_SLOPE_THRESHOLD:
-            hits += 1
+            kama_ok = True
             reasons.append(f"KAMA↓{s['kama_slope']:.2f}")
-
         if s["minus_di"] > s["plus_di"] and abs(s["di_gap"]) >= REVERSAL_DI_GAP_MIN:
-            hits += 1
-            reasons.append(f"-DI({s['minus_di']:.1f})>+DI({s['plus_di']:.1f})")
-
+            hits += 1; reasons.append(f"-DI>{s['minus_di']:.1f}")
         if s["adx"] >= REVERSAL_ADX_MIN:
-            hits += 1
-            reasons.append(f"ADX{s['adx']:.1f}")
+            hits += 1; reasons.append(f"ADX{s['adx']:.1f}")
 
-        signal = (hits >= 2)
-        reason = "CE_REVERSAL[" + ",".join(reasons) + f"](score:{hits}/3)" if signal else ""
-        return signal, hits, reason
+        # KAMA is the fastest indicator. It MUST agree, plus 1 of the 5m trend indicators.
+        signal = kama_ok and (hits >= 1)
+        reason = "CE_REVERSAL[" + ",".join(reasons) + f"](score:K+{hits}/2)" if signal else ""
+        return signal, hits + (1 if kama_ok else 0), reason
 
     @classmethod
     def is_reversal_for_pe(cls, indicators: dict) -> tuple:
         """
         Returns (signal: bool, confidence: int, reason: str)
         PE reversal = market turning UP → safe to re-enter SELL PE
-        Needs 2 of 3:
-          1. KAMA slope >= +REVERSAL_KAMA_SLOPE_THRESHOLD
-          2. +DI > -DI with gap >= REVERSAL_DI_GAP_MIN  (bullish DI cross)
-          3. ADX >= REVERSAL_ADX_MIN
         """
         s = cls._score(indicators)
-        hits = 0
-        reasons = []
-
+        hits = 0; reasons = []
+        kama_ok = False
         if s["kama_slope"] >= REVERSAL_KAMA_SLOPE_THRESHOLD:
-            hits += 1
+            kama_ok = True
             reasons.append(f"KAMA↑{s['kama_slope']:.2f}")
-
         if s["plus_di"] > s["minus_di"] and abs(s["di_gap"]) >= REVERSAL_DI_GAP_MIN:
-            hits += 1
-            reasons.append(f"+DI({s['plus_di']:.1f})>-DI({s['minus_di']:.1f})")
-
+            hits += 1; reasons.append(f"+DI>{s['plus_di']:.1f}")
         if s["adx"] >= REVERSAL_ADX_MIN:
-            hits += 1
-            reasons.append(f"ADX{s['adx']:.1f}")
+            hits += 1; reasons.append(f"ADX{s['adx']:.1f}")
 
-        signal = (hits >= 2)
-        reason = "PE_REVERSAL[" + ",".join(reasons) + f"](score:{hits}/3)" if signal else ""
-        return signal, hits, reason
+        signal = kama_ok and (hits >= 1)
+        reason = "PE_REVERSAL[" + ",".join(reasons) + f"](score:K+{hits}/2)" if signal else ""
+        return signal, hits + (1 if kama_ok else 0), reason
 
     @classmethod
     def is_trend_strongly_against(cls, leg: str, indicators: dict) -> tuple:
@@ -1346,11 +1329,18 @@ class ReversionDetector:
         return should_exit, reason
 
     @classmethod
-    def safest_leg_to_enter(cls, indicators: dict) -> str:
+    def safest_leg_to_enter(cls, indicators: dict, last_stopped_leg: str = None) -> str:
         """
         When recovering from 0 legs open, determine which single leg is safest.
-        Returns 'CE', 'PE', or 'BOTH' based on current market direction.
+        If a leg was just stopped out, the market is trending against it.
+        We should follow momentum and sell the OTHER side.
+        Returns 'CE', 'PE', or 'BOTH'.
         """
+        if last_stopped_leg == "CE":
+            return "PE"  # CE hit SL -> Market went UP -> Sell PE (Bullish)
+        if last_stopped_leg == "PE":
+            return "CE"  # PE hit SL -> Market went DOWN -> Sell CE (Bearish)
+
         s = cls._score(indicators)
         # In strong uptrend: sell PE (market going up, put decays)
         if s["kama_slope"] >= REVERSAL_KAMA_SLOPE_THRESHOLD and s["plus_di"] > s["minus_di"]:
@@ -2091,13 +2081,23 @@ class ExecutionEngine:
         immediately determines the safest leg to enter based on current market direction
         and enters it right away, then waits for reversal to add the second leg.
         """
+        # Determine the most recently stopped leg to infer momentum direction
+        last_stopped_leg = None
+        newest_time = 0
+        for leg, cd in self.cooldown_tracker.items():
+            if cd.get("active", False):
+                st_time = cd.get("stopped_time", 0)
+                if st_time > newest_time:
+                    newest_time = st_time
+                    last_stopped_leg = leg
+
         indicators = self.current_indicators
-        safest = ReversionDetector.safest_leg_to_enter(indicators)
+        safest = ReversionDetector.safest_leg_to_enter(indicators, last_stopped_leg)
         regime = indicators.get("regime", "CHOP")
 
         log_alert(
-            f"⚠️ NO ACTIVE SHORT LEGS! Applying Always-On rule: regime={regime}, safest={safest}. "
-            f"Entering immediately..."
+            f"⚠️ NO ACTIVE SHORT LEGS! (Last stopped: {last_stopped_leg}). "
+            f"Applying Always-On rule: regime={regime}, safest={safest}. Entering immediately..."
         )
 
         legs_to_enter = []
