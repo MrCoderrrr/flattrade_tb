@@ -717,8 +717,8 @@ def send_telegram_nifty_dashboard(spot: float, atm: int, mode: str, positions: d
     now_ist = get_ist_now()
     is_eod = (now_ist.hour > 15 or (now_ist.hour == 15 and now_ist.minute >= 34))
 
-    # Throttle edits to at most once per 0.95s
-    if (now_ts - _last_tg_dashboard_edit_ts) < 0.95:
+    # Throttle edits to at most once per 3.0s
+    if (now_ts - _last_tg_dashboard_edit_ts) < 3.0:
         return
     _last_tg_dashboard_edit_ts = now_ts
 
@@ -770,18 +770,18 @@ def send_telegram_nifty_dashboard(spot: float, atm: int, mode: str, positions: d
             
         t += "</pre>"
 
+
         # If an active message exists and is less than 60s old, edit it live in-place
         if _last_tg_dashboard_msg_id is not None and (now_ts - _last_tg_dashboard_new_msg_ts) < 60.0 and not is_eod:
             try:
-                edit_resp = requests.post(
+                requests.post(
                     f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText",
                     json={"chat_id": TELEGRAM_CHAT_ID, "message_id": _last_tg_dashboard_msg_id, "text": t, "parse_mode": "HTML"},
                     timeout=3
                 )
-                if edit_resp.status_code == 200 and edit_resp.json().get("ok"):
-                    return
             except Exception:
                 pass
+            return
 
         # Send a fresh message (every 60s, or after alert, or when edit fails)
         send_resp = requests.post(
