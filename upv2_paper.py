@@ -309,6 +309,7 @@ class NSEATMStreamer:
         self._last_spot: float = 24000.0
         self._last_atm: int = 24000
         self._token_cache: Dict[str, Dict[str, Any]] = {}
+        self._last_real_lp: Dict[str, float] = {}
 
     def get_spot_and_atm(self) -> Tuple[float, int, bool]:
         """
@@ -351,9 +352,13 @@ class NSEATMStreamer:
                                     break
                             except (ValueError, TypeError):
                                 pass
-                if lp <= 0:
-                    diff = abs(self._last_spot - strike)
-                    lp = max(0.50, round(180.0 - (diff * 0.35), 2))
+                if lp > 0:
+                    self._last_real_lp[cache_key] = lp
+                else:
+                    lp = self._last_real_lp.get(cache_key, 0.0)
+                    if lp <= 0:
+                        diff = abs(self._last_spot - strike)
+                        lp = max(0.50, round(180.0 - (diff * 0.35), 2))
                 return {"lp": lp, "tsym": cached['tsym'], "ls": cached.get('ls', LOT_SIZE)}
             except Exception as e:
                 log_warn(f"Fast get_quotes error for {cache_key}: {e}")
@@ -400,16 +405,23 @@ class NSEATMStreamer:
                                             break
                                     except (ValueError, TypeError):
                                         pass
-                        if lp <= 0:
-                            diff = abs(self._last_spot - strike)
-                            lp = max(0.50, round(180.0 - (diff * 0.35), 2))
+                        if lp > 0:
+                            self._last_real_lp[cache_key] = lp
+                        else:
+                            lp = self._last_real_lp.get(cache_key, 0.0)
+                            if lp <= 0:
+                                diff = abs(self._last_spot - strike)
+                                lp = max(0.50, round(180.0 - (diff * 0.35), 2))
                         return {"lp": lp, "tsym": tsym, "ls": ls}
             except Exception as e:
                 log_warn(f"get_live_quote searchscrip error: {e}")
 
-        diff = abs(self._last_spot - strike)
-        est_prem = max(0.50, round(180.0 - (diff * 0.35), 2))
-        return {"lp": round(est_prem, 2), "tsym": f"NIFTY{strike}{option_type}", "ls": LOT_SIZE}
+        # Ultimate fallback if completely uncached and search fails
+        lp = self._last_real_lp.get(cache_key, 0.0)
+        if lp <= 0:
+            diff = abs(self._last_spot - strike)
+            lp = max(0.50, round(180.0 - (diff * 0.35), 2))
+        return {"lp": round(lp, 2), "tsym": f"NIFTY{strike}{option_type}", "ls": LOT_SIZE}
 
     def get_near_expiry_dte(self) -> Tuple[Optional[datetime], float]:
         """Fetches near expiry date and DTE directly from Flattrade NFO contracts."""
