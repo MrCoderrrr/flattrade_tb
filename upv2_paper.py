@@ -1243,9 +1243,9 @@ class ReversionDetector:
         s = cls._score(indicators)
         hits = 0; reasons = []
         kama_ok = False
-        if s["kama_slope"] <= -REVERSAL_KAMA_SLOPE_THRESHOLD:
+        if s["kama_slope"] <= -REVERSAL_KAMA_SLOPE_THRESHOLD or abs(s["kama_slope"]) < REVERSAL_KAMA_SLOPE_THRESHOLD:
             kama_ok = True
-            reasons.append(f"KAMA↓{s['kama_slope']:.2f}")
+            reasons.append(f"KAMA↓/FLAT({s['kama_slope']:.2f})")
         if s["minus_di"] > s["plus_di"] and abs(s["di_gap"]) >= REVERSAL_DI_GAP_MIN:
             hits += 1; reasons.append(f"-DI>{s['minus_di']:.1f}")
         if s["adx"] >= REVERSAL_ADX_MIN:
@@ -1265,9 +1265,9 @@ class ReversionDetector:
         s = cls._score(indicators)
         hits = 0; reasons = []
         kama_ok = False
-        if s["kama_slope"] >= REVERSAL_KAMA_SLOPE_THRESHOLD:
+        if s["kama_slope"] >= REVERSAL_KAMA_SLOPE_THRESHOLD or abs(s["kama_slope"]) < REVERSAL_KAMA_SLOPE_THRESHOLD:
             kama_ok = True
-            reasons.append(f"KAMA↑{s['kama_slope']:.2f}")
+            reasons.append(f"KAMA↑/FLAT({s['kama_slope']:.2f})")
         if s["plus_di"] > s["minus_di"] and abs(s["di_gap"]) >= REVERSAL_DI_GAP_MIN:
             hits += 1; reasons.append(f"+DI>{s['plus_di']:.1f}")
         if s["adx"] >= REVERSAL_ADX_MIN:
