@@ -306,8 +306,8 @@ class NSEATMStreamer:
         self.api = api or global_api
         self._cached_expiry_date: Optional[datetime] = None
         self._cached_expiry_day: Optional[Any] = None
-        self._last_spot: float = 24000.0
-        self._last_atm: int = 24000
+        self._last_spot: float = 0.0
+        self._last_atm: int = 0
         self._token_cache: Dict[str, Dict[str, Any]] = {}
         self._last_real_lp: Dict[str, float] = {}
 
@@ -2474,6 +2474,9 @@ class ExecutionEngine:
 
                 # ── 1. STRICT 1-SECOND DATA FETCH & TICK CADENCE ──
                 spot, atm, is_new_1m_bar, is_stale = self.market_data.fetch_live_tick()
+                if spot <= 0:
+                    self._smart_sleep(1.0)
+                    continue
                 if not is_stale:
                     self.last_feed_tick = current_time
 
