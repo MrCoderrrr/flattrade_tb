@@ -554,7 +554,7 @@ class FlattradeBroker:
 
 # Capital & Allocation
 CAPITAL                 = 195784.0
-LOT_SIZE                = 25          # NIFTY 50 lot size is 25 (exchange standard)
+LOT_SIZE                = 65          # 1 lot per user request
 TRADE_LOG_FILE          = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "logs", "trade_book", "trades_v2_paper.csv")
 CAPITAL_BUFFER          = 0.95
 MARGIN_IRON_CONDOR      = 95_000
