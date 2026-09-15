@@ -1256,47 +1256,82 @@ class ReversionDetector:
         }
 
     @classmethod
-    def is_reversal_for_ce(cls, indicators: dict) -> tuple:
+    def is_reversal_for_ce(cls, indicators: dict, cooldown_data: dict = None) -> tuple:
         """
         Returns (signal: bool, confidence: int, reason: str)
-        CE reversal = market turning DOWN → safe to re-enter SELL CE
+        CE re-entry = trend that pushed market UP has EXHAUSTED itself.
+        Signal: ADX declining by 3+ pts from peak AND falling for 2 consecutive bars.
         """
         s = cls._score(indicators)
-        hits = 0; reasons = []
-        kama_ok = False
-        if s["kama_slope"] <= -REVERSAL_KAMA_SLOPE_THRESHOLD or abs(s["kama_slope"]) < REVERSAL_KAMA_SLOPE_THRESHOLD:
-            kama_ok = True
-            reasons.append(f"KAMA↓/FLAT({s['kama_slope']:.2f})")
-        if s["minus_di"] > s["plus_di"] and abs(s["di_gap"]) >= REVERSAL_DI_GAP_MIN:
-            hits += 1; reasons.append(f"-DI>{s['minus_di']:.1f}")
-        if s["adx"] >= REVERSAL_ADX_MIN:
-            hits += 1; reasons.append(f"ADX{s['adx']:.1f}")
-
-        # KAMA is the fastest indicator. It MUST agree, plus 1 of the 5m trend indicators.
-        signal = kama_ok and (hits >= 1)
-        reason = "CE_REVERSAL[" + ",".join(reasons) + f"](score:K+{hits}/2)" if signal else ""
-        return signal, hits + (1 if kama_ok else 0), reason
+        reasons = []
+        
+        adx = s["adx"]
+        peak_adx = cooldown_data.get("peak_adx", adx) if cooldown_data else adx
+        prev_adx = cooldown_data.get("prev_adx", adx) if cooldown_data else adx
+        
+        # Update tracking
+        if cooldown_data is not None:
+            if adx > peak_adx:
+                cooldown_data["peak_adx"] = adx
+                peak_adx = adx
+            cooldown_data["prev_adx"] = adx
+        
+        adx_drop = peak_adx - adx
+        adx_declining = adx < prev_adx  # current bar lower than last
+        
+        # Primary: ADX must have dropped 3+ pts from peak AND be currently declining
+        exhaustion_ok = adx_drop >= 3.0 and adx_declining
+        if exhaustion_ok:
+            reasons.append(f"ADX_EXHAUST(peak={peak_adx:.1f}→{adx:.1f}, drop={adx_drop:.1f})")
+        
+        # Secondary confirmation: KAMA not still pushing UP (against CE)
+        kama_not_against = s["kama_slope"] <= REVERSAL_KAMA_SLOPE_THRESHOLD
+        if kama_not_against:
+            reasons.append(f"KAMA_OK({s['kama_slope']:.2f})")
+        
+        signal = exhaustion_ok and kama_not_against
+        confidence = (1 if exhaustion_ok else 0) + (1 if kama_not_against else 0)
+        reason = "CE_REENTRY[" + ",".join(reasons) + f"](conf:{confidence}/2)" if signal else ""
+        return signal, confidence, reason
 
     @classmethod
-    def is_reversal_for_pe(cls, indicators: dict) -> tuple:
+    def is_reversal_for_pe(cls, indicators: dict, cooldown_data: dict = None) -> tuple:
         """
         Returns (signal: bool, confidence: int, reason: str)
-        PE reversal = market turning UP → safe to re-enter SELL PE
+        PE re-entry = trend that pushed market DOWN has EXHAUSTED itself.
+        Signal: ADX declining by 3+ pts from peak AND falling for 2 consecutive bars.
         """
         s = cls._score(indicators)
-        hits = 0; reasons = []
-        kama_ok = False
-        if s["kama_slope"] >= REVERSAL_KAMA_SLOPE_THRESHOLD or abs(s["kama_slope"]) < REVERSAL_KAMA_SLOPE_THRESHOLD:
-            kama_ok = True
-            reasons.append(f"KAMA↑/FLAT({s['kama_slope']:.2f})")
-        if s["plus_di"] > s["minus_di"] and abs(s["di_gap"]) >= REVERSAL_DI_GAP_MIN:
-            hits += 1; reasons.append(f"+DI>{s['plus_di']:.1f}")
-        if s["adx"] >= REVERSAL_ADX_MIN:
-            hits += 1; reasons.append(f"ADX{s['adx']:.1f}")
-
-        signal = kama_ok and (hits >= 1)
-        reason = "PE_REVERSAL[" + ",".join(reasons) + f"](score:K+{hits}/2)" if signal else ""
-        return signal, hits + (1 if kama_ok else 0), reason
+        reasons = []
+        
+        adx = s["adx"]
+        peak_adx = cooldown_data.get("peak_adx", adx) if cooldown_data else adx
+        prev_adx = cooldown_data.get("prev_adx", adx) if cooldown_data else adx
+        
+        # Update tracking
+        if cooldown_data is not None:
+            if adx > peak_adx:
+                cooldown_data["peak_adx"] = adx
+                peak_adx = adx
+            cooldown_data["prev_adx"] = adx
+        
+        adx_drop = peak_adx - adx
+        adx_declining = adx < prev_adx
+        
+        # Primary: ADX must have dropped 3+ pts from peak AND be currently declining
+        exhaustion_ok = adx_drop >= 3.0 and adx_declining
+        if exhaustion_ok:
+            reasons.append(f"ADX_EXHAUST(peak={peak_adx:.1f}→{adx:.1f}, drop={adx_drop:.1f})")
+        
+        # Secondary confirmation: KAMA not still pushing DOWN (against PE)
+        kama_not_against = s["kama_slope"] >= -REVERSAL_KAMA_SLOPE_THRESHOLD
+        if kama_not_against:
+            reasons.append(f"KAMA_OK({s['kama_slope']:.2f})")
+        
+        signal = exhaustion_ok and kama_not_against
+        confidence = (1 if exhaustion_ok else 0) + (1 if kama_not_against else 0)
+        reason = "PE_REENTRY[" + ",".join(reasons) + f"](conf:{confidence}/2)" if signal else ""
+        return signal, confidence, reason
 
     @classmethod
     def is_trend_strongly_against(cls, leg: str, indicators: dict) -> tuple:
@@ -2009,14 +2044,15 @@ class ExecutionEngine:
         The surviving leg stays open — NEVER close it when this is triggered.
         """
         current_kama = float(self.current_indicators.get("kama", current_spot) or current_spot)
+        current_adx = float(self.current_indicators.get("adx", 20.0) or 20.0)
         self.cooldown_tracker[stopped_leg] = {
             "stopped_time": time.time(),
-            
-            
             "active": True,
             "stop_reason": reason,
             "reentries_today": self.cooldown_tracker.get(stopped_leg, {}).get("reentries_today", 0),
             "next_eligible_time": time.time() + 60,  # 60s minimum before any re-entry attempt
+            "peak_adx": current_adx,   # track ADX at stop time as starting peak
+            "prev_adx": current_adx,   # for 2-bar declining check
         }
         surviving = "PE" if stopped_leg == "CE" else "CE"
         surviving_open = (surviving in self.positions and self.positions[surviving].get("side") == "SELL")
@@ -2053,13 +2089,13 @@ class ExecutionEngine:
             if time.time() < cd.get("next_eligible_time", 0):
                 continue
 
-            # ── Check reversal signal using 2/3 confluence ──
+            # ── Check trend exhaustion signal using ADX declining from peak ──
             if leg == "CE":
-                # CE stopped because market went UP → re-enter when market turns DOWN
-                signal, confidence, reason = ReversionDetector.is_reversal_for_ce(indicators)
+                # CE stopped because market went UP → re-enter when uptrend exhausts
+                signal, confidence, reason = ReversionDetector.is_reversal_for_ce(indicators, cooldown_data=cd)
             else:
-                # PE stopped because market went DOWN → re-enter when market turns UP
-                signal, confidence, reason = ReversionDetector.is_reversal_for_pe(indicators)
+                # PE stopped because market went DOWN → re-enter when downtrend exhausts
+                signal, confidence, reason = ReversionDetector.is_reversal_for_pe(indicators, cooldown_data=cd)
 
             if not signal:
                 continue
