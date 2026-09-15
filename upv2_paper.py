@@ -580,9 +580,9 @@ IVR_ACTION                = "SKIP"
 # --- DYNAMIC STRIKE & HEDGE ---
 
 # --- PREMIUM SL (percentage of entry premium) ---
-PREM_SL_INITIAL_PCT       = 0.12   # 12% initial SL
-PREM_SL_MIN_PCT          = 9.99   # 999% flat trail (SL DISABLED)
-PREM_SL_MAX_PCT          = 9.99   # 999% flat trail (SL DISABLED)
+PREM_SL_INITIAL_PCT       = 0.20   # 20% initial SL — gives ATM options room to breathe
+PREM_SL_MIN_PCT          = 0.07   # 7% tight trail when deep in profit (locks 93% of gains)
+PREM_SL_MAX_PCT          = 0.20   # 20% trail at breakeven, ratchets down as profit grows
 
 # --- REENTRY CAPS ---
 KAMA_REVERSAL_ATR_RATIO   = 0.15
@@ -627,9 +627,9 @@ REVERSAL_DI_GAP_MIN            = 2.0   # min gap between +DI and -DI to confirm 
 # --- PROACTIVE (EARLY) LEG EXIT ---
 # When a leg is losing AND market is trending strongly against it, exit early
 PROACTIVE_EXIT_ENABLED         = True
-PROACTIVE_EXIT_TREND_ADX       = 28.0  # ADX above this = strong trend (exit early)
+PROACTIVE_EXIT_TREND_ADX       = 32.0  # ADX above this = genuinely strong trend (exit early)
 PROACTIVE_EXIT_LOSS_PCT        = 0.07  # 7% loss threshold: if LTP > entry*(1+this), check early exit
-PROACTIVE_EXIT_DI_GAP_MIN      = 5.0   # min DI gap for proactive exit (avoid noise)
+PROACTIVE_EXIT_DI_GAP_MIN      = 8.0   # min DI gap for proactive exit (avoids noise-driven exits)
 
 # --- ALWAYS-ON 1-LEG RULE ---
 MIN_LEGS_ALWAYS_OPEN           = 1     # At least 1 short leg must be open at all times
@@ -814,8 +814,8 @@ class MarketData:
         self.bars_1m: List[Dict[str, Any]] = []
         self.logged_1m_keys: set = set()
         self.bars_5m: List[Dict[str, Any]] = []
-        self.latest_spot: float = 24000.0
-        self.latest_atm: int = 24000
+        self.latest_spot: float = 0.0
+        self.latest_atm: int = 0
         self.last_completed_1m_key: Optional[str] = None
         self._load_cache()
         self._seed_history_if_needed()
@@ -824,18 +824,37 @@ class MarketData:
         if not os.path.exists(self.cache_file):
             return
         try:
+            today_str = get_ist_now().strftime("%Y-%m-%d")
             minute_map = {}
+            stale_lines = []
+            today_lines = []
             with open(self.cache_file, "r") as f:
                 for line in f:
                     parts = line.strip().split(",")
                     if len(parts) >= 2:
                         try:
                             dt = datetime.strptime(parts[0].strip(), "%Y-%m-%d %H:%M:%S")
+                            # Only load bars from TODAY to prevent cross-day indicator corruption
+                            if dt.strftime("%Y-%m-%d") != today_str:
+                                stale_lines.append(line)
+                                continue
+                            today_lines.append(line)
                             min_key = dt.strftime("%Y-%m-%d %H:%M")
                             minute_map[min_key] = (dt, float(parts[1]))
                         except ValueError:
                             continue
-            
+
+            # Flush stale days from cache file (keep only today's bars)
+            if stale_lines and today_lines:
+                log_info(f"MarketData: Flushing {len(stale_lines)} stale bars from previous days. Keeping {len(today_lines)} bars from today.")
+                with open(self.cache_file, "w") as f:
+                    for line in today_lines:
+                        f.write(line if line.endswith("\n") else line + "\n")
+            elif stale_lines and not today_lines:
+                log_info(f"MarketData: Cache contains only old data ({len(stale_lines)} bars). Clearing file for fresh start.")
+                with open(self.cache_file, "w") as f:
+                    pass  # empty the file
+
             sorted_bars = sorted(minute_map.values(), key=lambda x: x[0])
             warmup_bars = sorted_bars[-300:] if len(sorted_bars) > 300 else sorted_bars
 
@@ -850,7 +869,9 @@ class MarketData:
             self._rebuild_5m_candles()
             if self.bars_1m:
                 self.last_completed_1m_key = self.bars_1m[-1]["minute_key"]
-                log_info(f"MarketData: Loaded {len(self.bars_1m)} collected 1-min bars ({len(self.bars_5m)} 5-min candles built). Latest Spot: {self.latest_spot:.2f}")
+                log_info(f"MarketData: Loaded {len(self.bars_1m)} today-only 1-min bars ({len(self.bars_5m)} 5-min candles built). Latest Spot: {self.latest_spot:.2f}")
+            else:
+                log_info(f"MarketData: No bars from today in cache. Will build fresh from live ticks.")
         except Exception as e:
             log_warn(f"MarketData: Error loading cache: {e}")
 
@@ -1774,9 +1795,18 @@ class ExecutionEngine:
         hedge_dist = HEDGE_WIDTH_PTS
         return atm_spot + hedge_dist, atm_spot - hedge_dist
 
+    _last_trade_log: Dict[str, float] = {}  # class-level dedup tracker
+
     def _log_trade(self, action: str, leg: str, strike: int, side: str, qty: int, price: float, pnl: float = None, reason: str = ""):
         try:
             import json, os, datetime
+            # Dedup guard: skip if same action+leg+side was logged within 2 seconds
+            dedup_key = f"{action}_{leg}_{side}_{strike}"
+            now_ts = time.time()
+            if dedup_key in self._last_trade_log and (now_ts - self._last_trade_log[dedup_key]) < 2.0:
+                return
+            self._last_trade_log[dedup_key] = now_ts
+
             if not os.path.exists(TRADE_LOG_FILE):
                 with open(TRADE_LOG_FILE, "w") as f: f.write("timestamp,action,leg,strike,side,qty,price,pnl,reason\n")
             with open(TRADE_LOG_FILE, "a") as f:
@@ -1986,7 +2016,7 @@ class ExecutionEngine:
             "active": True,
             "stop_reason": reason,
             "reentries_today": self.cooldown_tracker.get(stopped_leg, {}).get("reentries_today", 0),
-            "next_eligible_time": time.time() + 5,  # 5s minimum before any re-entry attempt
+            "next_eligible_time": time.time() + 60,  # 60s minimum before any re-entry attempt
         }
         surviving = "PE" if stopped_leg == "CE" else "CE"
         surviving_open = (surviving in self.positions and self.positions[surviving].get("side") == "SELL")
