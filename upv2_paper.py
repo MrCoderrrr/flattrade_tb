@@ -1399,6 +1399,8 @@ class RiskManager:
             # Phase A: not yet in profit — hold at initial SL
             prem_sl = initial_sl
         else:
+            if entry_prem <= 0.0:
+                return False, ""
             # Phase B: in profit — compute how much of the premium has decayed
             profit_pct = (entry_prem - best_prem) / entry_prem  # 0.0 → 1.0
 
@@ -1413,7 +1415,7 @@ class RiskManager:
             
         # STRICT RATCHET: The stop loss can NEVER move backwards (upwards).
         # It must stay at its tightest point until SL drags it further down.
-        if "current_premium_sl" in sl_state:
+        if "current_premium_sl" in sl_state and PREM_SL_MAX_PCT < 9.0:
             prem_sl = min(prem_sl, sl_state["current_premium_sl"])
 
         sl_state["current_premium_sl"] = prem_sl
@@ -1869,9 +1871,8 @@ class ExecutionEngine:
         tsym = pos.get("tsym", f"NIFTY{pos['strike']}{base}")
         close_side = "BUY" if pos["side"] == "SELL" else "SELL"
         
-        # HARD GUARD: Always cap exit qty to exactly 1 lot (65). Never more.
-        close_qty = LOT_SIZE
-        pos["qty"] = LOT_SIZE  # sanitize in-memory too
+        # Use the actual tracked position quantity
+        close_qty = pos.get("qty", LOT_SIZE)
         
         placed_successfully = False
         last_reason = ""
@@ -2615,10 +2616,10 @@ class ExecutionEngine:
                             enter_ce = True
                             enter_pe = True
 
-                        ce_h_ok = False
-                        pe_h_ok = False
-                        ce_s_ok = False
-                        pe_s_ok = False
+                        ce_h_ok = True if "CE_HEDGE" in self.positions else False
+                        pe_h_ok = True if "PE_HEDGE" in self.positions else False
+                        ce_s_ok = True if "CE" in self.positions else False
+                        pe_s_ok = True if "PE" in self.positions else False
 
                         # Enter CE Side if selected (Hedge then Short)
                         if enter_ce:
