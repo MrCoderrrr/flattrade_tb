@@ -580,9 +580,24 @@ IVR_ACTION                = "SKIP"
 # --- DYNAMIC STRIKE & HEDGE ---
 
 # --- PREMIUM SL (percentage of entry premium) ---
-PREM_SL_INITIAL_PCT       = 0.20   # 20% initial SL — gives ATM options room to breathe
-PREM_SL_MIN_PCT          = 0.07   # 7% tight trail when deep in profit (locks 93% of gains)
+PREM_SL_INITIAL_PCT       = 0.20   # 20% initial SL on standard days — gives ATM options room to breathe
+PREM_SL_INITIAL_PCT_EXPIRY= 0.15   # 15% initial SL on Expiry Day (0 DTE) — faster decay, tighter leash
+PREM_SL_MIN_PCT          = 0.07   # 7% tight trail baseline when deep in profit
 PREM_SL_MAX_PCT          = 0.20   # 20% trail at breakeven, ratchets down as profit grows
+
+# --- THETA ACCELERATION & EXPIRY DAY (0 DTE) TUNING ---
+AFTERNOON_TSL_HOUR        = 13     # 1:00 PM IST — theta decay accelerates (~60% of daily decay)
+AFTERNOON_TSL_MINUTE      = 0
+AFTERNOON_TSL_PCT         = 0.05   # 5% tight TSL after 1:00 PM IST to lock in theta decay
+EXPIRY_0DTE_THRESHOLD     = 1.0    # <= 1.0 DTE is classified as Expiry Day
+EXPIRY_TSL_PCT            = 0.05   # 5% TSL on Expiry Day (0 DTE)
+
+# --- SOLO LEG TRAILING SL (when other leg exits) ---
+SOLO_LEG_TSL_PCT          = 0.07   # 7% TSL anchored to LTP when other leg exits (5% after 1 PM/0 DTE)
+
+# --- OPENING NOISE SHIELD (9:15–9:25 IST) ---
+OPENING_NOISE_SHIELD_HOUR   = 9
+OPENING_NOISE_SHIELD_MINUTE = 25   # 09:25 AM IST — 10m clean warmup to absorb opening volatility
 
 # --- REENTRY CAPS ---
 KAMA_REVERSAL_ATR_RATIO   = 0.15
@@ -748,7 +763,8 @@ def send_telegram_nifty_dashboard(spot: float, atm: int, mode: str, positions: d
                 # Fetch SL if available safely
                 sl_state = pos.get("dual_sl_state") or {}
                 tsl = sl_state.get("current_premium_sl", 0.0)
-                tsl_str = f"  SL {tsl:>5.2f}" if tsl > 0 else ""
+                solo_tag = " (SOLO)" if sl_state.get("solo_mode") else ""
+                tsl_str = f"  SL {tsl:>5.2f}{solo_tag}" if tsl > 0 else ""
 
                 t += f"{leg:<8} {side:>4} {strike}\n"
                 t += f"  E {entry:>7.2f}  L {ltp:>7.2f}{tsl_str}\n"
@@ -1424,32 +1440,91 @@ class RiskManager:
             return True, f"Global Circuit Breaker Hit! PnL {total_pnl:.2f} <= Limit {self.circuit_breaker_loss_limit:.2f}"
         return False, ""
 
-    def init_dual_sl(self, leg: str, entry_spot: float, strike: float, entry_premium: float, atr: float, iv: float, dte_days: float) -> dict:
-        initial_sl = round(entry_premium * (1.0 + PREM_SL_INITIAL_PCT), 2)
+    def get_active_tsl_pct(self, now_ist: datetime, dte_days: float = 2.0, is_solo: bool = False) -> float:
+        """
+        Determines the active trailing stop loss percentage:
+        - Afternoon theta acceleration window (after 1:00 PM IST): 5% (0.05)
+        - Expiry Day (0 DTE, dte_days <= EXPIRY_0DTE_THRESHOLD): 5% (0.05)
+        - Solo leg (when other leg has exited): 7% (0.07) or 5% if afternoon/expiry
+        - Standard dual leg deep profit floor: 7% (0.07) or 5% if afternoon/expiry
+        """
+        is_after_1pm = (now_ist.hour > AFTERNOON_TSL_HOUR or (now_ist.hour == AFTERNOON_TSL_HOUR and now_ist.minute >= AFTERNOON_TSL_MINUTE))
+        is_expiry = (dte_days <= EXPIRY_0DTE_THRESHOLD)
+        if is_after_1pm or is_expiry:
+            return AFTERNOON_TSL_PCT   # 0.05 (5%)
+        if is_solo:
+            return SOLO_LEG_TSL_PCT    # 0.07 (7%)
+        return PREM_SL_MIN_PCT         # 0.07 (7%)
+
+    def init_dual_sl(self, leg: str, entry_spot: float, strike: float, entry_premium: float, atr: float, iv: float, dte_days: float = 2.0) -> dict:
+        is_expiry = (dte_days <= EXPIRY_0DTE_THRESHOLD)
+        initial_pct = PREM_SL_INITIAL_PCT_EXPIRY if is_expiry else PREM_SL_INITIAL_PCT
+        initial_sl = round(entry_premium * (1.0 + initial_pct), 2)
         return {
             "entry_spot": entry_spot,
             "entry_premium": entry_premium,
             "best_premium": entry_premium,
             "current_premium_sl": initial_sl,
+            "initial_sl_pct": initial_pct,
+            "is_expiry": is_expiry,
+            "solo_mode": False,
             "breach_count": 0
         }
 
-    def update_dual_sl_and_check(self, leg: str, pos_data: dict, current_spot: float, current_premium: float, is_strangle: bool, is_new_1m_bar: bool) -> tuple:
+    def update_dual_sl_and_check(self, leg: str, pos_data: dict, current_spot: float, current_premium: float, is_strangle: bool, is_new_1m_bar: bool, dte_days: float = 2.0) -> tuple:
         sl_state = pos_data.get("dual_sl_state")
         if not sl_state: return False, ""
 
+        now_ist = get_ist_now()
+        is_solo = bool(sl_state.get("solo_mode", False))
+        active_tsl_pct = self.get_active_tsl_pct(now_ist, dte_days, is_solo=is_solo)
+
+        if is_solo:
+            # ─────────────────────────────────────────────────────────────
+            # SOLO LEG MODE: When other leg was removed, this leg was anchored
+            # to its LTP. Best premium is tracked from that anchor point,
+            # and the SL is trailed strictly at 7% (or 5% after 1 PM / 0 DTE).
+            # ─────────────────────────────────────────────────────────────
+            anchor_prem = float(sl_state.get("entry_premium", current_premium))
+            if current_premium > 0 and current_premium < sl_state.get("best_premium", anchor_prem):
+                sl_state["best_premium"] = current_premium
+
+            best_prem = sl_state.get("best_premium", anchor_prem)
+            new_trail_sl = round(best_prem * (1.0 + active_tsl_pct), 2)
+
+            # Strict Ratchet: Stop loss can never move backwards (upwards)
+            if "current_premium_sl" in sl_state:
+                prem_sl = min(new_trail_sl, sl_state["current_premium_sl"])
+            else:
+                prem_sl = new_trail_sl
+
+            sl_state["current_premium_sl"] = prem_sl
+
+            # Check breach
+            if current_premium >= prem_sl:
+                return True, (
+                    f"⛔ {leg} Solo TSL Triggered! | Anchor LTP: {anchor_prem:.2f} | "
+                    f"Best: {best_prem:.2f} | Current: {current_premium:.2f} >= SL: {prem_sl:.2f} "
+                    f"({active_tsl_pct*100:.0f}% TSL)"
+                )
+            return False, ""
+
+        # ─────────────────────────────────────────────────────────────
+        # STANDARD DUAL-LEG STRANGLE MODE
+        # ─────────────────────────────────────────────────────────────
         entry_prem = float(sl_state.get("entry_premium", current_premium))
 
-        # 1. Update Best Premium (lowest seen since we are short = max profit point)
+        # 1. Update Best Premium (lowest seen since entry)
         if current_premium > 0 and current_premium < sl_state.get("best_premium", entry_prem):
             sl_state["best_premium"] = current_premium
 
         best_prem = sl_state.get("best_premium", entry_prem)
 
-        # 2. Calculate SL:
-        #    Phase A — Premium still above entry (in loss): fixed 15% initial SL
-        #    Phase B — Premium below entry (in profit): dynamic trail 12%→3% as profit grows
-        initial_sl = round(entry_prem * (1.0 + PREM_SL_INITIAL_PCT), 2)
+        # 2. Calculate Initial SL:
+        # On Expiry Day (0 DTE): 15% initial SL, else 20%
+        is_expiry = (dte_days <= EXPIRY_0DTE_THRESHOLD)
+        initial_pct = PREM_SL_INITIAL_PCT_EXPIRY if is_expiry else PREM_SL_INITIAL_PCT
+        initial_sl = round(entry_prem * (1.0 + initial_pct), 2)
 
         if best_prem >= entry_prem:
             # Phase A: not yet in profit — hold at initial SL
@@ -1457,13 +1532,13 @@ class RiskManager:
         else:
             if entry_prem <= 0.0:
                 return False, ""
-            # Phase B: in profit — compute how much of the premium has decayed
+            # Phase B: in profit — dynamic trail down to active_tsl_pct (7%, or 5% after 1 PM / 0 DTE)
             profit_pct = (entry_prem - best_prem) / entry_prem  # 0.0 → 1.0
 
-            # SL tightens linearly: 12% when profit_pct=0, 3% when profit_pct>=0.60
-            # Clamp at PREM_SL_MIN_PCT for very deep profit
-            trail_pct = PREM_SL_MAX_PCT - (PREM_SL_MAX_PCT - PREM_SL_MIN_PCT) * min(profit_pct / 0.60, 1.0)
-            trail_pct = max(trail_pct, PREM_SL_MIN_PCT)
+            trail_ceiling = PREM_SL_MAX_PCT
+            trail_floor = active_tsl_pct
+            trail_pct = trail_ceiling - (trail_ceiling - trail_floor) * min(profit_pct / 0.50, 1.0)
+            trail_pct = max(trail_pct, trail_floor)
 
             trail_sl = round(best_prem * (1.0 + trail_pct), 2)
             # Never let trail SL exceed initial SL
@@ -1496,10 +1571,16 @@ class RiskManager:
     def check_proactive_exit(self, leg: str, pos_data: dict, current_premium: float, indicators: dict) -> tuple:
         """
         Proactive early exit: exit a short leg BEFORE SL is hit when:
-          1. The leg is in loss >= PROACTIVE_EXIT_LOSS_PCT (7%)
-          2. The market is trending strongly against it (all 3 indicators confirm)
+          1. Not during 09:15-09:25 Opening Noise Shield (market settling).
+          2. The leg is in loss >= PROACTIVE_EXIT_LOSS_PCT (7%).
+          3. The market is trending strongly against it (all 3 indicators confirm).
         Returns (should_exit: bool, reason: str)
         """
+        now_ist = get_ist_now()
+        # Opening noise shield: suppress proactive early exits during 09:15-09:25 IST
+        if now_ist.hour == OPENING_NOISE_SHIELD_HOUR and now_ist.minute < OPENING_NOISE_SHIELD_MINUTE:
+            return False, ""
+
         sl_state = pos_data.get("dual_sl_state")
         if not sl_state:
             return False, ""
@@ -2037,11 +2118,55 @@ class ExecutionEngine:
         self.mode = "HEDGES_ONLY"
         self._save_state()
 
+    def _anchor_surviving_leg_sl(self, surviving_leg: str, spot: float):
+        """
+        When one short leg exits, anchor the surviving leg to its current LTP.
+        The current LTP becomes the baseline / best_premium, and the trailing SL
+        is set to 7% of that LTP (or 5% after 1 PM / on expiry day).
+        It trails downward as the premium drops, protecting all accumulated profits.
+        """
+        if surviving_leg not in self.positions or self.positions[surviving_leg].get("side") != "SELL":
+            return
+
+        pos = self.positions[surviving_leg]
+        base = pos["base"]
+        ltp = self._get_ltp(pos["strike"], base)
+        if ltp <= 0:
+            ltp = float(pos.get("entry_price", 0.0))
+
+        now_ist = get_ist_now()
+        _, dte_days = self.market_data.streamer.get_near_expiry_dte()
+        trail_pct = self.risk_manager.get_active_tsl_pct(now_ist, dte_days, is_solo=True)
+
+        sl_state = pos.get("dual_sl_state")
+        if not sl_state:
+            sl_state = self.risk_manager.init_dual_sl(
+                surviving_leg, spot, pos["strike"], ltp,
+                self.current_indicators.get("atr", DEFAULT_ATR_5M), 15.0, dte_days
+            )
+            pos["dual_sl_state"] = sl_state
+
+        new_sl = round(ltp * (1.0 + trail_pct), 2)
+        sl_state["entry_premium"] = ltp        # Baseline anchor price when other leg exited
+        sl_state["best_premium"] = ltp         # Start trailing from this exact LTP
+        sl_state["current_premium_sl"] = new_sl
+        sl_state["solo_mode"] = True
+        sl_state["solo_anchor_ltp"] = ltp
+        sl_state["solo_anchor_time"] = time.time()
+        sl_state["solo_trail_pct"] = trail_pct
+        sl_state["breach_count"] = 0
+
+        log_alert(
+            f"🎯 [SOLO LEG TSL ANCHORED] {surviving_leg} anchored at LTP ₹{ltp:.2f} (Other leg removed). "
+            f"SL reset to ₹{new_sl:.2f} ({trail_pct*100:.0f}% trail above LTP). Trailing active!"
+        )
+        self._save_state()
+
     def _trigger_leg_cooldown(self, stopped_leg: str, current_spot: float, reason: str = "12% SL"):
         """
         Marks a stopped leg as awaiting re-entry.
-        Re-entry is gated on ReversionDetector 2/3 confluence (not just KAMA slope).
-        The surviving leg stays open — NEVER close it when this is triggered.
+        Re-entry is gated on ReversionDetector ADX exhaustion.
+        The surviving leg stays open and anchors its trailing SL to 7% of its current LTP.
         """
         current_kama = float(self.current_indicators.get("kama", current_spot) or current_spot)
         current_adx = float(self.current_indicators.get("adx", 20.0) or 20.0)
@@ -2057,22 +2182,28 @@ class ExecutionEngine:
         surviving = "PE" if stopped_leg == "CE" else "CE"
         surviving_open = (surviving in self.positions and self.positions[surviving].get("side") == "SELL")
         log_alert(
-            f"⏳ {stopped_leg} stopped ({reason}). Awaiting reversal signal (2/3 indicators). "
+            f"⏳ {stopped_leg} stopped ({reason}). Awaiting trend exhaustion signal. "
             f"Surviving {surviving}: {'✅ OPEN' if surviving_open else '⚠️ ALSO CLOSED'}."
         )
         if surviving_open:
             self.mode = "COOLDOWN"   # 1 leg open → COOLDOWN
+            self._anchor_surviving_leg_sl(surviving, current_spot)
         else:
             self.mode = "RUNNING"    # Will be handled by always-on rule in run()
         self._save_state()
 
     def _check_cooldown_and_reenter(self, spot: float, atm: int, atr: float, regime: str, trend: int, dte_days: float = 2.0):
         """
-        Runs EVERY TICK (1 second). Checks ReversionDetector 2/3 confluence for each
+        Runs EVERY TICK (1 second). Checks ReversionDetector ADX exhaustion for each
         stopped leg and re-enters at ATM when signal fires.
         This is the heart of the Always-On 1-Leg Rule.
         """
         if self.strangle_resets_today >= MAX_STRANGLE_RESETS:
+            return
+
+        now = get_ist_now()
+        # Opening Noise Shield: let market stabilize cleanly for 10 minutes (09:15–09:25 IST) before re-entering
+        if now.hour == OPENING_NOISE_SHIELD_HOUR and now.minute < OPENING_NOISE_SHIELD_MINUTE:
             return
 
         indicators = self.current_indicators
@@ -2283,12 +2414,25 @@ class ExecutionEngine:
                     entry_spot_str = "—"
                     spot_sl_str = "—"
 
-                row = (f"  {c_white}{leg:<10}{res} {VS} {c_white}{pos['strike']:>7}{res} {VS} {side_col}{pos['side']:<5}{res} {VS} "
+                leg_name = f"{leg}*" if (sl_state and sl_state.get("solo_mode")) else leg
+                row = (f"  {c_white}{leg_name:<10}{res} {VS} {c_white}{pos['strike']:>7}{res} {VS} {side_col}{pos['side']:<5}{res} {VS} "
                        f"{c_white}{pos['qty']:>3}{res} {VS} "
                        f"{c_white}{pos['entry_price']:>7.2f}{res} {VS} {c_dim}{entry_spot_str:>10}{res} {VS} "
                        f"{c_yellow}{ltp:>7.2f}{res} {VS} {c_mag}{spot_sl_str:>10}{res} {VS} "
                        f"{pnl_col}{sign}₹{pnl:>8,.2f}{res}  ")
                 print(f"{V}{row}{' ' * max(0, W - ansi_len(row))}{V}")
+
+        solo_legs = [k for k, p in self.positions.items() if p.get("dual_sl_state", {}).get("solo_mode")]
+        if solo_legs:
+            print(MID_S)
+            solo_msg = f"  {c_cyan}🎯 SOLO TRAILING SL ACTIVE (*):{res} {', '.join(solo_legs)} anchored at exit LTP, trailing at 7% (5% after 1 PM/0 DTE)."
+            print(f"{V}{solo_msg}{' ' * max(0, W - ansi_len(solo_msg))}{V}")
+
+        now_ist = get_ist_now()
+        if now_ist.hour == OPENING_NOISE_SHIELD_HOUR and now_ist.minute < OPENING_NOISE_SHIELD_MINUTE:
+            print(MID_S)
+            shield_msg = f"  {c_yellow}🛡️ OPENING NOISE SHIELD ACTIVE:{res} Absorbing 9:15-9:25 opening noise. Clean data warmup."
+            print(f"{V}{shield_msg}{' ' * max(0, W - ansi_len(shield_msg))}{V}")
 
         active_cds = [f"{k} (Re-entry eligible next bar)" 
                       for k, v in self.cooldown_tracker.items() if v.get("active", False)]
@@ -2761,7 +2905,7 @@ class ExecutionEngine:
 
                         # ── Standard SL Check ──
                         is_stopped, reason = self.risk_manager.update_dual_sl_and_check(
-                            leg, self.positions[leg], spot, ltp_premium, is_strangle, is_new_1m_bar
+                            leg, self.positions[leg], spot, ltp_premium, is_strangle, is_new_1m_bar, dte_days=dte_days
                         )
                         if is_stopped:
                             log_alert(reason)
