@@ -358,7 +358,12 @@ class NSEATMStreamer:
                     lp = self._last_real_lp.get(cache_key, 0.0)
                     if lp <= 0:
                         diff = abs(self._last_spot - strike)
-                        lp = max(0.50, round(180.0 - (diff * 0.35), 2))
+                        if diff < 75:
+                            lp = 55.0  # Realistic ATM baseline for near-expiry NIFTY
+                        elif diff < 300:
+                            lp = max(5.0, round(55.0 - (diff * 0.18), 2))
+                        else:
+                            lp = 0.50  # Far OTM hedge baseline
                 return {"lp": lp, "tsym": cached['tsym'], "ls": cached.get('ls', LOT_SIZE)}
             except Exception as e:
                 log_warn(f"Fast get_quotes error for {cache_key}: {e}")
@@ -411,7 +416,12 @@ class NSEATMStreamer:
                             lp = self._last_real_lp.get(cache_key, 0.0)
                             if lp <= 0:
                                 diff = abs(self._last_spot - strike)
-                                lp = max(0.50, round(180.0 - (diff * 0.35), 2))
+                                if diff < 75:
+                                    lp = 55.0
+                                elif diff < 300:
+                                    lp = max(5.0, round(55.0 - (diff * 0.18), 2))
+                                else:
+                                    lp = 0.50
                         return {"lp": lp, "tsym": tsym, "ls": ls}
             except Exception as e:
                 log_warn(f"get_live_quote searchscrip error: {e}")
@@ -420,7 +430,12 @@ class NSEATMStreamer:
         lp = self._last_real_lp.get(cache_key, 0.0)
         if lp <= 0:
             diff = abs(self._last_spot - strike)
-            lp = max(0.50, round(180.0 - (diff * 0.35), 2))
+            if diff < 75:
+                lp = 55.0
+            elif diff < 300:
+                lp = max(5.0, round(55.0 - (diff * 0.18), 2))
+            else:
+                lp = 0.50
         return {"lp": round(lp, 2), "tsym": f"NIFTY{strike}{option_type}", "ls": LOT_SIZE}
 
     def get_near_expiry_dte(self) -> Tuple[Optional[datetime], float]:
@@ -2070,6 +2085,8 @@ class ExecutionEngine:
 
         # Only reach here if placed_successfully == True
         ltp = self._get_ltp(pos["strike"], base)
+        if ltp <= 0:
+            ltp = float(pos.get("entry_price", 0.0))
         if pos["side"] == "SELL":
             pnl = (pos["entry_price"] - ltp) * close_qty
         else:
@@ -2586,10 +2603,28 @@ class ExecutionEngine:
                     state = json.load(sf)
                 if state.get("date") == today_str:
                     self.realized_pnl = float(state.get("realized_pnl", 0.0))
-                    # Auto-sanitize ~10k testing bug error
-                    if abs(self.realized_pnl - (-10340.85)) < 50:
-                        log_warn(f"🔧 Resetting erroneous realized PnL ({self.realized_pnl:.2f}) from bug to 0.0")
-                        self.realized_pnl = 0.0
+                    # Auto-sanitize corrupted PnL by calculating true PnL from actual valid trades today
+                    true_trade_pnl = 0.0
+                    trade_book_found = False
+                    if os.path.exists(TRADE_LOG_FILE):
+                        try:
+                            import csv
+                            with open(TRADE_LOG_FILE, "r") as tf:
+                                reader = csv.DictReader(tf)
+                                for row in reader:
+                                    if row.get("timestamp", "").startswith(today_str) and row.get("action") == "EXIT":
+                                        pnl_val = float(row.get("pnl", 0.0) or 0.0)
+                                        px_val = float(row.get("price", 0.0) or 0.0)
+                                        # Filter out synthetic quote glitches (e.g. 168.89 emergency kill quotes)
+                                        if px_val <= 140.0:
+                                            true_trade_pnl += pnl_val
+                                trade_book_found = True
+                        except Exception as e:
+                            log_warn(f"Failed to reconcile trade book: {e}")
+
+                    if trade_book_found and abs(self.realized_pnl - true_trade_pnl) > 300.0:
+                        log_warn(f"🔧 Reconciled realized PnL from ₹{self.realized_pnl:,.2f} to true trade book PnL ₹{true_trade_pnl:,.2f}")
+                        self.realized_pnl = true_trade_pnl
                     self.positions = state.get("positions", {})
                     self.cooldown_tracker = state.get("cooldown_tracker", {})
                     self.session_em_1sd = float(state.get("session_em_1sd", 0.0))
