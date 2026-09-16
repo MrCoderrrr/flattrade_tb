@@ -63,8 +63,8 @@ DEFAULT_SL_PCT      = 0.15         # 15% initial stop-loss (fresh straddles)
 REENTRY_SL_PCT      = 0.05         # 5% initial stop-loss for reversal re-entry (instant cutoff)
 DEFAULT_TSL_PCT     = 0.08         # 8% trailing stop-loss
 POST_CLOSE_COOLDOWN = 5.0          # Seconds to wait after any close before re-entry
-REVERSAL_MIN_PTS    = 0.40         # Swing reversal threshold (0.40 pts pullback from peak/trough)
-MICRO_REVERSAL_PTS  = 0.25         # Fast micro-momentum threshold (0.25 pts with velocity)
+REVERSAL_MIN_PTS    = 0.80         # Swing reversal threshold (0.80 pts pullback from peak/trough)
+MICRO_REVERSAL_PTS  = 0.50         # Fast micro-momentum threshold (0.50 pts with velocity)
 REENTRY_COOLDOWN_S  = 10.0         # Min seconds between single-leg re-entries
 
 TELEGRAM_TOKEN = '8850507396:AAFwFm2_WxPdSM52JcCpJUj8V1rz9x3G-kE'
