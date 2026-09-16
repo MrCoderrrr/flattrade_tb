@@ -59,15 +59,13 @@ MCX_ENTRY_HOUR      = 18           # 18:00 IST open
 MCX_EXIT_HOUR       = 23
 MCX_EXIT_MINUTE     = 24           # 23:24 IST auto square-off
 LOT_SIZE            = 1250         # 1 lot = 1250 units
-MAX_DAILY_TRADES    = 16           # 8 straddles max (2 legs each)
-DEFAULT_SL_PCT      = 0.15         # 15% initial stop-loss
+DEFAULT_SL_PCT      = 0.15         # 15% initial stop-loss (fresh straddles)
+REENTRY_SL_PCT      = 0.05         # 5% initial stop-loss for reversal re-entry (instant cutoff)
 DEFAULT_TSL_PCT     = 0.08         # 8% trailing stop-loss
 POST_CLOSE_COOLDOWN = 5.0          # Seconds to wait after any close before re-entry
-KAMA_PERIOD         = 10
-KAMA_FAST           = 3
-KAMA_SLOW           = 30
-KAMA_MIN_DELTA      = 0.10         # Minimum KAMA slope to count as a reversal
-REENTRY_COOLDOWN_S  = 15.0         # Min seconds between single-leg re-entries
+REVERSAL_MIN_PTS    = 0.40         # Swing reversal threshold (0.40 pts pullback from peak/trough)
+MICRO_REVERSAL_PTS  = 0.25         # Fast micro-momentum threshold (0.25 pts with velocity)
+REENTRY_COOLDOWN_S  = 10.0         # Min seconds between single-leg re-entries
 
 TELEGRAM_TOKEN = '8850507396:AAFwFm2_WxPdSM52JcCpJUj8V1rz9x3G-kE'
 CHAT_ID        = '6307066850'
@@ -108,41 +106,6 @@ def send_telegram(msg: str):
 
 
 # ─────────────────────────────────────────────
-# KAMA  (Kaufman Adaptive Moving Average)
-# ─────────────────────────────────────────────
-class KAMA:
-    @staticmethod
-    def compute(closes: List[float], period: int = 10,
-                fast: int = 3, slow: int = 30):
-        """
-        Returns (current, previous, delta, trend)
-        trend: +1 = up, -1 = down, 0 = flat
-        """
-        if not closes:
-            return None, None, 0.0, 0
-        clean = [float(x) for x in closes
-                 if x is not None and not (isinstance(x, float) and (math.isnan(x) or math.isinf(x)))]
-        if len(clean) < period + 1:
-            return None, None, 0.0, 0
-
-        kama = [0.0] * len(clean)
-        kama[period - 1] = sum(clean[:period]) / period
-        fast_sc = 2.0 / (fast + 1.0)
-        slow_sc = 2.0 / (slow + 1.0)
-
-        for i in range(period, len(clean)):
-            change    = abs(clean[i] - clean[i - period])
-            vol       = sum(abs(clean[j] - clean[j - 1]) for j in range(i - period + 1, i + 1))
-            er        = (change / vol) if vol > 1e-6 else 0.0
-            er        = min(1.0, max(0.0, er))
-            sc        = (er * (fast_sc - slow_sc) + slow_sc) ** 2
-            kama[i]   = kama[i - 1] + sc * (clean[i] - kama[i - 1])
-
-        current  = float(kama[-1])
-        previous = float(kama[-2])
-        delta    = current - previous
-        trend    = 1 if delta > KAMA_MIN_DELTA else (-1 if delta < -KAMA_MIN_DELTA else 0)
-        return current, previous, delta, trend
 
 
 # ─────────────────────────────────────────────
@@ -179,7 +142,6 @@ class NaturalGasPaperBot:
     def __init__(self):
         self.api                   = NorenApiPy() if NorenApiPy else None
         self.positions: Dict[str, Dict] = {}
-        self.kama_prev_delta       = 0.0        # Previous KAMA delta (for reversal detection)
         self._reversal_latched     = False       # LATCHED reversal signal (not consumed by cooldown)
         self.last_reentry_ts       = 0.0         # Timestamp of last single-leg re-entry
         self.last_any_close_ts     = 0.0         # Timestamp of last leg close (for POST_CLOSE_COOLDOWN)
@@ -194,11 +156,11 @@ class NaturalGasPaperBot:
         self.front_month_futs_token: Optional[str] = None
         self.front_month_futs_symbol: Optional[str] = None
 
-        # 1-minute KAMA bar state
-        self._kama_hist: deque     = deque(maxlen=150)  # 1-min closes, 150 bars = 2.5 hrs
-        self._last_kama_bar_ts     = 0.0                # last bar timestamp
-        self._current_kama: Optional[float] = None
-        self._current_kama_delta   = 0.0
+        # Reversal tracking state
+        self._spot_history: deque  = deque(maxlen=60)
+        self._extreme_spot         = 0.0
+        self._trend_velocity       = 0.0
+        self._reversal_pullback    = 0.0
 
         self._load_state()
 
@@ -426,9 +388,6 @@ class NaturalGasPaperBot:
     def _enter_leg(self, leg: str, strike: float, side: str = 'SELL',
                    loss_stop_pct: float = DEFAULT_SL_PCT,
                    tsl_pct: float = DEFAULT_TSL_PCT) -> Optional[dict]:
-        if self.trades_today >= MAX_DAILY_TRADES:
-            print(f'[GUARD] Max daily trades ({MAX_DAILY_TRADES}) reached. Skipping {leg}.', flush=True)
-            return None
 
         option_type = 'CE' if leg == 'CE' else 'PE'
         match = self.find_option_symbol(strike, option_type)
@@ -519,6 +478,8 @@ class NaturalGasPaperBot:
               f'| PnL: {sign}₹{pnl:,.2f} | {reason}', flush=True)
         send_telegram(tg)
         del self.positions[leg]
+        if len(self.positions) == 1:
+            self._extreme_spot = 0.0  # Reset extreme tracking for the new solo leg
         self.last_any_close_ts = time.time()
         self._save_state()
 
@@ -579,38 +540,60 @@ class NaturalGasPaperBot:
 
         return False, ''
 
-    # ── KAMA reversal detection (latching) ───
-    def _update_kama(self, spot: float):
+    # ── Point-based momentum reversal tracking ───
+    def _update_reversal_tracker(self, spot: float):
         """
-        Append a 1-minute bar to KAMA history and update reversal latch.
-        Call once per second; only samples every 60 seconds.
+        Track 1-second spot ticks for momentum reversal.
+        Latches self._reversal_latched if price pulls back from extreme.
         """
-        now_ts = time.time()
-        if now_ts - self._last_kama_bar_ts < 60.0:
+        self._spot_history.append(spot)
+        
+        # Only process if we are in a 1-leg (solo) state waiting for re-entry
+        short_legs = [leg for leg, p in self.positions.items() if p['side'] == 'SELL']
+        if len(short_legs) != 1:
+            self._extreme_spot = 0.0
+            self._trend_velocity = 0.0
+            self._reversal_pullback = 0.0
             return
-        self._last_kama_bar_ts = now_ts
-        self._kama_hist.append(spot)
-
-        if len(self._kama_hist) < KAMA_PERIOD + 1:
-            return
-
-        current, previous, delta, trend = KAMA.compute(
-            list(self._kama_hist), period=KAMA_PERIOD, fast=KAMA_FAST, slow=KAMA_SLOW)
-
-        if current is None or previous is None:
-            return
-
-        self._current_kama       = current
-        self._current_kama_delta = delta
-
-        # Detect reversal: sign flip with sufficient magnitude
-        if abs(delta) >= KAMA_MIN_DELTA:
-            prev_d = self.kama_prev_delta
-            if (prev_d > 0 and delta < 0) or (prev_d < 0 and delta > 0):
-                # LATCH the signal — it stays True until consumed by a re-entry
+            
+        surviving_leg = short_legs[0]
+        
+        # Calculate velocity over last 10 ticks (~10 seconds)
+        hist = list(self._spot_history)
+        if len(hist) >= 10:
+            self._trend_velocity = hist[-1] - hist[-10]
+        else:
+            self._trend_velocity = 0.0
+            
+        # Initialize extreme spot if it's 0
+        if self._extreme_spot <= 0:
+            self._extreme_spot = spot
+            
+        # Surviving leg is PE (Call was hit). Market rallied. We want to re-enter Call on a dip.
+        if surviving_leg == 'PE':
+            # Market is going up, track the highest high
+            if spot > self._extreme_spot:
+                self._extreme_spot = spot
+            
+            pullback = self._extreme_spot - spot
+            self._reversal_pullback = pullback
+            
+            # Reversal criteria:
+            if pullback >= REVERSAL_MIN_PTS or (pullback >= MICRO_REVERSAL_PTS and self._trend_velocity < 0):
                 self._reversal_latched = True
-
-        self.kama_prev_delta = delta
+                
+        # Surviving leg is CE (Put was hit). Market dumped. We want to re-enter Put on a bounce.
+        elif surviving_leg == 'CE':
+            # Market is going down, track the lowest low
+            if spot < self._extreme_spot:
+                self._extreme_spot = spot
+                
+            pullback = spot - self._extreme_spot
+            self._reversal_pullback = pullback
+            
+            # Reversal criteria:
+            if pullback >= REVERSAL_MIN_PTS or (pullback >= MICRO_REVERSAL_PTS and self._trend_velocity > 0):
+                self._reversal_latched = True
 
     def _consume_reversal(self):
         """Mark the latched reversal as consumed after a successful re-entry."""
@@ -670,15 +653,15 @@ class NaturalGasPaperBot:
             V     = f'{DIM}║{RS}'
             VS    = f'{DIM}│{RS}'
 
-            # KAMA display
-            kama_str = f'{self._current_kama:.2f}' if self._current_kama else 'WARMUP'
-            delta    = self._current_kama_delta
-            if delta > KAMA_MIN_DELTA:
-                trend_str = f'{GR}▲ UP{RS}'
-            elif delta < -KAMA_MIN_DELTA:
-                trend_str = f'{RD}▼ DOWN{RS}'
+            # Momentum Reversal display
+            if self._extreme_spot > 0:
+                vel_col = GR if self._trend_velocity > 0 else (RD if self._trend_velocity < 0 else YL)
+                sign_str = '+' if self._trend_velocity > 0 else ''
+                trend_str = f'Vel: {vel_col}{sign_str}{self._trend_velocity:.2f}{RS} '
+                trend_str += f'Pull: {self._reversal_pullback:.2f}'
             else:
-                trend_str = f'{YL}━ FLAT{RS}'
+                trend_str = f'{DIM}WAITING{RS}'
+                
             reversal_tag = f'  {MG}[REVERSAL LATCHED]{RS}' if self._reversal_latched else ''
             cooldown_left = max(0.0, POST_CLOSE_COOLDOWN - (now_ts - self.last_any_close_ts))
             cooldown_tag  = (f'  {YL}[COOLDOWN {cooldown_left:.0f}s]{RS}'
@@ -688,7 +671,7 @@ class NaturalGasPaperBot:
             print(TOP)
 
             title_l = (f'  {CY}MCX NATGAS PAPER v3.0{RS}  {DIM}│{RS}  '
-                       f'{YL}ATM STRADDLE + KAMA{RS}  {DIM}│{RS}  '
+                       f'{YL}ATM STRADDLE + MOMENTUM{RS}  {DIM}│{RS}  '
                        f'{GR}tail -f natgas_paper.log{RS}')
             title_r = f'{DIM}{now.strftime("%H:%M:%S IST")}{RS}  '
             pad_top = max(1, W - _ansi_len(title_l) - _ansi_len(title_r))
@@ -697,9 +680,9 @@ class NaturalGasPaperBot:
             print(MID)
             ind_row = (f'  {DIM}SPOT:{RS} {WH}{spot:>8.2f}{RS}  '
                        f'{DIM}ATM:{RS} {YL}{int(atm):<5}{RS}  '
-                       f'{DIM}KAMA(1m):{RS} {WH}{kama_str}{RS} {trend_str}'
+                       f'{DIM}MOMENTUM:{RS} {trend_str}'
                        f'{reversal_tag}{cooldown_tag}  '
-                       f'{DIM}TRADES:{RS} {WH}{self.trades_today}/{MAX_DAILY_TRADES}{RS}')
+                       f'{DIM}TRADES:{RS} {WH}{self.trades_today}{RS}')
             print(f'{V}{_pad(ind_row, W)}{V}')
             print(MID)
 
@@ -760,16 +743,19 @@ class NaturalGasPaperBot:
                 return
             _last_tg_dash_edit_ts = now_ts
 
-            kama_str = f'{self._current_kama:.2f}' if self._current_kama else 'WARMUP'
-            delta    = self._current_kama_delta
-            kama_dir = '▲' if delta > KAMA_MIN_DELTA else ('▼' if delta < -KAMA_MIN_DELTA else '━')
+            if self._extreme_spot > 0:
+                sign_str = '+' if self._trend_velocity > 0 else ''
+                trend_str = f'Vel: {sign_str}{self._trend_velocity:.2f} Pull: {self._reversal_pullback:.2f}'
+            else:
+                trend_str = 'WAITING'
+                
             rev_tag  = ' [REVERSAL]' if self._reversal_latched else ''
 
             lines = [
                 '<pre>',
                 f'MCX NATURAL GAS  [{now.strftime("%H:%M:%S")}]',
                 f'Spot {spot:.2f}   ATM {int(atm)}',
-                f'KAMA {kama_str} {kama_dir}{rev_tag}',
+                f'{trend_str}{rev_tag}',
                 '─────────────────────',
             ]
             if snap_rows:
@@ -790,7 +776,7 @@ class NaturalGasPaperBot:
                 f'Realized  {r_sign}₹{self.total_realized_pnl:>9,.2f}',
                 f'Unreal    {u_sign}₹{total_unreal:>9,.2f}',
                 f'Net MTM   {n_sign}₹{net:>9,.2f}',
-                f'Trades    {self.trades_today}/{MAX_DAILY_TRADES}',
+                f'Trades    {self.trades_today}',
                 '</pre>',
             ]
             t = '\n'.join(lines)
@@ -970,8 +956,8 @@ class NaturalGasPaperBot:
                     continue
                 atm = round_to_price(spot, STRIKE_STEP)
 
-                # ── KAMA (1-minute bars) ─────────────────────
-                self._update_kama(spot)
+                # ── Momentum Reversal Tracking ────────────────────────
+                self._update_reversal_tracker(spot)
 
                 # ── STEP 1: NO POSITIONS → INSTANT ENTRY ─────
                 #    Always enter immediately whenever positions are empty.
@@ -980,9 +966,9 @@ class NaturalGasPaperBot:
                     time_since_close = now_ts - self.last_any_close_ts
                     if time_since_close < POST_CLOSE_COOLDOWN:
                         pass  # Brief cooldown (5s) to avoid double-close flicker
-                    elif self.trades_today < MAX_DAILY_TRADES:
+                    else:
                         print(f'[INIT] Entering ATM Straddle at {int(atm)} '
-                              f'(Trades: {self.trades_today}/{MAX_DAILY_TRADES})...', flush=True)
+                              f'(Trades: {self.trades_today})...', flush=True)
                         self._enter_leg('CE', atm, 'SELL')
                         self._enter_leg('PE', atm, 'SELL')
                         self._consume_reversal()          # Reset any stale latch after fresh entry
@@ -991,7 +977,7 @@ class NaturalGasPaperBot:
                     time.sleep(1.0)
                     continue
 
-                # ── STEP 2: 1 LEG OPEN → KAMA RE-ENTRY FIRST ─
+                # ── STEP 2: 1 LEG OPEN → MOMENTUM RE-ENTRY FIRST ─
                 #    Re-enter the missing leg BEFORE checking TSL.
                 #    This ensures re-entry happens while the surviving leg is still alive.
                 short_legs = [leg for leg, p in self.positions.items() if p['side'] == 'SELL']
@@ -1012,10 +998,12 @@ class NaturalGasPaperBot:
                             reentry_strike = round_to_price(
                                 atm + dist if missing_leg == 'CE' else atm - dist, STRIKE_STEP)
 
-                        print(f'[REENTRY] KAMA reversal latched! '
+                        print(f'[REENTRY] Momentum reversal latched! '
                               f'Re-entering {missing_leg} at {int(reentry_strike)} '
-                              f'(Surviving: {surviving_leg} {int(surviving_strike)})', flush=True)
-                        if self._enter_leg(missing_leg, reentry_strike, 'SELL'):
+                              f'(Surviving: {surviving_leg} {int(surviving_strike)}) '
+                              f'with {REENTRY_SL_PCT*100:.0f}% instant SL', flush=True)
+                        
+                        if self._enter_leg(missing_leg, reentry_strike, 'SELL', loss_stop_pct=REENTRY_SL_PCT):
                             self.last_reentry_ts = now_ts
                             self._consume_reversal()     # Consume latch on successful re-entry
 
