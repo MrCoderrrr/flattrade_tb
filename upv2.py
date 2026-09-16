@@ -409,7 +409,7 @@ HEDGE_DISTANCE_FLOOR      = 300
 HEDGE_DISTANCE_RATIO      = 1.5
 
 # --- PREMIUM TSL (percentage of entry premium) ---
-PREM_SL_INITIAL_PCT       = 0.05   # 5% initial SL
+PREM_SL_INITIAL_PCT       = 0.12   # 12% initial SL
 PREM_TSL_MIN_PCT          = 0.09   # 9% flat trail
 PREM_TSL_MAX_PCT          = 0.09   # 9% flat trail
 

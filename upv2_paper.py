@@ -597,10 +597,10 @@ IVR_ACTION                = "SKIP"
 # --- DYNAMIC STRIKE & HEDGE ---
 
 # --- PREMIUM SL (percentage of entry premium) ---
-PREM_SL_INITIAL_PCT       = 0.20   # 20% initial SL on standard days — gives ATM options room to breathe
-PREM_SL_INITIAL_PCT_EXPIRY= 0.15   # 15% initial SL on Expiry Day (0 DTE) — faster decay, tighter leash
+PREM_SL_INITIAL_PCT       = 0.12   # 12% initial SL on standard days — gives ATM options room to breathe
+PREM_SL_INITIAL_PCT_EXPIRY= 0.12   # 12% initial SL on Expiry Day (0 DTE)
 PREM_SL_MIN_PCT          = 0.07   # 7% tight trail baseline when deep in profit
-PREM_SL_MAX_PCT          = 0.20   # 20% trail at breakeven, ratchets down as profit grows
+PREM_SL_MAX_PCT          = 0.12   # 12% trail ceiling at breakeven, ratchets down as profit grows
 
 # --- THETA ACCELERATION & EXPIRY DAY (0 DTE) TUNING ---
 AFTERNOON_TSL_HOUR        = 13     # 1:00 PM IST — theta decay accelerates (~60% of daily decay)
@@ -1614,7 +1614,7 @@ class RiskManager:
         best_prem = sl_state.get("best_premium", entry_prem)
 
         # 2. Calculate Initial SL:
-        # On Expiry Day (0 DTE): 15% initial SL, else 20%
+        # 12% initial SL (both standard days and expiry day)
         is_expiry = (dte_days <= EXPIRY_0DTE_THRESHOLD)
         initial_pct = PREM_SL_INITIAL_PCT_EXPIRY if is_expiry else PREM_SL_INITIAL_PCT
         initial_sl = round(entry_prem * (1.0 + initial_pct), 2)
