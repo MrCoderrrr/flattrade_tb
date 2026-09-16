@@ -1,123 +1,63 @@
-import subprocess
-import time
-from datetime import datetime, timezone, timedelta
+"""Weekday session launcher for the paper-only runtime."""
+from __future__ import annotations
 import os
-import signal
+import subprocess
 import sys
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-# Define IST timezone
 IST = timezone(timedelta(hours=5, minutes=30))
+ROOT = Path(__file__).resolve().parent
+process_runtime: subprocess.Popen | None = None
 
-# Define process variables
-process_upv2 = None
-process_mcx = None
 
-def get_python_exec():
-    # Detect virtual environment python
-    candidates = [
-        os.path.abspath("venv/bin/python3"),
-        os.path.abspath("../venv/bin/python3"),
-        "/home/ubuntu/flattrade_tb/venv/bin/python3",
-        "/home/ubuntu/flattrade_tb/flattrade_tb/venv/bin/python3",
-        "/home/ubuntu/venv/bin/python3",
-        sys.executable
-    ]
-    for c in candidates:
-        if c and os.path.exists(c) and os.access(c, os.X_OK):
-            return c
-    return "python3"
+def in_session(now: datetime) -> bool:
+    hhmm = now.strftime("%H:%M")
+    # NSE runs Monday-Friday. MCX's evening session opens Sunday and runs
+    # through Friday; Saturday is closed. Boundaries are half-open so the
+    # scheduler never starts a process after the session has ended.
+    nse_open = now.weekday() < 5 and "09:15" <= hhmm < "15:15"
+    mcx_open = now.weekday() != 5 and "18:00" <= hhmm < "23:25"
+    return nse_open or mcx_open
 
-def is_process_running(script_name: str) -> bool:
-    try:
-        out = subprocess.check_output(["pgrep", "-f", script_name]).decode()
-        pids = [int(p) for p in out.strip().split() if int(p) != os.getpid()]
-        return len(pids) > 0
-    except Exception:
-        return False
 
-def start_upv2():
-    global process_upv2
-    if is_process_running("upv2_paper.py"):
+def start_runtime() -> None:
+    global process_runtime
+    if process_runtime is not None and process_runtime.poll() is None:
         return
-    if process_upv2 is None or process_upv2.poll() is not None:
-        py_bin = get_python_exec()
-        print(f"[{datetime.now(IST)}] Starting upv2_paper.py using {py_bin}")
-        with open("paper.log", "a") as out:
-            process_upv2 = subprocess.Popen(
-                [py_bin, "-u", "upv2_paper.py"],
-                stdout=out,
-                stderr=subprocess.STDOUT
-            )
+    log = (ROOT / "paper.log").open("a")
+    print(f"[{datetime.now(IST)}] Starting PAPER runtime (no live orders)", flush=True)
+    process_runtime = subprocess.Popen(
+        [sys.executable, "-u", str(ROOT / "runtime.py")],
+        cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
+        env={**os.environ, "PAPER_MODE": "1"})
 
-def stop_upv2():
-    global process_upv2
-    # Stop if running
-    if process_upv2 is not None and process_upv2.poll() is None:
-        print(f"[{datetime.now(IST)}] Stopping upv2_paper.py")
-        process_upv2.terminate()
+
+def stop_runtime() -> None:
+    global process_runtime
+    if process_runtime is not None and process_runtime.poll() is None:
+        print(f"[{datetime.now(IST)}] Stopping PAPER runtime", flush=True)
+        process_runtime.terminate()
         try:
-            process_upv2.wait(timeout=5)
+            process_runtime.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            process_upv2.kill()
-        process_upv2 = None
+            process_runtime.kill()
+    process_runtime = None
 
-def start_mcx():
-    global process_mcx
-    if is_process_running("mcx_naturalgas_paper.py"):
-        return
-    if process_mcx is None or process_mcx.poll() is not None:
-        py_bin = get_python_exec()
-        print(f"[{datetime.now(IST)}] Starting mcx_naturalgas_paper.py using {py_bin}")
-        with open("natgas_paper.log", "a") as out:
-            process_mcx = subprocess.Popen(
-                [py_bin, "-u", "mcx_naturalgas_paper.py"],
-                stdout=out,
-                stderr=subprocess.STDOUT
-            )
 
-def stop_mcx():
-    global process_mcx
-    # Stop if running
-    if process_mcx is not None and process_mcx.poll() is None:
-        print(f"[{datetime.now(IST)}] Stopping mcx_naturalgas_paper.py")
-        process_mcx.terminate()
-        try:
-            process_mcx.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process_mcx.kill()
-        process_mcx = None
-
-def main():
-    print(f"[{datetime.now(IST)}] Scheduler started...")
+def main() -> None:
+    print(f"[{datetime.now(IST)}] Paper scheduler started", flush=True)
     try:
         while True:
-            now = datetime.now(IST)
-            current_time = now.strftime("%H:%M")
-            
-            # Check if it's a weekday (Monday=0, Sunday=6)
-            # You can remove `and now.weekday() < 5` if you want it to run on weekends too.
-            is_weekday = now.weekday() < 5
-
-            # upv2_paper.py schedule: 09:15 to 15:35
-            if is_weekday and "09:15" <= current_time < "15:35":
-                start_upv2()
+            if in_session(datetime.now(IST)):
+                start_runtime()
             else:
-                stop_upv2()
-
-            # mcx_naturalgas_paper.py schedule: 18:00 to 23:25
-            if is_weekday and "18:00" <= current_time < "23:25":
-                start_mcx()
-            else:
-                stop_mcx()
-
-            # Wait 30 seconds before checking again
+                stop_runtime()
             time.sleep(30)
-            
     except KeyboardInterrupt:
-        print(f"[{datetime.now(IST)}] Scheduler stopping... shutting down active processes.")
-        stop_upv2()
-        stop_mcx()
-        print("Done.")
+        stop_runtime()
+
 
 if __name__ == "__main__":
     main()
