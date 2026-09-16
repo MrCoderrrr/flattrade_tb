@@ -44,19 +44,38 @@ DEFAULT_TSL_PCT  = 0.07   # 7% Trailing Stop Loss
 TELEGRAM_TOKEN = '8850507396:AAFwFm2_WxPdSM52JcCpJUj8V1rz9x3G-kE'
 CHAT_ID = '6307066850'
 
-_last_tg_dash_msg_id: Optional[int] = None
+def _get_tg_chat_ids() -> List[str]:
+    """Extract list of clean chat IDs from CHAT_ID (supports str, int, comma-separated str, or list)."""
+    if isinstance(CHAT_ID, list):
+        return [str(c).strip() for c in CHAT_ID if str(c).strip()]
+    if isinstance(CHAT_ID, (str, int)):
+        return [c.strip() for c in str(CHAT_ID).split(',') if c.strip()]
+    return []
+
+_last_tg_dash_msg_ids: Dict[str, int] = {}
 _last_tg_dash_new_msg_ts: float = 0.0
 _last_tg_dash_edit_ts: float = 0.0
+_tg_rate_limited_until: float = 0.0
 
 def send_telegram(msg: str):
-    global _last_tg_dash_msg_id
-    try:
-        url = f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage'
-        requests.post(url, data={'chat_id': CHAT_ID, 'text': msg, 'parse_mode': 'HTML'}, timeout=5)
-        # Reset dashboard message ID so next 1-sec tick posts fresh dashboard below the alert
-        _last_tg_dash_msg_id = None
-    except Exception:
-        pass
+    global _last_tg_dash_msg_ids, _tg_rate_limited_until
+    if time.time() < _tg_rate_limited_until:
+        return
+    chat_ids = _get_tg_chat_ids()
+    if not (TELEGRAM_TOKEN and chat_ids):
+        return
+    for cid in chat_ids:
+        try:
+            url = f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage'
+            resp = requests.post(url, data={'chat_id': cid, 'text': msg, 'parse_mode': 'HTML'}, timeout=5)
+            if resp.status_code == 429:
+                retry_after = resp.json().get('parameters', {}).get('retry_after', 30)
+                _tg_rate_limited_until = time.time() + retry_after
+                print(f"[TELEGRAM] ⚠️ Rate limited by Telegram. Cooldown for {retry_after}s")
+                return
+        except Exception:
+            pass
+    _last_tg_dash_msg_ids.clear()
 
 def round_to_price(value: float, step: float = STRIKE_STEP) -> float:
     return round(math.floor(value / step + 0.5) * step, 2)
@@ -64,21 +83,25 @@ def round_to_price(value: float, step: float = STRIKE_STEP) -> float:
 class KAMA:
     @staticmethod
     def compute(closes: List[float], period: int = 10, fast: int = 3, slow: int = 30):
-        if len(closes) < period + 1:
+        if not closes:
+            return None, None, 0.0, 0
+        clean_closes = [float(x) for x in closes if x is not None and not (isinstance(x, float) and (math.isnan(x) or math.isinf(x)))]
+        if len(clean_closes) < period + 1:
             return None, None, 0.0, 0
 
-        kama = [0.0] * len(closes)
-        kama[period - 1] = sum(closes[:period]) / period
+        kama = [0.0] * len(clean_closes)
+        kama[period - 1] = sum(clean_closes[:period]) / period
 
         fast_sc = 2.0 / (fast + 1.0)
         slow_sc = 2.0 / (slow + 1.0)
 
-        for i in range(period, len(closes)):
-            change = abs(closes[i] - closes[i - period])
-            volatility = sum(abs(closes[j] - closes[j - 1]) for j in range(i - period + 1, i + 1))
-            er = (change / volatility) if volatility > 0 else 0.0
+        for i in range(period, len(clean_closes)):
+            change = abs(clean_closes[i] - clean_closes[i - period])
+            volatility = sum(abs(clean_closes[j] - clean_closes[j - 1]) for j in range(i - period + 1, i + 1))
+            er = (change / volatility) if volatility > 1e-6 else 0.0
+            er = min(1.0, max(0.0, er))
             sc = (er * (fast_sc - slow_sc) + slow_sc) ** 2
-            kama[i] = kama[i - 1] + sc * (closes[i] - kama[i - 1])
+            kama[i] = kama[i - 1] + sc * (clean_closes[i] - kama[i - 1])
 
         current = float(kama[-1])
         previous = float(kama[-2])
@@ -461,7 +484,7 @@ class NaturalGasPaperBot:
         return False, ''
 
     def _print_dashboard(self, spot: float, atm: float):
-        global _last_tg_dash_msg_id, _last_tg_dash_new_msg_ts, _last_tg_dash_edit_ts
+        global _last_tg_dash_msg_ids, _last_tg_dash_new_msg_ts, _last_tg_dash_edit_ts, _tg_rate_limited_until
         now = get_ist_now()
         now_ts = time.time()
         now_s = now.strftime('%H:%M:%S IST')
@@ -478,8 +501,10 @@ class NaturalGasPaperBot:
                 print(f'  {leg:2} | {pos["side"]} {int(pos["strike"])} | Entry:{pos["entry_price"]:.2f} LTP:{ltp:.2f} TSL:{tsl:.2f} PnL:Rs{pnl:,.0f}')
             print('-' * 65)
 
-        # Telegram Live Dashboard every 1 second
-        if now_ts - _last_tg_dash_edit_ts >= 0.95:
+        # Telegram Live Dashboard every 3 seconds (safe rate for Telegram API)
+        if now_ts - _last_tg_dash_edit_ts >= 3.0:
+            if time.time() < _tg_rate_limited_until:
+                return
             _last_tg_dash_edit_ts = now_ts
             total_unrealized = 0.0
             leg_data = []
@@ -512,33 +537,50 @@ class NaturalGasPaperBot:
             lines.append('</pre>')
             t = chr(10).join(lines)
 
-            # Edit existing message in-place every 1s
-            if _last_tg_dash_msg_id is not None and (now_ts - _last_tg_dash_new_msg_ts) < 60.0:
-                try:
-                    edit_resp = requests.post(
-                        f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText',
-                        json={'chat_id': CHAT_ID, 'message_id': _last_tg_dash_msg_id, 'text': t, 'parse_mode': 'HTML'},
-                        timeout=3
-                    )
-                    if edit_resp.status_code == 200 and edit_resp.json().get('ok'):
-                        return
-                except Exception:
-                    pass
+            chat_ids = _get_tg_chat_ids()
+            is_refresh = (now_ts - _last_tg_dash_new_msg_ts) >= 60.0
 
-            # Send a fresh message every 60s or if edit failed
-            try:
-                send_resp = requests.post(
-                    f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage',
-                    data={'chat_id': CHAT_ID, 'text': t, 'parse_mode': 'HTML'},
-                    timeout=4
-                )
-                if send_resp.status_code == 200:
-                    rjson = send_resp.json()
-                    if rjson.get('ok'):
-                        _last_tg_dash_msg_id = rjson.get('result', {}).get('message_id')
-                        _last_tg_dash_new_msg_ts = now_ts
-            except Exception:
-                pass
+            for cid in chat_ids:
+                msg_id = _last_tg_dash_msg_ids.get(cid)
+                edited = False
+                if msg_id is not None and not is_refresh:
+                    try:
+                        edit_resp = requests.post(
+                            f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText',
+                            json={'chat_id': cid, 'message_id': msg_id, 'text': t, 'parse_mode': 'HTML'},
+                            timeout=3
+                        )
+                        if edit_resp.status_code == 200 and edit_resp.json().get('ok'):
+                            edited = True
+                        elif edit_resp.status_code == 400 and 'message is not modified' in edit_resp.text:
+                            edited = True  # Content identical, already up to date!
+                        elif edit_resp.status_code == 429:
+                            retry_after = edit_resp.json().get('parameters', {}).get('retry_after', 30)
+                            _tg_rate_limited_until = time.time() + retry_after
+                            return
+                    except Exception:
+                        pass
+
+                # Only send fresh message if no message exists yet or explicit 60s refresh cycle
+                if not edited and (msg_id is None or is_refresh):
+                    try:
+                        send_resp = requests.post(
+                            f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage',
+                            data={'chat_id': cid, 'text': t, 'parse_mode': 'HTML'},
+                            timeout=4
+                        )
+                        if send_resp.status_code == 200 and send_resp.json().get('ok'):
+                            _last_tg_dash_msg_ids[cid] = send_resp.json().get('result', {}).get('message_id')
+                            _last_tg_dash_new_msg_ts = now_ts
+                        elif send_resp.status_code == 429:
+                            retry_after = send_resp.json().get('parameters', {}).get('retry_after', 30)
+                            _tg_rate_limited_until = time.time() + retry_after
+                            return
+                    except Exception:
+                        pass
+
+            if is_refresh:
+                _last_tg_dash_new_msg_ts = now_ts
 
     def _kama_reversal_confirmed(self, current_kama: float, prev_kama: float) -> bool:
         if current_kama is None or prev_kama is None:
@@ -603,27 +645,36 @@ class NaturalGasPaperBot:
                 hist.append(spot)
 
                 reversal = False
-                if len(hist) >= 12:
-                    current_kama, prev_kama, delta, trend = KAMA.compute(list(hist), period=10, fast=4, slow=30)
+                if len(hist) >= 11:
+                    current_kama, prev_kama, delta, trend = KAMA.compute(list(hist), period=10, fast=3, slow=30)
                     if current_kama is not None and prev_kama is not None:
                         reversal = self._kama_reversal_confirmed(current_kama, prev_kama)
 
                 if not self.positions:
                     if now.hour >= MCX_ENTRY_HOUR and self.trades_today < MAX_DAILY_TRADES:
-                        # Require at least 5 minutes stabilization after a double stop-out
+                        # After double stop-out, wait for KAMA reversal to confirm market settling
                         time_since_stop = time.time() - getattr(self, "last_double_stop_ts", 0.0)
-                        if getattr(self, "last_double_stop_ts", 0.0) == 0.0 or time_since_stop >= 300.0:
+                        if getattr(self, "last_double_stop_ts", 0.0) == 0.0:
+                            # First entry of the session — no double stop-out history
                             print(f'[INIT] Opening ATM Straddle at Strike {int(atm)} (Trades today: {self.trades_today}/{MAX_DAILY_TRADES})...')
+                            self._enter_leg('CE', atm, 'SELL', loss_stop_pct=DEFAULT_SL_PCT, tsl_pct=DEFAULT_TSL_PCT)
+                            self._enter_leg('PE', atm, 'SELL', loss_stop_pct=DEFAULT_SL_PCT, tsl_pct=DEFAULT_TSL_PCT)
+                        elif time_since_stop < 15.0:
+                            # Minimum 15s cooldown before evaluating KAMA reversal
+                            pass
+                        elif reversal:
+                            # KAMA reversal confirmed — market settling, safe to re-enter
+                            print(f'[REENTRY] KAMA reversal after double stop-out. Re-entering ATM Straddle at {int(atm)}...')
                             self._enter_leg('CE', atm, 'SELL', loss_stop_pct=DEFAULT_SL_PCT, tsl_pct=DEFAULT_TSL_PCT)
                             self._enter_leg('PE', atm, 'SELL', loss_stop_pct=DEFAULT_SL_PCT, tsl_pct=DEFAULT_TSL_PCT)
                         else:
                             if int(time_since_stop) % 30 == 0:
-                                print(f'[WAIT] Double stop cooldown active. Resuming in {int(300 - time_since_stop)}s...')
+                                print(f'[WAIT] Awaiting KAMA reversal for re-entry after double stop ({int(time_since_stop)}s elapsed)...')
                 else:
                     short_legs = [leg for leg in self.positions if self.positions[leg]['side'] == 'SELL']
 
                     if len(short_legs) == 1 and reversal:
-                        if time.time() - self.last_reentry_ts >= 60.0:
+                        if time.time() - self.last_reentry_ts >= 15.0:
                             missing_leg = 'CE' if 'PE' in short_legs else 'PE'
                             surviving_leg = short_legs[0]
                             surviving_strike = self.positions[surviving_leg]['strike']

@@ -27,9 +27,18 @@ def get_python_exec():
             return c
     return "python3"
 
+def is_process_running(script_name: str) -> bool:
+    try:
+        out = subprocess.check_output(["pgrep", "-f", script_name]).decode()
+        pids = [int(p) for p in out.strip().split() if int(p) != os.getpid()]
+        return len(pids) > 0
+    except Exception:
+        return False
+
 def start_upv2():
     global process_upv2
-    # Start if not running
+    if is_process_running("upv2_paper.py"):
+        return
     if process_upv2 is None or process_upv2.poll() is not None:
         py_bin = get_python_exec()
         print(f"[{datetime.now(IST)}] Starting upv2_paper.py using {py_bin}")
@@ -54,7 +63,8 @@ def stop_upv2():
 
 def start_mcx():
     global process_mcx
-    # Start if not running
+    if is_process_running("mcx_naturalgas_paper.py"):
+        return
     if process_mcx is None or process_mcx.poll() is not None:
         py_bin = get_python_exec()
         print(f"[{datetime.now(IST)}] Starting mcx_naturalgas_paper.py using {py_bin}")

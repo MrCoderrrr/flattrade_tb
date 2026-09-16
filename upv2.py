@@ -11,7 +11,7 @@ KEY ARCHITECTURAL HIGHLIGHTS:
    - KAMA and Spot TSL run strictly on the 1-minute collected data, not before.
 2. Dual-Filter Regime Detection:
    - ADX(9) on 5m: <20 -> CHOP REGIME (decay focus), >=20 -> TREND REGIME (high delta risk).
-   - KAMA(13, 2, 30) on 5m: Directional trend filter (+1 UP, -1 DOWN, 0 FLAT).
+   - KAMA(10, 3, 30) on 1m: Directional trend filter (+1 UP, -1 DOWN, 0 FLAT).
 3. Precision Order Engine & Anti-Duplicate Trade Guard:
    - Rate limiting: At most 1 order dispatched per 1.05 seconds ("1 order in 1 sec not more").
    - Deep Verification: Pre- and post-order verification against broker order book.
@@ -386,8 +386,8 @@ MARGIN_IRON_CONDOR      = 95_000
 PORTFOLIO_CIRCUIT_PCT   = 1.8
 
 # --- REAL-MONEY SAFETY & GOVERNANCE ---
-TELEGRAM_BOT_TOKEN        = ""
-TELEGRAM_CHAT_ID          = ""
+TELEGRAM_BOT_TOKEN        = "8850507396:AAFwFm2_WxPdSM52JcCpJUj8V1rz9x3G-kE"
+TELEGRAM_CHAT_ID          = "6307066850"
 KILL_SWITCH_FILE          = os.path.join(CURRENT_DIR, "kill_switch.txt")
 CAPITAL_FRACTION_LIVE     = 0.40
 MAX_LOTS_PER_LEG          = 1
@@ -420,10 +420,10 @@ MAX_REENTRIES_PER_LEG     = 999
 MAX_REENTRIES_TOTAL       = 999
 MAX_STRANGLE_RESETS       = 999
 BACKOFF_BASE_SEC          = 60
-KAMA_PERIOD             = 12          # KAMA Efficiency Ratio lookback
-KAMA_FAST_EMA           = 3           # KAMA Fast EMA constant
-KAMA_SLOW_EMA           = 30          # KAMA Slow EMA constant
-KAMA_MIN_SLOPE          = 4.0         # Minimum KAMA slope (pts) to flip trend
+KAMA_PERIOD             = 10          # KAMA Efficiency Ratio lookback (10 bars)
+KAMA_FAST_EMA           = 3           # KAMA Fast EMA constant (3)
+KAMA_SLOW_EMA           = 30          # KAMA Slow EMA constant (30)
+KAMA_MIN_SLOPE          = 0.5         # Minimum KAMA slope (pts) to flip 1m trend
 
 ADX_PERIOD              = 14          # ADX lookback period on 5m candles (14 = standard Wilder)
 ADX_CHOP_THRESHOLD      = 30.0        # ADX < 30: CHOP REGIME (sideways market)
@@ -490,12 +490,19 @@ def log_warn(msg: str):
 def log_alert(msg: str):
     try:
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-            import requests
-            requests.post(f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage', json={'chat_id': TELEGRAM_CHAT_ID, 'text': f'[Algo v2] {msg}'}, timeout=2)
+            import requests, re
+            clean = re.sub(r"\x1b\[[0-9;]*m", "", msg)
+            requests.post(f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage', json={'chat_id': TELEGRAM_CHAT_ID, 'text': f'[NIFTY ALERT] {clean}'}, timeout=3)
     except: pass
     print(f"{Fore.RED}{Style.BRIGHT}[{_now_str()} ALERT]{Style.RESET_ALL} {msg}", flush=True)
 
 def log_trade(msg: str):
+    try:
+        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+            import requests, re
+            clean = re.sub(r"\x1b\[[0-9;]*m", "", msg)
+            requests.post(f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage', json={'chat_id': TELEGRAM_CHAT_ID, 'text': f'[NIFTY TRADE] {clean}'}, timeout=3)
+    except: pass
     print(f"{Fore.MAGENTA}{Style.BRIGHT}[{_now_str()} TRADE]{Style.RESET_ALL} {msg}", flush=True)
 
 def round_to_strike(price: float, strike_step: int = 50) -> int:
@@ -654,6 +661,78 @@ class MarketData:
             self.historical_5m_bars = []
             log_warn("MarketData: ⚠️ History seeding FAILED. ADX will be inflated until 30+ live bars accumulate.")
 
+        # 3. Seed 1-minute historical bars for instant KAMA(10, 3, 30) readiness
+        if len(self.bars_1m) < 30:
+            seeded_1m = []
+            api = getattr(self.streamer, "api", global_api)
+            if api and hasattr(api, "get_time_price_series"):
+                try:
+                    log_info("MarketData: Attempting historical 1-min seeding from Flattrade (Token 26000)...")
+                    end_time = get_ist_now()
+                    start_time_1m = end_time - timedelta(days=2)
+                    res_1m = api.get_time_price_series(
+                        exchange='NSE',
+                        token='26000',
+                        starttime=start_time_1m.timestamp(),
+                        endtime=end_time.timestamp(),
+                        interval=1
+                    )
+                    if res_1m and isinstance(res_1m, list) and len(res_1m) > 0:
+                        for row in res_1m:
+                            try:
+                                ts = datetime.strptime(row['time'], "%d-%m-%Y %H:%M:%S")
+                                min_key = ts.strftime("%Y-%m-%d %H:%M")
+                                c_val = float(row.get('intc') or row.get('close') or 0.0)
+                                if c_val > 0:
+                                    seeded_1m.append({
+                                        'timestamp': ts,
+                                        'spot': c_val,
+                                        'minute_key': min_key
+                                    })
+                            except Exception:
+                                continue
+                        if seeded_1m:
+                            log_info(f"MarketData: Successfully fetched {len(seeded_1m)} 1m bars from Flattrade.")
+                except Exception as e:
+                    log_warn(f"MarketData: Flattrade 1m seeding skipped ({e}).")
+
+            if len(seeded_1m) < 30 and yf is not None:
+                try:
+                    log_info("MarketData: Using yfinance fallback for historical 1-min bars (^NSEI)...")
+                    df_yf_1m = yf.download("^NSEI", period="2d", interval="1m", progress=False, timeout=8)
+                    if df_yf_1m is not None and not df_yf_1m.empty:
+                        if isinstance(df_yf_1m.columns, pd.MultiIndex):
+                            df_yf_1m.columns = df_yf_1m.columns.get_level_values(0)
+                        IST_OFFSET = timedelta(hours=5, minutes=30)
+                        for idx, row in df_yf_1m.iterrows():
+                            ts = idx.to_pydatetime() if hasattr(idx, "to_pydatetime") else idx
+                            if hasattr(ts, 'tzinfo') and ts.tzinfo is not None:
+                                ts = ts.astimezone(timezone(IST_OFFSET)).replace(tzinfo=None)
+                            min_key = ts.strftime("%Y-%m-%d %H:%M")
+                            c_val = float(row["Close"])
+                            if c_val > 0:
+                                seeded_1m.append({
+                                    "timestamp": ts,
+                                    "spot": c_val,
+                                    "minute_key": min_key
+                                })
+                        if seeded_1m:
+                            log_info(f"MarketData: Successfully seeded {len(seeded_1m)} 1m bars from yfinance.")
+                except Exception as e:
+                    log_warn(f"MarketData: yfinance 1m seeding fallback skipped ({e}).")
+
+            if seeded_1m:
+                seeded_1m.sort(key=lambda x: x['timestamp'])
+                existing_keys = {b['minute_key'] for b in self.bars_1m}
+                merged = [b for b in seeded_1m if b['minute_key'] not in existing_keys] + self.bars_1m
+                merged.sort(key=lambda x: x['timestamp'])
+                self.bars_1m = merged[-300:]
+                for b in self.bars_1m:
+                    self.logged_1m_keys.add(b['minute_key'])
+                if self.bars_1m:
+                    self.last_completed_1m_key = self.bars_1m[-1]['minute_key']
+                    log_info(f"MarketData: ✅ Seeded {len(self.bars_1m)} 1-min bars | KAMA(10,3,30) active immediately!")
+
     def _rebuild_5m_candles(self):
         if not self.bars_1m:
             return
@@ -728,6 +807,11 @@ class MarketData:
 class Indicators:
     @staticmethod
     def calculate_kama(closes: np.ndarray, period: int = KAMA_PERIOD, fast: int = KAMA_FAST_EMA, slow: int = KAMA_SLOW_EMA) -> Tuple[Optional[float], Optional[float], int]:
+        if closes is None:
+            return None, None, 0
+        closes = np.asarray(closes, dtype=float)
+        valid_mask = ~np.isnan(closes) & ~np.isinf(closes)
+        closes = closes[valid_mask]
         if len(closes) < period + 1:
             return None, None, 0
         
@@ -741,6 +825,7 @@ class Indicators:
             change = abs(closes[i] - closes[i - period])
             volatility = np.sum(np.abs(np.diff(closes[i - period:i + 1])))
             er = (change / volatility) if volatility > 1e-6 else 0.0
+            er = min(1.0, max(0.0, er))
             sc = (er * (fast_sc - slow_sc) + slow_sc) ** 2
             kama[i] = kama[i - 1] + sc * (closes[i] - kama[i - 1])
             
@@ -1590,7 +1675,7 @@ class ExecutionEngine:
         
         ind_bar = (f"  {c_dim}SPOT:{res} {c_white}{spot:>9.2f}{res}  {c_dim}ATM:{res} {c_yellow}{atm:<5}{res}  "
                    f"{c_dim}ADX(5m):{res} {regime_col}{ind['adx']:>4.1f} ({ind['regime']}){res}  "
-                   f"{c_dim}KAMA(5m):{res} {c_white}{kama_str:>8}{res} {trend_col}{trend_str}{res}  "
+                   f"{c_dim}KAMA(1m):{res} {c_white}{kama_str:>8}{res} {trend_col}{trend_str}{res}  "
                    f"{c_dim}ATR(5m):{res} {c_white}{ind['atr']:>4.1f} pts{res}")
         pad_ind = max(0, W - ansi_len(ind_bar))
         print(MID)
@@ -2040,7 +2125,7 @@ def prompt_user_variables():
                 return default
 
         CAPITAL = ask("Initial Capital (Rs.)", 195784.0, float)
-        KAMA_PERIOD = ask("KAMA Lookback", 12, int)
+        KAMA_PERIOD = ask("KAMA Lookback", 10, int)
         KAMA_FAST_EMA = ask("KAMA Fast EMA", 3, int)
         KAMA_SLOW_EMA = ask("KAMA Slow EMA", 30, int)
         ADX_PERIOD = ask("ADX Period (5m)", 7, int)

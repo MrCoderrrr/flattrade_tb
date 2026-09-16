@@ -11,7 +11,7 @@ KEY ARCHITECTURAL HIGHLIGHTS:
    - KAMA and Spot SL run strictly on the 1-minute collected data, not before.
 2. Dual-Filter Regime Detection:
    - ADX(9) on 5m: <20 -> CHOP REGIME (decay focus), >=20 -> TREND REGIME (high delta risk).
-   - KAMA(13, 2, 30) on 5m: Directional trend filter (+1 UP, -1 DOWN, 0 FLAT).
+   - KAMA(10, 3, 30) on 1m: Directional trend filter (+1 UP, -1 DOWN, 0 FLAT).
 3. Precision Order Engine & Anti-Duplicate Trade Guard:
    - Rate limiting: At most 1 order dispatched per 1.05 seconds ("1 order in 1 sec not more").
    - Deep Verification: Pre- and post-order verification against broker order book.
@@ -33,6 +33,8 @@ import os
 import sys
 import time
 import json
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 import math
 def norm_cdf(x):
@@ -570,7 +572,7 @@ class FlattradeBroker:
 # Capital & Allocation
 CAPITAL                 = 195784.0
 LOT_SIZE                = 65          # 1 lot per user request
-TRADE_LOG_FILE          = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "logs", "trade_book", "trades_v2_paper.csv")
+TRADE_LOG_FILE          = os.path.join(PROJECT_ROOT, "data", "logs", "trade_book", "trades_v2_paper.csv")
 CAPITAL_BUFFER          = 0.95
 MARGIN_IRON_CONDOR      = 95_000
 PORTFOLIO_CIRCUIT_PCT   = 1.8
@@ -620,10 +622,10 @@ KAMA_CONSECUTIVE_BARS     = 2
 MAX_REENTRIES_PER_LEG     = 999
 MAX_REENTRIES_TOTAL       = 999
 MAX_STRANGLE_RESETS       = 999
-KAMA_PERIOD             = 12          # KAMA Efficiency Ratio lookback
-KAMA_FAST_EMA           = 3           # KAMA Fast EMA constant
-KAMA_SLOW_EMA           = 30          # KAMA Slow EMA constant
-KAMA_MIN_SLOPE          = 4.0         # Minimum KAMA slope (pts) to flip trend
+KAMA_PERIOD             = 10          # KAMA Efficiency Ratio lookback (10 bars)
+KAMA_FAST_EMA           = 3           # KAMA Fast EMA constant (3)
+KAMA_SLOW_EMA           = 30          # KAMA Slow EMA constant (30)
+KAMA_MIN_SLOPE          = 0.5         # Minimum KAMA slope (pts) to flip 1m trend
 
 ADX_PERIOD              = 14          # ADX lookback period on 5m candles (14 = standard Wilder)
 ADX_CHOP_THRESHOLD      = 30.0        # ADX < 30: CHOP REGIME (sideways market)
@@ -691,23 +693,47 @@ _EMERGENCY_STOP_LOCK = threading.Lock()
 def _now_str() -> str:
     return get_ist_now().strftime("%H:%M:%S")
 
+def _get_tg_chat_ids() -> List[str]:
+    """Extract list of clean chat IDs from TELEGRAM_CHAT_ID (supports str, int, comma-separated str, or list)."""
+    if isinstance(TELEGRAM_CHAT_ID, list):
+        return [str(c).strip() for c in TELEGRAM_CHAT_ID if str(c).strip()]
+    if isinstance(TELEGRAM_CHAT_ID, (str, int)):
+        return [c.strip() for c in str(TELEGRAM_CHAT_ID).split(",") if c.strip()]
+    return []
+
+_last_tg_dashboard_msg_ids: Dict[str, int] = {}
+_last_tg_dashboard_new_msg_ts: float = 0.0
+_last_tg_dashboard_edit_ts: float = 0.0
+_tg_rate_limited_until: float = 0.0
+
 def _tg_send(msg: str):
-    """Core silent Telegram sender — HTML mode, strips ANSI codes."""
-    global _last_tg_dashboard_msg_id
+    """Core silent Telegram sender — HTML mode, strips ANSI codes, escapes HTML, and broadcasts to all configured chat IDs."""
+    global _last_tg_dashboard_msg_ids, _tg_rate_limited_until
+    if time.time() < _tg_rate_limited_until:
+        return
     import re
+    import html
     clean = re.sub(r"\x1b\[[0-9;]*m", "", msg)
-    try:
-        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-            import requests
-            requests.post(
+    chat_ids = _get_tg_chat_ids()
+    if not (TELEGRAM_BOT_TOKEN and chat_ids):
+        return
+    import requests
+    for cid in chat_ids:
+        try:
+            resp = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                data={"chat_id": TELEGRAM_CHAT_ID, "text": clean, "parse_mode": "HTML"},
+                data={"chat_id": cid, "text": clean, "parse_mode": "HTML"},
                 timeout=5
             )
-            # Reset dashboard message ID so next 1-sec tick posts fresh dashboard below the alert
-            _last_tg_dashboard_msg_id = None
-    except Exception:
-        pass
+            if resp.status_code == 429:
+                retry_after = resp.json().get("parameters", {}).get("retry_after", 30)
+                _tg_rate_limited_until = time.time() + retry_after
+                print(f"[TELEGRAM] ⚠️ Rate limited by Telegram. Cooldown for {retry_after}s")
+                return
+        except Exception:
+            pass
+    # Reset dashboard message IDs so next tick posts a fresh dashboard below the alert
+    _last_tg_dashboard_msg_ids.clear()
 
 def log_info(msg: str):
     print(f"{Fore.CYAN}[{_now_str()} INFO]{Style.RESET_ALL}  {msg}", flush=True)
@@ -717,38 +743,42 @@ def log_warn(msg: str):
 
 def log_alert(msg: str):
     import re
+    import html
     clean = re.sub(r"\x1b\[[0-9;]*m", "", msg)
-    _tg_send(f"<pre>NIFTY ALERT\n{clean}</pre>")
+    escaped = html.escape(clean)
+    _tg_send(f"<pre>NIFTY ALERT\n{escaped}</pre>")
     print(f"{Fore.RED}{Style.BRIGHT}[{_now_str()} ALERT]{Style.RESET_ALL} {msg}", flush=True)
 
 def log_trade(msg: str):
     import re
+    import html
     clean = re.sub(r"\x1b\[[0-9;]*m", "", msg)
-    _tg_send(f"<pre>{clean}</pre>")
+    escaped = html.escape(clean)
+    _tg_send(f"<pre>{escaped}</pre>")
     print(f"{Fore.MAGENTA}{Style.BRIGHT}[{_now_str()} TRADE]{Style.RESET_ALL} {msg}", flush=True)
-
-_last_tg_dashboard_msg_id: Optional[int] = None
-_last_tg_dashboard_new_msg_ts: float = 0.0
-_last_tg_dashboard_edit_ts: float = 0.0
 
 def send_telegram_nifty_dashboard(spot: float, atm: int, mode: str, positions: dict,
                                    realized_pnl: float, unrealized_pnl: float,
                                    ind: dict, total_cap: float, mtd_pnl: float, ytd_pnl: float):
     """
-    Updates live Nifty dashboard in Telegram every 1 second.
-    Uses editMessageText for 1-second live ticker updates without spamming chat.
+    Updates live Nifty dashboard in Telegram.
+    Uses editMessageText for live ticker updates without spamming chat.
     Sends a fresh message every 60s (or on alert/EOD) to maintain chat history.
+    Broadcasts to all configured chat IDs (personal, dad, or family group).
     """
-    global _last_tg_dashboard_msg_id, _last_tg_dashboard_new_msg_ts, _last_tg_dashboard_edit_ts
-    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+    global _last_tg_dashboard_msg_ids, _last_tg_dashboard_new_msg_ts, _last_tg_dashboard_edit_ts, _tg_rate_limited_until
+    chat_ids = _get_tg_chat_ids()
+    if not (TELEGRAM_BOT_TOKEN and chat_ids):
         return
 
     now_ts = time.time()
     now_ist = get_ist_now()
     is_eod = (now_ist.hour > 15 or (now_ist.hour == 15 and now_ist.minute >= 34))
 
-    # Throttle edits to at most once per 3.0s
+    # Throttle edits to at most once per 3.0s to respect Telegram rate limits
     if (now_ts - _last_tg_dashboard_edit_ts) < 3.0:
+        return
+    if time.time() < _tg_rate_limited_until:
         return
     _last_tg_dashboard_edit_ts = now_ts
 
@@ -756,7 +786,6 @@ def send_telegram_nifty_dashboard(spot: float, atm: int, mode: str, positions: d
         import requests
         regime = ind.get("regime", "?")
         adx    = ind.get("adx", 0.0) or 0.0
-        # Guard against None KAMA during warmup
         kama_raw = ind.get("kama")
         kama_str = f"{kama_raw:.0f}" if kama_raw is not None else "WARMUP"
         total_pnl = realized_pnl + unrealized_pnl
@@ -775,7 +804,6 @@ def send_telegram_nifty_dashboard(spot: float, atm: int, mode: str, positions: d
                 ltp = pos.get("ltp", entry)
                 pnl = pos.get("pnl", 0.0)
                 sign = "+" if pnl >= 0 else ""
-                # Fetch SL if available safely
                 sl_state = pos.get("dual_sl_state") or {}
                 tsl = sl_state.get("current_premium_sl", 0.0)
                 solo_tag = " (SOLO)" if sl_state.get("solo_mode") else ""
@@ -792,7 +820,6 @@ def send_telegram_nifty_dashboard(spot: float, atm: int, mode: str, positions: d
         t += f"Unreal   {'+' if unrealized_pnl >= 0 else ''}{unrealized_pnl:>10,.0f}\n"
         t += f"Net MTM  {'+' if total_pnl >= 0 else ''}{total_pnl:>10,.0f}\n"
         
-        # Only show MTD/YTD/Capital at end of day
         if is_eod:
             t += "─────────────────────\n"
             t += f"MTD {'+' if mtd_pnl >= 0 else ''}{mtd_pnl:>8,.0f}"
@@ -801,30 +828,49 @@ def send_telegram_nifty_dashboard(spot: float, atm: int, mode: str, positions: d
             
         t += "</pre>"
 
+        is_refresh_cycle = (now_ts - _last_tg_dashboard_new_msg_ts) >= 60.0 or is_eod
 
-        # If an active message exists and is less than 60s old, edit it live in-place
-        if _last_tg_dashboard_msg_id is not None and (now_ts - _last_tg_dashboard_new_msg_ts) < 60.0 and not is_eod:
-            try:
-                requests.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText",
-                    json={"chat_id": TELEGRAM_CHAT_ID, "message_id": _last_tg_dashboard_msg_id, "text": t, "parse_mode": "HTML"},
-                    timeout=3
-                )
-            except Exception:
-                pass
-            return
+        for cid in chat_ids:
+            msg_id = _last_tg_dashboard_msg_ids.get(cid)
+            edited = False
 
-        # Send a fresh message (every 60s, or after alert, or when edit fails)
-        send_resp = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            data={"chat_id": TELEGRAM_CHAT_ID, "text": t, "parse_mode": "HTML"},
-            timeout=4
-        )
-        if send_resp.status_code == 200:
-            rjson = send_resp.json()
-            if rjson.get("ok"):
-                _last_tg_dashboard_msg_id = rjson.get("result", {}).get("message_id")
-                _last_tg_dashboard_new_msg_ts = now_ts
+            if msg_id is not None and not is_refresh_cycle:
+                try:
+                    edit_resp = requests.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText",
+                        json={"chat_id": cid, "message_id": msg_id, "text": t, "parse_mode": "HTML"},
+                        timeout=3
+                    )
+                    if edit_resp.status_code == 200 and edit_resp.json().get("ok"):
+                        edited = True
+                    elif edit_resp.status_code == 400 and "message is not modified" in edit_resp.text:
+                        edited = True  # Content identical, already up to date!
+                    elif edit_resp.status_code == 429:
+                        retry_after = edit_resp.json().get("parameters", {}).get("retry_after", 30)
+                        _tg_rate_limited_until = time.time() + retry_after
+                        return
+                except Exception:
+                    pass
+
+            if not edited and (msg_id is None or is_refresh_cycle):
+                try:
+                    send_resp = requests.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                        data={"chat_id": cid, "text": t, "parse_mode": "HTML"},
+                        timeout=4
+                    )
+                    if send_resp.status_code == 200 and send_resp.json().get("ok"):
+                        _last_tg_dashboard_msg_ids[cid] = send_resp.json().get("result", {}).get("message_id")
+                        _last_tg_dashboard_new_msg_ts = now_ts
+                    elif send_resp.status_code == 429:
+                        retry_after = send_resp.json().get("parameters", {}).get("retry_after", 30)
+                        _tg_rate_limited_until = time.time() + retry_after
+                        return
+                except Exception:
+                    pass
+
+        if is_refresh_cycle:
+            _last_tg_dashboard_new_msg_ts = now_ts
     except Exception as e:
         log_warn(f"Telegram dashboard failed: {e}")
 
@@ -869,9 +915,13 @@ class MarketData:
                             if dt.strftime("%Y-%m-%d") != today_str:
                                 stale_lines.append(line)
                                 continue
+                            price_val = float(parts[1])
+                            if price_val < 10000.0:
+                                stale_lines.append(line)
+                                continue
                             today_lines.append(line)
                             min_key = dt.strftime("%Y-%m-%d %H:%M")
-                            minute_map[min_key] = (dt, float(parts[1]))
+                            minute_map[min_key] = (dt, price_val)
                         except ValueError:
                             continue
 
@@ -1007,6 +1057,78 @@ class MarketData:
             self.historical_5m_bars = []
             log_warn("MarketData: ⚠️ History seeding FAILED. ADX will be inflated until 30+ live bars accumulate.")
 
+        # 3. Seed 1-minute historical bars for instant KAMA(10, 3, 30) readiness
+        if len(self.bars_1m) < 30:
+            seeded_1m = []
+            api = getattr(self.streamer, "api", global_api)
+            if api and hasattr(api, "get_time_price_series"):
+                try:
+                    log_info("MarketData: Attempting historical 1-min seeding from Flattrade (Token 26000)...")
+                    end_time = get_ist_now()
+                    start_time_1m = end_time - timedelta(days=2)
+                    res_1m = api.get_time_price_series(
+                        exchange='NSE',
+                        token='26000',
+                        starttime=start_time_1m.timestamp(),
+                        endtime=end_time.timestamp(),
+                        interval=1
+                    )
+                    if res_1m and isinstance(res_1m, list) and len(res_1m) > 0:
+                        for row in res_1m:
+                            try:
+                                ts = datetime.strptime(row['time'], "%d-%m-%Y %H:%M:%S")
+                                min_key = ts.strftime("%Y-%m-%d %H:%M")
+                                c_val = float(row.get('intc') or row.get('close') or 0.0)
+                                if c_val > 0:
+                                    seeded_1m.append({
+                                        'timestamp': ts,
+                                        'spot': c_val,
+                                        'minute_key': min_key
+                                    })
+                            except Exception:
+                                continue
+                        if seeded_1m:
+                            log_info(f"MarketData: Successfully fetched {len(seeded_1m)} 1m bars from Flattrade.")
+                except Exception as e:
+                    log_warn(f"MarketData: Flattrade 1m seeding skipped ({e}).")
+
+            if len(seeded_1m) < 30 and yf is not None:
+                try:
+                    log_info("MarketData: Using yfinance fallback for historical 1-min bars (^NSEI)...")
+                    df_yf_1m = yf.download("^NSEI", period="2d", interval="1m", progress=False, timeout=8)
+                    if df_yf_1m is not None and not df_yf_1m.empty:
+                        if isinstance(df_yf_1m.columns, pd.MultiIndex):
+                            df_yf_1m.columns = df_yf_1m.columns.get_level_values(0)
+                        IST_OFFSET = timedelta(hours=5, minutes=30)
+                        for idx, row in df_yf_1m.iterrows():
+                            ts = idx.to_pydatetime() if hasattr(idx, "to_pydatetime") else idx
+                            if hasattr(ts, 'tzinfo') and ts.tzinfo is not None:
+                                ts = ts.astimezone(timezone(IST_OFFSET)).replace(tzinfo=None)
+                            min_key = ts.strftime("%Y-%m-%d %H:%M")
+                            c_val = float(row["Close"])
+                            if c_val > 0:
+                                seeded_1m.append({
+                                    "timestamp": ts,
+                                    "spot": c_val,
+                                    "minute_key": min_key
+                                })
+                        if seeded_1m:
+                            log_info(f"MarketData: Successfully seeded {len(seeded_1m)} 1m bars from yfinance.")
+                except Exception as e:
+                    log_warn(f"MarketData: yfinance 1m seeding fallback skipped ({e}).")
+
+            if seeded_1m:
+                seeded_1m.sort(key=lambda x: x['timestamp'])
+                existing_keys = {b['minute_key'] for b in self.bars_1m}
+                merged = [b for b in seeded_1m if b['minute_key'] not in existing_keys] + self.bars_1m
+                merged.sort(key=lambda x: x['timestamp'])
+                self.bars_1m = merged[-300:]
+                for b in self.bars_1m:
+                    self.logged_1m_keys.add(b['minute_key'])
+                if self.bars_1m:
+                    self.last_completed_1m_key = self.bars_1m[-1]['minute_key']
+                    log_info(f"MarketData: ✅ Seeded {len(self.bars_1m)} 1-min bars | KAMA(10,3,30) active immediately!")
+
     def _rebuild_5m_candles(self):
         if not self.bars_1m:
             return
@@ -1043,7 +1165,7 @@ class MarketData:
         current_min_key = now.strftime("%Y-%m-%d %H:%M")
         is_new_1m_bar = (current_min_key != self.last_completed_1m_key)
         
-        if is_new_1m_bar:
+        if is_new_1m_bar and spot > 10000.0:
             candle_ts_str = f"{current_min_key}:00"
             dt = datetime.strptime(candle_ts_str, "%Y-%m-%d %H:%M:%S")
             
@@ -1081,6 +1203,11 @@ class MarketData:
 class Indicators:
     @staticmethod
     def calculate_kama(closes: np.ndarray, period: int = KAMA_PERIOD, fast: int = KAMA_FAST_EMA, slow: int = KAMA_SLOW_EMA) -> Tuple[Optional[float], Optional[float], int]:
+        if closes is None:
+            return None, None, 0
+        closes = np.asarray(closes, dtype=float)
+        valid_mask = ~np.isnan(closes) & ~np.isinf(closes)
+        closes = closes[valid_mask]
         if len(closes) < period + 1:
             return None, None, 0
         
@@ -1094,6 +1221,7 @@ class Indicators:
             change = abs(closes[i] - closes[i - period])
             volatility = np.sum(np.abs(np.diff(closes[i - period:i + 1])))
             er = (change / volatility) if volatility > 1e-6 else 0.0
+            er = min(1.0, max(0.0, er))
             sc = (er * (fast_sc - slow_sc) + slow_sc) ** 2
             kama[i] = kama[i - 1] + sc * (closes[i] - kama[i - 1])
             
@@ -1290,79 +1418,29 @@ class ReversionDetector:
     def is_reversal_for_ce(cls, indicators: dict, cooldown_data: dict = None) -> tuple:
         """
         Returns (signal: bool, confidence: int, reason: str)
-        CE re-entry = trend that pushed market UP has EXHAUSTED itself.
-        Signal: ADX declining by 3+ pts from peak AND falling for 2 consecutive bars.
+        CE re-entry strictly on 1m KAMA reversal:
+        CE was stopped because market surged UP.
+        Re-enter when KAMA 1m slope reverses / halts upward momentum (kama_slope <= REVERSAL_KAMA_SLOPE_THRESHOLD).
         """
         s = cls._score(indicators)
-        reasons = []
-        
-        adx = s["adx"]
-        peak_adx = cooldown_data.get("peak_adx", adx) if cooldown_data else adx
-        prev_adx = cooldown_data.get("prev_adx", adx) if cooldown_data else adx
-        
-        # Update tracking
-        if cooldown_data is not None:
-            if adx > peak_adx:
-                cooldown_data["peak_adx"] = adx
-                peak_adx = adx
-            cooldown_data["prev_adx"] = adx
-        
-        adx_drop = peak_adx - adx
-        adx_declining = adx < prev_adx  # current bar lower than last
-        
-        # Primary: ADX must have dropped 3+ pts from peak AND be currently declining
-        exhaustion_ok = adx_drop >= 3.0 and adx_declining
-        if exhaustion_ok:
-            reasons.append(f"ADX_EXHAUST(peak={peak_adx:.1f}→{adx:.1f}, drop={adx_drop:.1f})")
-        
-        # Secondary confirmation: KAMA not still pushing UP (against CE)
-        kama_not_against = s["kama_slope"] <= REVERSAL_KAMA_SLOPE_THRESHOLD
-        if kama_not_against:
-            reasons.append(f"KAMA_OK({s['kama_slope']:.2f})")
-        
-        signal = exhaustion_ok and kama_not_against
-        confidence = (1 if exhaustion_ok else 0) + (1 if kama_not_against else 0)
-        reason = "CE_REENTRY[" + ",".join(reasons) + f"](conf:{confidence}/2)" if signal else ""
-        return signal, confidence, reason
+        kama_slope = s["kama_slope"]
+        reversal = (kama_slope <= REVERSAL_KAMA_SLOPE_THRESHOLD)
+        reason = f"KAMA_REVERSAL_CE(slope={kama_slope:.2f}<=+{REVERSAL_KAMA_SLOPE_THRESHOLD})" if reversal else ""
+        return reversal, (2 if reversal else 0), reason
 
     @classmethod
     def is_reversal_for_pe(cls, indicators: dict, cooldown_data: dict = None) -> tuple:
         """
         Returns (signal: bool, confidence: int, reason: str)
-        PE re-entry = trend that pushed market DOWN has EXHAUSTED itself.
-        Signal: ADX declining by 3+ pts from peak AND falling for 2 consecutive bars.
+        PE re-entry strictly on 1m KAMA reversal:
+        PE was stopped because market dumped DOWN.
+        Re-enter when KAMA 1m slope reverses / halts downward momentum (kama_slope >= -REVERSAL_KAMA_SLOPE_THRESHOLD).
         """
         s = cls._score(indicators)
-        reasons = []
-        
-        adx = s["adx"]
-        peak_adx = cooldown_data.get("peak_adx", adx) if cooldown_data else adx
-        prev_adx = cooldown_data.get("prev_adx", adx) if cooldown_data else adx
-        
-        # Update tracking
-        if cooldown_data is not None:
-            if adx > peak_adx:
-                cooldown_data["peak_adx"] = adx
-                peak_adx = adx
-            cooldown_data["prev_adx"] = adx
-        
-        adx_drop = peak_adx - adx
-        adx_declining = adx < prev_adx
-        
-        # Primary: ADX must have dropped 3+ pts from peak AND be currently declining
-        exhaustion_ok = adx_drop >= 3.0 and adx_declining
-        if exhaustion_ok:
-            reasons.append(f"ADX_EXHAUST(peak={peak_adx:.1f}→{adx:.1f}, drop={adx_drop:.1f})")
-        
-        # Secondary confirmation: KAMA not still pushing DOWN (against PE)
-        kama_not_against = s["kama_slope"] >= -REVERSAL_KAMA_SLOPE_THRESHOLD
-        if kama_not_against:
-            reasons.append(f"KAMA_OK({s['kama_slope']:.2f})")
-        
-        signal = exhaustion_ok and kama_not_against
-        confidence = (1 if exhaustion_ok else 0) + (1 if kama_not_against else 0)
-        reason = "PE_REENTRY[" + ",".join(reasons) + f"](conf:{confidence}/2)" if signal else ""
-        return signal, confidence, reason
+        kama_slope = s["kama_slope"]
+        reversal = (kama_slope >= -REVERSAL_KAMA_SLOPE_THRESHOLD)
+        reason = f"KAMA_REVERSAL_PE(slope={kama_slope:.2f}>=-{REVERSAL_KAMA_SLOPE_THRESHOLD})" if reversal else ""
+        return reversal, (2 if reversal else 0), reason
 
     @classmethod
     def is_trend_strongly_against(cls, leg: str, indicators: dict) -> tuple:
@@ -1938,6 +2016,7 @@ class ExecutionEngine:
                 return
             self._last_trade_log[dedup_key] = now_ts
 
+            os.makedirs(os.path.dirname(TRADE_LOG_FILE), exist_ok=True)
             if not os.path.exists(TRADE_LOG_FILE):
                 with open(TRADE_LOG_FILE, "w") as f: f.write("timestamp,action,leg,strike,side,qty,price,pnl,reason\n")
             with open(TRADE_LOG_FILE, "a") as f:
@@ -2019,7 +2098,15 @@ class ExecutionEngine:
             pos_info["dual_sl_state"] = self.risk_manager.init_dual_sl(leg, spot, strike, ltp, atr, current_iv, dte_days)
             
         self.positions[leg] = pos_info
+        log_trade(f"ENTERED {leg:10s} Strike: {strike} {side} @ ₹{ltp:.2f} (Qty: {qty}) [{tsym}]")
         self._log_trade("ENTRY", leg, strike, side, qty, ltp, reason="SIGNAL")
+        
+        other_leg = "PE" if leg == "CE" else ("CE" if leg == "PE" else None)
+        if other_leg and other_leg in self.positions:
+            other_sl = self.positions[other_leg].get("dual_sl_state")
+            if other_sl and other_sl.get("solo_mode"):
+                other_sl["solo_mode"] = False
+        
         self._save_state()
         return True
     def _exit_leg(self, leg: str, reason: str = "MANUAL") -> float:
@@ -2164,6 +2251,9 @@ class ExecutionEngine:
             pos["dual_sl_state"] = sl_state
 
         new_sl = round(ltp * (1.0 + trail_pct), 2)
+        existing_sl = sl_state.get("current_premium_sl", 0.0)
+        if existing_sl > 0:
+            new_sl = min(new_sl, existing_sl)
         sl_state["entry_premium"] = ltp        # Baseline anchor price when other leg exited
         sl_state["best_premium"] = ltp         # Start trailing from this exact LTP
         sl_state["current_premium_sl"] = new_sl
@@ -2192,28 +2282,27 @@ class ExecutionEngine:
             "active": True,
             "stop_reason": reason,
             "reentries_today": self.cooldown_tracker.get(stopped_leg, {}).get("reentries_today", 0),
-            "next_eligible_time": time.time() + 60,  # 60s minimum before any re-entry attempt
+            "next_eligible_time": time.time() + 15,  # 15s before KAMA reversal re-entry check
             "peak_adx": current_adx,   # track ADX at stop time as starting peak
             "prev_adx": current_adx,   # for 2-bar declining check
         }
         surviving = "PE" if stopped_leg == "CE" else "CE"
         surviving_open = (surviving in self.positions and self.positions[surviving].get("side") == "SELL")
         log_alert(
-            f"⏳ {stopped_leg} stopped ({reason}). Awaiting trend exhaustion signal. "
+            f"⏳ {stopped_leg} stopped ({reason}). Awaiting KAMA reversal signal. "
             f"Surviving {surviving}: {'✅ OPEN' if surviving_open else '⚠️ ALSO CLOSED'}."
         )
         if surviving_open:
             self.mode = "COOLDOWN"   # 1 leg open → COOLDOWN
             self._anchor_surviving_leg_sl(surviving, current_spot)
         else:
-            self.mode = "RUNNING"    # Will be handled by always-on rule in run()
+            self.mode = "RUNNING"    # Will be handled by balanced re-entry in run()
         self._save_state()
 
     def _check_cooldown_and_reenter(self, spot: float, atm: int, atr: float, regime: str, trend: int, dte_days: float = 2.0):
         """
-        Runs EVERY TICK (1 second). Checks ReversionDetector ADX exhaustion for each
+        Runs EVERY TICK (1 second). Checks 1m KAMA reversal for each
         stopped leg and re-enters at ATM when signal fires.
-        This is the heart of the Always-On 1-Leg Rule.
         """
         if self.strangle_resets_today >= MAX_STRANGLE_RESETS:
             return
@@ -2237,12 +2326,12 @@ class ExecutionEngine:
             if time.time() < cd.get("next_eligible_time", 0):
                 continue
 
-            # ── Check trend exhaustion signal using ADX declining from peak ──
+            # ── Check KAMA reversal signal ──
             if leg == "CE":
-                # CE stopped because market went UP → re-enter when uptrend exhausts
+                # CE stopped because market went UP → re-enter when uptrend reverses/halts
                 signal, confidence, reason = ReversionDetector.is_reversal_for_ce(indicators, cooldown_data=cd)
             else:
-                # PE stopped because market went DOWN → re-enter when downtrend exhausts
+                # PE stopped because market went DOWN → re-enter when downtrend reverses/halts
                 signal, confidence, reason = ReversionDetector.is_reversal_for_pe(indicators, cooldown_data=cd)
 
             if not signal:
@@ -2271,64 +2360,24 @@ class ExecutionEngine:
                 cd["active"] = False
                 cd["reentries_today"] = cd.get("reentries_today", 0) + 1
                 self.total_reentries_today += 1
-                cd["next_eligible_time"] = time.time() + 30  # 30s cooldown between re-entries
+                cd["next_eligible_time"] = time.time() + 15  # 15s cooldown between re-entries
                 self.mode = "RUNNING"
                 log_info(f"✅ {leg} re-entered at ATM {strike}. Mode → RUNNING. Total re-entries today: {self.total_reentries_today}")
                 self._save_state()
 
     def _ensure_always_one_leg_open(self, spot: float, atm: int, atr: float, dte_days: float):
         """
-        Core 'Always-On 1-Leg' safety net.
-        Called when no short legs are found open. Instead of waiting 10 seconds,
-        immediately determines the safest leg to enter based on current market direction
-        and enters it right away, then waits for reversal to add the second leg.
+        Safety net when 0 short legs are open.
+        Re-enters a balanced 2-leg straddle at ATM with hedges, avoiding forced 1-leg entry.
         """
-        # Determine the most recently stopped leg to infer momentum direction
-        last_stopped_leg = None
-        newest_time = 0
-        for leg, cd in self.cooldown_tracker.items():
-            if cd.get("active", False):
-                st_time = cd.get("stopped_time", 0)
-                if st_time > newest_time:
-                    newest_time = st_time
-                    last_stopped_leg = leg
-
         indicators = self.current_indicators
-        safest = ReversionDetector.safest_leg_to_enter(indicators, last_stopped_leg)
         regime = indicators.get("regime", "CHOP")
 
         log_alert(
-            f"⚠️ NO ACTIVE SHORT LEGS! (Last stopped: {last_stopped_leg}). "
-            f"Applying Always-On rule: regime={regime}, safest={safest}. Entering immediately..."
+            f"⚠️ NO ACTIVE SHORT LEGS! Re-entering balanced 2-leg straddle (CE + PE) at ATM {atm}..."
         )
 
-        legs_to_enter = []
-        if safest == "BOTH" or regime == "CHOP":
-            legs_to_enter = ["CE", "PE"]
-        elif safest == "PE":
-            legs_to_enter = ["PE"]
-            # Mark CE as needing reversal-gated re-entry
-            if not self.cooldown_tracker.get("CE", {}).get("active"):
-                self.cooldown_tracker["CE"] = {
-                    "stopped_time": time.time(),
-                    
-                    "active": True,
-                    "stop_reason": "ALWAYS_ON_DEFERRED",
-                    "reentries_today": self.cooldown_tracker.get("CE", {}).get("reentries_today", 0),
-                    "next_eligible_time": time.time() + 30,
-                }
-        elif safest == "CE":
-            legs_to_enter = ["CE"]
-            # Mark PE as needing reversal-gated re-entry
-            if not self.cooldown_tracker.get("PE", {}).get("active"):
-                self.cooldown_tracker["PE"] = {
-                    "stopped_time": time.time(),
-                    
-                    "active": True,
-                    "stop_reason": "ALWAYS_ON_DEFERRED",
-                    "reentries_today": self.cooldown_tracker.get("PE", {}).get("reentries_today", 0),
-                    "next_eligible_time": time.time() + 30,
-                }
+        legs_to_enter = ["CE", "PE"]
 
         entered_any = False
         for leg in legs_to_enter:
@@ -2391,7 +2440,7 @@ class ExecutionEngine:
         
         ind_bar = (f"  {c_dim}SPOT:{res} {c_white}{spot:>9.2f}{res}  {c_dim}ATM:{res} {c_yellow}{atm:<5}{res}  "
                    f"{c_dim}ADX(5m):{res} {regime_col}{ind['adx']:>4.1f} ({ind['regime']}){res}  "
-                   f"{c_dim}KAMA(5m):{res} {c_white}{kama_str:>8}{res} {trend_col}{trend_str}{res}  "
+                   f"{c_dim}KAMA(1m):{res} {c_white}{kama_str:>8}{res} {trend_col}{trend_str}{res}  "
                    f"{c_dim}ATR(5m):{res} {c_white}{ind['atr']:>4.1f} pts{res}")
         pad_ind = max(0, W - ansi_len(ind_bar))
         print(MID)
@@ -2836,7 +2885,7 @@ class ExecutionEngine:
                                         "active": True,
                                         "stop_reason": "BULLISH_OPEN_DEFERRED",
                                         "reentries_today": 0,
-                                        "next_eligible_time": time.time() + 60  # 60s before first re-entry attempt
+                                        "next_eligible_time": time.time() + 15  # 15s before first KAMA re-entry check
                                     }
                                 else:
                                     # Bearish move (-20 pts): Sell CE at ATM (Call writing on bear move), defer PE
@@ -2849,7 +2898,7 @@ class ExecutionEngine:
                                         "active": True,
                                         "stop_reason": "BEARISH_OPEN_DEFERRED",
                                         "reentries_today": 0,
-                                        "next_eligible_time": time.time() + 60  # 60s before first re-entry attempt
+                                        "next_eligible_time": time.time() + 15  # 15s before first KAMA re-entry check
                                     }
                             else:
                                 # Choppy market (<= 20 pts): start with 2 legs at ATM

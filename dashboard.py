@@ -452,7 +452,7 @@ def render_rich(snap: Optional[Dict]):
     trades_today = snap.get('trade_count', '—')
 
     top.add_row(
-        f"[bold]KAMA(13,3,30):[/bold] {kama_str}",
+        f"[bold]KAMA(10,3,30):[/bold] {kama_str}",
         f"[bold]ATR(5m):[/bold] {snap.get('atr', 0):.2f}",
         f"[bold]Realized:[/bold] {r_str}   [bold]Unrealized:[/bold] {u_str}",
         f"[bold]Total MTM:[/bold] {tot_str}   [dim]({trades_today} trades today)[/dim]",
@@ -515,7 +515,7 @@ def render_rich(snap: Optional[Dict]):
     cd_table.add_column("Config")
     cd_table.add_row("Premium Trailing SL", "[green]✅ ACTIVE (Per-Second Live Ticks)[/green]", "5% trail (CHOP) / 7% trail (TREND)")
     cd_table.add_row("Dual-Leg Exit", "[green]✅ ENABLED[/green]", "Instantly closes BOTH short legs on any SL hit")
-    cd_table.add_row("KAMA 1m Engine", "[green]✅ ENABLED[/green]", "KAMA(13,3,30) calculated on 1-min closes")
+    cd_table.add_row("KAMA 1m Engine", "[green]✅ ENABLED[/green]", "KAMA(10,3,30) calculated on 1-min closes")
     cd_table.add_row("Regime Gateway", "[green]✅ ENABLED[/green]", "ADX(9) + ATR(14) calculated on 5-min bars")
 
     footer = Text(

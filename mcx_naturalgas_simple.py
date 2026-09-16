@@ -28,21 +28,25 @@ def round_to_price(value: float, step: float = STRIKE_STEP) -> float:
 class KAMA:
     @staticmethod
     def compute(closes: List[float], period: int = 10, fast: int = 3, slow: int = 30):
-        if len(closes) < period + 1:
+        if not closes:
+            return None, None, 0.0, 0.0
+        clean_closes = [float(x) for x in closes if x is not None and not (isinstance(x, float) and (math.isnan(x) or math.isinf(x)))]
+        if len(clean_closes) < period + 1:
             return None, None, 0.0, 0.0
 
-        kama = [0.0] * len(closes)
-        kama[period - 1] = sum(closes[:period]) / period
+        kama = [0.0] * len(clean_closes)
+        kama[period - 1] = sum(clean_closes[:period]) / period
 
         fast_sc = 2.0 / (fast + 1.0)
         slow_sc = 2.0 / (slow + 1.0)
 
-        for i in range(period, len(closes)):
-            change = abs(closes[i] - closes[i - period])
-            volatility = sum(abs(closes[j] - closes[j - 1]) for j in range(i - period + 1, i + 1))
-            er = (change / volatility) if volatility > 0 else 0.0
+        for i in range(period, len(clean_closes)):
+            change = abs(clean_closes[i] - clean_closes[i - period])
+            volatility = sum(abs(clean_closes[j] - clean_closes[j - 1]) for j in range(i - period + 1, i + 1))
+            er = (change / volatility) if volatility > 1e-6 else 0.0
+            er = min(1.0, max(0.0, er))
             sc = (er * (fast_sc - slow_sc) + slow_sc) ** 2
-            kama[i] = kama[i - 1] + sc * (closes[i] - kama[i - 1])
+            kama[i] = kama[i - 1] + sc * (clean_closes[i] - kama[i - 1])
 
         current = float(kama[-1])
         previous = float(kama[-2])

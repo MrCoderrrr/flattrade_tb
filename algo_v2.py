@@ -416,10 +416,10 @@ MAX_REENTRIES_PER_LEG     = 2
 MAX_REENTRIES_TOTAL       = 4
 MAX_STRANGLE_RESETS       = 2
 BACKOFF_BASE_SEC          = 60
-KAMA_PERIOD             = 13          # KAMA Efficiency Ratio lookback
-KAMA_FAST_EMA           = 2           # KAMA Fast EMA constant
-KAMA_SLOW_EMA           = 30          # KAMA Slow EMA constant
-KAMA_MIN_SLOPE          = 4.0         # Minimum KAMA slope (pts) to flip trend
+KAMA_PERIOD             = 10          # KAMA Efficiency Ratio lookback (10 bars)
+KAMA_FAST_EMA           = 3           # KAMA Fast EMA constant (3)
+KAMA_SLOW_EMA           = 30          # KAMA Slow EMA constant (30)
+KAMA_MIN_SLOPE          = 0.5         # Minimum KAMA slope (pts) to flip 1m trend
 
 ADX_PERIOD              = 9           # ADX lookback period on 5m candles
 ADX_CHOP_THRESHOLD      = 20.0        # ADX < 20: CHOP REGIME
@@ -692,6 +692,11 @@ class MarketData:
 class Indicators:
     @staticmethod
     def calculate_kama(closes: np.ndarray, period: int = KAMA_PERIOD, fast: int = KAMA_FAST_EMA, slow: int = KAMA_SLOW_EMA) -> Tuple[Optional[float], Optional[float], int]:
+        if closes is None:
+            return None, None, 0
+        closes = np.asarray(closes, dtype=float)
+        valid_mask = ~np.isnan(closes) & ~np.isinf(closes)
+        closes = closes[valid_mask]
         if len(closes) < period + 1:
             return None, None, 0
         
@@ -705,6 +710,7 @@ class Indicators:
             change = abs(closes[i] - closes[i - period])
             volatility = np.sum(np.abs(np.diff(closes[i - period:i + 1])))
             er = (change / volatility) if volatility > 1e-6 else 0.0
+            er = min(1.0, max(0.0, er))
             sc = (er * (fast_sc - slow_sc) + slow_sc) ** 2
             kama[i] = kama[i - 1] + sc * (closes[i] - kama[i - 1])
             
@@ -1523,7 +1529,7 @@ class ExecutionEngine:
         
         ind_bar = (f"  {c_dim}SPOT:{res} {c_white}{spot:>9.2f}{res}  {c_dim}ATM:{res} {c_yellow}{atm:<5}{res}  "
                    f"{c_dim}ADX(5m):{res} {regime_col}{ind['adx']:>4.1f} ({ind['regime']}){res}  "
-                   f"{c_dim}KAMA(5m):{res} {c_white}{kama_str:>8}{res} {trend_col}{trend_str}{res}  "
+                   f"{c_dim}KAMA(1m):{res} {c_white}{kama_str:>8}{res} {trend_col}{trend_str}{res}  "
                    f"{c_dim}ATR(5m):{res} {c_white}{ind['atr']:>4.1f} pts{res}")
         pad_ind = max(0, W - ansi_len(ind_bar))
         print(MID)
@@ -1975,8 +1981,8 @@ def prompt_user_variables():
                 return default
 
         CAPITAL = ask("Initial Capital (Rs.)", 195784.0, float)
-        KAMA_PERIOD = ask("KAMA Lookback", 13, int)
-        KAMA_FAST_EMA = ask("KAMA Fast EMA", 2, int)
+        KAMA_PERIOD = ask("KAMA Lookback", 10, int)
+        KAMA_FAST_EMA = ask("KAMA Fast EMA", 3, int)
         KAMA_SLOW_EMA = ask("KAMA Slow EMA", 30, int)
         ADX_PERIOD = ask("ADX Period (5m)", 9, int)
         gate = ask("ADX Regime Gate", 20.0, float)
