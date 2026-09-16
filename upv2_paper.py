@@ -652,7 +652,7 @@ PREM_SL_DEBOUNCE_BARS   = 1
 
 # --- REVERSION DETECTOR (Multi-Indicator Confluence) ---
 # Signals a reversal when 2 of 3 indicators agree
-REVERSAL_KAMA_SLOPE_THRESHOLD  = 0.50  # min |KAMA slope| for reversal signal (faster response)
+REVERSAL_KAMA_SLOPE_THRESHOLD  = 0.15  # min |KAMA slope| for reversal signal (user requested > 0.15)
 REVERSAL_ADX_MIN               = 20.0  # min ADX for the reversal to be meaningful
 REVERSAL_DI_GAP_MIN            = 2.0   # min gap between +DI and -DI to confirm direction
 
@@ -1420,12 +1420,12 @@ class ReversionDetector:
         Returns (signal: bool, confidence: int, reason: str)
         CE re-entry strictly on 1m KAMA reversal:
         CE was stopped because market surged UP.
-        Re-enter when KAMA 1m slope reverses / halts upward momentum (kama_slope <= REVERSAL_KAMA_SLOPE_THRESHOLD).
+        Re-enter when KAMA 1m slope turns DOWN by more than 0.15 (kama_slope <= -0.15).
         """
         s = cls._score(indicators)
         kama_slope = s["kama_slope"]
-        reversal = (kama_slope <= REVERSAL_KAMA_SLOPE_THRESHOLD)
-        reason = f"KAMA_REVERSAL_CE(slope={kama_slope:.2f}<=+{REVERSAL_KAMA_SLOPE_THRESHOLD})" if reversal else ""
+        reversal = (kama_slope <= -REVERSAL_KAMA_SLOPE_THRESHOLD)
+        reason = f"KAMA_REVERSAL_CE(slope={kama_slope:.2f}<=-{REVERSAL_KAMA_SLOPE_THRESHOLD})" if reversal else ""
         return reversal, (2 if reversal else 0), reason
 
     @classmethod
@@ -1434,12 +1434,12 @@ class ReversionDetector:
         Returns (signal: bool, confidence: int, reason: str)
         PE re-entry strictly on 1m KAMA reversal:
         PE was stopped because market dumped DOWN.
-        Re-enter when KAMA 1m slope reverses / halts downward momentum (kama_slope >= -REVERSAL_KAMA_SLOPE_THRESHOLD).
+        Re-enter when KAMA 1m slope turns UP by more than 0.15 (kama_slope >= +0.15).
         """
         s = cls._score(indicators)
         kama_slope = s["kama_slope"]
-        reversal = (kama_slope >= -REVERSAL_KAMA_SLOPE_THRESHOLD)
-        reason = f"KAMA_REVERSAL_PE(slope={kama_slope:.2f}>=-{REVERSAL_KAMA_SLOPE_THRESHOLD})" if reversal else ""
+        reversal = (kama_slope >= REVERSAL_KAMA_SLOPE_THRESHOLD)
+        reason = f"KAMA_REVERSAL_PE(slope={kama_slope:.2f}>=+{REVERSAL_KAMA_SLOPE_THRESHOLD})" if reversal else ""
         return reversal, (2 if reversal else 0), reason
 
     @classmethod
