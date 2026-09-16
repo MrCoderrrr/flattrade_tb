@@ -2664,8 +2664,7 @@ class ExecutionEngine:
                                     if row.get("timestamp", "").startswith(today_str) and row.get("action") == "EXIT":
                                         pnl_val = float(row.get("pnl", 0.0) or 0.0)
                                         px_val = float(row.get("price", 0.0) or 0.0)
-                                        # Filter out synthetic quote glitches (e.g. 168.89 emergency kill quotes)
-                                        if px_val <= 140.0:
+                                        if px_val > 0.0:
                                             true_trade_pnl += pnl_val
                                 trade_book_found = True
                         except Exception as e:
