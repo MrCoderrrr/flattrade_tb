@@ -162,6 +162,15 @@ def _pad(row: str, width: int) -> str:
     return row + ' ' * max(0, width - _ansi_len(row))
 
 
+def _fmt_pnl(val: float, width: int = 12) -> Tuple[str, str]:
+    """Format PnL with explicit +/- sign, rupee symbol, and right-alignment."""
+    if abs(val) < 1e-4:
+        val = 0.0
+    sign = '+' if val > 0 else ('-' if val < 0 else ' ')
+    pnl_str = f"{sign}₹{abs(val):,.2f}"
+    return sign, f"{pnl_str:>{width}}"
+
+
 # ─────────────────────────────────────────────
 # Main Bot
 # ─────────────────────────────────────────────
@@ -386,19 +395,26 @@ class NaturalGasPaperBot:
             return None
 
     # ── Live LTP for an open leg ──────────────
-    def _get_leg_ltp(self, pos: dict) -> float:
+    def _get_leg_ltp(self, pos: dict, max_age: float = 0.8) -> float:
+        now_ts = time.time()
+        # Return cached value if fetched recently within this tick
+        if now_ts - pos.get('_last_ltp_ts', 0.0) < max_age and pos.get('_last_ltp', 0.0) > 0:
+            return pos['_last_ltp']
+
         token = pos.get('token')
         if token and self.api:
             try:
                 q = self.api.get_quotes(exchange='MCX', token=token)
                 if q and isinstance(q, dict):
-                    for field in ('lp', 'ltp', 'c', 'sp1', 'bp1'):
+                    # Never use 'c' (yesterday's close) for live LTP!
+                    for field in ('lp', 'ltp', 'sp1', 'bp1'):
                         raw = q.get(field)
                         if raw is not None:
                             try:
                                 val = float(raw)
                                 if val > 0:
                                     pos['_last_ltp'] = val
+                                    pos['_last_ltp_ts'] = now_ts
                                     return val
                             except (ValueError, TypeError):
                                 pass
@@ -428,6 +444,7 @@ class NaturalGasPaperBot:
 
         qty        = LOT_SIZE
         initial_sl = round(ltp * (1.0 + loss_stop_pct), 2)
+        now_ts     = time.time()
 
         pos = {
             'leg':           leg,
@@ -438,11 +455,13 @@ class NaturalGasPaperBot:
             'qty':           qty,
             'entry_price':   ltp,
             '_last_ltp':     ltp,
+            '_last_ltp_ts':  now_ts,
             'loss_stop_pct': loss_stop_pct,
             'tsl_pct':       tsl_pct,
             'sl_state': {
-                'lowest_ltp':   ltp,
-                'current_sl':   initial_sl,
+                'lowest_ltp':    ltp,
+                'current_sl':    initial_sl,
+                'initial_sl':    initial_sl,
                 'loss_stop_pct': loss_stop_pct,
                 'tsl_pct':       tsl_pct,
             }
@@ -467,17 +486,21 @@ class NaturalGasPaperBot:
         return pos
 
     # ── Close a single leg ────────────────────
-    def _close_leg(self, leg: str, reason: str):
+    def _close_leg(self, leg: str, reason: str, exit_price: Optional[float] = None):
         pos = self.positions.get(leg)
         if not pos:
             return
-        ltp        = self._get_leg_ltp(pos)
+        if exit_price is not None and exit_price > 0:
+            ltp = exit_price
+        else:
+            ltp = self._get_leg_ltp(pos)
         trade_side = 'BUY' if pos['side'] == 'SELL' else 'SELL'
         pnl        = (pos['entry_price'] - ltp) * pos['qty'] if pos['side'] == 'SELL' \
                      else (ltp - pos['entry_price']) * pos['qty']
 
         self.total_realized_pnl += pnl
-        sign = '+' if pnl >= 0 else ''
+        sign     = '+' if pnl >= 0 else ''
+        tot_sign = '+' if self.total_realized_pnl >= 0 else ''
 
         tg = '\n'.join([
             '<pre>',
@@ -486,13 +509,13 @@ class NaturalGasPaperBot:
             f'  {leg:<4} {int(pos["strike"]):<5} {reason}',
             f'  Entry  {pos["entry_price"]:.2f}',
             f'  Exit   {ltp:.2f}',
-            f'  PnL    {sign}{pnl:,.0f}',
+            f'  PnL    {sign}₹{pnl:,.2f}',
             '',
-            f'  Total Realized: {sign}{self.total_realized_pnl:,.0f}',
+            f'  Total Realized: {tot_sign}₹{self.total_realized_pnl:,.2f}',
             '</pre>',
         ])
         print(f'[PAPER EXIT] {trade_side} {pos["qty"]}x {pos["tsym"]} @ ₹{ltp:.2f} '
-              f'| PnL: ₹{pnl:,.2f} | {reason}', flush=True)
+              f'| PnL: {sign}₹{pnl:,.2f} | {reason}', flush=True)
         send_telegram(tg)
         del self.positions[leg]
         self.last_any_close_ts = time.time()
@@ -509,16 +532,24 @@ class NaturalGasPaperBot:
             return False, ''
 
         state       = pos['sl_state']
-        lowest      = float(state.get('lowest_ltp', pos['entry_price']))
+        entry_prem  = pos['entry_price']
+        lowest      = float(state.get('lowest_ltp', entry_prem))
         if live_ltp < lowest:
             lowest = live_ltp
             state['lowest_ltp'] = round(lowest, 2)
 
-        entry_prem  = pos['entry_price']
         initial_sl  = round(entry_prem * (1.0 + pos['loss_stop_pct']), 2)
-        trail_sl    = round(lowest     * (1.0 + pos['tsl_pct']), 2)
-        target_sl   = min(trail_sl, initial_sl)
-        current_sl  = min(target_sl, state.get('current_sl', target_sl))
+
+        if lowest >= entry_prem:
+            # Position has not moved into profit yet — hold at initial SL (e.g. 10%)
+            target_sl = initial_sl
+        else:
+            # Position is in profit — trail from lowest achieved price at tsl_pct (e.g. 7%)
+            trail_sl  = round(lowest * (1.0 + pos['tsl_pct']), 2)
+            target_sl = min(trail_sl, initial_sl)
+
+        # Strict ratchet: stop loss can only move down, never up
+        current_sl = min(target_sl, state.get('current_sl', initial_sl))
         state['current_sl'] = current_sl
 
         if live_ltp >= current_sl:
@@ -570,11 +601,36 @@ class NaturalGasPaperBot:
         now    = get_ist_now()
         now_ts = time.time()
 
+        # Build unified snapshot of all positions for this render
+        snap_rows = []
+        total_unreal = 0.0
+        for leg, pos in list(self.positions.items()):
+            ltp = self._get_leg_ltp(pos)
+            is_short = (pos['side'] == 'SELL')
+            pnl = ((pos['entry_price'] - ltp) if is_short else (ltp - pos['entry_price'])) * pos['qty']
+            total_unreal += pnl
+            sl = pos.get('sl_state', {}).get('current_sl', 0.0)
+            best = pos.get('sl_state', {}).get('lowest_ltp', pos['entry_price'])
+            snap_rows.append({
+                'leg': leg,
+                'strike': pos['strike'],
+                'side': pos['side'],
+                'entry': pos['entry_price'],
+                'best': best,
+                'ltp': ltp,
+                'sl': sl,
+                'pnl': pnl,
+                'qty': pos['qty'],
+                'tsym': pos.get('tsym', '')
+            })
+
+        net = self.total_realized_pnl + total_unreal
+
         # ── Console (every 1 second) ──────────
         if now_ts - self._last_console_dash_ts >= 1.0:
             self._last_console_dash_ts = now_ts
 
-            W   = DASH_W
+            W   = 98
             DIM = f'{Fore.WHITE}{Style.DIM}'
             CY  = f'{Fore.CYAN}{Style.BRIGHT}'
             WH  = f'{Fore.WHITE}{Style.BRIGHT}'
@@ -608,11 +664,12 @@ class NaturalGasPaperBot:
             print()
             print(TOP)
 
-            title_l = (f'  {CY}MCX NATURAL GAS PAPER  v3.0{RS}  {DIM}│{RS}  '
-                       f'{YL}ATM STRADDLE + KAMA RE-ENTRY{RS}  {DIM}│{RS}  '
+            title_l = (f'  {CY}MCX NATGAS PAPER v3.0{RS}  {DIM}│{RS}  '
+                       f'{YL}ATM STRADDLE + KAMA{RS}  {DIM}│{RS}  '
                        f'{GR}tail -f natgas_paper.log{RS}')
             title_r = f'{DIM}{now.strftime("%H:%M:%S IST")}{RS}  '
-            print(f'{V}{_pad(title_l + " " * max(0, W - _ansi_len(title_l) - _ansi_len(title_r)) + title_r, W)}{V}')
+            pad_top = max(1, W - _ansi_len(title_l) - _ansi_len(title_r))
+            print(f'{V}{title_l}{" " * pad_top}{title_r}{V}')
 
             print(MID)
             ind_row = (f'  {DIM}SPOT:{RS} {WH}{spot:>8.2f}{RS}  '
@@ -624,46 +681,46 @@ class NaturalGasPaperBot:
             print(MID)
 
             # Position table
-            if not self.positions:
+            if not snap_rows:
                 msg = f'  {YL}No open positions — waiting for entry...{RS}'
                 print(f'{V}{_pad(msg, W)}{V}')
             else:
                 hdr = (f'  {"LEG":<6} {VS} {"STRIKE":>7} {VS} {"SIDE":<5} {VS} '
-                       f'{"ENTRY":>7} {VS} {"BEST PREM":>10} {VS} {"LTP":>7} {VS} '
-                       f'{"CURR SL":>8} {VS} {"PNL":>11}  ')
+                       f'{"ENTRY":>8} {VS} {"BEST PREM":>10} {VS} {"LTP":>8} {VS} '
+                       f'{"CURR SL":>9} {VS} {"PNL":>14}  ')
                 print(f'{V}{_pad(hdr, W)}{V}')
                 print(MIDS)
 
-                for leg, pos in self.positions.items():
-                    ltp  = self._get_leg_ltp(pos)
-                    pnl  = (pos['entry_price'] - ltp) * pos['qty']
-                    sl   = pos.get('sl_state', {}).get('current_sl', 0.0)
-                    best = pos.get('sl_state', {}).get('lowest_ltp', pos['entry_price'])
-                    pnl_col = GR if pnl >= 0 else RD
-                    sign = '+' if pnl >= 0 else ''
+                for r in snap_rows:
+                    pnl_sign, pnl_fmt = _fmt_pnl(r['pnl'], width=12)
+                    pnl_col  = GR if r['pnl'] > 0 else (RD if r['pnl'] < 0 else YL)
+                    side_col = RD if r['side'] == 'SELL' else GR
 
-                    row = (f'  {WH}{leg:<6}{RS} {VS} {WH}{int(pos["strike"]):>7}{RS} {VS} '
-                           f'{RD}{"SELL":<5}{RS} {VS} '
-                           f'{WH}{pos["entry_price"]:>7.2f}{RS} {VS} '
-                           f'{DIM}{best:>10.2f}{RS} {VS} '
-                           f'{YL}{ltp:>7.2f}{RS} {VS} '
-                           f'{MG}{sl:>8.2f}{RS} {VS} '
-                           f'{pnl_col}{sign}₹{pnl:>9,.0f}{RS}  ')
+                    row = (f"  {WH}{r['leg']:<6}{RS} {VS} {WH}{int(r['strike']):>7}{RS} {VS} "
+                           f"{side_col}{r['side']:<5}{RS} {VS} "
+                           f"{WH}{r['entry']:>8.2f}{RS} {VS} "
+                           f"{DIM}{r['best']:>10.2f}{RS} {VS} "
+                           f"{YL}{r['ltp']:>8.2f}{RS} {VS} "
+                           f"{MG}{r['sl']:>9.2f}{RS} {VS} "
+                           f"  {pnl_col}{pnl_fmt}{RS}  ")
                     print(f'{V}{_pad(row, W)}{V}')
 
             print(MID)
-            # Compute unrealized
-            total_unreal = sum(
-                (p['entry_price'] - self._get_leg_ltp(p)) * p['qty']
-                for p in self.positions.values() if p['side'] == 'SELL'
-            )
-            net = self.total_realized_pnl + total_unreal
-            pnl_col = GR if net >= 0 else RD
-            sign    = '+' if net >= 0 else ''
+            real_sign, real_fmt = _fmt_pnl(self.total_realized_pnl, width=10)
+            unreal_sign, unreal_fmt = _fmt_pnl(total_unreal, width=10)
+            net_sign, net_fmt = _fmt_pnl(net, width=10)
 
-            pnl_row = (f'  {DIM}REALIZED:{RS} {WH}₹{self.total_realized_pnl:>10,.0f}{RS}  '
-                       f'{DIM}UNREALIZED:{RS} {WH}₹{total_unreal:>10,.0f}{RS}  '
-                       f'{DIM}NET MTM:{RS} {pnl_col}{sign}₹{net:>10,.0f}{RS}')
+            real_col   = GR if self.total_realized_pnl > 0 else (RD if self.total_realized_pnl < 0 else YL)
+            unreal_col = GR if total_unreal > 0 else (RD if total_unreal < 0 else YL)
+            net_col    = GR if net > 0 else (RD if net < 0 else YL)
+
+            r_txt = f"{real_col}{real_fmt}{RS}"
+            u_txt = f"{unreal_col}{unreal_fmt}{RS}"
+            n_txt = f"{net_col}{net_fmt}{RS}"
+
+            pnl_row = (f"  {DIM}REALIZED:{RS} {r_txt}  {VS}  "
+                       f"{DIM}UNREALIZED:{RS} {u_txt}  {VS}  "
+                       f"{DIM}NET MTM:{RS} {n_txt}")
             print(f'{V}{_pad(pnl_row, W)}{V}')
             print(BOT)
             sys.stdout.flush()
@@ -673,12 +730,6 @@ class NaturalGasPaperBot:
             if now_ts < _tg_rate_limited_until:
                 return
             _last_tg_dash_edit_ts = now_ts
-
-            total_unreal = sum(
-                (p['entry_price'] - self._get_leg_ltp(p)) * p['qty']
-                for p in self.positions.values() if p['side'] == 'SELL'
-            )
-            net = self.total_realized_pnl + total_unreal
 
             kama_str = f'{self._current_kama:.2f}' if self._current_kama else 'WARMUP'
             delta    = self._current_kama_delta
@@ -692,14 +743,11 @@ class NaturalGasPaperBot:
                 f'KAMA {kama_str} {kama_dir}{rev_tag}',
                 '─────────────────────',
             ]
-            if self.positions:
-                for leg, pos in self.positions.items():
-                    ltp  = self._get_leg_ltp(pos)
-                    pnl  = (pos['entry_price'] - ltp) * pos['qty']
-                    sl   = pos.get('sl_state', {}).get('current_sl', 0.0)
-                    sign = '+' if pnl >= 0 else ''
-                    lines.append(f'{leg:<3} SELL {int(pos["strike"]):<4}  PnL {sign}{pnl:>8,.0f}')
-                    lines.append(f'  E {pos["entry_price"]:>6.2f}  L {ltp:>6.2f}  SL {sl:>6.2f}')
+            if snap_rows:
+                for r in snap_rows:
+                    pnl_sign = '+' if r['pnl'] >= 0 else ''
+                    lines.append(f'{r["leg"]:<3} SELL {int(r["strike"]):<4}  PnL {pnl_sign}₹{r["pnl"]:>8,.2f}')
+                    lines.append(f'  E {r["entry"]:>6.2f}  L {r["ltp"]:>6.2f}  SL {r["sl"]:>6.2f}')
             else:
                 lines.append('  No Open Positions')
 
@@ -710,9 +758,9 @@ class NaturalGasPaperBot:
             u_sign = '+' if total_unreal >= 0 else ''
             n_sign = '+' if net >= 0 else ''
             lines += [
-                f'Realized  {r_sign}{self.total_realized_pnl:>9,.0f}',
-                f'Unreal    {u_sign}{total_unreal:>9,.0f}',
-                f'Net MTM   {n_sign}{net:>9,.0f}',
+                f'Realized  {r_sign}₹{self.total_realized_pnl:>9,.2f}',
+                f'Unreal    {u_sign}₹{total_unreal:>9,.2f}',
+                f'Net MTM   {n_sign}₹{net:>9,.2f}',
                 f'Trades    {self.trades_today}/{MAX_DAILY_TRADES}',
                 '</pre>',
             ]
@@ -868,7 +916,7 @@ class NaturalGasPaperBot:
                 # ── STEP 3: CHECK TSL/SL FOR ALL LEGS (NO BREAK) ─
                 #    Collect all triggered legs first, then close them all.
                 #    This prevents a partially-open state triggering premature re-entry.
-                legs_to_close: List[Tuple[str, str]] = []
+                legs_to_close: List[Tuple[str, str, float]] = []
                 for leg in list(self.positions.keys()):
                     pos      = self.positions.get(leg)
                     if not pos or pos['side'] != 'SELL':
@@ -876,11 +924,11 @@ class NaturalGasPaperBot:
                     live_ltp = self._get_leg_ltp(pos)
                     hit, reason = self._update_leg(leg, live_ltp)
                     if hit:
-                        legs_to_close.append((leg, reason))
+                        legs_to_close.append((leg, reason, live_ltp))
 
-                for leg, reason in legs_to_close:
+                for leg, reason, exit_px in legs_to_close:
                     print(f'[ALERT] {reason}', flush=True)
-                    self._close_leg(leg, reason)
+                    self._close_leg(leg, reason, exit_price=exit_px)
 
                 # ── STEP 4: Dashboard ────────────────────────
                 self._render_dashboard(spot, atm)
