@@ -60,8 +60,8 @@ MCX_EXIT_HOUR       = 23
 MCX_EXIT_MINUTE     = 24           # 23:24 IST auto square-off
 LOT_SIZE            = 1250         # 1 lot = 1250 units
 MAX_DAILY_TRADES    = 16           # 8 straddles max (2 legs each)
-DEFAULT_SL_PCT      = 0.10         # 10% initial stop-loss
-DEFAULT_TSL_PCT     = 0.07         # 7% trailing stop-loss
+DEFAULT_SL_PCT      = 0.15         # 15% initial stop-loss
+DEFAULT_TSL_PCT     = 0.08         # 8% trailing stop-loss
 POST_CLOSE_COOLDOWN = 5.0          # Seconds to wait after any close before re-entry
 KAMA_PERIOD         = 10
 KAMA_FAST           = 3
@@ -514,7 +514,8 @@ class NaturalGasPaperBot:
             f'  Total Realized: {tot_sign}₹{self.total_realized_pnl:,.2f}',
             '</pre>',
         ])
-        print(f'[PAPER EXIT] {trade_side} {pos["qty"]}x {pos["tsym"]} @ ₹{ltp:.2f} '
+        tsym = pos.get('tsym', leg)
+        print(f'[PAPER EXIT] {trade_side} {pos["qty"]}x {tsym} @ ₹{ltp:.2f} '
               f'| PnL: {sign}₹{pnl:,.2f} | {reason}', flush=True)
         send_telegram(tg)
         del self.positions[leg]
@@ -806,10 +807,77 @@ class NaturalGasPaperBot:
             if is_refresh:
                 _last_tg_dash_new_msg_ts = now_ts
 
+    def _cancel_open_orders_for_symbol(self, tsym: Optional[str] = None):
+        """Cancel any pending broker orders matching tsym or PE."""
+        if not self.api:
+            return
+        try:
+            orders = self.api.get_order_book()
+            if orders and isinstance(orders, list):
+                for o in orders:
+                    status = str(o.get('status', '')).upper()
+                    if status in ('OPEN', 'PENDING', 'TRIGGER_PENDING'):
+                        o_tsym = str(o.get('tsym', ''))
+                        if (tsym and tsym in o_tsym) or 'PE' in o_tsym:
+                            norenordno = o.get('norenordno')
+                            if norenordno:
+                                print(f"[ACTION] Canceling open broker order {norenordno} ({o_tsym})...", flush=True)
+                                self.api.cancel_order(norenordno=norenordno)
+        except Exception as e:
+            print(f"[WARN] Order book check / cancel: {e}", flush=True)
+
+    def _apply_leg_adjustments(self):
+        """
+        Applies requested live adjustments on startup:
+        1. Closes and removes current PE leg from data and cancels any open PE orders.
+        2. Updates any surviving open legs (e.g. CE) to new SL (15%) and TSL (8%).
+        """
+        # 1. Close PE leg if currently open in positions
+        if 'PE' in self.positions:
+            pe_pos = self.positions['PE']
+            pe_tsym = pe_pos.get('tsym', '')
+            print(f"[ACTION] Closing current PE leg ({pe_tsym}) as requested by user...", flush=True)
+            self._cancel_open_orders_for_symbol(pe_tsym)
+            self._close_leg('PE', 'USER_REQUEST_CLOSE_PE')
+            print("[ACTION] PE leg successfully closed and removed from positions & state.", flush=True)
+        else:
+            self._cancel_open_orders_for_symbol('PE')
+
+        # 2. Update surviving open legs (e.g. CE) with new 15% SL and 8% TSL
+        if self.positions:
+            for leg, pos in self.positions.items():
+                pos['loss_stop_pct'] = DEFAULT_SL_PCT
+                pos['tsl_pct']       = DEFAULT_TSL_PCT
+                entry_prem          = pos['entry_price']
+                new_initial_sl      = round(entry_prem * (1.0 + DEFAULT_SL_PCT), 2)
+
+                if 'sl_state' in pos:
+                    pos['sl_state']['loss_stop_pct'] = DEFAULT_SL_PCT
+                    pos['sl_state']['tsl_pct']       = DEFAULT_TSL_PCT
+                    pos['sl_state']['initial_sl']    = new_initial_sl
+                    lowest = float(pos['sl_state'].get('lowest_ltp', entry_prem))
+                    if lowest >= entry_prem:
+                        pos['sl_state']['current_sl'] = new_initial_sl
+                    else:
+                        trail_sl = round(lowest * (1.0 + DEFAULT_TSL_PCT), 2)
+                        pos['sl_state']['current_sl'] = min(trail_sl, new_initial_sl)
+                else:
+                    pos['sl_state'] = {
+                        'lowest_ltp':    entry_prem,
+                        'current_sl':    new_initial_sl,
+                        'initial_sl':    new_initial_sl,
+                        'loss_stop_pct': DEFAULT_SL_PCT,
+                        'tsl_pct':       DEFAULT_TSL_PCT
+                    }
+                print(f"[ACTION] Updated {leg} SL to {DEFAULT_SL_PCT*100:.0f}% (Initial SL: ₹{new_initial_sl:.2f}), "
+                      f"TSL to {DEFAULT_TSL_PCT*100:.0f}% (Current SL: ₹{pos['sl_state']['current_sl']:.2f})", flush=True)
+            self._save_state()
+
     # ── Main run loop ─────────────────────────
     def run(self):
         self.authenticate()
         self._get_mcx_csv()
+        self._apply_leg_adjustments()
 
         DIM = f'{Fore.WHITE}{Style.DIM}'
         CY  = f'{Fore.CYAN}{Style.BRIGHT}'
