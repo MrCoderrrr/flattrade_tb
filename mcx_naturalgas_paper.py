@@ -539,23 +539,44 @@ class NaturalGasPaperBot:
             lowest = live_ltp
             state['lowest_ltp'] = round(lowest, 2)
 
+        is_strangle = ('CE' in self.positions and 'PE' in self.positions)
         initial_sl  = round(entry_prem * (1.0 + pos['loss_stop_pct']), 2)
 
-        if lowest >= entry_prem:
-            # Position has not moved into profit yet — hold at initial SL (e.g. 10%)
-            target_sl = initial_sl
+        if is_strangle:
+            # ── STRANGLE IS ON (both legs open) ──
+            # Initial SL (15%) is active until position moves into profit.
+            # Once in profit, trail at tsl_pct (8%).
+            state['solo_mode'] = False
+            if lowest >= entry_prem:
+                target_sl = initial_sl
+            else:
+                trail_sl  = round(lowest * (1.0 + pos['tsl_pct']), 2)
+                target_sl = min(trail_sl, initial_sl)
+
+            # Strict ratchet: stop loss can only move down, never up
+            current_sl = min(target_sl, state.get('current_sl', initial_sl))
+            state['current_sl'] = current_sl
+
+            if live_ltp >= current_sl:
+                label = 'TSL Hit' if current_sl < initial_sl else 'SL Hit'
+                return True, f'{label} on {leg} ({live_ltp:.2f} >= {current_sl:.2f})'
         else:
-            # Position is in profit — trail from lowest achieved price at tsl_pct (e.g. 7%)
-            trail_sl  = round(lowest * (1.0 + pos['tsl_pct']), 2)
-            target_sl = min(trail_sl, initial_sl)
+            # ── STRANGLE IS OFF (Solo surviving leg) ──
+            # "sl is till strangle is on" — Initial 15% SL does NOT apply here.
+            # Surviving leg is managed exclusively by tight TSL (8% above lowest price).
+            state['solo_mode'] = True
+            solo_tsl = round(lowest * (1.0 + pos['tsl_pct']), 2)
 
-        # Strict ratchet: stop loss can only move down, never up
-        current_sl = min(target_sl, state.get('current_sl', initial_sl))
-        state['current_sl'] = current_sl
+            # Strict ratchet: can only tighten down
+            if 'current_sl' in state:
+                current_sl = min(solo_tsl, state['current_sl'])
+            else:
+                current_sl = solo_tsl
+            state['current_sl'] = current_sl
 
-        if live_ltp >= current_sl:
-            label = 'TSL Hit' if current_sl < initial_sl else 'SL Hit'
-            return True, f'{label} on {leg} ({live_ltp:.2f} >= {current_sl:.2f})'
+            if live_ltp >= current_sl:
+                return True, f'Solo TSL Hit on {leg} ({live_ltp:.2f} >= {current_sl:.2f})'
+
         return False, ''
 
     # ── KAMA reversal detection (latching) ───
@@ -622,7 +643,8 @@ class NaturalGasPaperBot:
                 'sl': sl,
                 'pnl': pnl,
                 'qty': pos['qty'],
-                'tsym': pos.get('tsym', '')
+                'tsym': pos.get('tsym', ''),
+                'solo_mode': pos.get('sl_state', {}).get('solo_mode', False)
             })
 
         net = self.total_realized_pnl + total_unreal
@@ -696,8 +718,9 @@ class NaturalGasPaperBot:
                     pnl_sign, pnl_fmt = _fmt_pnl(r['pnl'], width=12)
                     pnl_col  = GR if r['pnl'] > 0 else (RD if r['pnl'] < 0 else YL)
                     side_col = RD if r['side'] == 'SELL' else GR
+                    leg_label = f"{r['leg']}*" if r.get('solo_mode') else r['leg']
 
-                    row = (f"  {WH}{r['leg']:<6}{RS} {VS} {WH}{int(r['strike']):>7}{RS} {VS} "
+                    row = (f"  {WH}{leg_label:<6}{RS} {VS} {WH}{int(r['strike']):>7}{RS} {VS} "
                            f"{side_col}{r['side']:<5}{RS} {VS} "
                            f"{WH}{r['entry']:>8.2f}{RS} {VS} "
                            f"{DIM}{r['best']:>10.2f}{RS} {VS} "
@@ -705,6 +728,11 @@ class NaturalGasPaperBot:
                            f"{MG}{r['sl']:>9.2f}{RS} {VS} "
                            f"  {pnl_col}{pnl_fmt}{RS}  ")
                     print(f'{V}{_pad(row, W)}{V}')
+
+                if any(r.get('solo_mode') for r in snap_rows):
+                    print(MIDS)
+                    solo_msg = f"  {CY}🎯 SOLO TSL ACTIVE (*):{RS} Strangle OFF — trailing strictly at {DEFAULT_TSL_PCT*100:.0f}% TSL (no initial SL)"
+                    print(f'{V}{_pad(solo_msg, W)}{V}')
 
             print(MID)
             real_sign, real_fmt = _fmt_pnl(self.total_realized_pnl, width=10)
@@ -845,32 +873,42 @@ class NaturalGasPaperBot:
 
         # 2. Update surviving open legs (e.g. CE) with new 15% SL and 8% TSL
         if self.positions:
+            is_strangle = ('CE' in self.positions and 'PE' in self.positions)
             for leg, pos in self.positions.items():
                 pos['loss_stop_pct'] = DEFAULT_SL_PCT
                 pos['tsl_pct']       = DEFAULT_TSL_PCT
                 entry_prem          = pos['entry_price']
                 new_initial_sl      = round(entry_prem * (1.0 + DEFAULT_SL_PCT), 2)
+                lowest              = float(pos.get('sl_state', {}).get('lowest_ltp', entry_prem))
 
-                if 'sl_state' in pos:
-                    pos['sl_state']['loss_stop_pct'] = DEFAULT_SL_PCT
-                    pos['sl_state']['tsl_pct']       = DEFAULT_TSL_PCT
-                    pos['sl_state']['initial_sl']    = new_initial_sl
-                    lowest = float(pos['sl_state'].get('lowest_ltp', entry_prem))
+                if is_strangle:
                     if lowest >= entry_prem:
-                        pos['sl_state']['current_sl'] = new_initial_sl
+                        curr_sl = new_initial_sl
                     else:
                         trail_sl = round(lowest * (1.0 + DEFAULT_TSL_PCT), 2)
-                        pos['sl_state']['current_sl'] = min(trail_sl, new_initial_sl)
-                else:
+                        curr_sl = min(trail_sl, new_initial_sl)
                     pos['sl_state'] = {
-                        'lowest_ltp':    entry_prem,
-                        'current_sl':    new_initial_sl,
+                        'lowest_ltp':    lowest,
+                        'current_sl':    curr_sl,
                         'initial_sl':    new_initial_sl,
                         'loss_stop_pct': DEFAULT_SL_PCT,
-                        'tsl_pct':       DEFAULT_TSL_PCT
+                        'tsl_pct':       DEFAULT_TSL_PCT,
+                        'solo_mode':     False
                     }
-                print(f"[ACTION] Updated {leg} SL to {DEFAULT_SL_PCT*100:.0f}% (Initial SL: ₹{new_initial_sl:.2f}), "
-                      f"TSL to {DEFAULT_TSL_PCT*100:.0f}% (Current SL: ₹{pos['sl_state']['current_sl']:.2f})", flush=True)
+                    print(f"[ACTION] Strangle ON: Updated {leg} SL to {DEFAULT_SL_PCT*100:.0f}% (Initial SL: ₹{new_initial_sl:.2f}), "
+                          f"TSL to {DEFAULT_TSL_PCT*100:.0f}% (Current SL: ₹{curr_sl:.2f})", flush=True)
+                else:
+                    # Strangle is OFF — solo leg operates strictly on 8% TSL
+                    solo_tsl = round(lowest * (1.0 + DEFAULT_TSL_PCT), 2)
+                    pos['sl_state'] = {
+                        'lowest_ltp':    lowest,
+                        'current_sl':    solo_tsl,
+                        'initial_sl':    new_initial_sl,
+                        'loss_stop_pct': DEFAULT_SL_PCT,
+                        'tsl_pct':       DEFAULT_TSL_PCT,
+                        'solo_mode':     True
+                    }
+                    print(f"[ACTION] Strangle OFF: Updated {leg} to Solo TSL @ {DEFAULT_TSL_PCT*100:.0f}% (Current TSL: ₹{solo_tsl:.2f})", flush=True)
             self._save_state()
 
     # ── Main run loop ─────────────────────────
