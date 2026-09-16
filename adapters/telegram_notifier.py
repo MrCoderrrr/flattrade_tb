@@ -12,8 +12,8 @@ log = logging.getLogger(__name__)
 
 class TelegramNotifier:
     def __init__(self, interval_seconds: float = 10.0):
-        self.token = os.getenv("TELEGRAM_BOT_TOKEN")
-        self.chat_id = os.getenv("TELEGRAM_CHAT_ID")
+        self.token = os.getenv("TELEGRAM_BOT_TOKEN", "8850507396:AAFwFm2_WxPdSM52JcCpJUj8V1rz9x3G-kE")
+        self.chat_id = os.getenv("TELEGRAM_CHAT_ID", "6307066850")
         self.interval_seconds = interval_seconds
         self.last_sent: datetime | None = None
         if not self.token or not self.chat_id:
