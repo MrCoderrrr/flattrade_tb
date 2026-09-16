@@ -2,6 +2,9 @@
 from __future__ import annotations
 from datetime import datetime, timezone
 import os
+import csv
+import re
+from pathlib import Path
 from dataclasses import dataclass
 from core_engine.models import Quote
 from typing import Protocol
@@ -16,10 +19,11 @@ class FlattradeMarketData:
     def __init__(self, api=None, symbols: dict[str, tuple[str, str]] | None = None):
         self.api = api
         self.symbols = symbols or {
-            "NIFTY": ("NSE", os.getenv("NIFTY_TOKEN", "NIFTY")),
-            "MCX-NATGAS": ("MCX", os.getenv("MCX_NATGAS_TOKEN", "NATGAS")),
+            "NIFTY": ("NSE", os.getenv("NIFTY_TOKEN", "26000")),
+            "MCX-NATGAS": ("MCX", os.getenv("MCX_NATGAS_TOKEN", "")),
         }
         self.latest: dict[str, Quote] = {}
+        self._contract_cache: dict[str, dict] = {}
 
     def _ensure_api(self):
         if self.api is not None:
@@ -42,6 +46,10 @@ class FlattradeMarketData:
 
     def quote(self, exchange: str, symbol: str) -> Quote | None:
         api = self._ensure_api()
+        if exchange == "MCX" and not symbol:
+            symbol = self._front_month_natgas_token()
+        if not symbol:
+            return None
         now = datetime.now(timezone.utc)
         if api is not None:
             try:
@@ -52,6 +60,35 @@ class FlattradeMarketData:
         # A missing feed is not a quote.  In particular, never manufacture a
         # price: doing so can turn a paper heartbeat into a false trade.
         return None
+
+    def _front_month_natgas_token(self) -> str:
+        """Resolve the nearest non-expired NATURALGAS future from the symbol master."""
+        today = datetime.now(timezone.utc).date()
+        root = Path(__file__).resolve().parent.parent
+        files = sorted(root.glob("MCX_symbols_*.csv"), reverse=True)
+        files += [root / "MCX_symbols.txt"]
+        rows = []
+        for path in files:
+            if not path.exists():
+                continue
+            try:
+                with path.open(newline="") as handle:
+                    rows.extend(csv.DictReader(handle))
+                break
+            except OSError:
+                continue
+        candidates = []
+        for row in rows:
+            if row.get("Symbol") != "NATURALGAS" or row.get("Instrument") != "FUTCOM":
+                continue
+            try:
+                expiry = datetime.strptime(row["Expiry"], "%d-%b-%Y").date()
+            except (KeyError, ValueError):
+                continue
+            if expiry >= today:
+                candidates.append((expiry, str(row.get("Token", ""))))
+        candidates.sort()
+        return candidates[0][1] if candidates else ""
 
     def poll(self, now: datetime | None = None) -> dict[str, Quote]:
         quotes = {}
@@ -76,9 +113,10 @@ class FlattradeMarketData:
         if api is None:
             return None
         parts = logical_symbol.split("-")
-        if len(parts) != 2 or parts[1] not in {"CE", "PE"}:
+        if len(parts) < 2 or parts[1] not in {"CE", "PE"}:
             return None
         underlying, option_type = parts
+        hedge = len(parts) == 3 and parts[2] == "HEDGE"
         if underlying == "NIFTY":
             exchange, token = "NSE", self.symbols["NIFTY"][1]
             quote = self.latest.get("NIFTY")
@@ -87,9 +125,11 @@ class FlattradeMarketData:
             if quote is None:
                 return None
             strike = int(round(quote.last / 50.0) * 50)
+            if hedge:
+                strike += 1000 if option_type == "CE" else -1000
             search_exchange, search_text = "NFO", f"NIFTY {strike} {option_type}"
         elif underlying == "MCX-NATGAS":
-            exchange, token = "MCX", self.symbols["MCX-NATGAS"][1]
+            exchange, token = "MCX", self.symbols["MCX-NATGAS"][1] or self._front_month_natgas_token()
             quote = self.latest.get("MCX-NATGAS")
             if quote is None:
                 quote = self.quote(exchange, token)
@@ -102,9 +142,10 @@ class FlattradeMarketData:
         try:
             result = api.searchscrip(exchange=search_exchange, searchtext=search_text)
             values = result.get("values", []) if isinstance(result, dict) else []
-            if not values:
+            candidates = self._select_contracts(values, underlying, option_type, strike)
+            if not candidates:
                 return None
-            item = values[0]
+            item = candidates[0]
             contract = str(item.get("token", ""))
             response = api.get_quotes(exchange=search_exchange, token=contract)
             now = datetime.now(timezone.utc)
@@ -114,6 +155,50 @@ class FlattradeMarketData:
                          float(response.get("lp", 0.0)))
         except (KeyError, TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _select_contracts(values: list[dict], underlying: str,
+                          option_type: str, strike: int) -> list[dict]:
+        """Select the nearest valid expiry and exact strike, never values[0]."""
+        today = datetime.now(timezone.utc).date()
+        candidates = []
+        for item in values:
+            tsym = str(item.get("tsym", "")).upper()
+            if underlying == "NIFTY" and (
+                not tsym.startswith("NIFTY")
+                or tsym.startswith(("BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"))
+            ):
+                continue
+            if option_type not in tsym:
+                continue
+            item_strike = item.get("strprc", item.get("strike", item.get("StrikePrice")))
+            if item_strike is not None:
+                try:
+                    if abs(float(item_strike) - strike) > 0.01:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+            expiry_text = str(item.get("exd", item.get("expiry", "")))
+            expiry = None
+            for fmt in ("%d-%b-%Y", "%d-%b-%y", "%Y-%m-%d"):
+                try:
+                    expiry = datetime.strptime(expiry_text, fmt).date()
+                    break
+                except ValueError:
+                    pass
+            if expiry is None:
+                match = re.search(r"(\d{2})([A-Z]{3})(\d{2,4})", tsym)
+                if match:
+                    for fmt in ("%d%b%Y", "%d%b%y"):
+                        try:
+                            expiry = datetime.strptime("".join(match.groups()), fmt).date()
+                            break
+                        except ValueError:
+                            pass
+            if expiry is not None and expiry >= today:
+                candidates.append((expiry, item))
+        candidates.sort(key=lambda pair: pair[0])
+        return [item for _, item in candidates]
 
     def atm_straddle_iv(self, underlying: str) -> float:
         if self.api is None:

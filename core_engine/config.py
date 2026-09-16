@@ -22,6 +22,10 @@ class EngineConfig:
     mcx_flip_cooldown_seconds: float = 45.0
     mcx_loss_limit_pct: float = 0.03
     mcx_k: float = 2.5
+    mcx_reversal_min_points: float = 0.80
+    mcx_micro_reversal_points: float = 0.50
+    mcx_velocity_ticks: int = 10
+    nifty_hedge_width_points: int = 1000
     nifty_dte_profiles: tuple[float, float, float] = (0.60, 1.00, 0.50)
     nifty_high_dte_persistence: float = 5.0
     nifty_low_dte_persistence: float = 5.0

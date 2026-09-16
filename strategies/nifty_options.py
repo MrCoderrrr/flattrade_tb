@@ -13,7 +13,11 @@ class NiftyOptionsStrategy:
     _signal_since: datetime | None = None
 
     def dte_profile(self, dte: int) -> float:
-        return self.config.nifty_dte_profiles[0 if dte <= 1 else (1 if dte <= 3 else 2)]
+        if dte <= 1:
+            return self.config.nifty_dte_profiles[2]
+        if dte <= 3:
+            return self.config.nifty_dte_profiles[1]
+        return self.config.nifty_dte_profiles[0]
 
     def dte_bucket(self, dte: int) -> str:
         return "LOW" if dte <= 1 else ("MID" if dte <= 3 else "HIGH")
@@ -46,11 +50,12 @@ class NiftyOptionsStrategy:
             return "FLAT"  # strong trend: do not add/re-center
         return "DECELERATE" if decelerating else "RE_CENTER"
 
-    def size(self, base_quantity: int, iv_rank: float | None) -> int:
-        """Reduce size by 50% when live ATM straddle IV rank is elevated."""
-        if iv_rank is not None and iv_rank >= 20.0:
-            return max(1, int(base_quantity * self.config.ivr_size_factor))
-        return base_quantity
+    def size(self, base_quantity: int, iv_rank: float | None, dte: int = 5) -> int:
+        """Apply DTE sizing, then halve it when IVR is below the 20th percentile."""
+        quantity = max(1, int(base_quantity * self.dte_profile(dte)))
+        if iv_rank is not None and iv_rank < 20.0:
+            quantity = max(1, int(quantity * self.config.ivr_size_factor))
+        return quantity
 
     def ivr_allows_entry(self, ivr20: float | None) -> bool:
         """IVR20 gate: elevated IV is allowed only at reduced size."""

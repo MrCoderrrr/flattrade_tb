@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from datetime import datetime
+from collections import deque
 from core_engine.config import DEFAULT_CONFIG, EngineConfig
 from core_engine.models import Order, Side, TriggerType, Quote, Position
 
@@ -12,6 +13,15 @@ class MCXNatGasState:
     strangle_initialized: bool = False
     entry_price: float = 0.0
     best_price: float = 0.0
+    spot_history: deque = None
+    extreme_spot: float = 0.0
+    trend_velocity: float = 0.0
+    reversal_pullback: float = 0.0
+    reversal_latched: bool = False
+
+    def __post_init__(self):
+        if self.spot_history is None:
+            self.spot_history = deque(maxlen=60)
 
 
 class MCXNatGasStrategy:
@@ -89,3 +99,32 @@ class MCXNatGasStrategy:
     def reset_session(self) -> None:
         self.state = MCXNatGasState()
         self.position = Position("MCX-NATGAS")
+
+    def update_momentum(self, spot: float) -> bool:
+        """Latch a 0.80-point pullback, or 0.50-point pullback with reversal velocity."""
+        self.state.spot_history.append(spot)
+        if self.state.direction == 0:
+            return False
+        history = list(self.state.spot_history)
+        if len(history) >= self.config.mcx_velocity_ticks:
+            self.state.trend_velocity = history[-1] - history[-self.config.mcx_velocity_ticks]
+        if self.state.extreme_spot <= 0:
+            self.state.extreme_spot = spot
+        if self.state.direction > 0:
+            self.state.extreme_spot = max(self.state.extreme_spot, spot)
+            self.state.reversal_pullback = self.state.extreme_spot - spot
+            reversing = self.state.trend_velocity < 0
+        else:
+            self.state.extreme_spot = min(self.state.extreme_spot, spot)
+            self.state.reversal_pullback = spot - self.state.extreme_spot
+            reversing = self.state.trend_velocity > 0
+        self.state.reversal_latched = (
+            self.state.reversal_pullback >= self.config.mcx_reversal_min_points
+            or (self.state.reversal_pullback >= self.config.mcx_micro_reversal_points and reversing)
+        )
+        return self.state.reversal_latched
+
+    def consume_momentum_reversal(self) -> None:
+        self.state.reversal_latched = False
+        self.state.extreme_spot = 0.0
+        self.state.reversal_pullback = 0.0

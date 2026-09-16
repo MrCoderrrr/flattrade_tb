@@ -298,6 +298,7 @@ class TradingRuntime:
         return None
 
     def _submit(self, order: Order, quote: Quote, now: datetime) -> None:
+        self.quotes[order.symbol] = quote
         trade = self.execution.submit(order, quote)
         self.logger.log(trade, state_at_entry=order.trigger_type.value)
 
@@ -368,7 +369,7 @@ class TradingRuntime:
 
     def _manage_mcx(self, now: datetime, signal: int, quotes: dict[str, Quote]):
         positions = {s: p for s, p in self.execution.positions.items()
-                     if s.startswith("MCX-NATGAS-") and p.quantity}
+                     if s.startswith("MCX-NATGAS-") and p.quantity and p.quantity < 0}
         for symbol, position in positions.items():
             quote = self.quotes.get(symbol)
             if quote is None:
@@ -389,6 +390,20 @@ class TradingRuntime:
                     self.mcx.state.direction = -1
                 elif symbol.endswith("-PE"):
                     self.mcx.state.direction = 1
+        underlying_quote = quotes.get("MCX-NATGAS")
+        if (len(positions) == 1 and underlying_quote
+                and self.mcx.update_momentum(underlying_quote.last)):
+            surviving = next(iter(positions))
+            missing = ("MCX-NATGAS-PE" if surviving.endswith("-CE")
+                       else "MCX-NATGAS-CE")
+            missing_quote = quotes.get(missing) or self._option_quote(missing, quotes)
+            if missing_quote and self.mcx.can_flip(now):
+                self._submit(self.mcx.order(missing, 1, Side.SELL,
+                                            TriggerType.RE_CENTER),
+                             missing_quote, now)
+                direction = -1 if missing.endswith("-PE") else 1
+                self.mcx.flip(now, direction)
+                self.mcx.consume_momentum_reversal()
         if signal and self.mcx.state.direction and signal == -self.mcx.state.direction:
             if self.mcx.confirm_flip(now, signal, True):
                 old = "-CE" if signal < 0 else "-PE"
@@ -438,7 +453,7 @@ class TradingRuntime:
             new_quote = self._option_quote(losing_symbol, quotes)
             if new_quote:
                 self._submit(Order(losing_symbol, Side.SELL,
-                                   self.nifty.size(1, getattr(self.risk, "ivr20", None)),
+                                   self.nifty.size(1, getattr(self.risk, "ivr20", None), dte),
                                    trigger_type=TriggerType.RE_CENTER,
                                    strategy="NiftyOptions"), new_quote, now)
 
@@ -489,11 +504,19 @@ class TradingRuntime:
                 if (signal and _in_window(now, "09:15", "15:15")
                         and not snapshot.get("warmup") and not self._nifty_entered
                         and not self.risk.halted and self.nifty.ivr_allows_entry(ivr)):
+                    dte = int(getattr(self.market_data, "nifty_dte", 5))
+                    quantity = self.nifty.size(1, ivr, dte)
                     legs = [(s, self._option_quote(s, quotes))
-                            for s in ("NIFTY-CE", "NIFTY-PE")]
+                            for s in ("NIFTY-CE-HEDGE", "NIFTY-PE-HEDGE",
+                                      "NIFTY-CE", "NIFTY-PE")]
                     if all(q for _, q in legs):
-                        for symbol, leg_quote in legs:
-                            self._submit(Order(symbol, Side.SELL, 1,
+                        for symbol, leg_quote in legs[:2]:
+                            self._submit(Order(symbol, Side.BUY, quantity,
+                                               strategy="NiftyOptions",
+                                               trigger_type=TriggerType.RE_CENTER),
+                                         leg_quote, now)
+                        for symbol, leg_quote in legs[2:]:
+                            self._submit(Order(symbol, Side.SELL, quantity,
                                                strategy="NiftyOptions",
                                                trigger_type=TriggerType.RE_CENTER),
                                          leg_quote, now)
