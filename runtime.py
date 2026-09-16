@@ -549,8 +549,11 @@ class TradingRuntime:
                             f"halted={self.risk.halted}")
         if self.dashboard:
             rendered = self.dashboard.render(self, now)
-            if sys.stdout.isatty() and os.getenv("PAPER_NO_DASHBOARD") != "1":
-                sys.stdout.write("\033[2J\033[H" + rendered + "\n")
+            if os.getenv("PAPER_NO_DASHBOARD") != "1":
+                if sys.stdout.isatty():
+                    sys.stdout.write("\033[2J\033[H" + rendered + "\n")
+                else:
+                    sys.stdout.write("\n" + rendered + "\n")
                 sys.stdout.flush()
         self.notifier.send(self.last_status, now)
 
