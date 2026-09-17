@@ -183,8 +183,8 @@ class FlattradeMarketData:
                         quotes[symbol] = oq
                         self.latest[symbol] = oq
 
-        # 2. Only keep ATM option chain quotes refreshed when waiting for entry (no open positions)
-        if "NIFTY" in quotes and not has_active:
+        # 2. Refresh ATM option chain quotes every single second
+        if "NIFTY" in quotes:
             for logical in ("NIFTY-CE", "NIFTY-PE", "NIFTY-CE-HEDGE", "NIFTY-PE-HEDGE"):
                 oq = self.option_quote(logical, quotes=quotes)
                 if oq:

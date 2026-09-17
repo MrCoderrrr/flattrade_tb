@@ -140,6 +140,7 @@ class TerminalDashboard:
             sl, tsl = self._stops(runtime, p, prefix, snapshot)
 
             _, strike_val, opt_type, is_hedge = FlattradeMarketData.parse_option_symbol(p.symbol)
+            is_hedge = is_hedge or (p.quantity > 0 and ("NIFTY" in p.symbol or prefix == "NIFTY-"))
             leg_name = f"{opt_type}_HEDGE" if is_hedge else opt_type
 
             if strike_val:
@@ -249,10 +250,9 @@ class TerminalDashboard:
             return sl, tsl
         entry_p = position.average_price
         lowest_p = runtime._nifty_low.get(position.symbol, entry_p) if hasattr(runtime, "_nifty_low") else entry_p
-        dte = int(getattr(runtime.market_data, "nifty_dte", 0))
-        trail_pct = 0.05 if dte <= 1 else 0.07
-        initial_sl = entry_p * 1.35
-        tsl = lowest_p * (1.0 + trail_pct) if lowest_p <= entry_p * 0.95 else None
+        initial_sl = round(entry_p * 1.12, 2)
+        current_sl = getattr(runtime, "_nifty_sl", {}).get(position.symbol, initial_sl)
+        tsl = current_sl if lowest_p < entry_p else None
         return initial_sl, tsl
 
     @staticmethod
@@ -520,13 +520,23 @@ class TradingRuntime:
         if "NIFTY" in order.symbol:
             if not hasattr(self, "_nifty_low"):
                 self._nifty_low = {}
+            if not hasattr(self, "_nifty_sl"):
+                self._nifty_sl = {}
+            if not hasattr(self, "_nifty_solo"):
+                self._nifty_solo = set()
+            if not hasattr(self, "_nifty_solo_anchor"):
+                self._nifty_solo_anchor = {}
             if order.side is Side.SELL:
-                # Entering new short leg - anchor lowest observed ask at entry
+                # Entering new short leg - anchor lowest observed ask at entry and initial 12% SL
                 init_ask = quote.ask if quote and quote.ask > 0 else trade.price
                 self._nifty_low[order.symbol] = init_ask
+                self._nifty_sl[order.symbol] = round(init_ask * 1.12, 2)
             elif order.side is Side.BUY:
-                # Exiting short leg - clear lowest observed ask so stale data is never reused
+                # Exiting short leg - clear lowest observed ask and SL state
                 self._nifty_low.pop(order.symbol, None)
+                self._nifty_sl.pop(order.symbol, None)
+                self._nifty_solo.discard(order.symbol)
+                self._nifty_solo_anchor.pop(order.symbol, None)
 
     def _flatten(self, now: datetime, predicate) -> None:
         """Flatten only from a real quote; never invent a close price."""
@@ -664,33 +674,46 @@ class TradingRuntime:
 
         if not hasattr(self, "_nifty_low"):
             self._nifty_low = {}
+        if not hasattr(self, "_nifty_sl"):
+            self._nifty_sl = {}
+        if not hasattr(self, "_nifty_solo"):
+            self._nifty_solo = set()
+        if not hasattr(self, "_nifty_solo_anchor"):
+            self._nifty_solo_anchor = {}
+
         for symbol, position in positions.items():
             q = quotes.get(symbol) or self._option_quote(symbol, quotes)
             if q:
                 self.quotes[symbol] = q
-                if position.quantity < 0:
-                    curr_low = self._nifty_low.get(symbol, position.average_price)
-                    if curr_low <= 0 or curr_low < position.average_price * 0.5:
-                        curr_low = position.average_price
-                    self._nifty_low[symbol] = min(curr_low, q.ask)
+
+        # Hedges: all positive quantity positions. Shorts: all negative quantity positions.
+        short_positions = {s: p for s, p in positions.items() if p.quantity < 0}
+        hedge_positions = {s: p for s, p in positions.items() if p.quantity > 0}
 
         dte = int(getattr(self.market_data, "nifty_dte", 0))
-        if self.nifty.should_flatten(now, dte):
-            for symbol, position in positions.items():
-                quote = self.quotes.get(symbol)
-                if quote:
-                    close_side = Side.SELL if position.quantity > 0 else Side.BUY
-                    self._submit(Order(symbol, close_side, abs(position.quantity),
-                                       trigger_type=TriggerType.CIRCUIT_BREAKER,
-                                       strategy="NiftyOptions"), quote, now)
-            return
 
-        short_positions = {s: p for s, p in positions.items() if p.quantity < 0}
-        hedge_positions = {
-            s: p for s, p in positions.items()
-            if p.quantity > 0 and "HEDGE" in s.upper()
-        }
-        # If both short ATM legs were stopped, retain the protective hedges but
+        # Check session close: HEDGES ARE SOLD ONLY WHEN SESSION CLOSES (>= 15:15 IST)
+        if self.nifty.should_flatten(now, dte):
+            if now.strftime("%H:%M") >= self.config.nifty_flatten_time:
+                for symbol, position in positions.items():
+                    quote = self.quotes.get(symbol)
+                    if quote:
+                        close_side = Side.SELL if position.quantity > 0 else Side.BUY
+                        self._submit(Order(symbol, close_side, abs(position.quantity),
+                                           trigger_type=TriggerType.CIRCUIT_BREAKER,
+                                           strategy="NiftyOptions"), quote, now)
+                return
+            else:
+                # Intraday: only close short positions, NEVER sell hedges!
+                for symbol, position in short_positions.items():
+                    quote = self.quotes.get(symbol)
+                    if quote:
+                        self._submit(Order(symbol, Side.BUY, abs(position.quantity),
+                                           trigger_type=TriggerType.CIRCUIT_BREAKER,
+                                           strategy="NiftyOptions"), quote, now)
+                return
+
+        # If both short ATM legs were stopped, retain the protective hedges and
         # immediately rebuild the ATM short strangle.
         if hedge_positions and not short_positions and len(hedge_positions) == 2:
             if not self.risk.halted and snapshot.get("adx_300_1s", 0.0) <= self.config.nifty_adx_threshold:
@@ -715,27 +738,57 @@ class TradingRuntime:
                     log.info("Re-entered ATM Nifty short strangle after hedge-only state")
             return
 
-        trail_pct = 0.05 if dte <= 1 else 0.07
+        hhmm = now.strftime("%H:%M")
+        is_after_1pm = hhmm >= "13:00"
+        is_expiry = dte <= 1
+        active_tsl_pct = 0.05 if (is_after_1pm or is_expiry) else 0.07
+
+        # Evaluate Stop Loss & Trailing SL for short legs ONLY (HEDGES ARE NEVER STOPPED OUT)
         for symbol, position in list(short_positions.items()):
             quote = self.quotes.get(symbol)
             if not quote or position.average_price <= 0:
                 continue
+
             entry_p = position.average_price
+            curr_low = self._nifty_low.get(symbol, entry_p)
+            if quote.ask > 0 and (curr_low <= 0 or quote.ask < curr_low):
+                self._nifty_low[symbol] = quote.ask
             lowest_p = self._nifty_low.get(symbol, entry_p)
-            initial_sl = entry_p * 1.35
-            tsl = lowest_p * (1.0 + trail_pct)
-            
-            trigger = None
-            if quote.ask >= initial_sl:
-                trigger = TriggerType.STOP_LOSS_HIT
-            elif lowest_p <= entry_p * 0.95 and quote.ask >= tsl:
-                trigger = TriggerType.TRAILING_STOP_HIT
-            if trigger:
+
+            is_solo = symbol in self._nifty_solo
+            if is_solo:
+                new_trail_sl = round(lowest_p * (1.0 + active_tsl_pct), 2)
+                if symbol in self._nifty_sl:
+                    prem_sl = min(new_trail_sl, self._nifty_sl[symbol])
+                else:
+                    prem_sl = new_trail_sl
+                self._nifty_sl[symbol] = prem_sl
+            else:
+                initial_sl = round(entry_p * 1.12, 2)
+                if lowest_p >= entry_p:
+                    prem_sl = initial_sl
+                else:
+                    profit_pct = (entry_p - lowest_p) / entry_p
+                    trail_ceiling = 0.12
+                    trail_floor = active_tsl_pct
+                    trail_pct = trail_ceiling - (trail_ceiling - trail_floor) * min(profit_pct / 0.50, 1.0)
+                    trail_pct = max(trail_pct, trail_floor)
+                    trail_sl = round(lowest_p * (1.0 + trail_pct), 2)
+                    prem_sl = min(trail_sl, initial_sl)
+
+                if symbol in self._nifty_sl:
+                    prem_sl = min(prem_sl, self._nifty_sl[symbol])
+                self._nifty_sl[symbol] = prem_sl
+
+            if quote.ask >= self._nifty_sl[symbol]:
+                triggered_sl = self._nifty_sl[symbol]
+                trigger = TriggerType.TRAILING_STOP_HIT if lowest_p < entry_p else TriggerType.STOP_LOSS_HIT
                 self._submit(Order(symbol, Side.BUY, abs(position.quantity),
                                    trigger_type=trigger,
                                    strategy="NiftyOptions"), quote, now)
-                log.info("Nifty short position %s stopped out via %s (ask=%.2f)",
-                         symbol, trigger.value, quote.ask)
+                self._last_nifty_recenter_time = now.timestamp()
+                log.info("Nifty short position %s stopped out via %s (ask=%.2f >= SL=%.2f)",
+                         symbol, trigger.value, quote.ask, triggered_sl)
 
         # Refresh active short positions after stop evaluations
         active_shorts = {
@@ -746,6 +799,20 @@ class TradingRuntime:
         # Solo leg safeguard & re-centering when only 1 short leg remains:
         if len(active_shorts) == 1:
             surviving_sym = next(iter(active_shorts))
+            if surviving_sym not in self._nifty_solo:
+                self._nifty_solo.add(surviving_sym)
+                surv_pos = active_shorts[surviving_sym]
+                surv_q = self.quotes.get(surviving_sym)
+                anchor_p = surv_q.ask if surv_q and surv_q.ask > 0 else surv_pos.average_price
+                self._nifty_solo_anchor[surviving_sym] = anchor_p
+                self._nifty_low[surviving_sym] = anchor_p
+                new_sl = round(anchor_p * (1.0 + active_tsl_pct), 2)
+                if surviving_sym in self._nifty_sl:
+                    new_sl = min(new_sl, self._nifty_sl[surviving_sym])
+                self._nifty_sl[surviving_sym] = new_sl
+                log.info("🎯 SOLO LEG TSL ANCHORED: %s anchored at ask ₹%.2f. SL set to ₹%.2f (%.0f%% trail)",
+                         surviving_sym, anchor_p, new_sl, active_tsl_pct * 100)
+
             is_surviving_ce = "CE" in surviving_sym or bool(re.search(r"C\d+", surviving_sym))
             missing_type = "PE" if is_surviving_ce else "CE"
             missing_logical = f"NIFTY-{missing_type}"
@@ -755,8 +822,7 @@ class TradingRuntime:
             now_ts = now.timestamp()
             # If market is ranging/calm (ADX <= threshold) and 45s cooldown elapsed, re-center the missing leg
             if (now_ts - last_recenter >= 45.0
-                    and adx_value <= self.config.nifty_adx_threshold
-                    and (dte > 1 or now.strftime("%H:%M") < self.config.nifty_low_dte_cutoff)):
+                    and adx_value <= self.config.nifty_adx_threshold):
                 new_quote = self._option_quote(missing_logical, quotes)
                 if new_quote and new_quote.ask > 0:
                     new_sym = new_quote.symbol
@@ -765,6 +831,7 @@ class TradingRuntime:
                                        trigger_type=TriggerType.RE_CENTER,
                                        strategy="NiftyOptions"), new_quote, now)
                     self._last_nifty_recenter_time = now_ts
+                    self._nifty_solo.discard(surviving_sym)
                     log.info("Re-centered Nifty strangle by selling missing leg %s (ask=%.2f)",
                              new_sym, new_quote.ask)
             return
@@ -772,6 +839,7 @@ class TradingRuntime:
         if len(active_shorts) <= 1:
             return
 
+        # Proactive cut evaluated ONLY when both short legs are open (never cut last surviving leg)
         signal = self.signal_events[-1]["direction"] if self.signal_events and self.signal_events[-1]["underlying"] == "NIFTY" else 0
         if signal == 0 or signal == self._last_nifty_action_signal:
             return
@@ -789,14 +857,13 @@ class TradingRuntime:
         if not quote:
             return
         loss_pct = (quote.ask - losing_pos.average_price) / losing_pos.average_price
-        if loss_pct >= 0.05:
+        if loss_pct >= 0.07:  # 7% loss threshold (matching upv2_paper.py)
             self._submit(Order(losing_symbol, Side.BUY, abs(losing_pos.quantity),
                                trigger_type=TriggerType.PROACTIVE_CUT,
                                strategy="NiftyOptions"), quote, now)
             self._last_nifty_action_signal = signal
             adx_value = snapshot.get("adx_300_1s") or 0.0
-            if adx_value <= self.config.nifty_adx_threshold and (
-                    dte > 1 or now.strftime("%H:%M") < self.config.nifty_low_dte_cutoff):
+            if adx_value <= self.config.nifty_adx_threshold:
                 recenter_logical = "NIFTY-CE" if is_call_loss else "NIFTY-PE"
                 new_quote = self._option_quote(recenter_logical, quotes)
                 if new_quote:
