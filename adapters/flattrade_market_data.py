@@ -131,8 +131,59 @@ class FlattradeMarketData:
                 self.latest[underlying] = quote
         return quotes
 
-    def heartbeat(self, now: datetime, runtime) -> dict[str, Quote]:
-        return self.poll(now)
+    @staticmethod
+    def parse_option_symbol(symbol: str) -> tuple[str, int | None, str, bool]:
+        """Parse underlying, strike, option_type (CE/PE), and hedge flag from any option symbol format."""
+        underlying = "MCX-NATGAS" if ("MCX" in symbol or "NATGAS" in symbol) else "NIFTY"
+        hedge = "HEDGE" in symbol
+        clean = symbol.replace("-HEDGE", "")
+
+        if underlying == "NIFTY":
+            m = re.search(r"(\d{5})[-_]?(CE|PE)$", clean)
+            if m:
+                return underlying, int(m.group(1)), m.group(2), hedge
+            m = re.search(r"([CP])(\d{5})$", clean)
+            if m:
+                opt_type = "CE" if m.group(1) == "C" else "PE"
+                return underlying, int(m.group(2)), opt_type, hedge
+            m = re.search(r"(\d{4})[-_]?(CE|PE)$", clean)
+            if m:
+                return underlying, int(m.group(1)), m.group(2), hedge
+            m = re.search(r"([CP])(\d{4})$", clean)
+            if m:
+                opt_type = "CE" if m.group(1) == "C" else "PE"
+                return underlying, int(m.group(2)), opt_type, hedge
+        else:
+            m = re.search(r"(\d{2,4})[-_]?(CE|PE)$", clean)
+            if m:
+                return underlying, int(m.group(1)), m.group(2), hedge
+
+        opt_type = "PE" if ("PE" in clean or clean.endswith("P")) else "CE"
+        return underlying, None, opt_type, hedge
+
+    def heartbeat(self, now: datetime, runtime=None) -> dict[str, Quote]:
+        quotes = self.poll(now)
+
+        # 1. Update quotes for all open positions every single second
+        if runtime and hasattr(runtime, "execution") and hasattr(runtime.execution, "positions"):
+            for symbol, position in runtime.execution.positions.items():
+                if position.quantity:
+                    oq = self.option_quote(symbol, quotes=quotes)
+                    if oq:
+                        quotes[symbol] = oq
+                        self.latest[symbol] = oq
+
+        # 2. Also keep ATM option chain quotes refreshed every second
+        if "NIFTY" in quotes:
+            for logical in ("NIFTY-CE", "NIFTY-PE", "NIFTY-CE-HEDGE", "NIFTY-PE-HEDGE"):
+                oq = self.option_quote(logical, quotes=quotes)
+                if oq:
+                    quotes[oq.symbol] = oq
+                    self.latest[oq.symbol] = oq
+                    quotes[logical] = oq
+                    self.latest[logical] = oq
+
+        return quotes
 
     @property
     def nifty_dte(self) -> int:
@@ -153,26 +204,7 @@ class FlattradeMarketData:
         expiry through the broker contract search before requesting its quote.
         Falls back to realistic option simulation if live broker quote is unavailable.
         """
-        explicit_strike = None
-        if "-" in logical_symbol and not re.search(r"\d{4,}", logical_symbol):
-            parts = logical_symbol.split("-")
-            if len(parts) < 2 or parts[1] not in {"CE", "PE"}:
-                return None
-            underlying = parts[0]
-            option_type = parts[1]
-            hedge = len(parts) == 3 and parts[2] == "HEDGE"
-        else:
-            m = re.search(r"(NIFTY|MCX-NATGAS).*?(\d{4,6})(CE|PE)", logical_symbol)
-            if m:
-                underlying = m.group(1)
-                explicit_strike = int(m.group(2))
-                option_type = m.group(3)
-                hedge = "HEDGE" in logical_symbol
-            else:
-                parts = logical_symbol.split("-")
-                underlying = parts[0] if parts else "NIFTY"
-                option_type = "CE" if "CE" in logical_symbol else "PE"
-                hedge = "HEDGE" in logical_symbol
+        underlying, explicit_strike, option_type, hedge = self.parse_option_symbol(logical_symbol)
 
         quote = (quotes and quotes.get(underlying)) or self.latest.get(underlying)
         if quote is None:
@@ -193,10 +225,13 @@ class FlattradeMarketData:
         else:
             strike = explicit_strike or 0
 
-        cache_key = f"{logical_symbol}_{strike}"
         api = self._ensure_api()
         if api is not None:
-            cached = self._contract_cache.get(cache_key)
+            cached = (
+                self._contract_cache.get(logical_symbol)
+                or self._contract_cache.get(f"{logical_symbol}_{strike}")
+                or self._contract_cache.get(f"{underlying}_{strike}_{option_type}")
+            )
             if cached:
                 try:
                     response = api.get_quotes(
@@ -208,8 +243,7 @@ class FlattradeMarketData:
                     if real_q is not None:
                         return real_q
                 except Exception as exc:
-                    self._last_error = f"cached option quote failed for {cache_key}: {exc}"
-                self._contract_cache.pop(cache_key, None)
+                    self._last_error = f"cached option quote failed for {logical_symbol}: {exc}"
 
             if quote is not None and strike > 0:
                 if underlying == "NIFTY":
@@ -227,17 +261,20 @@ class FlattradeMarketData:
                         if candidates:
                             item = candidates[0]
                             contract = str(item.get("token", ""))
+                            tsym = str(item.get("tsym", logical_symbol))
                             response = api.get_quotes(exchange=search_exchange, token=contract)
                             now = datetime.now(timezone.utc)
-                            real_q = self._quote_from_response(
-                                str(item.get("tsym", logical_symbol)), response, now
-                            )
+                            real_q = self._quote_from_response(tsym, response, now)
+                            contract_info = {
+                                "exchange": search_exchange,
+                                "token": contract,
+                                "tsym": tsym,
+                            }
+                            self._contract_cache[logical_symbol] = contract_info
+                            self._contract_cache[f"{logical_symbol}_{strike}"] = contract_info
+                            self._contract_cache[f"{underlying}_{strike}_{option_type}"] = contract_info
+                            self._contract_cache[tsym] = contract_info
                             if real_q is not None:
-                                self._contract_cache[cache_key] = {
-                                    "exchange": search_exchange,
-                                    "token": contract,
-                                    "tsym": str(item.get("tsym", logical_symbol)),
-                                }
                                 return real_q
                     except Exception as exc:
                         self._last_error = f"option lookup failed for {logical_symbol}: {exc}"
@@ -249,24 +286,7 @@ class FlattradeMarketData:
         return None
 
     def _simulate_option_quote(self, logical_symbol: str, spot: float, now: datetime) -> Quote:
-        explicit_strike = None
-        if "-" in logical_symbol and not re.search(r"\d{4,}", logical_symbol):
-            parts = logical_symbol.split("-")
-            underlying = parts[0]
-            option_type = parts[1]
-            hedge = len(parts) == 3 and parts[2] == "HEDGE"
-        else:
-            m = re.search(r"(NIFTY|MCX-NATGAS).*?(\d{4,6})(CE|PE)", logical_symbol)
-            if m:
-                underlying = m.group(1)
-                explicit_strike = int(m.group(2))
-                option_type = m.group(3)
-                hedge = "HEDGE" in logical_symbol
-            else:
-                parts = logical_symbol.split("-")
-                underlying = parts[0] if parts else "NIFTY"
-                option_type = "CE" if "CE" in logical_symbol else "PE"
-                hedge = "HEDGE" in logical_symbol
+        underlying, explicit_strike, option_type, hedge = self.parse_option_symbol(logical_symbol)
 
         if underlying == "NIFTY":
             atm = int(round(spot / 50.0) * 50)
@@ -295,7 +315,7 @@ class FlattradeMarketData:
             ask = round(lp + 0.20, 2)
             return Quote(tsym, now, bid, ask, lp)
         elif underlying == "MCX-NATGAS":
-            strike = round(spot / 5.0) * 5
+            strike = explicit_strike if explicit_strike is not None else round(spot / 5.0) * 5
             diff = abs(spot - strike)
             lp = max(0.50, round(8.0 - diff * 0.15, 2))
             delta = 0.50

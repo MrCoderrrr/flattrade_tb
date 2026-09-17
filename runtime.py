@@ -139,26 +139,24 @@ class TerminalDashboard:
             side = "LONG" if p.quantity > 0 else "SHORT"
             sl, tsl = self._stops(runtime, p, prefix, snapshot)
 
-            is_hedge = "HEDGE" in p.symbol
-            is_ce = "CE" in p.symbol or bool(re.search(r"C\d+", p.symbol))
-            if is_hedge:
-                leg_name = "CE_HEDGE" if is_ce else "PE_HEDGE"
-            else:
-                leg_name = "CE" if is_ce else "PE"
+            _, strike_val, opt_type, is_hedge = FlattradeMarketData.parse_option_symbol(p.symbol)
+            leg_name = f"{opt_type}_HEDGE" if is_hedge else opt_type
 
-            m = re.search(r'(\d{4,6})', p.symbol)
-            if m:
-                strike_str = f"{int(m.group(1)):>7}"
+            if strike_val:
+                strike_str = f"{strike_val:>7}"
             elif spot_q:
-                atm = int(round(spot_q.last / 50.0) * 50)
-                s = atm + (1000 if is_ce else -1000) if is_hedge else atm
+                step = 50.0 if underlying == "NIFTY" else 5.0
+                atm = int(round(spot_q.last / step) * step)
+                hedge_offset = 1000 if underlying == "NIFTY" else 20
+                s = atm + (hedge_offset if opt_type == "CE" else -hedge_offset) if is_hedge else atm
                 strike_str = f"{s:>7}"
             else:
                 strike_str = "    n/a"
 
+            current_ltp = q.last if q and q.last > 0 else mark
             lines.append(self._row(
                 f"  {leg_name:<12}│{strike_str}│{spot_str}│{side:<6}│"
-                f"{p.quantity:>+5}│{p.average_price:>9.2f}│{self._num(mark):>9}│"
+                f"{p.quantity:>+5}│{p.average_price:>9.2f}│{self._num(current_ltp):>9}│"
                 f"{self._num(sl):>9}│{self._num(tsl):>9}│"
                 f"{self._money(unreal or 0.0, 14)}",
                 width,
