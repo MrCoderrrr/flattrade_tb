@@ -50,7 +50,7 @@ class TerminalDashboard:
         if now_ist.weekday() < 5 and _in_window(now_ist, "09:15", "15:15"):
             strategy = "NIFTY"
             prefix = "NIFTY-"
-        elif now_ist.weekday() != 5 and _in_window(now_ist, "18:00", "23:25"):
+        elif now_ist.weekday() != 5 and _in_window(now_ist, "17:00", "23:24"):
             strategy = "MCX NATURAL GAS"
             prefix = "MCX-NATGAS-"
         else:
@@ -321,7 +321,7 @@ class TerminalDashboard:
         active_underlyings = []
         if now_ist.weekday() < 5 and _in_window(now_ist, "09:15", "15:15"):
             active_underlyings.append("NIFTY")
-        if now_ist.weekday() != 5 and _in_window(now_ist, "18:00", "23:25"):
+        if now_ist.weekday() != 5 and _in_window(now_ist, "17:00", "23:24"):
             active_underlyings.append("MCX-NATGAS")
         ages = []
         for underlying in active_underlyings:
@@ -576,7 +576,7 @@ class TradingRuntime:
         self._session_date = date
         if not _in_window(now.astimezone(IST), "09:15", "15:15"):
             self._flatten(now, lambda symbol: symbol.startswith("NIFTY"))
-        if not _in_window(now.astimezone(IST), "18:00", "23:25"):
+        if not _in_window(now.astimezone(IST), "17:00", "23:24"):
             self._flatten(now, lambda symbol: symbol.startswith("MCX-NATGAS-"))
 
     def _persisted_signal(self, underlying: str, snapshot: dict,
@@ -909,9 +909,9 @@ class TradingRuntime:
                                            "timestamp": now, "confirmed": True,
                                            "indicators": snapshot})
             if underlying == "MCX-NATGAS":
-                if not _in_window(now, "18:00", "23:25"):
+                if not _in_window(now, "17:00", "23:24"):
                     continue
-                if (_in_window(now, "18:00", "23:24") and not snapshot.get("warmup")
+                if (_in_window(now, "17:00", "23:23") and not snapshot.get("warmup")
                         and not self.mcx.state.strangle_initialized
                         and not self.risk.halted):
                     legs = [(s, self._option_quote(s, quotes))

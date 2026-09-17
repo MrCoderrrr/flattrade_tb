@@ -13,12 +13,12 @@ process_runtime: subprocess.Popen | None = None
 
 
 def in_session(now: datetime) -> bool:
-    hhmm = now.strftime("%H:%M")
-    # NSE runs Monday-Friday. MCX's evening session opens Sunday and runs
-    # through Friday; Saturday is closed. Boundaries are half-open so the
-    # scheduler never starts a process after the session has ended.
-    nse_open = now.weekday() < 5 and "09:15" <= hhmm < "15:15"
-    mcx_open = now.weekday() != 5 and "18:00" <= hhmm < "23:25"
+    now_ist = now.astimezone(IST) if now.tzinfo is not None else now
+    hhmm = now_ist.strftime("%H:%M")
+    # NSE runs Monday-Friday until 15:34 session close (scheduler window 09:15-15:35).
+    # MCX's evening session opens Sunday and runs through Friday; Saturday is closed.
+    nse_open = now_ist.weekday() < 5 and "09:15" <= hhmm < "15:35"
+    mcx_open = now_ist.weekday() != 5 and "17:00" <= hhmm < "23:24"
     return nse_open or mcx_open
 
 

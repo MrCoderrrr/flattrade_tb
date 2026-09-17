@@ -11,6 +11,7 @@ from core_engine.models import Quote
 from typing import Protocol
 
 log = logging.getLogger(__name__)
+IST = timezone(timedelta(hours=5, minutes=30))
 
 
 class ATMStraddleIVProvider(Protocol):
@@ -73,7 +74,7 @@ class FlattradeMarketData:
             symbol = self._front_month_natgas_token()
         if not symbol:
             return None
-        now = datetime.now(timezone.utc)
+        now = datetime.now(IST)
         if api is not None:
             try:
                 result = api.get_quotes(exchange=exchange, token=symbol)
@@ -95,7 +96,7 @@ class FlattradeMarketData:
 
     def _front_month_natgas_token(self) -> str:
         """Resolve the nearest non-expired NATURALGAS future from the symbol master."""
-        today = datetime.now(timezone.utc).date()
+        today = datetime.now(IST).date()
         root = Path(__file__).resolve().parent.parent
         files = sorted(root.glob("MCX_symbols_*.csv"), reverse=True)
         files += [root / "MCX_symbols.txt"]
@@ -119,15 +120,15 @@ class FlattradeMarketData:
                 continue
             if expiry >= today:
                 candidates.append((expiry, str(row.get("Token", ""))))
-        candidates.sort()
+            candidates.sort()
         return candidates[0][1] if candidates else ""
 
     def poll(self, now: datetime | None = None) -> dict[str, Quote]:
         quotes = {}
-        now_dt = now or datetime.now(timezone.utc)
-        now_ist = now_dt.astimezone(timezone(timedelta(hours=5, minutes=30)))
+        now_dt = now or datetime.now(IST)
+        now_ist = now_dt.astimezone(IST) if now_dt.tzinfo is not None else now_dt.replace(tzinfo=IST)
         hhmm = now_ist.strftime("%H:%M")
-        is_mcx_window = now_ist.weekday() != 5 and "18:00" <= hhmm < "23:25"
+        is_mcx_window = now_ist.weekday() != 5 and "17:00" <= hhmm < "23:24"
 
         for underlying, (exchange, token) in self.symbols.items():
             if underlying == "MCX-NATGAS" and not is_mcx_window:
@@ -248,7 +249,7 @@ class FlattradeMarketData:
                         exchange=cached["exchange"], token=cached["token"]
                     )
                     real_q = self._quote_from_response(
-                        cached["tsym"], response, datetime.now(timezone.utc)
+                        cached["tsym"], response, datetime.now(IST)
                     )
                     if real_q is not None:
                         return real_q
@@ -273,7 +274,7 @@ class FlattradeMarketData:
                             contract = str(item.get("token", ""))
                             tsym = str(item.get("tsym", logical_symbol))
                             response = api.get_quotes(exchange=search_exchange, token=contract)
-                            now = datetime.now(timezone.utc)
+                            now = datetime.now(IST)
                             real_q = self._quote_from_response(tsym, response, now)
                             contract_info = {
                                 "exchange": search_exchange,
@@ -291,7 +292,7 @@ class FlattradeMarketData:
 
         # 2. Simulation fallback (as in legacy paper bot)
         if quote is not None and quote.last > 0:
-            return self._simulate_option_quote(logical_symbol, quote.last, datetime.now(timezone.utc))
+            return self._simulate_option_quote(logical_symbol, quote.last, datetime.now(IST))
 
         return None
 
