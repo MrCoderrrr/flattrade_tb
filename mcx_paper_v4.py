@@ -112,7 +112,11 @@ def send_telegram(msg: str):
 # Utility
 # ─────────────────────────────────────────────
 def round_to_price(value: float, step: float = STRIKE_STEP) -> float:
-    return round(math.floor(value / step + 0.5) * step, 2)
+    return round_to_tick(math.floor(value / step + 0.5) * step)
+
+
+def round_to_tick(value: float) -> float:
+    return round(value * 20.0) / 20.0
 
 
 def _ansi_len(s: str) -> int:
@@ -402,7 +406,7 @@ class NaturalGasPaperBot:
             return None
 
         qty        = LOT_SIZE
-        initial_sl = round(ltp * (1.0 + loss_stop_pct), 2)
+        initial_sl = round_to_tick(ltp * (1.0 + loss_stop_pct))
         now_ts     = time.time()
 
         pos = {
@@ -501,7 +505,7 @@ class NaturalGasPaperBot:
             state['lowest_ltp'] = round(lowest, 2)
 
         is_strangle = ('CE' in self.positions and 'PE' in self.positions)
-        initial_sl  = round(entry_prem * (1.0 + pos['loss_stop_pct']), 2)
+        initial_sl  = round_to_tick(entry_prem * (1.0 + pos['loss_stop_pct']))
 
         if is_strangle:
             # ── STRANGLE IS ON (both legs open) ──
@@ -511,7 +515,7 @@ class NaturalGasPaperBot:
             if lowest >= entry_prem:
                 target_sl = initial_sl
             else:
-                trail_sl  = round(lowest * (1.0 + pos['tsl_pct']), 2)
+                trail_sl  = round_to_tick(lowest * (1.0 + pos['tsl_pct']))
                 target_sl = min(trail_sl, initial_sl)
 
             # Strict ratchet: stop loss can only move down, never up
@@ -526,7 +530,7 @@ class NaturalGasPaperBot:
             # "sl is till strangle is on" — Initial 15% SL does NOT apply here.
             # Surviving leg is managed exclusively by tight TSL (8% above lowest price).
             state['solo_mode'] = True
-            solo_tsl = round(lowest * (1.0 + pos['tsl_pct']), 2)
+            solo_tsl = round_to_tick(lowest * (1.0 + pos['tsl_pct']))
 
             # Strict ratchet: can only tighten down
             if 'current_sl' in state:
@@ -864,14 +868,14 @@ class NaturalGasPaperBot:
                 pos['loss_stop_pct'] = DEFAULT_SL_PCT
                 pos['tsl_pct']       = DEFAULT_TSL_PCT
                 entry_prem          = pos['entry_price']
-                new_initial_sl      = round(entry_prem * (1.0 + DEFAULT_SL_PCT), 2)
+                new_initial_sl      = round_to_tick(entry_prem * (1.0 + DEFAULT_SL_PCT))
                 lowest              = float(pos.get('sl_state', {}).get('lowest_ltp', entry_prem))
 
                 if is_strangle:
                     if lowest >= entry_prem:
                         curr_sl = new_initial_sl
                     else:
-                        trail_sl = round(lowest * (1.0 + DEFAULT_TSL_PCT), 2)
+                        trail_sl = round_to_tick(lowest * (1.0 + DEFAULT_TSL_PCT))
                         curr_sl = min(trail_sl, new_initial_sl)
                     pos['sl_state'] = {
                         'lowest_ltp':    lowest,
@@ -885,7 +889,7 @@ class NaturalGasPaperBot:
                           f"TSL to {DEFAULT_TSL_PCT*100:.0f}% (Current SL: ₹{curr_sl:.2f})", flush=True)
                 else:
                     # Strangle is OFF — solo leg operates strictly on 8% TSL
-                    solo_tsl = round(lowest * (1.0 + DEFAULT_TSL_PCT), 2)
+                    solo_tsl = round_to_tick(lowest * (1.0 + DEFAULT_TSL_PCT))
                     pos['sl_state'] = {
                         'lowest_ltp':    lowest,
                         'current_sl':    solo_tsl,
