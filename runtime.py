@@ -208,10 +208,14 @@ class TerminalDashboard:
     def _option_status(runtime, prefix: str) -> str:
         if prefix != "NIFTY-":
             return "n/a"
+        quote = runtime.quotes.get("NIFTY")
+        if quote is None:
+            return "waiting for spot"
+        atm = int(round(quote.last / 50.0) * 50)
+        dte = int(getattr(runtime.market_data, "nifty_dte", 0))
         if runtime._nifty_entered:
-            return "resolved"
-        error = getattr(runtime.market_data, "_last_error", "")
-        return error[-40:] if error else "waiting for signal"
+            return f"RESOLVED (ATM {atm} | DTE {dte}d)"
+        return f"ATM {atm} (CE/PE {atm} | HEDGE {atm+1000}/{atm-1000} | DTE {dte}d)"
 
     @staticmethod
     def _stops(runtime, position, prefix: str, snapshot: dict):
@@ -601,14 +605,14 @@ class TradingRuntime:
 
     def _manage_nifty(self, now: datetime, snapshot: dict, quotes: dict[str, Quote]):
         positions = {s: p for s, p in self.execution.positions.items()
-                     if s.startswith("NIFTY-") and p.quantity}
+                     if (s.startswith("NIFTY") or "NIFTY" in s) and p.quantity}
         if not positions:
             return
         for symbol in positions:
-            q = self._option_quote(symbol, quotes)
+            q = quotes.get(symbol) or self._option_quote(symbol, quotes)
             if q:
                 self.quotes[symbol] = q
-        dte = int(getattr(self.market_data, "nifty_dte", 5))
+        dte = int(getattr(self.market_data, "nifty_dte", 0))
         if self.nifty.should_flatten(now, dte):
             for symbol, position in positions.items():
                 quote = self.quotes.get(symbol)
@@ -623,12 +627,19 @@ class TradingRuntime:
         if signal == self._last_nifty_action_signal:
             return
         self._last_nifty_action_signal = signal
-        losing_symbol = "NIFTY-CE" if signal > 0 else "NIFTY-PE"
-        position = positions.get(losing_symbol)
-        quote = self.quotes.get(losing_symbol)
-        if not position or not quote:
+        is_call_loss = signal > 0
+        losing_pos = next(
+            (p for s, p in positions.items()
+             if p.quantity < 0 and (("CE" in s or "C" in s) if is_call_loss else ("PE" in s or "P" in s))),
+            None
+        )
+        if not losing_pos:
             return
-        self._submit(Order(losing_symbol, Side.BUY, abs(position.quantity),
+        losing_symbol = losing_pos.symbol
+        quote = self.quotes.get(losing_symbol)
+        if not quote:
+            return
+        self._submit(Order(losing_symbol, Side.BUY, abs(losing_pos.quantity),
                            trigger_type=TriggerType.PROACTIVE_CUT,
                            strategy="NiftyOptions"), quote, now)
         adx_value = snapshot.get("adx_300_1s") or 0.0
@@ -636,7 +647,8 @@ class TradingRuntime:
                 dte > 1 or now.strftime("%H:%M") < self.config.nifty_low_dte_cutoff):
             new_quote = self._option_quote(losing_symbol, quotes)
             if new_quote:
-                self._submit(Order(losing_symbol, Side.SELL,
+                new_sym = new_quote.symbol
+                self._submit(Order(new_sym, Side.SELL,
                                    self.nifty.size(1, getattr(self.risk, "ivr20", None), dte),
                                    trigger_type=TriggerType.RE_CENTER,
                                    strategy="NiftyOptions"), new_quote, now)
@@ -704,12 +716,14 @@ class TradingRuntime:
                                       "NIFTY-CE", "NIFTY-PE")]
                     if all(q for _, q in legs):
                         for symbol, leg_quote in legs[:2]:
-                            self._submit(Order(symbol, Side.BUY, quantity,
+                            order_sym = leg_quote.symbol if leg_quote else symbol
+                            self._submit(Order(order_sym, Side.BUY, quantity,
                                                strategy="NiftyOptions",
                                                trigger_type=TriggerType.RE_CENTER),
                                          leg_quote, now)
                         for symbol, leg_quote in legs[2:]:
-                            self._submit(Order(symbol, Side.SELL, quantity,
+                            order_sym = leg_quote.symbol if leg_quote else symbol
+                            self._submit(Order(order_sym, Side.SELL, quantity,
                                                strategy="NiftyOptions",
                                                trigger_type=TriggerType.RE_CENTER),
                                          leg_quote, now)
