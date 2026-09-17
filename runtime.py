@@ -10,6 +10,7 @@ import logging
 import json
 import atexit
 import os
+import re
 import signal
 import sys
 import time
@@ -64,7 +65,7 @@ class TerminalDashboard:
         snapshot = runtime.snapshots.get(underlying, {})
         active = [
             p for symbol, p in runtime.execution.positions.items()
-            if symbol.startswith(prefix) and p.quantity
+            if (symbol.startswith(prefix) or symbol.startswith(underlying)) and p.quantity
         ]
         lines = [
             self._line("╔", "═", "╗", width),
@@ -120,24 +121,44 @@ class TerminalDashboard:
             self._row("  OPEN PAPER POSITIONS", width),
             self._line("╟", "─", "╢", width),
             self._row(
-                f"  {'SYMBOL':<22}│{'QTY':>6}│{'SIDE':<6}│"
-                f"{'ENTRY':>10}│{'CURRENT':>10}│{'SL':>10}│"
-                f"{'TSL':>10}│{'UNREAL PNL':>14}",
+                f"  {'LEG':<12}│{'STRIKE':>7}│{'SPOT':>10}│{'SIDE':<6}│"
+                f"{'QTY':>5}│{'ENTRY':>9}│{'CURRENT':>9}│{'SL':>9}│"
+                f"{'TSL':>9}│{'UNREAL PNL':>14}",
                 width,
             )
         ])
         if not active:
             lines.append(self._row("  No open paper positions", width))
+        spot_q = runtime.quotes.get(underlying)
+        spot_str = f"{spot_q.last:>10.2f}" if spot_q else "       n/a"
         for p in active:
             q = runtime.quotes.get(p.symbol) or runtime.execution.last_quotes.get(p.symbol)
             mark = (q.bid if p.quantity > 0 else q.ask) if q else None
             unreal = p.quantity * (mark - p.average_price) if mark is not None else None
             side = "LONG" if p.quantity > 0 else "SHORT"
             sl, tsl = self._stops(runtime, p, prefix, snapshot)
+
+            is_hedge = "HEDGE" in p.symbol
+            is_ce = "CE" in p.symbol or bool(re.search(r"C\d+", p.symbol))
+            if is_hedge:
+                leg_name = "CE_HEDGE" if is_ce else "PE_HEDGE"
+            else:
+                leg_name = "CE" if is_ce else "PE"
+
+            m = re.search(r'(\d{4,6})', p.symbol)
+            if m:
+                strike_str = f"{int(m.group(1)):>7}"
+            elif spot_q:
+                atm = int(round(spot_q.last / 50.0) * 50)
+                s = atm + (1000 if is_ce else -1000) if is_hedge else atm
+                strike_str = f"{s:>7}"
+            else:
+                strike_str = "    n/a"
+
             lines.append(self._row(
-                f"  {p.symbol:<22}│{p.quantity:>+6}│{side:<6}│"
-                f"{p.average_price:>10.2f}│{self._num(mark):>10}│"
-                f"{self._num(sl):>10}│{self._num(tsl):>10}│"
+                f"  {leg_name:<12}│{strike_str}│{spot_str}│{side:<6}│"
+                f"{p.quantity:>+5}│{p.average_price:>9.2f}│{self._num(mark):>9}│"
+                f"{self._num(sl):>9}│{self._num(tsl):>9}│"
                 f"{self._money(unreal or 0.0, 14)}",
                 width,
             ))
@@ -227,7 +248,13 @@ class TerminalDashboard:
             atr_value = snapshot.get("atr_1m")
             tsl = best + runtime.config.mcx_k * atr_value if atr_value else None
             return sl, tsl
-        return position.metadata.get("sl"), position.metadata.get("tsl")
+        entry_p = position.average_price
+        lowest_p = runtime._nifty_low.get(position.symbol, entry_p) if hasattr(runtime, "_nifty_low") else entry_p
+        dte = int(getattr(runtime.market_data, "nifty_dte", 0))
+        trail_pct = 0.05 if dte <= 1 else 0.07
+        initial_sl = entry_p * 1.35
+        tsl = lowest_p * (1.0 + trail_pct)
+        return initial_sl, tsl
 
     @staticmethod
     def _line(left: str, fill: str, right: str, width: int) -> str:
@@ -276,8 +303,14 @@ class TerminalDashboard:
         return "FLAT"
 
     @staticmethod
-    def _num(value) -> str:
-        return "n/a" if value is None else f"{float(value):.3f}"
+    def _num(value, decimals: int = 2) -> str:
+        if value is None:
+            return "n/a"
+        try:
+            d = decimals if decimals <= 6 else 2
+            return f"{float(value):.{d}f}"
+        except Exception:
+            return "n/a"
 
     @staticmethod
     def _warmup(runtime) -> str:
@@ -608,29 +641,58 @@ class TradingRuntime:
                      if (s.startswith("NIFTY") or "NIFTY" in s) and p.quantity}
         if not positions:
             return
-        for symbol in positions:
+
+        if not hasattr(self, "_nifty_low"):
+            self._nifty_low = {}
+        for symbol, position in positions.items():
             q = quotes.get(symbol) or self._option_quote(symbol, quotes)
             if q:
                 self.quotes[symbol] = q
+                if position.quantity < 0:
+                    self._nifty_low[symbol] = min(self._nifty_low.get(symbol, position.average_price), q.ask)
+
         dte = int(getattr(self.market_data, "nifty_dte", 0))
         if self.nifty.should_flatten(now, dte):
             for symbol, position in positions.items():
                 quote = self.quotes.get(symbol)
                 if quote:
-                    self._submit(Order(symbol, Side.BUY, abs(position.quantity),
+                    close_side = Side.SELL if position.quantity > 0 else Side.BUY
+                    self._submit(Order(symbol, close_side, abs(position.quantity),
                                        trigger_type=TriggerType.CIRCUIT_BREAKER,
                                        strategy="NiftyOptions"), quote, now)
             return
+
+        short_positions = {s: p for s, p in positions.items() if p.quantity < 0}
+        trail_pct = 0.05 if dte <= 1 else 0.07
+        for symbol, position in short_positions.items():
+            quote = self.quotes.get(symbol)
+            if not quote:
+                continue
+            entry_p = position.average_price
+            lowest_p = self._nifty_low.get(symbol, entry_p)
+            initial_sl = entry_p * 1.35
+            tsl = lowest_p * (1.0 + trail_pct)
+            
+            trigger = None
+            if quote.ask >= initial_sl:
+                trigger = TriggerType.STOP_LOSS_HIT
+            elif lowest_p <= entry_p * 0.95 and quote.ask >= tsl:
+                trigger = TriggerType.TRAILING_STOP_HIT
+            if trigger:
+                self._submit(Order(symbol, Side.BUY, abs(position.quantity),
+                                   trigger_type=trigger,
+                                   strategy="NiftyOptions"), quote, now)
+                log.info("Nifty short position %s stopped out via %s (ask=%.2f)",
+                         symbol, trigger.value, quote.ask)
+
         signal = self.signal_events[-1]["direction"] if self.signal_events and self.signal_events[-1]["underlying"] == "NIFTY" else 0
-        if signal == 0:
+        if signal == 0 or signal == self._last_nifty_action_signal:
             return
-        if signal == self._last_nifty_action_signal:
-            return
-        self._last_nifty_action_signal = signal
+
         is_call_loss = signal > 0
         losing_pos = next(
-            (p for s, p in positions.items()
-             if p.quantity < 0 and (("CE" in s or "C" in s) if is_call_loss else ("PE" in s or "P" in s))),
+            (p for s, p in short_positions.items()
+             if (("CE" in s or "C" in s) if is_call_loss else ("PE" in s or "P" in s))),
             None
         )
         if not losing_pos:
@@ -639,19 +701,22 @@ class TradingRuntime:
         quote = self.quotes.get(losing_symbol)
         if not quote:
             return
-        self._submit(Order(losing_symbol, Side.BUY, abs(losing_pos.quantity),
-                           trigger_type=TriggerType.PROACTIVE_CUT,
-                           strategy="NiftyOptions"), quote, now)
-        adx_value = snapshot.get("adx_300_1s") or 0.0
-        if adx_value <= self.config.nifty_adx_threshold and (
-                dte > 1 or now.strftime("%H:%M") < self.config.nifty_low_dte_cutoff):
-            new_quote = self._option_quote(losing_symbol, quotes)
-            if new_quote:
-                new_sym = new_quote.symbol
-                self._submit(Order(new_sym, Side.SELL,
-                                   self.nifty.size(1, getattr(self.risk, "ivr20", None), dte),
-                                   trigger_type=TriggerType.RE_CENTER,
-                                   strategy="NiftyOptions"), new_quote, now)
+        loss_pct = (quote.ask - losing_pos.average_price) / losing_pos.average_price
+        if loss_pct >= 0.05:
+            self._submit(Order(losing_symbol, Side.BUY, abs(losing_pos.quantity),
+                               trigger_type=TriggerType.PROACTIVE_CUT,
+                               strategy="NiftyOptions"), quote, now)
+            self._last_nifty_action_signal = signal
+            adx_value = snapshot.get("adx_300_1s") or 0.0
+            if adx_value <= self.config.nifty_adx_threshold and (
+                    dte > 1 or now.strftime("%H:%M") < self.config.nifty_low_dte_cutoff):
+                new_quote = self._option_quote(losing_symbol, quotes)
+                if new_quote:
+                    new_sym = new_quote.symbol
+                    self._submit(Order(new_sym, Side.SELL,
+                                       self.nifty.size(1, getattr(self.risk, "ivr20", None), dte),
+                                       trigger_type=TriggerType.RE_CENTER,
+                                       strategy="NiftyOptions"), new_quote, now)
 
     def process_quotes(self, quotes: dict[str, Quote], now: datetime) -> None:
         self.quotes.update({s: q for s, q in quotes.items() if isinstance(q, Quote)})
@@ -728,6 +793,7 @@ class TradingRuntime:
                                                trigger_type=TriggerType.RE_CENTER),
                                          leg_quote, now)
                         self.nifty.state, self._nifty_entered = "OPEN", True
+                        self._last_nifty_action_signal = signal
                     else:
                         missing = [symbol for symbol, leg_quote in legs if leg_quote is None]
                         self.next_action = f"waiting for option contracts: {', '.join(missing)}"
