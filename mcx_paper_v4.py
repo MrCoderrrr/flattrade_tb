@@ -379,6 +379,8 @@ class NaturalGasPaperBot:
                             try:
                                 val = float(raw)
                                 if val > 0:
+                                    self._last_spot_for_sim = val
+
                                     pos['_last_ltp'] = val
                                     pos['_last_ltp_ts'] = now_ts
                                     return val
@@ -905,7 +907,6 @@ class NaturalGasPaperBot:
     def run(self):
         self.authenticate()
         self._get_mcx_csv()
-        self._apply_leg_adjustments()
 
         DIM = f'{Fore.WHITE}{Style.DIM}'
         CY  = f'{Fore.CYAN}{Style.BRIGHT}'
