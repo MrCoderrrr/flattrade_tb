@@ -161,7 +161,8 @@ class FlattradeMarketData:
         parts = logical_symbol.split("-")
         if len(parts) < 2 or parts[1] not in {"CE", "PE"}:
             return None
-        underlying, option_type = parts
+        underlying = parts[0]
+        option_type = parts[1]
         hedge = len(parts) == 3 and parts[2] == "HEDGE"
         if underlying == "NIFTY":
             exchange, token = "NSE", self.symbols["NIFTY"][1]
@@ -218,9 +219,15 @@ class FlattradeMarketData:
         if not isinstance(response, dict):
             self._last_error = f"invalid option quote response for {symbol}: {response}"
             return None
-        last = float(response.get("lp", response.get("ltp", 0.0)) or 0.0)
-        bid = float(response.get("bp", response.get("bid", last)) or last)
-        ask = float(response.get("sp", response.get("ask", last)) or last)
+        last = float(response.get("lp", response.get("ltp", response.get("c", 0.0))) or 0.0)
+        bid = float(response.get("bp1", response.get("bp", response.get("bid", 0.0))) or 0.0)
+        ask = float(response.get("sp1", response.get("sp", response.get("ask", 0.0))) or 0.0)
+        if last <= 0 and max(bid, ask) > 0:
+            last = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else max(bid, ask)
+        if bid <= 0:
+            bid = last
+        if ask <= 0:
+            ask = last
         if min(last, bid, ask) <= 0:
             self._last_error = f"option quote has no positive prices for {symbol}: {response}"
             return None
@@ -230,8 +237,13 @@ class FlattradeMarketData:
     def _select_contracts(values: list[dict], underlying: str,
                           option_type: str, strike: int) -> list[dict]:
         """Select the nearest valid expiry and exact strike, never values[0]."""
-        today = datetime.now(timezone.utc).date()
+        IST = timezone(timedelta(hours=5, minutes=30))
+        today = datetime.now(IST).date()
         candidates = []
+        is_ce = option_type.startswith("C")
+        target_char = "C" if is_ce else "P"
+        other_char = "P" if is_ce else "C"
+
         for item in values:
             tsym = str(item.get("tsym", "")).upper()
             if underlying == "NIFTY" and (
@@ -239,27 +251,43 @@ class FlattradeMarketData:
                 or tsym.startswith(("BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"))
             ):
                 continue
-            if option_type not in tsym:
-                continue
+
+            optt = str(item.get("optt", "")).upper()
+            if optt in ("CE", "PE", "CALL", "PUT"):
+                if is_ce and optt in ("PE", "PUT"):
+                    continue
+                if not is_ce and optt in ("CE", "CALL"):
+                    continue
+            else:
+                has_target = (option_type in tsym) or bool(re.search(rf"{target_char}\d+$", tsym)) or bool(re.search(rf"\d+{target_char}$", tsym))
+                has_other = ("PE" if is_ce else "CE") in tsym or bool(re.search(rf"{other_char}\d+$", tsym)) or bool(re.search(rf"\d+{other_char}$", tsym))
+                if not has_target and has_other:
+                    continue
+
             item_strike = item.get("strprc", item.get("strike", item.get("StrikePrice")))
             if item_strike is not None:
                 try:
-                    if abs(float(item_strike) - strike) > 0.01:
+                    s_val = float(item_strike)
+                    if s_val > 100000:
+                        s_val /= 100.0
+                    if abs(s_val - strike) > 0.01:
                         continue
                 except (TypeError, ValueError):
-                    continue
+                    pass
+
             expiry_text = str(item.get("exd", item.get("expiry", "")))
             expiry = None
-            for fmt in ("%d-%b-%Y", "%d-%b-%y", "%Y-%m-%d"):
+            for fmt in (
+                "%d-%b-%Y", "%d-%b-%y", "%d-%B-%Y",
+                "%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d",
+                "%d%b%Y", "%d%b%y", "%Y%m%d"
+            ):
                 try:
                     expiry = datetime.strptime(expiry_text, fmt).date()
                     break
                 except ValueError:
                     pass
             if expiry is None:
-                # Flattrade symbols commonly encode expiry as 25SEP26,
-                # immediately after the NIFTY prefix. Parse two-digit years
-                # before attempting a four-digit fallback.
                 match = re.search(r"(\d{2}[A-Z]{3}\d{2})", tsym)
                 if match:
                     try:
@@ -273,10 +301,34 @@ class FlattradeMarketData:
                         expiry = datetime.strptime(match.group(1), "%d%b%Y").date()
                     except ValueError:
                         expiry = None
-            if expiry is not None and expiry >= today:
+            if expiry is None:
+                match = re.search(r"NIFTY(\d{2})([1-9OND])(\d{2})", tsym)
+                if match:
+                    try:
+                        yr = 2000 + int(match.group(1))
+                        m_char = match.group(2)
+                        mo = 10 if m_char == "O" else (11 if m_char == "N" else (12 if m_char == "D" else int(m_char)))
+                        dy = int(match.group(3))
+                        expiry = datetime(yr, mo, dy).date()
+                    except ValueError:
+                        expiry = None
+
+            if expiry is None:
+                expiry = today
+
+            if expiry >= today:
                 candidates.append((expiry, item))
+
         candidates.sort(key=lambda pair: pair[0])
-        return [item for _, item in candidates]
+        if candidates:
+            return [item for _, item in candidates]
+
+        fallback = []
+        for item in values:
+            tsym = str(item.get("tsym", "")).upper()
+            if underlying == "NIFTY" and not tsym.startswith(("BANKNIFTY", "FINNIFTY", "MIDCPNIFTY")):
+                fallback.append(item)
+        return fallback or values
 
     def atm_straddle_iv(self, underlying: str) -> float:
         if self.api is None:

@@ -712,7 +712,8 @@ class TradingRuntime:
             self.next_action = "risk halt: liquidating positions; awaiting operator reset"
             log.error("combined paper loss limit reached (%.2f); guardian halted", pnl)
         elif not self.risk.halted:
-            self.next_action = "monitoring feed and strategy gates"
+            if not self.next_action.startswith("waiting for option contracts"):
+                self.next_action = "monitoring feed and strategy gates"
 
     def heartbeat(self, now: datetime | None = None) -> None:
         now = now or datetime.now(IST)
