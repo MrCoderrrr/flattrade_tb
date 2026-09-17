@@ -144,6 +144,20 @@ class FlattradeMarketData:
         api = self._ensure_api()
         if api is None:
             return None
+        cached = self._contract_cache.get(logical_symbol)
+        if cached:
+            try:
+                response = api.get_quotes(
+                    exchange=cached["exchange"], token=cached["token"]
+                )
+                quote = self._quote_from_response(
+                    cached["tsym"], response, datetime.now(timezone.utc)
+                )
+                if quote is not None:
+                    return quote
+            except (KeyError, TypeError, ValueError) as exc:
+                self._last_error = f"cached option quote failed for {logical_symbol}: {exc}"
+            self._contract_cache.pop(logical_symbol, None)
         parts = logical_symbol.split("-")
         if len(parts) < 2 or parts[1] not in {"CE", "PE"}:
             return None
@@ -184,20 +198,33 @@ class FlattradeMarketData:
             item = candidates[0]
             contract = str(item.get("token", ""))
             response = api.get_quotes(exchange=search_exchange, token=contract)
-            if not isinstance(response, dict):
-                self._last_error = f"invalid option quote response for {contract}: {response}"
-                return None
             now = datetime.now(timezone.utc)
-            last = float(response.get("lp", response.get("ltp", 0.0)) or 0.0)
-            bid = float(response.get("bp", response.get("bid", last)) or last)
-            ask = float(response.get("sp", response.get("ask", last)) or last)
-            if min(last, bid, ask) <= 0:
-                self._last_error = f"option quote has no positive prices for {contract}: {response}"
+            quote = self._quote_from_response(
+                str(item.get("tsym", logical_symbol)), response, now
+            )
+            if quote is None:
                 return None
-            return Quote(str(item.get("tsym", logical_symbol)), now, bid, ask, last)
+            self._contract_cache[logical_symbol] = {
+                "exchange": search_exchange,
+                "token": contract,
+                "tsym": str(item.get("tsym", logical_symbol)),
+            }
+            return quote
         except (KeyError, TypeError, ValueError) as exc:
             self._last_error = f"option lookup failed for {logical_symbol}: {exc}"
             return None
+
+    def _quote_from_response(self, symbol: str, response, now: datetime) -> Quote | None:
+        if not isinstance(response, dict):
+            self._last_error = f"invalid option quote response for {symbol}: {response}"
+            return None
+        last = float(response.get("lp", response.get("ltp", 0.0)) or 0.0)
+        bid = float(response.get("bp", response.get("bid", last)) or last)
+        ask = float(response.get("sp", response.get("ask", last)) or last)
+        if min(last, bid, ask) <= 0:
+            self._last_error = f"option quote has no positive prices for {symbol}: {response}"
+            return None
+        return Quote(symbol, now, bid, ask, last)
 
     @staticmethod
     def _select_contracts(values: list[dict], underlying: str,
