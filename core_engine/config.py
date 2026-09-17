@@ -34,7 +34,7 @@ class EngineConfig:
     nifty_recenter_k: float = 1.5
     nifty_deceleration_k: float = 1.0
     nifty_low_dte_cutoff: str = "14:00"
-    nifty_flatten_time: str = "15:15"
+    nifty_flatten_time: str = "15:34"
 
 
 DEFAULT_CONFIG = EngineConfig()

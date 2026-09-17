@@ -17,7 +17,7 @@ def in_session(now: datetime) -> bool:
     # NSE runs Monday-Friday. MCX's evening session opens Sunday and runs
     # through Friday; Saturday is closed. Boundaries are half-open so the
     # scheduler never starts a process after the session has ended.
-    nse_open = now.weekday() < 5 and "09:15" <= hhmm < "15:15"
+    nse_open = now.weekday() < 5 and "09:15" <= hhmm < "15:34"
     mcx_open = now.weekday() != 5 and "18:00" <= hhmm < "23:25"
     return nse_open or mcx_open
 

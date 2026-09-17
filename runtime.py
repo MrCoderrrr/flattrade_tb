@@ -33,7 +33,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 
 
 def _in_window(now: datetime, start: str, end: str) -> bool:
-    value = now.strftime("%H:%M")
+    value = now.astimezone(IST).strftime("%H:%M")
     return start <= value < end
 
 
@@ -47,7 +47,7 @@ class TerminalDashboard:
 
     def render(self, runtime: "TradingRuntime", now: datetime) -> str:
         now_ist = now.astimezone(IST)
-        if now_ist.weekday() < 5 and _in_window(now_ist, "09:15", "15:15"):
+        if now_ist.weekday() < 5 and _in_window(now_ist, "09:15", "15:34"):
             strategy = "NIFTY"
             prefix = "NIFTY-"
         elif now_ist.weekday() != 5 and _in_window(now_ist, "18:00", "23:25"):
@@ -196,7 +196,7 @@ class TerminalDashboard:
             self._row(f"  PAPER TRADING SYSTEM{' ' * 39}{now.strftime('%Y-%m-%d %H:%M:%S IST')}", width),
             self._line("╠", "═", "╣", width),
             self._row("  NO STRATEGY SESSION ACTIVE", width),
-            self._row("  NIFTY: 09:15–15:15 IST  │  MCX NATURAL GAS: 18:00–23:25 IST", width),
+            self._row("  NIFTY: 09:15–15:34 IST  │  MCX NATURAL GAS: 18:00–23:25 IST", width),
             self._row("  Scheduler/runtime is waiting for the next configured paper session.", width),
             self._line("╚", "═", "╝", width),
         ])
@@ -328,7 +328,7 @@ class TerminalDashboard:
     def _feed(runtime, now) -> str:
         now_ist = now.astimezone(IST)
         active_underlyings = []
-        if now_ist.weekday() < 5 and _in_window(now_ist, "09:15", "15:15"):
+        if now_ist.weekday() < 5 and _in_window(now_ist, "09:15", "15:34"):
             active_underlyings.append("NIFTY")
         if now_ist.weekday() != 5 and _in_window(now_ist, "18:00", "23:25"):
             active_underlyings.append("MCX-NATGAS")
@@ -563,7 +563,7 @@ class TradingRuntime:
             self._history = {"NIFTY": [], "MCX-NATGAS": []}
             self._persist_indicator_state()
         self._session_date = date
-        if not _in_window(now.astimezone(IST), "09:15", "15:15"):
+        if not _in_window(now, "09:15", "15:34"):
             self._flatten(now, lambda symbol: symbol.startswith("NIFTY"))
         if not _in_window(now.astimezone(IST), "18:00", "23:25"):
             self._flatten(now, lambda symbol: symbol.startswith("MCX-NATGAS-"))
@@ -800,13 +800,21 @@ class TradingRuntime:
         if hasattr(self.market_data, "latest"):
             self.market_data.latest.update(self.quotes)
         self._session_controls(now)
-        if not quotes:
+        now_ist = now.astimezone(IST)
+        active = []
+        if now_ist.weekday() < 5 and _in_window(now, "09:15", "15:34"):
+            active.append("NIFTY")
+        if now_ist.weekday() != 5 and _in_window(now, "18:00", "23:25"):
+            active.append("MCX-NATGAS")
+        active_quotes = {name: quotes.get(name) for name in active}
+        if not active_quotes or not any(active_quotes.values()):
             detail = getattr(self.market_data, "_last_error", "")
             self.next_action = (
                 f"feed unavailable: {detail}" if detail
                 else "waiting for an authenticated market-data feed; no fabricated quotes"
             )
-            log.warning("market-data feed unavailable; no tradable quotes")
+            log.warning("active-session market-data unavailable for %s; no tradable quotes",
+                        ", ".join(active) or "none")
             return
         for underlying in ("MCX-NATGAS", "NIFTY"):
             quote = quotes.get(underlying)
@@ -821,7 +829,7 @@ class TradingRuntime:
             signal = self._persisted_signal(
                 underlying, snapshot, now, emit=underlying != "NIFTY")
             if underlying == "NIFTY":
-                if not _in_window(now, "09:15", "15:15"):
+                if not _in_window(now, "09:15", "15:34"):
                     continue
                 dte = int(getattr(self.market_data, "nifty_dte", 5))
                 signal = signal if self.nifty.confirm_signal(now, dte, signal) else 0
@@ -848,7 +856,7 @@ class TradingRuntime:
                 self._manage_mcx(now, signal, quotes)
             else:
                 ivr = self.risk.ivr20
-                if (signal and _in_window(now, "09:15", "15:15")
+                if (signal and _in_window(now, "09:15", "15:34")
                         and not snapshot.get("warmup") and not self._nifty_entered
                         and not self.risk.halted and self.nifty.ivr_allows_entry(ivr)):
                     dte = int(getattr(self.market_data, "nifty_dte", 5))

@@ -86,5 +86,6 @@ class NiftyOptionsStrategy:
         return None
 
     def should_flatten(self, now: datetime, dte: int) -> bool:
-        hhmm = now.strftime("%H:%M")
+        from runtime import IST
+        hhmm = now.astimezone(IST).strftime("%H:%M")
         return hhmm >= self.config.nifty_flatten_time or (dte <= 1 and hhmm >= self.config.nifty_low_dte_cutoff)
