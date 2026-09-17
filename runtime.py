@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import logging
 import json
+import atexit
 import os
+import signal
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -19,7 +21,7 @@ from adapters.paper_execution import PaperExecution
 from adapters.telegram_notifier import TelegramNotifier
 from core_engine.config import DEFAULT_CONFIG
 from core_engine.indicators import IndicatorRegistry
-from core_engine.models import Bar, Order, Quote, Side, TriggerType
+from core_engine.models import Bar, Order, Position, Quote, Side, TriggerType
 from core_engine.risk_guardian import RiskGuardian
 from core_engine.trade_logger import TradeLogger
 from strategies.mcx_natgas import MCXNatGasStrategy
@@ -311,6 +313,16 @@ class TradingRuntime:
         ))
         self._history: dict[str, list[Quote]] = {"NIFTY": [], "MCX-NATGAS": []}
         self._restore_indicator_state()
+        atexit.register(self._persist_indicator_state)
+        try:
+            for signum in (signal.SIGTERM, signal.SIGINT):
+                signal.signal(signum, self._handle_shutdown)
+        except ValueError:
+            pass
+
+    def _handle_shutdown(self, signum, frame) -> None:
+        self._persist_indicator_state()
+        raise SystemExit(128 + signum)
 
     @staticmethod
     def _quote_to_dict(quote: Quote) -> dict:
@@ -363,6 +375,22 @@ class TradingRuntime:
                     self.snapshots[underlying] = self.indicators.update(
                         underlying, self._bar(underlying, quote)
                     )
+            for symbol, value in payload.get("positions", {}).items():
+                position = self.execution.positions.setdefault(
+                    symbol, self.execution.positions.get(symbol)
+                    or Position(symbol)
+                )
+                position.quantity = int(value.get("quantity", 0))
+                position.average_price = float(value.get("average_price", 0.0))
+                position.realized_pnl = float(value.get("realized_pnl", 0.0))
+            self.execution.cash_pnl = float(payload.get("cash_pnl", 0.0))
+            if any(symbol.startswith("NIFTY-") and position.quantity
+                   for symbol, position in self.execution.positions.items()):
+                self.nifty.state = "OPEN"
+                self._nifty_entered = True
+            if any(symbol.startswith("MCX-NATGAS-") and position.quantity
+                   for symbol, position in self.execution.positions.items()):
+                self.mcx.state.strangle_initialized = True
             restored_count = sum(len(values) for values in self._history.values())
             if restored_count:
                 self.next_action = f"restored {restored_count} persisted market ticks"
@@ -381,6 +409,16 @@ class TradingRuntime:
                 ]
                 for underlying, values in self._history.items()
             },
+            "positions": {
+                symbol: {
+                    "quantity": position.quantity,
+                    "average_price": position.average_price,
+                    "realized_pnl": position.realized_pnl,
+                }
+                for symbol, position in self.execution.positions.items()
+                if position.quantity
+            },
+            "cash_pnl": self.execution.cash_pnl,
         }
         temporary = self._state_file.with_suffix(self._state_file.suffix + ".tmp")
         try:
@@ -673,6 +711,8 @@ class TradingRuntime:
         except Exception:
             log.exception("market-data heartbeat failed; entries halted for tick")
             self.next_action = "feed error; entries halted for this heartbeat"
+        finally:
+            self._persist_indicator_state()
         self.last_status = (f"PAPER heartbeat={self.heartbeat_count} positions="
                             f"{sum(abs(p.quantity) for p in self.execution.positions.values())} "
                             f"pnl={self.execution.mark_to_market(self.quotes):.2f} "
