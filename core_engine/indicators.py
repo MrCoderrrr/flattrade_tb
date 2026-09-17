@@ -49,20 +49,22 @@ class AdaptivePersistence:
 
 def atr(bars: Iterable, period: int = 14) -> Optional[float]:
     bars = list(bars)
-    if len(bars) < period + 1:
+    actual_period = min(period, len(bars) - 1)
+    if actual_period < 1:
         return None
     trs = [max(b.high - b.low, abs(b.high - p.close), abs(b.low - p.close))
-           for p, b in zip(bars[-period - 1:-1], bars[-period:])]
-    return sum(trs) / period
+           for p, b in zip(bars[-actual_period - 1:-1], bars[-actual_period:])]
+    return sum(trs) / actual_period
 
 
 def adx(bars: Iterable, period: int = 300) -> Optional[float]:
     bars = list(bars)
-    if len(bars) < period + 1:
+    actual_period = min(period, len(bars) - 1)
+    if actual_period < 1:
         return None
     highs, lows, closes = [b.high for b in bars], [b.low for b in bars], [b.close for b in bars]
     trs, plus, minus = [], [], []
-    for i in range(-period, 0):
+    for i in range(-actual_period, 0):
         trs.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1])))
         up, down = highs[i] - highs[i - 1], lows[i - 1] - lows[i]
         plus.append(up if up > down and up > 0 else 0.0)
@@ -130,7 +132,7 @@ class ContinuousIndicatorEngine:
                 "rv60": rv60, "rv300": rv300, "adx_300_1s": adx(self.second_bars, 300),
                 "atr_1m": self.atr_1m, "vr_ratio": vr,
                 "persistence_raw": None if vr is None else AdaptivePersistence.raw(vr),
-                "warmup": len(self.second_bars) < 301 or len(self.minute_bars) < 15}
+                "warmup": len(self.second_bars) < 2}
 
 
 class IndicatorRegistry:
