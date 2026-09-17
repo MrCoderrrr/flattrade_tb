@@ -171,17 +171,20 @@ class FlattradeMarketData:
     def heartbeat(self, now: datetime, runtime=None) -> dict[str, Quote]:
         quotes = self.poll(now)
 
+        has_active = False
         # 1. Update quotes for all open positions every single second
         if runtime and hasattr(runtime, "execution") and hasattr(runtime.execution, "positions"):
-            for symbol, position in runtime.execution.positions.items():
-                if position.quantity:
+            active_items = [(s, p) for s, p in runtime.execution.positions.items() if p.quantity]
+            if active_items:
+                has_active = True
+                for symbol, position in active_items:
                     oq = self.option_quote(symbol, quotes=quotes)
                     if oq:
                         quotes[symbol] = oq
                         self.latest[symbol] = oq
 
-        # 2. Also keep ATM option chain quotes refreshed every second
-        if "NIFTY" in quotes:
+        # 2. Only keep ATM option chain quotes refreshed when waiting for entry (no open positions)
+        if "NIFTY" in quotes and not has_active:
             for logical in ("NIFTY-CE", "NIFTY-PE", "NIFTY-CE-HEDGE", "NIFTY-PE-HEDGE"):
                 oq = self.option_quote(logical, quotes=quotes)
                 if oq:

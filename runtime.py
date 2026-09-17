@@ -517,6 +517,16 @@ class TradingRuntime:
         self.quotes[order.symbol] = quote
         trade = self.execution.submit(order, quote)
         self.logger.log(trade, state_at_entry=order.trigger_type.value)
+        if "NIFTY" in order.symbol:
+            if not hasattr(self, "_nifty_low"):
+                self._nifty_low = {}
+            if order.side is Side.SELL:
+                # Entering new short leg - anchor lowest observed ask at entry
+                init_ask = quote.ask if quote and quote.ask > 0 else trade.price
+                self._nifty_low[order.symbol] = init_ask
+            elif order.side is Side.BUY:
+                # Exiting short leg - clear lowest observed ask so stale data is never reused
+                self._nifty_low.pop(order.symbol, None)
 
     def _flatten(self, now: datetime, predicate) -> None:
         """Flatten only from a real quote; never invent a close price."""
@@ -659,7 +669,10 @@ class TradingRuntime:
             if q:
                 self.quotes[symbol] = q
                 if position.quantity < 0:
-                    self._nifty_low[symbol] = min(self._nifty_low.get(symbol, position.average_price), q.ask)
+                    curr_low = self._nifty_low.get(symbol, position.average_price)
+                    if curr_low <= 0 or curr_low < position.average_price * 0.5:
+                        curr_low = position.average_price
+                    self._nifty_low[symbol] = min(curr_low, q.ask)
 
         dte = int(getattr(self.market_data, "nifty_dte", 0))
         if self.nifty.should_flatten(now, dte):
@@ -703,9 +716,9 @@ class TradingRuntime:
             return
 
         trail_pct = 0.05 if dte <= 1 else 0.07
-        for symbol, position in short_positions.items():
+        for symbol, position in list(short_positions.items()):
             quote = self.quotes.get(symbol)
-            if not quote:
+            if not quote or position.average_price <= 0:
                 continue
             entry_p = position.average_price
             lowest_p = self._nifty_low.get(symbol, entry_p)
@@ -724,9 +737,15 @@ class TradingRuntime:
                 log.info("Nifty short position %s stopped out via %s (ask=%.2f)",
                          symbol, trigger.value, quote.ask)
 
+        # Refresh active short positions after stop evaluations
+        active_shorts = {
+            s: p for s, p in self.execution.positions.items()
+            if (s.startswith("NIFTY") or "NIFTY" in s) and p.quantity < 0 and p.average_price > 0
+        }
+
         # Solo leg safeguard & re-centering when only 1 short leg remains:
-        if len(short_positions) == 1:
-            surviving_sym = next(iter(short_positions))
+        if len(active_shorts) == 1:
+            surviving_sym = next(iter(active_shorts))
             is_surviving_ce = "CE" in surviving_sym or bool(re.search(r"C\d+", surviving_sym))
             missing_type = "PE" if is_surviving_ce else "CE"
             missing_logical = f"NIFTY-{missing_type}"
@@ -750,17 +769,20 @@ class TradingRuntime:
                              new_sym, new_quote.ask)
             return
 
+        if len(active_shorts) <= 1:
+            return
+
         signal = self.signal_events[-1]["direction"] if self.signal_events and self.signal_events[-1]["underlying"] == "NIFTY" else 0
         if signal == 0 or signal == self._last_nifty_action_signal:
             return
 
         is_call_loss = signal > 0
         losing_pos = next(
-            (p for s, p in short_positions.items()
+            (p for s, p in active_shorts.items()
              if (("CE" in s or "C" in s) if is_call_loss else ("PE" in s or "P" in s))),
             None
         )
-        if not losing_pos:
+        if not losing_pos or losing_pos.average_price <= 0:
             return
         losing_symbol = losing_pos.symbol
         quote = self.quotes.get(losing_symbol)
