@@ -339,7 +339,7 @@ class TradingRuntime:
             self._flatten(now, lambda symbol: symbol.startswith("MCX-NATGAS-"))
 
     def _persisted_signal(self, underlying: str, snapshot: dict,
-                          now: datetime) -> int:
+                          now: datetime, *, emit: bool = True) -> int:
         if snapshot.get("warmup"):
             self._pending.pop(underlying, None)
             self._emitted.pop(underlying, None)
@@ -362,9 +362,10 @@ class TradingRuntime:
             return 0
         if (now - prior[1]).total_seconds() < required:
             return 0
-        if self._emitted.get(underlying) == direction:
+        if emit and self._emitted.get(underlying) == direction:
             return 0
-        self._emitted[underlying] = direction
+        if emit:
+            self._emitted[underlying] = direction
         return direction
 
     def _manage_mcx(self, now: datetime, signal: int, quotes: dict[str, Quote]):
@@ -476,7 +477,8 @@ class TradingRuntime:
                 self.risk.update_ivr(quote.iv)
             snapshot = self.indicators.update(underlying, self._bar(underlying, quote))
             self.snapshots[underlying] = snapshot
-            signal = self._persisted_signal(underlying, snapshot, now)
+            signal = self._persisted_signal(
+                underlying, snapshot, now, emit=underlying != "NIFTY")
             if underlying == "NIFTY":
                 if not _in_window(now, "09:15", "15:15"):
                     continue
