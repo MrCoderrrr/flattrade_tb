@@ -141,7 +141,7 @@ class NiftyPaperBot:
                 pass
         
         if not user_id or not os.path.exists(TOKEN_FILE):
-            print("[ERROR] Missing credentials for Flattrade.")
+            print(flush=True, "[ERROR] Missing credentials for Flattrade.")
             return False
 
         self.api = NorenApiPy()
@@ -150,7 +150,7 @@ class NiftyPaperBot:
         
         resp = self.api.set_session(userid=user_id, password="", usertoken=token)
         if isinstance(resp, dict) and str(resp.get("stat", "")).lower() in {"ok", "success"}:
-            print(f"[OK] Authenticated as {user_id}")
+            print(flush=True, f"[OK] Authenticated as {user_id}")
             return True
         return False
 
@@ -212,7 +212,7 @@ class NiftyPaperBot:
             'entry_price': price,
             'token': token
         }
-        print(f"[ENTER] {side} {qty}x {leg_id} @ {price}")
+        print(flush=True, f"[ENTER] {side} {qty}x {leg_id} @ {price}")
 
     def _close_leg(self, leg_id: str, reason: str):
         if leg_id not in self.positions: return
@@ -222,7 +222,7 @@ class NiftyPaperBot:
         
         pnl = (price - pos['entry_price']) * pos['qty'] if pos['side'] == 'BUY' else (pos['entry_price'] - price) * pos['qty']
         self.total_realized_pnl += pnl
-        print(f"[CLOSE] {pos['side']} {pos['qty']}x {leg_id} @ {price} | PnL: {pnl:.2f} ({reason})")
+        print(flush=True, f"[CLOSE] {pos['side']} {pos['qty']}x {leg_id} @ {price} | PnL: {pnl:.2f} ({reason})")
         del self.positions[leg_id]
 
     def _close_all(self, reason: str):
@@ -296,7 +296,7 @@ class NiftyPaperBot:
         
         dash_str = "\n".join(lines)
         os.system('clear' if os.name == 'posix' else 'cls')
-        print(dash_str)
+        print(flush=True, dash_str)
         
         # Telegram Update
         global _last_tg_dash_msg_ids
@@ -315,23 +315,32 @@ class NiftyPaperBot:
             except: pass
 
     def run(self):
-        print("Starting NIFTY Engine...")
+        print(flush=True, "Starting NIFTY Engine...")
         if not self.authenticate(): return
         
         nifty_token = os.getenv("NIFTY_TOKEN", "26000")
         
+        last_wait_msg = 0.0
         while True:
             now = datetime.datetime.now(IST)
+            now_ts = time.time()
             
             # Session Control
             if now.hour > EXIT_HOUR or (now.hour == EXIT_HOUR and now.minute >= EXIT_MINUTE):
                 if self.positions:
                     self._close_all("SESSION_END")
                     send_telegram(f"Session Ended. Net PnL: {self.total_realized_pnl:.2f}")
-                time.sleep(60)
+                
+                if now_ts - last_wait_msg > 60:
+                    print(f"[{now.strftime('%H:%M:%S')}] NIFTY session closed. Sleeping...", flush=True)
+                    last_wait_msg = now_ts
+                time.sleep(10)
                 continue
                 
             if now.hour < ENTRY_HOUR_START or (now.hour == ENTRY_HOUR_START and now.minute < ENTRY_MINUTE_START):
+                if now_ts - last_wait_msg > 60:
+                    print(f"[{now.strftime('%H:%M:%S')}] Waiting for NIFTY market open at 09:15...", flush=True)
+                    last_wait_msg = now_ts
                 time.sleep(10)
                 continue
 
