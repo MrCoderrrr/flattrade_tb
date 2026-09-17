@@ -1,7 +1,9 @@
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from itertools import count
 from core_engine.execution import ExecutionAdapter
 from core_engine.models import Order, Quote, Trade, Position, Side
+
+IST = timezone(timedelta(hours=5, minutes=30))
 
 
 class PaperExecution(ExecutionAdapter):
@@ -19,7 +21,7 @@ class PaperExecution(ExecutionAdapter):
         if price is None:
             raise ValueError("paper execution requires a quote or limit_price")
         oid = f"PAPER-{next(self._ids)}"
-        trade = Trade(order, float(price), quote.timestamp if quote else datetime.now(timezone.utc), oid)
+        trade = Trade(order, float(price), quote.timestamp if quote else datetime.now(IST), oid)
         self.orders[oid] = trade
         position = self.positions.setdefault(order.symbol, Position(order.symbol))
         self.cash_pnl += position.apply(order.side, order.quantity, float(price))

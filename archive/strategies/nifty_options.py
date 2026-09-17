@@ -1,7 +1,9 @@
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from core_engine.config import DEFAULT_CONFIG, EngineConfig
 from core_engine.models import Order, Side, TriggerType, Position
+
+IST = timezone(timedelta(hours=5, minutes=30))
 
 
 @dataclass
@@ -86,5 +88,6 @@ class NiftyOptionsStrategy:
         return None
 
     def should_flatten(self, now: datetime, dte: int) -> bool:
-        hhmm = now.strftime("%H:%M")
+        now_ist = now.astimezone(IST) if now.tzinfo is not None else now
+        hhmm = now_ist.strftime("%H:%M")
         return hhmm >= self.config.nifty_flatten_time
