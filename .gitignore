@@ -11,3 +11,4 @@ data/
 *.patch
 token.txt
 multiplier.txt
+paper_runtime_state.json

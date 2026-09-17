@@ -7,10 +7,12 @@ Flattrade source simply returns no data.
 from __future__ import annotations
 
 import logging
+import json
 import os
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from adapters.flattrade_market_data import FlattradeMarketData
 from adapters.paper_execution import PaperExecution
@@ -302,6 +304,95 @@ class TradingRuntime:
         self.dashboard = TerminalDashboard() if dashboard else None
         self.next_action = "waiting for an authenticated market-data feed"
         self._session_date = None
+        self._history_limit = 1200
+        self._state_file = Path(os.getenv(
+            "PAPER_STATE_FILE",
+            str(Path(__file__).resolve().parent / "paper_runtime_state.json"),
+        ))
+        self._history: dict[str, list[Quote]] = {"NIFTY": [], "MCX-NATGAS": []}
+        self._restore_indicator_state()
+
+    @staticmethod
+    def _quote_to_dict(quote: Quote) -> dict:
+        return {
+            "timestamp": quote.timestamp.isoformat(),
+            "bid": quote.bid,
+            "ask": quote.ask,
+            "last": quote.last,
+            "iv": quote.iv,
+        }
+
+    @staticmethod
+    def _quote_from_dict(symbol: str, value: dict) -> Quote | None:
+        try:
+            timestamp = datetime.fromisoformat(str(value["timestamp"]))
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+            return Quote(
+                symbol,
+                timestamp,
+                float(value["bid"]),
+                float(value["ask"]),
+                float(value["last"]),
+                None if value.get("iv") is None else float(value["iv"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _restore_indicator_state(self) -> None:
+        """Replay today's persisted ticks so a restart does not reset warm-up."""
+        if not self._state_file.is_file():
+            return
+        try:
+            payload = json.loads(self._state_file.read_text())
+            saved_date = payload.get("date")
+            today = datetime.now(IST).date().isoformat()
+            if saved_date != today:
+                return
+            for underlying in ("NIFTY", "MCX-NATGAS"):
+                values = payload.get("quotes", {}).get(underlying, [])
+                restored = [
+                    quote for value in values
+                    if isinstance(value, dict)
+                    for quote in [self._quote_from_dict(underlying, value)]
+                    if quote is not None
+                ][-self._history_limit:]
+                self._history[underlying] = restored
+                for quote in restored:
+                    self.quotes[underlying] = quote
+                    self.snapshots[underlying] = self.indicators.update(
+                        underlying, self._bar(underlying, quote)
+                    )
+            restored_count = sum(len(values) for values in self._history.values())
+            if restored_count:
+                self.next_action = f"restored {restored_count} persisted market ticks"
+                log.info("Restored %d persisted market ticks from %s",
+                         restored_count, self._state_file)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            log.warning("Could not restore paper runtime state: %s", exc)
+
+    def _persist_indicator_state(self) -> None:
+        payload = {
+            "date": datetime.now(IST).date().isoformat(),
+            "quotes": {
+                underlying: [
+                    self._quote_to_dict(quote)
+                    for quote in values[-self._history_limit:]
+                ]
+                for underlying, values in self._history.items()
+            },
+        }
+        temporary = self._state_file.with_suffix(self._state_file.suffix + ".tmp")
+        try:
+            self._state_file.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(json.dumps(payload, separators=(",", ":")))
+            os.replace(temporary, self._state_file)
+        except OSError as exc:
+            log.warning("Could not persist paper runtime state: %s", exc)
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _bar(self, underlying: str, quote: Quote) -> Bar:
         return Bar(underlying, quote.timestamp, quote.last, quote.last,
@@ -357,6 +448,8 @@ class TradingRuntime:
             self.indicators = IndicatorRegistry(self.config)
             self.risk = RiskGuardian(self.config)
             self._guardian_liquidated = False
+            self._history = {"NIFTY": [], "MCX-NATGAS": []}
+            self._persist_indicator_state()
         self._session_date = date
         if not _in_window(now, "09:15", "15:15"):
             self._flatten(now, lambda symbol: symbol.startswith("NIFTY-"))
@@ -502,6 +595,8 @@ class TradingRuntime:
                 self.risk.update_ivr(quote.iv)
             snapshot = self.indicators.update(underlying, self._bar(underlying, quote))
             self.snapshots[underlying] = snapshot
+            self._history.setdefault(underlying, []).append(quote)
+            self._history[underlying] = self._history[underlying][-self._history_limit:]
             signal = self._persisted_signal(
                 underlying, snapshot, now, emit=underlying != "NIFTY")
             if underlying == "NIFTY":
@@ -556,6 +651,7 @@ class TradingRuntime:
                         missing = [symbol for symbol, leg_quote in legs if leg_quote is None]
                         self.next_action = f"waiting for option contracts: {', '.join(missing)}"
                 self._manage_nifty(now, snapshot, quotes)
+        self._persist_indicator_state()
         pnl = self.execution.mark_to_market(self.quotes)
         if not self.risk.check_pnl(pnl) and not self._guardian_liquidated:
             self.execution.close_all(self.quotes)
