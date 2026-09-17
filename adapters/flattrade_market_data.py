@@ -176,16 +176,27 @@ class FlattradeMarketData:
             values = result.get("values", []) if isinstance(result, dict) else []
             candidates = self._select_contracts(values, underlying, option_type, strike)
             if not candidates:
+                self._last_error = (
+                    f"no current {underlying} {option_type} contract for strike {strike}; "
+                    f"search returned {len(values)} results"
+                )
                 return None
             item = candidates[0]
             contract = str(item.get("token", ""))
             response = api.get_quotes(exchange=search_exchange, token=contract)
+            if not isinstance(response, dict):
+                self._last_error = f"invalid option quote response for {contract}: {response}"
+                return None
             now = datetime.now(timezone.utc)
-            return Quote(str(item.get("tsym", logical_symbol)), now,
-                         float(response.get("bp", response.get("lp", 0.0))),
-                         float(response.get("sp", response.get("lp", 0.0))),
-                         float(response.get("lp", 0.0)))
-        except (KeyError, TypeError, ValueError):
+            last = float(response.get("lp", response.get("ltp", 0.0)) or 0.0)
+            bid = float(response.get("bp", response.get("bid", last)) or last)
+            ask = float(response.get("sp", response.get("ask", last)) or last)
+            if min(last, bid, ask) <= 0:
+                self._last_error = f"option quote has no positive prices for {contract}: {response}"
+                return None
+            return Quote(str(item.get("tsym", logical_symbol)), now, bid, ask, last)
+        except (KeyError, TypeError, ValueError) as exc:
+            self._last_error = f"option lookup failed for {logical_symbol}: {exc}"
             return None
 
     @staticmethod
@@ -219,14 +230,22 @@ class FlattradeMarketData:
                 except ValueError:
                     pass
             if expiry is None:
-                match = re.search(r"(\d{2})([A-Z]{3})(\d{2,4})", tsym)
+                # Flattrade symbols commonly encode expiry as 25SEP26,
+                # immediately after the NIFTY prefix. Parse two-digit years
+                # before attempting a four-digit fallback.
+                match = re.search(r"(\d{2}[A-Z]{3}\d{2})", tsym)
                 if match:
-                    for fmt in ("%d%b%Y", "%d%b%y"):
-                        try:
-                            expiry = datetime.strptime("".join(match.groups()), fmt).date()
-                            break
-                        except ValueError:
-                            pass
+                    try:
+                        expiry = datetime.strptime(match.group(1), "%d%b%y").date()
+                    except ValueError:
+                        expiry = None
+            if expiry is None:
+                match = re.search(r"(\d{2}[A-Z]{3}\d{4})", tsym)
+                if match:
+                    try:
+                        expiry = datetime.strptime(match.group(1), "%d%b%Y").date()
+                    except ValueError:
+                        expiry = None
             if expiry is not None and expiry >= today:
                 candidates.append((expiry, item))
         candidates.sort(key=lambda pair: pair[0])

@@ -107,6 +107,11 @@ class TerminalDashboard:
                 f"│  ACTIVE LEGS  {len(active):>2}",
                 width,
             ),
+            self._row(
+                f"  SIGNAL  {self._signal_status(runtime, underlying):<20}"
+                f"│  OPTION DATA  {self._option_status(runtime, prefix):<40}",
+                width,
+            ),
             self._line("╠", "═", "╣", width),
             self._row("  OPEN PAPER POSITIONS", width),
             self._line("╟", "─", "╢", width),
@@ -168,6 +173,26 @@ class TerminalDashboard:
         if prefix == "NIFTY-":
             return runtime.nifty.state
         return TerminalDashboard._mcx_state(runtime)
+
+    @staticmethod
+    def _signal_status(runtime, underlying: str) -> str:
+        snapshot = runtime.snapshots.get(underlying, {})
+        if snapshot.get("warmup"):
+            return "WARMUP"
+        fast, medium, slope = snapshot.get("ema_15"), snapshot.get("ema_90"), snapshot.get("slow_slope")
+        if fast is None or medium is None or slope is None:
+            return "INDICATORS INCOMPLETE"
+        return "UP CANDIDATE" if fast > medium and slope > 0 else (
+            "DOWN CANDIDATE" if fast < medium and slope < 0 else "NO CONFIRMED SETUP")
+
+    @staticmethod
+    def _option_status(runtime, prefix: str) -> str:
+        if prefix != "NIFTY-":
+            return "n/a"
+        if runtime._nifty_entered:
+            return "resolved"
+        error = getattr(runtime.market_data, "_last_error", "")
+        return error[-40:] if error else "waiting for signal"
 
     @staticmethod
     def _stops(runtime, position, prefix: str, snapshot: dict):
@@ -527,6 +552,9 @@ class TradingRuntime:
                                                trigger_type=TriggerType.RE_CENTER),
                                          leg_quote, now)
                         self.nifty.state, self._nifty_entered = "OPEN", True
+                    else:
+                        missing = [symbol for symbol, leg_quote in legs if leg_quote is None]
+                        self.next_action = f"waiting for option contracts: {', '.join(missing)}"
                 self._manage_nifty(now, snapshot, quotes)
         pnl = self.execution.mark_to_market(self.quotes)
         if not self.risk.check_pnl(pnl) and not self._guardian_liquidated:
