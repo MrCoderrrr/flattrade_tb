@@ -124,7 +124,14 @@ class FlattradeMarketData:
 
     def poll(self, now: datetime | None = None) -> dict[str, Quote]:
         quotes = {}
+        now_dt = now or datetime.now(timezone.utc)
+        now_ist = now_dt.astimezone(timezone(timedelta(hours=5, minutes=30)))
+        hhmm = now_ist.strftime("%H:%M")
+        is_mcx_window = now_ist.weekday() != 5 and "18:00" <= hhmm < "23:25"
+
         for underlying, (exchange, token) in self.symbols.items():
+            if underlying == "MCX-NATGAS" and not is_mcx_window:
+                continue
             quote = self.quote(exchange, token)
             if quote is not None:
                 quotes[underlying] = quote
