@@ -458,7 +458,10 @@ class TradingRuntime:
             fn = getattr(self.market_data, name, None)
             if callable(fn):
                 try:
-                    result = fn(symbol)
+                    try:
+                        result = fn(symbol, quotes=quotes)
+                    except TypeError:
+                        result = fn(symbol)
                     if isinstance(result, Quote):
                         return result
                 except Exception:
@@ -519,8 +522,10 @@ class TradingRuntime:
         if fast is None or slow is None:
             return 0
         direction = 1 if fast > slow else -1
-        if (direction > 0 and snapshot.get("slow_slope", 0) <= 0) or (
-                direction < 0 and snapshot.get("slow_slope", 0) >= 0):
+        slope = snapshot.get("slow_slope")
+        if slope is None:
+            return 0
+        if (direction > 0 and slope <= 0) or (direction < 0 and slope >= 0):
             self._pending.pop(underlying, None)
             self._emitted.pop(underlying, None)
             return 0
@@ -543,6 +548,9 @@ class TradingRuntime:
         positions = {s: p for s, p in self.execution.positions.items()
                      if s.startswith("MCX-NATGAS-") and p.quantity and p.quantity < 0}
         for symbol, position in positions.items():
+            q = quotes.get(symbol) or self._option_quote(symbol, quotes)
+            if q:
+                self.quotes[symbol] = q
             quote = self.quotes.get(symbol)
             if quote is None:
                 continue
@@ -596,6 +604,10 @@ class TradingRuntime:
                      if s.startswith("NIFTY-") and p.quantity}
         if not positions:
             return
+        for symbol in positions:
+            q = self._option_quote(symbol, quotes)
+            if q:
+                self.quotes[symbol] = q
         dte = int(getattr(self.market_data, "nifty_dte", 5))
         if self.nifty.should_flatten(now, dte):
             for symbol, position in positions.items():
@@ -631,6 +643,8 @@ class TradingRuntime:
 
     def process_quotes(self, quotes: dict[str, Quote], now: datetime) -> None:
         self.quotes.update({s: q for s, q in quotes.items() if isinstance(q, Quote)})
+        if hasattr(self.market_data, "latest"):
+            self.market_data.latest.update(self.quotes)
         self._session_controls(now)
         if not quotes:
             detail = getattr(self.market_data, "_last_error", "")
