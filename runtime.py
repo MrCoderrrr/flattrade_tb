@@ -13,7 +13,7 @@ import os
 import signal
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime from datetime import datetime, timedelta, timezone, timedelta, timezone
 from pathlib import Path
 
 from adapters.flattrade_market_data import FlattradeMarketData
@@ -186,8 +186,23 @@ class TerminalDashboard:
         fast, medium, slope = snapshot.get("ema_15"), snapshot.get("ema_90"), snapshot.get("slow_slope")
         if fast is None or medium is None or slope is None:
             return "INDICATORS INCOMPLETE"
-        return "UP CANDIDATE" if fast > medium and slope > 0 else (
-            "DOWN CANDIDATE" if fast < medium and slope < 0 else "NO CONFIRMED SETUP")
+        
+        direction = 1 if fast > medium and slope > 0 else (-1 if fast < medium and slope < 0 else 0)
+        if direction == 0:
+            return "NO CONFIRMED SETUP"
+            
+        base_str = "UP CANDIDATE" if direction == 1 else "DOWN CANDIDATE"
+        prior = runtime._pending.get(underlying)
+        if prior and prior[0] == direction:
+            from datetime import datetime, timedelta, timezone
+            now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+            elapsed = (now - prior[1]).total_seconds()
+            required = snapshot.get("persistence_raw", 30.0)
+            if elapsed < required:
+                return f"{base_str} (WAIT {int(required - elapsed)}s)"
+            else:
+                return f"{base_str} (READY)"
+        return base_str
 
     @staticmethod
     def _option_status(runtime, prefix: str) -> str:
