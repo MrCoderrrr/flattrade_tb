@@ -132,7 +132,7 @@ class ContinuousIndicatorEngine:
                 "rv60": rv60, "rv300": rv300, "adx_300_1s": adx(self.second_bars, 300),
                 "atr_1m": self.atr_1m, "vr_ratio": vr,
                 "persistence_raw": None if vr is None else AdaptivePersistence.raw(vr),
-                "warmup": len(self.second_bars) < 2}
+                "warmup": len(self.second_bars) < 15}
 
 
 class IndicatorRegistry:

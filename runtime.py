@@ -102,13 +102,14 @@ class TerminalDashboard:
                 f"{self._signed(snapshot.get('atr_1m'), 10)}",
                 width,
             ))
+        stat_mid = f"FLIPS  {runtime.mcx.state.flips}/4" if prefix == "MCX-NATGAS-" else f"DTE    {int(getattr(runtime.market_data, 'nifty_dte', 0))}d  "
         lines.extend([
             self._line("╠", "═", "╣", width),
             self._row("  STRATEGY STATUS", width),
             self._line("╟", "─", "╢", width),
             self._row(
                 f"  STATE  {self._strategy_state(runtime, prefix):<24}"
-                f"│  FLIPS  {runtime.mcx.state.flips}/4"
+                f"│  {stat_mid}"
                 f"│  ACTIVE LEGS  {len(active):>2}",
                 width,
             ),
@@ -253,7 +254,7 @@ class TerminalDashboard:
         dte = int(getattr(runtime.market_data, "nifty_dte", 0))
         trail_pct = 0.05 if dte <= 1 else 0.07
         initial_sl = entry_p * 1.35
-        tsl = lowest_p * (1.0 + trail_pct)
+        tsl = lowest_p * (1.0 + trail_pct) if lowest_p <= entry_p * 0.95 else None
         return initial_sl, tsl
 
     @staticmethod
@@ -685,6 +686,32 @@ class TradingRuntime:
                 log.info("Nifty short position %s stopped out via %s (ask=%.2f)",
                          symbol, trigger.value, quote.ask)
 
+        # Solo leg safeguard & re-centering when only 1 short leg remains:
+        if len(short_positions) == 1:
+            surviving_sym = next(iter(short_positions))
+            is_surviving_ce = "CE" in surviving_sym or bool(re.search(r"C\d+", surviving_sym))
+            missing_type = "PE" if is_surviving_ce else "CE"
+            missing_logical = f"NIFTY-{missing_type}"
+
+            adx_value = snapshot.get("adx_300_1s") or 0.0
+            last_recenter = getattr(self, "_last_nifty_recenter_time", 0.0)
+            now_ts = now.timestamp()
+            # If market is ranging/calm (ADX <= threshold) and 45s cooldown elapsed, re-center the missing leg
+            if (now_ts - last_recenter >= 45.0
+                    and adx_value <= self.config.nifty_adx_threshold
+                    and (dte > 1 or now.strftime("%H:%M") < self.config.nifty_low_dte_cutoff)):
+                new_quote = self._option_quote(missing_logical, quotes)
+                if new_quote and new_quote.ask > 0:
+                    new_sym = new_quote.symbol
+                    self._submit(Order(new_sym, Side.SELL,
+                                       self.nifty.size(1, getattr(self.risk, "ivr20", None), dte),
+                                       trigger_type=TriggerType.RE_CENTER,
+                                       strategy="NiftyOptions"), new_quote, now)
+                    self._last_nifty_recenter_time = now_ts
+                    log.info("Re-centered Nifty strangle by selling missing leg %s (ask=%.2f)",
+                             new_sym, new_quote.ask)
+            return
+
         signal = self.signal_events[-1]["direction"] if self.signal_events and self.signal_events[-1]["underlying"] == "NIFTY" else 0
         if signal == 0 or signal == self._last_nifty_action_signal:
             return
@@ -710,13 +737,15 @@ class TradingRuntime:
             adx_value = snapshot.get("adx_300_1s") or 0.0
             if adx_value <= self.config.nifty_adx_threshold and (
                     dte > 1 or now.strftime("%H:%M") < self.config.nifty_low_dte_cutoff):
-                new_quote = self._option_quote(losing_symbol, quotes)
+                recenter_logical = "NIFTY-CE" if is_call_loss else "NIFTY-PE"
+                new_quote = self._option_quote(recenter_logical, quotes)
                 if new_quote:
                     new_sym = new_quote.symbol
                     self._submit(Order(new_sym, Side.SELL,
                                        self.nifty.size(1, getattr(self.risk, "ivr20", None), dte),
                                        trigger_type=TriggerType.RE_CENTER,
                                        strategy="NiftyOptions"), new_quote, now)
+                    self._last_nifty_recenter_time = now.timestamp()
 
     def process_quotes(self, quotes: dict[str, Quote], now: datetime) -> None:
         self.quotes.update({s: q for s, q in quotes.items() if isinstance(q, Quote)})
