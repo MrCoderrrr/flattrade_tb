@@ -122,7 +122,7 @@ class TerminalDashboard:
             self._row("  OPEN PAPER POSITIONS", width),
             self._line("╟", "─", "╢", width),
             self._row(
-                f"  {'LEG':<12}│{'STRIKE':>7}│{'SPOT':>10}│{'SIDE':<6}│"
+                f"  {'LEG':<10}│{'CONTRACT':<20}│{'STRIKE':>7}│{'SPOT':>10}│{'SIDE':<6}│"
                 f"{'QTY':>5}│{'ENTRY':>9}│{'CURRENT':>9}│{'SL':>9}│"
                 f"{'TSL':>9}│{'UNREAL PNL':>14}",
                 width,
@@ -146,18 +146,25 @@ class TerminalDashboard:
             else:
                 leg_name = "CE" if is_ce else "PE"
 
-            m = re.search(r'(\d{4,6})', p.symbol)
+            # Broker symbols may include expiry digits before the strike
+            # (for example NIFTY25SEP25000CE). Prefer the digits immediately
+            # before CE/PE so the dashboard always identifies the traded leg.
+            m = re.search(r'(\d{4,6})(?:-HEDGE)?(?:CE|PE)$', p.symbol, re.IGNORECASE)
+            if not m:
+                m = re.search(r'(\d{4,6})', p.symbol)
             if m:
-                strike_str = f"{int(m.group(1)):>7}"
+                strike = int(m.group(1))
+                strike_str = f"{strike:>7}"
             elif spot_q:
                 atm = int(round(spot_q.last / 50.0) * 50)
-                s = atm + (1000 if is_ce else -1000) if is_hedge else atm
-                strike_str = f"{s:>7}"
+                strike = atm + (1000 if is_ce else -1000) if is_hedge else atm
+                strike_str = f"{strike:>7}"
             else:
+                strike = None
                 strike_str = "    n/a"
 
             lines.append(self._row(
-                f"  {leg_name:<12}│{strike_str}│{spot_str}│{side:<6}│"
+                f"  {leg_name:<10}│{p.symbol[:20]:<20}│{strike_str}│{spot_str}│{side:<6}│"
                 f"{p.quantity:>+5}│{p.average_price:>9.2f}│{self._num(mark):>9}│"
                 f"{self._num(sl):>9}│{self._num(tsl):>9}│"
                 f"{self._money(unreal or 0.0, 14)}",
@@ -319,9 +326,17 @@ class TerminalDashboard:
 
     @staticmethod
     def _feed(runtime, now) -> str:
+        now_ist = now.astimezone(IST)
+        active_underlyings = []
+        if now_ist.weekday() < 5 and _in_window(now_ist, "09:15", "15:15"):
+            active_underlyings.append("NIFTY")
+        if now_ist.weekday() != 5 and _in_window(now_ist, "18:00", "23:25"):
+            active_underlyings.append("MCX-NATGAS")
         ages = []
-        for q in runtime.quotes.values():
-            ages.append(max(0.0, (now - q.timestamp).total_seconds()))
+        for underlying in active_underlyings:
+            q = runtime.quotes.get(underlying)
+            if q is not None:
+                ages.append(max(0.0, (now - q.timestamp).total_seconds()))
         if not ages:
             return "DOWN (no quote)"
         age = max(ages)
@@ -523,6 +538,9 @@ class TradingRuntime:
             if quote is None:
                 self.next_action = f"waiting for quote to flatten {symbol}"
                 continue
+            if (now - quote.timestamp).total_seconds() > self.config.stale_quote_seconds:
+                self.next_action = f"waiting for fresh quote to flatten {symbol}"
+                continue
             self._submit(Order(symbol, Side.SELL if position.quantity > 0 else Side.BUY,
                                abs(position.quantity), strategy="SessionFlatten",
                                trigger_type=TriggerType.CIRCUIT_BREAKER), quote, now)
@@ -545,9 +563,9 @@ class TradingRuntime:
             self._history = {"NIFTY": [], "MCX-NATGAS": []}
             self._persist_indicator_state()
         self._session_date = date
-        if not _in_window(now, "09:15", "15:15"):
-            self._flatten(now, lambda symbol: symbol.startswith("NIFTY-"))
-        if not _in_window(now, "18:00", "23:25"):
+        if not _in_window(now.astimezone(IST), "09:15", "15:15"):
+            self._flatten(now, lambda symbol: symbol.startswith("NIFTY"))
+        if not _in_window(now.astimezone(IST), "18:00", "23:25"):
             self._flatten(now, lambda symbol: symbol.startswith("MCX-NATGAS-"))
 
     def _persisted_signal(self, underlying: str, snapshot: dict,
@@ -664,6 +682,36 @@ class TradingRuntime:
             return
 
         short_positions = {s: p for s, p in positions.items() if p.quantity < 0}
+        hedge_positions = {
+            s: p for s, p in positions.items()
+            if p.quantity > 0 and "HEDGE" in s.upper()
+        }
+        # If both short ATM legs were stopped, retain the protective hedges but
+        # immediately rebuild the ATM short strangle. This is deliberately
+        # gated to the hedge-only state so it cannot pyramid on every tick.
+        if hedge_positions and not short_positions and len(hedge_positions) == 2:
+            if not self.risk.halted and snapshot.get("adx_300_1s", 0.0) <= self.config.nifty_adx_threshold:
+                legs = [(name, self._option_quote(name, quotes))
+                        for name in ("NIFTY-CE", "NIFTY-PE")]
+                if all(quote is not None and quote.ask > 0 for _, quote in legs):
+                    quantity = self.nifty.size(1, getattr(self.risk, "ivr20", None), dte)
+                    for logical_symbol, leg_quote in legs:
+                        self._submit(
+                            Order(
+                                leg_quote.symbol,
+                                Side.SELL,
+                                quantity,
+                                trigger_type=TriggerType.RE_CENTER,
+                                strategy="NiftyOptions",
+                            ),
+                            leg_quote,
+                            now,
+                        )
+                    self._last_nifty_action_signal = 0
+                    self.next_action = "hedge-only recovery: ATM short strangle re-entered"
+                    log.info("Re-entered ATM Nifty short strangle after hedge-only state")
+            return
+
         trail_pct = 0.05 if dte <= 1 else 0.07
         for symbol, position in short_positions.items():
             quote = self.quotes.get(symbol)
@@ -830,7 +878,13 @@ class TradingRuntime:
         self._persist_indicator_state()
         pnl = self.execution.mark_to_market(self.quotes)
         if not self.risk.check_pnl(pnl) and not self._guardian_liquidated:
-            self.execution.close_all(self.quotes)
+            # A circuit breaker must never manufacture a fill from an old
+            # display quote. Only quotes received on this heartbeat are valid.
+            fresh_quotes = {
+                symbol: quote for symbol, quote in quotes.items()
+                if (now - quote.timestamp).total_seconds() <= self.config.stale_quote_seconds
+            }
+            self.execution.close_all(fresh_quotes)
             self._guardian_liquidated = True
             self.next_action = "risk halt: liquidating positions; awaiting operator reset"
             log.error("combined paper loss limit reached (%.2f); guardian halted", pnl)

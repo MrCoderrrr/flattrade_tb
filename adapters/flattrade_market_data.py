@@ -362,15 +362,19 @@ class FlattradeMarketData:
                     continue
 
             item_strike = item.get("strprc", item.get("strike", item.get("StrikePrice")))
-            if item_strike is not None:
-                try:
-                    s_val = float(item_strike)
-                    if s_val > 100000:
-                        s_val /= 100.0
-                    if abs(s_val - strike) > 0.01:
-                        continue
-                except (TypeError, ValueError):
-                    pass
+            if item_strike is None:
+                # Contract search responses are not consistent across
+                # Flattrade deployments. Refuse an ambiguous contract rather
+                # than trading the first result returned by the API.
+                continue
+            try:
+                s_val = float(item_strike)
+                if s_val > 100000:
+                    s_val /= 100.0
+                if abs(s_val - strike) > 0.01:
+                    continue
+            except (TypeError, ValueError):
+                continue
 
             expiry_text = str(item.get("exd", item.get("expiry", "")))
             expiry = None
@@ -420,12 +424,10 @@ class FlattradeMarketData:
         if candidates:
             return [item for _, item in candidates]
 
-        fallback = []
-        for item in values:
-            tsym = str(item.get("tsym", "")).upper()
-            if underlying == "NIFTY" and not tsym.startswith(("BANKNIFTY", "FINNIFTY", "MIDCPNIFTY")):
-                fallback.append(item)
-        return fallback or values
+        # No exact, non-expired contract is safe to use. Returning an
+        # arbitrary search result can produce a valid quote for the wrong
+        # strike or expiry and is therefore worse than no quote.
+        return []
 
     def atm_straddle_iv(self, underlying: str) -> float:
         if self.api is None:
