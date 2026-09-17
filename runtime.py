@@ -461,7 +461,11 @@ class TradingRuntime:
         self.quotes.update({s: q for s, q in quotes.items() if isinstance(q, Quote)})
         self._session_controls(now)
         if not quotes:
-            self.next_action = "waiting for an authenticated market-data feed; no fabricated quotes"
+            detail = getattr(self.market_data, "_last_error", "")
+            self.next_action = (
+                f"feed unavailable: {detail}" if detail
+                else "waiting for an authenticated market-data feed; no fabricated quotes"
+            )
             log.warning("market-data feed unavailable; no tradable quotes")
             return
         for underlying in ("MCX-NATGAS", "NIFTY"):

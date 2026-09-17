@@ -4,10 +4,13 @@ from datetime import datetime, timezone
 import os
 import csv
 import re
+import logging
 from pathlib import Path
 from dataclasses import dataclass
 from core_engine.models import Quote
 from typing import Protocol
+
+log = logging.getLogger(__name__)
 
 
 class ATMStraddleIVProvider(Protocol):
@@ -18,29 +21,49 @@ class ATMStraddleIVProvider(Protocol):
 class FlattradeMarketData:
     def __init__(self, api=None, symbols: dict[str, tuple[str, str]] | None = None):
         self.api = api
+        nifty_token = os.getenv("NIFTY_TOKEN") or "26000"
+        mcx_token = os.getenv("MCX_NATGAS_TOKEN") or ""
         self.symbols = symbols or {
-            "NIFTY": ("NSE", os.getenv("NIFTY_TOKEN", "26000")),
-            "MCX-NATGAS": ("MCX", os.getenv("MCX_NATGAS_TOKEN", "")),
+            "NIFTY": ("NSE", nifty_token),
+            "MCX-NATGAS": ("MCX", mcx_token),
         }
         self.latest: dict[str, Quote] = {}
         self._contract_cache: dict[str, dict] = {}
+        self._last_error = ""
 
     def _ensure_api(self):
         if self.api is not None:
             return self.api
         # api_helper itself is safe to import, while authentication remains
         # entirely opt-in through the existing Flattrade token flow.
-        token_file = os.getenv("FLATTRADE_TOKEN_FILE", "token.txt")
-        user_id = os.getenv("FLATTRADE_USER_ID")
-        if not user_id or not os.path.exists(token_file):
+        root = Path(__file__).resolve().parent.parent
+        token_file = Path(os.getenv("FLATTRADE_TOKEN_FILE", str(root / "token.txt")))
+        user_id = os.getenv("FLATTRADE_USER_ID") or os.getenv("USER_ID")
+        if not user_id:
+            try:
+                from creds import USER_ID
+                user_id = str(USER_ID).strip()
+            except ImportError:
+                user_id = ""
+        if not user_id or not token_file.is_file():
+            self._last_error = "missing Flattrade user ID or token file"
             return None
         try:
             from api_helper import NorenApiPy
             api = NorenApiPy()
-            with open(token_file) as token:
-                api.set_session(userid=user_id, password="", usertoken=token.read().strip())
+            token = token_file.read_text().strip()
+            if not token:
+                self._last_error = f"empty token file: {token_file}"
+                return None
+            response = api.set_session(userid=user_id, password="", usertoken=token)
+            if isinstance(response, dict) and str(response.get("stat", "")).lower() not in {"ok", "success"}:
+                self._last_error = f"Flattrade authentication rejected: {response}"
+                return None
             self.api = api
-        except Exception:
+            log.info("Flattrade market-data session established for %s", user_id)
+        except Exception as exc:
+            self._last_error = f"Flattrade session initialization failed: {exc}"
+            log.warning(self._last_error)
             return None
         return self.api
 
@@ -54,9 +77,18 @@ class FlattradeMarketData:
         if api is not None:
             try:
                 result = api.get_quotes(exchange=exchange, token=symbol)
-                return Quote(symbol, now, float(result["bp"]), float(result["sp"]), float(result["lp"]))
-            except Exception:
-                pass
+                if not isinstance(result, dict) or str(result.get("stat", "Ok")).lower() not in {"ok", "success"}:
+                    self._last_error = f"quote rejected for {exchange}:{symbol}: {result}"
+                    return None
+                last = float(result.get("lp", result.get("ltp", 0.0)) or 0.0)
+                bid = float(result.get("bp", result.get("bid", last)) or last)
+                ask = float(result.get("sp", result.get("ask", last)) or last)
+                if last > 0 and bid > 0 and ask > 0:
+                    return Quote(symbol, now, bid, ask, last)
+                self._last_error = f"quote had no positive prices for {exchange}:{symbol}: {result}"
+            except Exception as exc:
+                self._last_error = f"quote request failed for {exchange}:{symbol}: {exc}"
+                log.warning(self._last_error)
         # A missing feed is not a quote.  In particular, never manufacture a
         # price: doing so can turn a paper heartbeat into a false trade.
         return None
