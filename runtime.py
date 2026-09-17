@@ -13,7 +13,7 @@ import os
 import signal
 import sys
 import time
-from datetime from datetime import datetime, timedelta, timezone, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from adapters.flattrade_market_data import FlattradeMarketData
