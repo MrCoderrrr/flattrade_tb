@@ -60,7 +60,7 @@ MCX_EXIT_HOUR       = 23
 MCX_EXIT_MINUTE     = 24           # 23:24 IST auto square-off
 LOT_SIZE            = 1250         # 1 lot = 1250 units
 DEFAULT_SL_PCT      = 0.15         # 15% initial stop-loss (fresh straddles)
-REENTRY_SL_PCT      = 0.05         # 5% initial stop-loss for reversal re-entry (instant cutoff)
+REENTRY_SL_PCT      = 0.15         # 5% initial stop-loss for reversal re-entry (instant cutoff)
 DEFAULT_TSL_PCT     = 0.08         # 8% trailing stop-loss
 POST_CLOSE_COOLDOWN = 5.0          # Seconds to wait after any close before re-entry
 REVERSAL_MIN_PTS    = 0.80         # Swing reversal threshold (0.80 pts pullback from peak/trough)
@@ -867,7 +867,7 @@ class NaturalGasPaperBot:
         if self.positions:
             is_strangle = ('CE' in self.positions and 'PE' in self.positions)
             for leg, pos in self.positions.items():
-                pos['loss_stop_pct'] = DEFAULT_SL_PCT
+                pos["loss_stop_pct"] = DEFAULT_SL_PCT
                 pos['tsl_pct']       = DEFAULT_TSL_PCT
                 entry_prem          = pos['entry_price']
                 new_initial_sl      = round_to_tick(entry_prem * (1.0 + DEFAULT_SL_PCT))
