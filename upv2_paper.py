@@ -429,7 +429,7 @@ class NSEATMStreamer:
     def get_spot_and_atm(self) -> Tuple[float, int, bool]:
         """
         Fetches live NIFTY 50 Spot price directly from Flattrade every second (Token 26000 on NSE).
-        Falls back to real-time market data in paper mode if Flattrade session key is expired.
+        Only relies on authentic Flattrade broker market data.
         Returns: (spot, atm, is_stale)
         """
         self.check_token_reload()
@@ -447,31 +447,14 @@ class NSEATMStreamer:
             except Exception as e:
                 log_warn(f"Flattrade get_quotes error for Spot: {e}")
 
-        # Real-time fallback for paper trading if Flattrade API returns None / token expired
-        if PAPER_TRADING_MODE:
-            try:
-                now_ts = time.time()
-                if (now_ts - getattr(self, "_last_pub_query", 0.0)) >= 0.8:
-                    self._last_pub_query = now_ts
-                    url = "https://query1.finance.yahoo.com/v8/finance/chart/%5ENSEI?interval=1m"
-                    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}, timeout=3)
-                    if r.status_code == 200:
-                        data = r.json()
-                        p = float(data["chart"]["result"][0]["meta"]["regularMarketPrice"])
-                        if p > 0:
-                            self._last_spot = p
-                            self._last_atm = int(round(p / 50.0) * 50)
-                            return self._last_spot, self._last_atm, False
-            except Exception:
-                pass
-
+        self.is_flattrade_live = False
         if self._last_spot > 0:
-            return self._last_spot, self._last_atm, False
+            return self._last_spot, self._last_atm, True
 
-        return self._last_spot, self._last_atm, True
+        return 0.0, 0, True
 
     def get_live_quote(self, strike: int, option_type: str) -> Dict[str, Any]:
-        """Fetches live option quote with NFO symbol master resolution and dynamic token caching."""
+        """Fetches live option quote strictly from Flattrade NFO market data."""
         self.check_token_reload()
         cache_key = f"{strike}_{option_type}"
         cached = self._token_cache.get(cache_key)
@@ -521,12 +504,12 @@ class NSEATMStreamer:
         tsym = cached['tsym'] if cached else f"NIFTY{strike}{option_type}"
         ls = cached['ls'] if cached else LOT_SIZE
 
-        # Fast path: query live broker quote
+        # Strictly query real broker quote
         if token and self.api and hasattr(self.api, "get_quotes"):
             try:
                 quote = self.api.get_quotes(exchange='NFO', token=token)
                 if quote and isinstance(quote, dict) and str(quote.get('stat', '')).lower() in ('ok', 'success'):
-                    for field in ('lp', 'ltp', 'c', 'sp1', 'bp1', 'ap'):
+                    for field in ('lp', 'ltp', 'sp1', 'bp1'):
                         val = quote.get(field)
                         if val is not None:
                             try:
@@ -541,16 +524,8 @@ class NSEATMStreamer:
                 pass
 
         self.is_flattrade_live = False
-
-        # Fallback simulation when broker API is unavailable / session expired
-        if self._last_spot > 0:
-            diff = (self._last_spot - strike) if option_type == "CE" else (strike - self._last_spot)
-            intrinsic = max(0.0, diff)
-            time_val = max(0.50, 65.0 * math.exp(-abs(self._last_spot - strike) / 250.0))
-            lp = round(intrinsic + time_val, 2)
-        else:
-            lp = 50.0
-
+        # Return last known real quote from broker, or 0.0 if not available
+        lp = self._last_real_lp.get(cache_key, 0.0)
         return {"lp": lp, "tsym": tsym, "ls": ls}
 
     def get_near_expiry_dte(self) -> Tuple[Optional[datetime], float]:
@@ -2152,6 +2127,9 @@ class ExecutionEngine:
         return False, "INCONCLUSIVE_IN_LIVE_MODE"
 
     def _enter_leg(self, leg: str, strike: int, side: str, spot: float, atr: float, dte_days: float = 2.0) -> bool:
+        if not getattr(self.market_data.streamer, "is_flattrade_live", False):
+            log_warn(f"Cannot enter {leg}: Flattrade live feed is not active.")
+            return False
         base = leg.split("_")[0]
         contract = self.market_data.streamer.get_option_contract(strike, base)
         q = self.market_data.streamer.get_live_quote(strike, base)
@@ -2529,14 +2507,16 @@ class ExecutionEngine:
         V     = f"{c_dim}║{res}"
         VS    = f"{c_dim}│{res}"
 
-        ind = self.current_indicators
+        ind = self.current_indicators or {
+            "trend": 0, "regime": "WAITING", "kama": 0.0, "adx": 0.0, "atr": 0.0
+        }
         trend_str = "▲ UP" if ind["trend"] == 1 else ("▼ DOWN" if ind["trend"] == -1 else "━ FLAT")
         trend_col = c_green if ind["trend"] == 1 else (c_red if ind["trend"] == -1 else c_yellow)
         regime_col = c_mag if ind["regime"] == "CHOP" else (c_cyan if ind["regime"] == "TREND" else c_yellow)
         kama_str = f"{ind['kama']:.2f}" if ind["kama"] else "WARMUP"
         
         is_live = getattr(self.market_data.streamer, "is_flattrade_live", False)
-        feed_status = f"{c_green}● LIVE FLATTRADE{res}" if is_live else f"{c_yellow}⚠️ SIMULATED (Token Expired){res}"
+        feed_status = f"{c_green}● LIVE FLATTRADE{res}" if is_live else f"{c_red}🔴 WAITING FOR FLATTRADE (Token Expired){res}"
 
         print()
         print(TOP)
@@ -2567,6 +2547,10 @@ class ExecutionEngine:
 
             for leg, pos in self.positions.items():
                 ltp = self._get_ltp(pos["strike"], pos["base"])
+                if ltp > 0:
+                    pos["last_real_ltp"] = ltp
+                else:
+                    ltp = pos.get("last_real_ltp", pos["entry_price"])
                 is_short = (pos["side"] == "SELL")
                 pnl = ((pos["entry_price"] - ltp) if is_short else (ltp - pos["entry_price"])) * pos["qty"]
                 unrealized += pnl
@@ -2893,7 +2877,8 @@ class ExecutionEngine:
 
                 # ── 1. STRICT 1-SECOND DATA FETCH & TICK CADENCE ──
                 spot, atm, is_new_1m_bar, is_stale = self.market_data.fetch_live_tick()
-                if spot <= 0:
+                if spot <= 0 or not getattr(self.market_data.streamer, "is_flattrade_live", False):
+                    self._render_dashboard(self.market_data.latest_spot, self.market_data.latest_atm)
                     self._smart_sleep(1.0)
                     continue
                 if not is_stale:
@@ -2930,7 +2915,7 @@ class ExecutionEngine:
                 
                 # ── 3. Check Portfolio Circuit Breaker (-1.8% Capital) ──
                 unrealized = sum([
-                    ((p["entry_price"] - self._get_ltp(p["strike"], p["base"])) if p["side"] == "SELL" else (self._get_ltp(p["strike"], p["base"]) - p["entry_price"])) * p["qty"]
+                    ((p["entry_price"] - (self._get_ltp(p["strike"], p["base"]) or p.get("last_real_ltp", p["entry_price"]))) if p["side"] == "SELL" else ((self._get_ltp(p["strike"], p["base"]) or p.get("last_real_ltp", p["entry_price"])) - p["entry_price"])) * p["qty"]
                     for p in self.positions.values()
                 ])
                 cb_triggered, cb_msg = self.risk_manager.check_portfolio_circuit_breaker(self.realized_pnl, unrealized)
@@ -3093,6 +3078,8 @@ class ExecutionEngine:
                                        and self.positions["CE"].get("side") == "SELL"
                                        and self.positions["PE"].get("side") == "SELL")
                         ltp_premium = self._get_ltp(self.positions[leg]["strike"], self.positions[leg]["base"])
+                        if ltp_premium <= 0:
+                            continue
 
                         # ── Proactive Exit: exit early if trend is strongly against leg ──
                         # (only check if the OTHER leg is still open — never exit the last leg proactively)
