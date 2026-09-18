@@ -33,6 +33,7 @@ import os
 import sys
 import time
 import json
+from collections import deque
 
 import math
 def norm_cdf(x):
@@ -510,7 +511,124 @@ def round_to_strike(price: float, strike_step: int = 50) -> int:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MODULE 1: MARKET DATA INGESTION & 5-MIN AGGREGATION
+# MODULE 1A: CONTINUOUS STREAMING EMA & MOMENTUM ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ContinuousEMA:
+    """Continuous exponential moving average with half-life in seconds."""
+    def __init__(self, half_life_seconds: float):
+        self.half_life_seconds = float(half_life_seconds)
+        self.value: Optional[float] = None
+        self.timestamp: Optional[float] = None
+
+    def update(self, value: float, timestamp: float) -> float:
+        if self.value is None or self.timestamp is None:
+            self.value = value
+        else:
+            dt = max(0.0, timestamp - self.timestamp)
+            alpha = 1.0 - math.exp(-math.log(2) * dt / self.half_life_seconds)
+            self.value += alpha * (value - self.value)
+        self.timestamp = timestamp
+        return self.value
+
+
+class RollingVolatility:
+    """Sample rolling standard deviation over a fixed window of ticks."""
+    def __init__(self, window: int):
+        self.values = deque(maxlen=window)
+
+    def update(self, value: float) -> Optional[float]:
+        self.values.append(float(value))
+        if len(self.values) < 2:
+            return None
+        mean = sum(self.values) / len(self.values)
+        variance = sum((x - mean) ** 2 for x in self.values) / (len(self.values) - 1)
+        return math.sqrt(max(0.0, variance))
+
+
+class AdaptivePersistence:
+    """Maps volatility ratio to required signal hold duration."""
+    @staticmethod
+    def raw(volatility_ratio: float, minimum: float = 3.0, maximum: float = 30.0) -> float:
+        """P_raw = 10/VR, clamped to [minimum, maximum]."""
+        return max(minimum, min(maximum, 10.0 / max(float(volatility_ratio), 1e-12)))
+
+
+class ContinuousEMAEngine:
+    """Continuous streaming indicator pipeline tracking EMA 15s, 90s, 300s, slope, and persistence."""
+    def __init__(self):
+        self.emas = {h: ContinuousEMA(h) for h in (15.0, 90.0, 300.0)}
+        self.slow_history = deque(maxlen=11)
+        self.rv = {60: RollingVolatility(60), 300: RollingVolatility(300)}
+        self.raw_signal: int = 0
+        self.signal_start_ts: Optional[float] = None
+        self.confirmed_signal: int = 0
+        self.latest_snapshot: Dict[str, Any] = {}
+
+    def update(self, spot: float, now_ts: float) -> Dict[str, Any]:
+        if spot <= 0:
+            return self.latest_snapshot
+
+        for ema in self.emas.values():
+            ema.update(spot, now_ts)
+
+        if self.emas[300.0].value is not None:
+            self.slow_history.append(self.emas[300.0].value)
+
+        rv60 = self.rv[60].update(spot)
+        rv300 = self.rv[300].update(spot)
+
+        vr = (rv60 / rv300) if rv60 is not None and rv300 and rv300 > 0 else 1.0
+        p_req = AdaptivePersistence.raw(vr)
+
+        slow_slope = (self.slow_history[-1] - self.slow_history[0]) if len(self.slow_history) >= 2 else 0.0
+
+        fast_val = self.emas[15.0].value if self.emas[15.0].value is not None else spot
+        slow_val = self.emas[90.0].value if self.emas[90.0].value is not None else spot
+
+        # Directional raw signal: Fast > Slow and Slow Slope > 0 (Bullish), or Fast < Slow and Slope < 0 (Bearish)
+        if fast_val > slow_val and slow_slope > 0:
+            sig = 1
+        elif fast_val < slow_val and slow_slope < 0:
+            sig = -1
+        else:
+            sig = 0
+
+        if sig != 0:
+            if sig == self.raw_signal:
+                pass
+            else:
+                self.raw_signal = sig
+                self.signal_start_ts = now_ts
+        else:
+            self.raw_signal = 0
+            self.signal_start_ts = None
+            self.confirmed_signal = 0
+
+        hold_time = (now_ts - self.signal_start_ts) if self.signal_start_ts else 0.0
+        if self.raw_signal != 0 and hold_time >= p_req:
+            self.confirmed_signal = self.raw_signal
+        else:
+            self.confirmed_signal = 0
+
+        self.latest_snapshot = {
+            "ema_15": fast_val,
+            "ema_90": slow_val,
+            "ema_300": self.emas[300.0].value or spot,
+            "slow_slope": slow_slope,
+            "rv60": rv60 or 0.0,
+            "rv300": rv300 or 0.0,
+            "vr": vr,
+            "persistence_req": p_req,
+            "raw_signal": self.raw_signal,
+            "hold_time": hold_time,
+            "confirmed_signal": self.confirmed_signal
+        }
+        return self.latest_snapshot
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODULE 1B: MARKET DATA INGESTION & 5-MIN AGGREGATION
 # ══════════════════════════════════════════════════════════════════════════════
 
 class MarketData:
@@ -523,6 +641,8 @@ class MarketData:
         self.latest_spot: float = 24000.0
         self.latest_atm: int = 24000
         self.last_completed_1m_key: Optional[str] = None
+        self.ema_engine = ContinuousEMAEngine()
+        self.latest_ema_snapshot: Dict[str, Any] = {}
         self._load_cache()
         self._seed_history_if_needed()
 
@@ -764,6 +884,8 @@ class MarketData:
         spot, atm, is_stale = self.streamer.get_spot_and_atm()
         self.latest_spot = spot
         self.latest_atm = atm
+        if spot > 0:
+            self.latest_ema_snapshot = self.ema_engine.update(spot, time.time())
         
         now = get_ist_now()
         current_min_key = now.strftime("%Y-%m-%d %H:%M")
@@ -1613,14 +1735,15 @@ class ExecutionEngine:
             if self.total_reentries_today >= MAX_REENTRIES_TOTAL: continue
             if time.time() < cd.get("next_eligible_time", 0): continue
             
+            ema_sig = self.current_indicators.get("confirmed_signal", 0)
             if leg == "CE":
-                # CE stopped out because market went UP. We re-enter if KAMA slope goes DOWN by > 0.15.
-                if kama_slope <= -0.15:
+                # CE stopped out because market went UP. We re-enter if KAMA slope goes DOWN by > 0.15 or EMA signal is confirmed bearish (-1).
+                if kama_slope <= -0.15 or ema_sig == -1:
                     cd["consecutive_bars"] = cd.get("consecutive_bars", 0) + 1
                 else: cd["consecutive_bars"] = 0
             else:
-                # PE stopped out because market went DOWN. We re-enter if KAMA slope goes UP by > 0.15.
-                if kama_slope >= 0.15:
+                # PE stopped out because market went DOWN. We re-enter if KAMA slope goes UP by > 0.15 or EMA signal is confirmed bullish (+1).
+                if kama_slope >= 0.15 or ema_sig == 1:
                     cd["consecutive_bars"] = cd.get("consecutive_bars", 0) + 1
                 else: cd["consecutive_bars"] = 0
                 
@@ -1643,7 +1766,7 @@ class ExecutionEngine:
         import re
         def ansi_len(s): return len(re.sub(r"\x1b\[[0-9;]*m", "", s))
         
-        W = 114
+        W = 126
         c_cyan   = f"{Fore.CYAN}{Style.BRIGHT}"
         c_white  = f"{Fore.WHITE}{Style.BRIGHT}"
         c_dim    = f"{Fore.WHITE}{Style.DIM}"
@@ -1660,12 +1783,17 @@ class ExecutionEngine:
         V     = f"{c_dim}║{res}"
         VS    = f"{c_dim}│{res}"
 
-        ind = self.current_indicators
-        trend_str = "▲ UP" if ind["trend"] == 1 else ("▼ DOWN" if ind["trend"] == -1 else "━ FLAT")
-        trend_col = c_green if ind["trend"] == 1 else (c_red if ind["trend"] == -1 else c_yellow)
-        regime_col = c_mag if ind["regime"] == "CHOP" else (c_cyan if ind["regime"] == "TREND" else c_yellow)
-        kama_str = f"{ind['kama']:.2f}" if ind["kama"] else "WARMUP"
+        ind = self.current_indicators or {
+            "trend": 0, "regime": "WAITING", "kama": 0.0, "adx": 0.0, "atr": 0.0
+        }
+        trend_str = "▲ UP" if ind.get("trend") == 1 else ("▼ DOWN" if ind.get("trend") == -1 else "━ FLAT")
+        trend_col = c_green if ind.get("trend") == 1 else (c_red if ind.get("trend") == -1 else c_yellow)
+        regime_col = c_mag if ind.get("regime") == "CHOP" else (c_cyan if ind.get("regime") == "TREND" else c_yellow)
+        kama_str = f"{ind['kama']:.2f}" if ind.get("kama") else "WARMUP"
         
+        is_live = getattr(self.market_data.streamer, "is_flattrade_live", False)
+        feed_status = f"{c_green}● LIVE FLATTRADE{res}" if is_live else f"{c_red}🔴 WAITING FOR FLATTRADE (Token Expired){res}"
+
         print()
         print(TOP)
         title_left = f"  {c_cyan}ADAPTIVE KAMA-ADX HEDGED STRANGLE (V2.0){res}  {c_dim}│{res}  {c_yellow}DUAL-TSL (SPOT+PREM) ACTIVE{res}  {c_dim}│{res}  {c_green}TYPE 'zxc' TO STOP{res}"
@@ -1673,13 +1801,31 @@ class ExecutionEngine:
         pad = max(0, W - ansi_len(title_left) - ansi_len(title_right))
         print(f"{V}{title_left}{' ' * pad}{title_right}{V}")
         
+        ema_15 = ind.get("ema_15") or spot
+        ema_90 = ind.get("ema_90") or spot
+        slow_slope = ind.get("slow_slope", 0.0)
+        vr = ind.get("vr", 1.0)
+        p_req = ind.get("persistence_req", 5.0)
+        sig_val = ind.get("confirmed_signal", 0)
+        sig_str = f"{c_green}▲ UP{res}" if sig_val > 0 else (f"{c_red}▼ DOWN{res}" if sig_val < 0 else f"{c_yellow}━ FLAT{res}")
+        hold = ind.get("hold_time", 0.0)
+
         ind_bar = (f"  {c_dim}SPOT:{res} {c_white}{spot:>9.2f}{res}  {c_dim}ATM:{res} {c_yellow}{atm:<5}{res}  "
-                   f"{c_dim}ADX(5m):{res} {regime_col}{ind['adx']:>4.1f} ({ind['regime']}){res}  "
+                   f"{c_dim}FEED:{res} {feed_status}  "
+                   f"{c_dim}ADX(5m):{res} {regime_col}{ind.get('adx', 0.0):>4.1f} ({ind.get('regime', 'WAIT')}){res}  "
                    f"{c_dim}KAMA(1m):{res} {c_white}{kama_str:>8}{res} {trend_col}{trend_str}{res}  "
-                   f"{c_dim}ATR(5m):{res} {c_white}{ind['atr']:>4.1f} pts{res}")
+                   f"{c_dim}ATR(5m):{res} {c_white}{ind.get('atr', 0.0):>4.1f} pts{res}")
         pad_ind = max(0, W - ansi_len(ind_bar))
         print(MID)
         print(f"{V}{ind_bar}{' ' * pad_ind}{V}")
+
+        ind_bar2 = (f"  {c_cyan}MOMENTUM:{res} {c_dim}EMA15:{res} {c_white}{ema_15:>9.2f}{res}  {c_dim}EMA90:{res} {c_white}{ema_90:>9.2f}{res}  "
+                    f"{c_dim}SLOPE:{res} {c_white}{slow_slope:>+6.3f}{res}  {c_dim}VR:{res} {c_white}{vr:>4.2f}{res}  "
+                    f"{c_dim}PERSIST:{res} {c_yellow}{p_req:>4.1f}s{res}  "
+                    f"{c_dim}SIGNAL:{res} {sig_str} {c_dim}({hold:.1f}s){res}")
+        pad_ind2 = max(0, W - ansi_len(ind_bar2))
+        print(MID_S)
+        print(f"{V}{ind_bar2}{' ' * pad_ind2}{V}")
         print(MID)
 
         unrealized = 0.0
@@ -1902,6 +2048,11 @@ class ExecutionEngine:
                 spot, atm, is_new_1m_bar, is_stale = self.market_data.fetch_live_tick()
                 if not is_stale:
                     self.last_feed_tick = current_time
+                
+                if getattr(self.market_data, "latest_ema_snapshot", None):
+                    if getattr(self, "current_indicators", None) is None:
+                        self.current_indicators = {}
+                    self.current_indicators.update(self.market_data.latest_ema_snapshot)
                 
                 if not is_new_1m_bar and getattr(self, "current_indicators", None) is None:
                     self._smart_sleep(1.0)

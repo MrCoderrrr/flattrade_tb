@@ -33,6 +33,7 @@ import os
 import sys
 import time
 import json
+from collections import deque
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -952,7 +953,124 @@ def round_to_strike(price: float, strike_step: int = 50) -> int:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MODULE 1: MARKET DATA INGESTION & 5-MIN AGGREGATION
+# MODULE 1A: CONTINUOUS STREAMING EMA & MOMENTUM ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ContinuousEMA:
+    """Continuous exponential moving average with half-life in seconds."""
+    def __init__(self, half_life_seconds: float):
+        self.half_life_seconds = float(half_life_seconds)
+        self.value: Optional[float] = None
+        self.timestamp: Optional[float] = None
+
+    def update(self, value: float, timestamp: float) -> float:
+        if self.value is None or self.timestamp is None:
+            self.value = value
+        else:
+            dt = max(0.0, timestamp - self.timestamp)
+            alpha = 1.0 - math.exp(-math.log(2) * dt / self.half_life_seconds)
+            self.value += alpha * (value - self.value)
+        self.timestamp = timestamp
+        return self.value
+
+
+class RollingVolatility:
+    """Sample rolling standard deviation over a fixed window of ticks."""
+    def __init__(self, window: int):
+        self.values = deque(maxlen=window)
+
+    def update(self, value: float) -> Optional[float]:
+        self.values.append(float(value))
+        if len(self.values) < 2:
+            return None
+        mean = sum(self.values) / len(self.values)
+        variance = sum((x - mean) ** 2 for x in self.values) / (len(self.values) - 1)
+        return math.sqrt(max(0.0, variance))
+
+
+class AdaptivePersistence:
+    """Maps volatility ratio to required signal hold duration."""
+    @staticmethod
+    def raw(volatility_ratio: float, minimum: float = 3.0, maximum: float = 30.0) -> float:
+        """P_raw = 10/VR, clamped to [minimum, maximum]."""
+        return max(minimum, min(maximum, 10.0 / max(float(volatility_ratio), 1e-12)))
+
+
+class ContinuousEMAEngine:
+    """Continuous streaming indicator pipeline tracking EMA 15s, 90s, 300s, slope, and persistence."""
+    def __init__(self):
+        self.emas = {h: ContinuousEMA(h) for h in (15.0, 90.0, 300.0)}
+        self.slow_history = deque(maxlen=11)
+        self.rv = {60: RollingVolatility(60), 300: RollingVolatility(300)}
+        self.raw_signal: int = 0
+        self.signal_start_ts: Optional[float] = None
+        self.confirmed_signal: int = 0
+        self.latest_snapshot: Dict[str, Any] = {}
+
+    def update(self, spot: float, now_ts: float) -> Dict[str, Any]:
+        if spot <= 0:
+            return self.latest_snapshot
+
+        for ema in self.emas.values():
+            ema.update(spot, now_ts)
+
+        if self.emas[300.0].value is not None:
+            self.slow_history.append(self.emas[300.0].value)
+
+        rv60 = self.rv[60].update(spot)
+        rv300 = self.rv[300].update(spot)
+
+        vr = (rv60 / rv300) if rv60 is not None and rv300 and rv300 > 0 else 1.0
+        p_req = AdaptivePersistence.raw(vr)
+
+        slow_slope = (self.slow_history[-1] - self.slow_history[0]) if len(self.slow_history) >= 2 else 0.0
+
+        fast_val = self.emas[15.0].value if self.emas[15.0].value is not None else spot
+        slow_val = self.emas[90.0].value if self.emas[90.0].value is not None else spot
+
+        # Directional raw signal: Fast > Slow and Slow Slope > 0 (Bullish), or Fast < Slow and Slope < 0 (Bearish)
+        if fast_val > slow_val and slow_slope > 0:
+            sig = 1
+        elif fast_val < slow_val and slow_slope < 0:
+            sig = -1
+        else:
+            sig = 0
+
+        if sig != 0:
+            if sig == self.raw_signal:
+                pass
+            else:
+                self.raw_signal = sig
+                self.signal_start_ts = now_ts
+        else:
+            self.raw_signal = 0
+            self.signal_start_ts = None
+            self.confirmed_signal = 0
+
+        hold_time = (now_ts - self.signal_start_ts) if self.signal_start_ts else 0.0
+        if self.raw_signal != 0 and hold_time >= p_req:
+            self.confirmed_signal = self.raw_signal
+        else:
+            self.confirmed_signal = 0
+
+        self.latest_snapshot = {
+            "ema_15": fast_val,
+            "ema_90": slow_val,
+            "ema_300": self.emas[300.0].value or spot,
+            "slow_slope": slow_slope,
+            "rv60": rv60 or 0.0,
+            "rv300": rv300 or 0.0,
+            "vr": vr,
+            "persistence_req": p_req,
+            "raw_signal": self.raw_signal,
+            "hold_time": hold_time,
+            "confirmed_signal": self.confirmed_signal
+        }
+        return self.latest_snapshot
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODULE 1B: MARKET DATA INGESTION & 5-MIN AGGREGATION
 # ══════════════════════════════════════════════════════════════════════════════
 
 class MarketData:
@@ -965,6 +1083,8 @@ class MarketData:
         self.latest_spot: float = 0.0
         self.latest_atm: int = 0
         self.last_completed_1m_key: Optional[str] = None
+        self.ema_engine = ContinuousEMAEngine()
+        self.latest_ema_snapshot: Dict[str, Any] = {}
         self._load_cache()
         self._seed_history_if_needed()
 
@@ -1231,6 +1351,8 @@ class MarketData:
         spot, atm, is_stale = self.streamer.get_spot_and_atm()
         self.latest_spot = spot
         self.latest_atm = atm
+        if spot > 0:
+            self.latest_ema_snapshot = self.ema_engine.update(spot, time.time())
         
         now = get_ist_now()
         current_min_key = now.strftime("%Y-%m-%d %H:%M")
@@ -1489,28 +1611,30 @@ class ReversionDetector:
     def is_reversal_for_ce(cls, indicators: dict, cooldown_data: dict = None) -> tuple:
         """
         Returns (signal: bool, confidence: int, reason: str)
-        CE re-entry strictly on 1m KAMA reversal:
+        CE re-entry strictly on 1m KAMA reversal or Continuous EMA confirmed bearish lock:
         CE was stopped because market surged UP.
-        Re-enter when KAMA 1m slope turns DOWN by more than 0.15 (kama_slope <= -0.15).
+        Re-enter when KAMA 1m slope turns DOWN (kama_slope <= -0.15) OR EMA confirms bearish trend (sig == -1).
         """
         s = cls._score(indicators)
         kama_slope = s["kama_slope"]
-        reversal = (kama_slope <= -REVERSAL_KAMA_SLOPE_THRESHOLD)
-        reason = f"KAMA_REVERSAL_CE(slope={kama_slope:.2f}<=-{REVERSAL_KAMA_SLOPE_THRESHOLD})" if reversal else ""
+        sig = indicators.get("confirmed_signal", 0)
+        reversal = (kama_slope <= -REVERSAL_KAMA_SLOPE_THRESHOLD) or (sig == -1)
+        reason = f"REVERSAL_CE(kama_slope={kama_slope:.2f}, ema_sig={sig})" if reversal else ""
         return reversal, (2 if reversal else 0), reason
 
     @classmethod
     def is_reversal_for_pe(cls, indicators: dict, cooldown_data: dict = None) -> tuple:
         """
         Returns (signal: bool, confidence: int, reason: str)
-        PE re-entry strictly on 1m KAMA reversal:
+        PE re-entry strictly on 1m KAMA reversal or Continuous EMA confirmed bullish lock:
         PE was stopped because market dumped DOWN.
-        Re-enter when KAMA 1m slope turns UP by more than 0.15 (kama_slope >= +0.15).
+        Re-enter when KAMA 1m slope turns UP (kama_slope >= +0.15) OR EMA confirms bullish trend (sig == +1).
         """
         s = cls._score(indicators)
         kama_slope = s["kama_slope"]
-        reversal = (kama_slope >= REVERSAL_KAMA_SLOPE_THRESHOLD)
-        reason = f"KAMA_REVERSAL_PE(slope={kama_slope:.2f}>=+{REVERSAL_KAMA_SLOPE_THRESHOLD})" if reversal else ""
+        sig = indicators.get("confirmed_signal", 0)
+        reversal = (kama_slope >= REVERSAL_KAMA_SLOPE_THRESHOLD) or (sig == 1)
+        reason = f"REVERSAL_PE(kama_slope={kama_slope:.2f}, ema_sig={sig})" if reversal else ""
         return reversal, (2 if reversal else 0), reason
 
     @classmethod
@@ -1524,11 +1648,13 @@ class ReversionDetector:
           - +DI > -DI with gap >= PROACTIVE_EXIT_DI_GAP_MIN
           - ADX >= PROACTIVE_EXIT_TREND_ADX (strong trend, not choppy)
           - KAMA slope >= +REVERSAL_KAMA_SLOPE_THRESHOLD (upward momentum)
+          - Continuous EMA confirmed bullish (+1)
 
         PE short is hurt when market goes DOWN (bearish trend):
           - -DI > +DI with gap >= PROACTIVE_EXIT_DI_GAP_MIN
           - ADX >= PROACTIVE_EXIT_TREND_ADX
           - KAMA slope <= -REVERSAL_KAMA_SLOPE_THRESHOLD (downward momentum)
+          - Continuous EMA confirmed bearish (-1)
         """
         if not PROACTIVE_EXIT_ENABLED:
             return False, ""
@@ -1536,6 +1662,7 @@ class ReversionDetector:
         s = cls._score(indicators)
         hits = 0
         reasons = []
+        sig = indicators.get("confirmed_signal", 0)
 
         if leg == "CE":
             # CE is hurt by UP moves
@@ -1548,6 +1675,9 @@ class ReversionDetector:
             if s["adx"] >= PROACTIVE_EXIT_TREND_ADX:
                 hits += 1
                 reasons.append(f"ADX{s['adx']:.1f}(STRONG)")
+            if sig == 1:
+                hits += 1
+                reasons.append("EMA_BULLISH_LOCKED")
         elif leg == "PE":
             # PE is hurt by DOWN moves
             if s["kama_slope"] <= -REVERSAL_KAMA_SLOPE_THRESHOLD:
@@ -1559,8 +1689,11 @@ class ReversionDetector:
             if s["adx"] >= PROACTIVE_EXIT_TREND_ADX:
                 hits += 1
                 reasons.append(f"ADX{s['adx']:.1f}(STRONG)")
+            if sig == -1:
+                hits += 1
+                reasons.append("EMA_BEARISH_LOCKED")
 
-        # Need all 3 for proactive exit (high conviction required)
+        # Need at least 3 confirming factors for proactive exit
         should_exit = (hits >= 3)
         reason = f"PROACTIVE_EXIT_{leg}[" + ",".join(reasons) + "]" if should_exit else ""
         return should_exit, reason
@@ -1577,6 +1710,12 @@ class ReversionDetector:
             return "PE"  # CE hit SL -> Market went UP -> Sell PE (Bullish)
         if last_stopped_leg == "PE":
             return "CE"  # PE hit SL -> Market went DOWN -> Sell CE (Bearish)
+
+        sig = indicators.get("confirmed_signal", 0)
+        if sig == 1:
+            return "PE"  # Continuous EMA locked bullish -> Sell PE
+        if sig == -1:
+            return "CE"  # Continuous EMA locked bearish -> Sell CE
 
         s = cls._score(indicators)
         # In strong uptrend: sell PE (market going up, put decays)
@@ -2525,6 +2664,15 @@ class ExecutionEngine:
         pad = max(0, W - ansi_len(title_left) - ansi_len(title_right))
         print(f"{V}{title_left}{' ' * pad}{title_right}{V}")
         
+        ema_15 = ind.get("ema_15") or spot
+        ema_90 = ind.get("ema_90") or spot
+        slow_slope = ind.get("slow_slope", 0.0)
+        vr = ind.get("vr", 1.0)
+        p_req = ind.get("persistence_req", 5.0)
+        sig_val = ind.get("confirmed_signal", 0)
+        sig_str = f"{c_green}▲ UP{res}" if sig_val > 0 else (f"{c_red}▼ DOWN{res}" if sig_val < 0 else f"{c_yellow}━ FLAT{res}")
+        hold = ind.get("hold_time", 0.0)
+
         ind_bar = (f"  {c_dim}SPOT:{res} {c_white}{spot:>9.2f}{res}  {c_dim}ATM:{res} {c_yellow}{atm:<5}{res}  "
                    f"{c_dim}FEED:{res} {feed_status}  "
                    f"{c_dim}ADX(5m):{res} {regime_col}{ind['adx']:>4.1f} ({ind['regime']}){res}  "
@@ -2533,6 +2681,14 @@ class ExecutionEngine:
         pad_ind = max(0, W - ansi_len(ind_bar))
         print(MID)
         print(f"{V}{ind_bar}{' ' * pad_ind}{V}")
+
+        ind_bar2 = (f"  {c_cyan}MOMENTUM:{res} {c_dim}EMA15:{res} {c_white}{ema_15:>9.2f}{res}  {c_dim}EMA90:{res} {c_white}{ema_90:>9.2f}{res}  "
+                    f"{c_dim}SLOPE:{res} {c_white}{slow_slope:>+6.3f}{res}  {c_dim}VR:{res} {c_white}{vr:>4.2f}{res}  "
+                    f"{c_dim}PERSIST:{res} {c_yellow}{p_req:>4.1f}s{res}  "
+                    f"{c_dim}SIGNAL:{res} {sig_str} {c_dim}({hold:.1f}s){res}")
+        pad_ind2 = max(0, W - ansi_len(ind_bar2))
+        print(MID_S)
+        print(f"{V}{ind_bar2}{' ' * pad_ind2}{V}")
         print(MID)
 
         unrealized = 0.0
@@ -2908,6 +3064,10 @@ class ExecutionEngine:
                         self.current_indicators["regime"] = "TRANSITION"
                         log_info(f"RV/IV Divergence {rv_iv_ratio:.2f} > 1.15. Early Trend detected. Shifting CHOP -> TRANSITION.")
                 
+                # Continuously overlay real-time streaming EMA indicators on every 1-second tick
+                if getattr(self.market_data, "latest_ema_snapshot", None):
+                    self.current_indicators.update(self.market_data.latest_ema_snapshot)
+
                 atr = self.current_indicators["atr"]
                 regime = self.current_indicators["regime"]
                 trend = self.current_indicators["trend"]
