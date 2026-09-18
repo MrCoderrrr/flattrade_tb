@@ -2381,6 +2381,14 @@ class ExecutionEngine:
         if leg not in self.positions:
             return 0.0
         
+        # Hedges are bought OTM and sold ONLY when session closes at 15:34 IST or emergency liquidation
+        if leg.endswith("_HEDGE") and not (
+            reason in ("SESSION_CLOSE", "CIRCUIT_BREAKER", "STOP_FLAG", "EMERGENCY_ZXC") or
+            reason.startswith("SIGNAL_") or reason.startswith("GLOBAL_")
+        ):
+            log_warn(f"🛡️ BLOCKED EXIT for {leg} (Reason: {reason})! Protective hedges are held until 15:34 IST session close.")
+            return 0.0
+        
         pos = self.positions[leg]
         base = pos["base"]
         tsym = pos.get("tsym")
@@ -2678,6 +2686,42 @@ class ExecutionEngine:
         else:
             log_warn("⚠️ Always-On rule: Could not enter any leg. Will retry next tick.")
 
+    def _ensure_protective_hedges(self, spot: float, atm: int, atr: float, dte_days: float = 2.0):
+        """
+        Safety integrity check: Guarantees protective OTM hedges (CE_HEDGE and PE_HEDGE)
+        are always active whenever the bot is in an active trading mode (RUNNING, CHOP_MODE, COOLDOWN, HEDGES_ONLY)
+        or whenever any short position exists.
+        Hedges are bought OTM (ATM +/- HEDGE_WIDTH_PTS) and held until 15:34 IST session close.
+        """
+        if not getattr(self.market_data.streamer, "is_flattrade_live", False):
+            return
+
+        now_ts = time.time()
+        if hasattr(self, "_last_hedge_check_ts") and (now_ts - self._last_hedge_check_ts) < 3.0:
+            return
+        self._last_hedge_check_ts = now_ts
+
+        has_shorts = any(p.get("side") == "SELL" for p in self.positions.values())
+        in_active_mode = self.mode in ("RUNNING", "CHOP_MODE", "COOLDOWN", "HEDGES_ONLY")
+
+        if not (has_shorts or in_active_mode):
+            return
+
+        hedge_configs = [
+            ("CE_HEDGE", atm + HEDGE_WIDTH_PTS),
+            ("PE_HEDGE", atm - HEDGE_WIDTH_PTS),
+        ]
+
+        for hedge_leg, hedge_strike in hedge_configs:
+            if hedge_leg not in self.positions:
+                log_alert(f"🛡️ PROTECTIVE HEDGE MISSING: Entering {hedge_leg} at strike {hedge_strike} (ATM {atm})...")
+                ok = self._enter_leg(hedge_leg, hedge_strike, "BUY", spot, atr, dte_days)
+                if ok:
+                    log_info(f"✅ {hedge_leg} active and protecting portfolio.")
+                    self._save_state()
+                else:
+                    log_warn(f"⚠️ Failed to enter missing {hedge_leg} at strike {hedge_strike}. Will retry.")
+
     def _render_dashboard(self, spot: float, atm: int):
         import re
         def ansi_len(s): return len(re.sub(r"\x1b\[[0-9;]*m", "", s))
@@ -2753,8 +2797,11 @@ class ExecutionEngine:
             hdr = f"  {'LEG':<10} {VS} {'CONTRACT':<19} {VS} {'STRIKE':>7} {VS} {'SIDE':<5} {VS} {'QTY':>3} {VS} {'ENTRY':>7} {VS} {'BEST PREM':>10} {VS} {'LTP':>7} {VS} {'SL':>10} {VS} {'PNL':>10}  "
             print(f"{V}{hdr}{' ' * max(0, W - ansi_len(hdr))}{V}")
             print(MID_S)
+            def _leg_order(k):
+                order = {"CE_HEDGE": 1, "PE_HEDGE": 2, "CE": 3, "PE": 4}
+                return order.get(k, 99)
 
-            for leg, pos in self.positions.items():
+            for leg, pos in sorted(self.positions.items(), key=lambda x: _leg_order(x[0])):
                 ltp = self._get_ltp(pos["strike"], pos["base"])
                 if ltp > 0:
                     pos["last_real_ltp"] = ltp
@@ -3268,6 +3315,9 @@ class ExecutionEngine:
 
                 # Phase B: Active Trading Management (RUNNING, CHOP_MODE, COOLDOWN)
                 elif self.mode in ("RUNNING", "CHOP_MODE", "COOLDOWN"):
+                    # ── Protective Hedge Integrity Check: Ensure hedges are ALWAYS active ──
+                    self._ensure_protective_hedges(spot, atm, atr, dte_days)
+
                     # ── Always-On Safety Check: ensure ≥1 short leg always open ──
                     active_shorts = [leg for leg in ("CE", "PE")
                                      if leg in self.positions and self.positions[leg].get("side") == "SELL"]
@@ -3334,8 +3384,7 @@ class ExecutionEngine:
 
                 # Phase C: HEDGES_ONLY mode → treat same as no-short-legs → use Always-On rule
                 elif self.mode == "HEDGES_ONLY":
-                    # Clear any old 10s timer (removed)
-                    
+                    self._ensure_protective_hedges(spot, atm, atr, dte_days)
                     if not getattr(self, "_hedges_only_logged", False):
                         log_info("🔁 HEDGES_ONLY mode: Applying Always-On rule to re-enter short legs immediately...")
                         self._hedges_only_logged = True
