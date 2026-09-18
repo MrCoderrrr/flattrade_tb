@@ -2859,13 +2859,15 @@ class ExecutionEngine:
                 "atm": atm,
                 "mode": self.mode,
                 "config": {
+                    "capital": CAPITAL,
+                    "qty": self.qty,
                     "kama_period": KAMA_PERIOD,
                     "kama_fast": KAMA_FAST_EMA,
                     "kama_slow": KAMA_SLOW_EMA,
                     "kama_min_slope": KAMA_MIN_SLOPE,
                     "adx_period": ADX_PERIOD,
                     "atr_period": ATR_PERIOD,
-                    "strike_width_mult": BASE_ATR_MULTIPLIER,
+                    "strike_width_mult": globals().get("BASE_ATR_MULTIPLIER", 1.0),
                     "circuit_breaker_pct": PORTFOLIO_CIRCUIT_PCT,
                     "cooldown_minutes": COOLDOWN_MINUTES,
                     "cooldown_min": 0
