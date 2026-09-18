@@ -2869,7 +2869,7 @@ class ExecutionEngine:
                     "atr_period": ATR_PERIOD,
                     "strike_width_mult": globals().get("BASE_ATR_MULTIPLIER", 1.0),
                     "circuit_breaker_pct": PORTFOLIO_CIRCUIT_PCT,
-                    "cooldown_minutes": COOLDOWN_MINUTES,
+                    "cooldown_minutes": globals().get("COOLDOWN_MINUTES", 0),
                     "cooldown_min": 0
                 },
                 "indicators": self.current_indicators,
