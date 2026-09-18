@@ -204,106 +204,159 @@ except ImportError:
                 try:
                     with open(target_file, 'r') as f:
                         d = json.load(f)
-                except:
+                except Exception:
                     pass
 
+            base_cap = globals().get("CAPITAL", 195784.0)
             if d is None or not isinstance(d, dict):
-                d = {"mtd_pnl": 0.0, "ytd_pnl": 0.0, "current_capital": 195784.0, "today_pnl": 0.0, "last_date": "", "intraday_date": ""}
+                d = {
+                    "mtd_pnl": 0.0,
+                    "ytd_pnl": 0.0,
+                    "current_capital": base_cap,
+                    "today_pnl": 0.0,
+                    "last_date": "",
+                    "intraday_date": "",
+                    "daily_pnl": {}
+                }
 
-            # Auto-sanitize erroneous ~10k PnL anomaly from testing bug
+            if "daily_pnl" not in d or not isinstance(d["daily_pnl"], dict):
+                d["daily_pnl"] = {}
+
+            # Sanitize any anomalous testing bug records
             modified = False
-            for list_key in ("history", "trades", "daily_pnl_list", "records"):
-                if list_key in d and isinstance(d[list_key], list):
-                    for item in d[list_key]:
-                        if isinstance(item, dict):
-                            val = float(item.get("pnl") or item.get("realized_pnl") or 0.0)
-                            if -15000.0 <= val <= -3000.0:
-                                item["pnl"] = 0.0
-                                if "realized_pnl" in item: item["realized_pnl"] = 0.0
-                                modified = True
+            for k in list(d["daily_pnl"].keys()):
+                val = d["daily_pnl"][k]
+                if isinstance(val, (int, float)) and (-15000.0 <= val <= -3000.0):
+                    d["daily_pnl"][k] = 0.0
+                    modified = True
 
-            for dict_key in ("daily_pnl", "days", "daily"):
-                if dict_key in d and isinstance(d[dict_key], dict):
-                    for dt_k, val in list(d[dict_key].items()):
-                        if isinstance(val, (int, float)) and (-15000.0 <= val <= -3000.0):
-                            d[dict_key][dt_k] = 0.0
-                            modified = True
-                        elif isinstance(val, dict):
-                            p_val = val.get("pnl", val.get("realized_pnl", 0.0))
-                            if -15000.0 <= p_val <= -3000.0:
-                                val["pnl"] = 0.0
-                                if "realized_pnl" in val: val["realized_pnl"] = 0.0
-                                modified = True
-
-            if -15000.0 <= d.get("mtd_pnl", 0.0) <= -3000.0 or abs(d.get("mtd_pnl", 0.0) - (-10340.85)) < 500:
+            if -15000.0 <= d.get("mtd_pnl", 0.0) <= -3000.0:
                 d["mtd_pnl"] = 0.0
                 modified = True
-            if -15000.0 <= d.get("ytd_pnl", 0.0) <= -3000.0 or abs(d.get("ytd_pnl", 0.0) - (-10340.85)) < 500:
+            if -15000.0 <= d.get("ytd_pnl", 0.0) <= -3000.0:
                 d["ytd_pnl"] = 0.0
                 modified = True
             if -15000.0 <= d.get("today_pnl", 0.0) <= -3000.0:
                 d["today_pnl"] = 0.0
                 modified = True
-            if d.get("current_capital", 195784.0) < 190000.0:
-                d["current_capital"] = 195784.0
+            if d.get("current_capital", base_cap) < 190000.0:
+                d["current_capital"] = base_cap
                 modified = True
 
             if modified:
                 try:
                     with open(target_file, 'w') as f:
                         json.dump(d, f, indent=2)
-                except:
+                except Exception:
                     pass
 
             return d
             
         def _save(self):
-            import json
-            with open(self.filename, 'w') as f: json.dump(self.data, f)
+            import json, os
+            target_file = self.filename
+            if not os.path.exists(target_file):
+                cand = os.path.join(PROJECT_ROOT, self.filename)
+                if os.path.exists(cand) or os.path.exists(PROJECT_ROOT):
+                    target_file = cand
+            try:
+                os.makedirs(os.path.dirname(os.path.abspath(target_file)), exist_ok=True)
+                with open(target_file, 'w') as f:
+                    json.dump(self.data, f, indent=2)
+            except Exception:
+                pass
             
-        def commit_daily_pnl(self, realized_pnl: float):
-            today_str = self._get_ist_str()
-            if self.data.get("last_date") == today_str: return  # already committed today
-            
-            last_date_str = self.data.get("last_date", "")
-            if last_date_str:
-                try:
-                    from datetime import datetime
-                    last_dt = datetime.strptime(last_date_str, "%Y-%m-%d")
-                    now_dt = datetime.strptime(today_str, "%Y-%m-%d")
-                    if last_dt.month != now_dt.month: self.data["mtd_pnl"] = 0.0
-                    if last_dt.year != now_dt.year: self.data["ytd_pnl"] = 0.0
-                except: pass
-                
-            self.data["mtd_pnl"] = self.data.get("mtd_pnl", 0.0) + realized_pnl
-            self.data["ytd_pnl"] = self.data.get("ytd_pnl", 0.0) + realized_pnl
-            self.data["current_capital"] = self.data.get("current_capital", 195784.0) + realized_pnl
+        def commit_daily_pnl(self, realized_pnl: float, date_str: Optional[str] = None):
+            today_str = date_str or self._get_ist_str()
+            month_prefix = today_str[:7]
+            year_prefix = today_str[:4]
+            base_cap = globals().get("CAPITAL", 195784.0)
+
+            daily_map = self.data.setdefault("daily_pnl", {})
+            daily_map[today_str] = round(float(realized_pnl), 2)
+
+            # Recompute MTD, YTD, and Capital from daily history
+            mtd_sum = round(sum(v for d, v in daily_map.items() if d.startswith(month_prefix)), 2)
+            ytd_sum = round(sum(v for d, v in daily_map.items() if d.startswith(year_prefix)), 2)
+
+            self.data["mtd_pnl"] = mtd_sum
+            self.data["ytd_pnl"] = ytd_sum
+            self.data["current_capital"] = round(base_cap + ytd_sum, 2)
+            self.data["today_pnl"] = round(float(realized_pnl), 2)
             self.data["last_date"] = today_str
-            self.data["today_pnl"] = 0.0  # reset for next day
+            self.data["intraday_date"] = today_str
             self._save()
+
+            # Record to CSV log
+            try:
+                csv_path = os.path.join(PROJECT_ROOT, "data", "logs", "daily_pnl_v2_paper.csv")
+                os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+                import csv
+                rows = []
+                found = False
+                fieldnames = ["date", "daily_pnl", "mtd_pnl", "ytd_pnl", "current_capital"]
+                if os.path.exists(csv_path) and os.path.getsize(csv_path) > 0:
+                    with open(csv_path, "r") as f:
+                        reader = csv.DictReader(f)
+                        fieldnames = reader.fieldnames or fieldnames
+                        for r in reader:
+                            if r.get("date") == today_str:
+                                r["daily_pnl"] = f"{realized_pnl:.2f}"
+                                r["mtd_pnl"] = f"{mtd_sum:.2f}"
+                                r["ytd_pnl"] = f"{ytd_sum:.2f}"
+                                r["current_capital"] = f"{base_cap + ytd_sum:.2f}"
+                                found = True
+                            rows.append(r)
+                if not found:
+                    rows.append({
+                        "date": today_str,
+                        "daily_pnl": f"{realized_pnl:.2f}",
+                        "mtd_pnl": f"{mtd_sum:.2f}",
+                        "ytd_pnl": f"{ytd_sum:.2f}",
+                        "current_capital": f"{base_cap + ytd_sum:.2f}"
+                    })
+                with open(csv_path, "w") as f:
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    writer.writeheader()
+                    writer.writerows(rows)
+            except Exception:
+                pass
             
         def update_intraday_pnl(self, realized_pnl: float):
             today_str = self._get_ist_str()
             
-            # Auto-commit previous day if we rolled over
+            # Auto-commit previous day if date rolled over past midnight
             if self.data.get("intraday_date") and self.data.get("intraday_date") != today_str:
-                if self.data.get("last_date") != self.data.get("intraday_date"):
-                    self.commit_daily_pnl(self.data.get("today_pnl", 0.0))
+                prev_date = self.data["intraday_date"]
+                if self.data.get("last_date") != prev_date:
+                    self.commit_daily_pnl(self.data.get("today_pnl", 0.0), date_str=prev_date)
                     
-            self.data["today_pnl"] = realized_pnl
+            self.data["today_pnl"] = round(float(realized_pnl), 2)
             self.data["intraday_date"] = today_str
             self._save()
             
         def record_trade(self, *args, **kwargs): pass
         
         def get_strategy_pnl_summary(self, *args, **kwargs):
-            # Late-bind CAPITAL here so we always get the real configured value
+            today_str = self._get_ist_str()
+            month_prefix = today_str[:7]
+            year_prefix = today_str[:4]
             base = kwargs.get("base_capital", globals().get("CAPITAL", 195784.0))
+            
+            daily_map = self.data.get("daily_pnl", {})
+            # Sum of completed previous days in this month
+            past_mtd = round(sum(v for d, v in daily_map.items() if d.startswith(month_prefix) and d != today_str), 2)
+            # Sum of completed previous days in this year
+            past_ytd = round(sum(v for d, v in daily_map.items() if d.startswith(year_prefix) and d != today_str), 2)
+            
             return {
+                "base_capital": base,
+                "past_mtd": past_mtd,
+                "past_ytd": past_ytd,
                 "today_pnl": self.data.get("today_pnl", 0.0),
-                "mtd_pnl": self.data.get("mtd_pnl", 0.0),
-                "ytd_pnl": self.data.get("ytd_pnl", 0.0),
-                "current_capital": self.data.get("current_capital", base)
+                "mtd_pnl": self.data.get("mtd_pnl", past_mtd),
+                "ytd_pnl": self.data.get("ytd_pnl", past_ytd),
+                "current_capital": self.data.get("current_capital", round(base + past_ytd, 2))
             }
             
     db = DBManager()
@@ -2766,30 +2819,34 @@ class ExecutionEngine:
 
         print(MID)
         db_stats = db.get_strategy_pnl_summary("v2", base_capital=CAPITAL)
-        db_today = db_stats.get("today_pnl", 0.0)
-        uncommitted_pnl = (self.realized_pnl - db_today) if abs(self.realized_pnl - db_today) > 0.01 else 0.0
-        mtd_pnl = db_stats.get("mtd_pnl", 0.0) + uncommitted_pnl
-        mtd_ret = (mtd_pnl / CAPITAL) * 100.0
-        ytd_pnl = db_stats.get("ytd_pnl", 0.0) + uncommitted_pnl
-        ytd_ret = (ytd_pnl / CAPITAL) * 100.0
-        total_cap = db_stats.get("current_capital", CAPITAL) + uncommitted_pnl
+        base_cap = db_stats.get("base_capital", CAPITAL)
+        past_mtd = db_stats.get("past_mtd", 0.0)
+        past_ytd = db_stats.get("past_ytd", 0.0)
 
-        total_pnl = self.realized_pnl + unrealized
-        ret_pct = (total_pnl / CAPITAL) * 100.0
-        pnl_col = c_green if total_pnl >= 0 else c_red
-        sign = "+" if total_pnl >= 0 else ""
+        # Today's net MTM (realized + open unrealized PnL)
+        today_net_mtm = self.realized_pnl + unrealized
+        ret_pct = (today_net_mtm / CAPITAL) * 100.0
+        pnl_col = c_green if today_net_mtm >= 0 else c_red
+        sign = "+" if today_net_mtm >= 0 else ""
 
-        mtd_col = c_green if mtd_pnl >= 0 else c_red
-        ytd_col = c_green if ytd_pnl >= 0 else c_red
+        # Live MTD, YTD, and Capital dynamically include today's net MTM
+        live_mtd = past_mtd + today_net_mtm
+        mtd_ret = (live_mtd / CAPITAL) * 100.0
+        live_ytd = past_ytd + today_net_mtm
+        ytd_ret = (live_ytd / CAPITAL) * 100.0
+        live_capital = base_cap + past_ytd + today_net_mtm
+
+        mtd_col = c_green if live_mtd >= 0 else c_red
+        ytd_col = c_green if live_ytd >= 0 else c_red
 
         pnl_str = (f"  {c_dim}TODAY REALIZED:{res} ₹{self.realized_pnl:,.2f}  {c_dim}UNREAL:{res} ₹{unrealized:,.2f}  "
-                   f"{c_dim}NET MTM:{res} {pnl_col}{sign}₹{total_pnl:,.2f} ({ret_pct:+.2f}%){res}  "
+                   f"{c_dim}NET MTM:{res} {pnl_col}{sign}₹{today_net_mtm:,.2f} ({ret_pct:+.2f}%){res}  "
                    f"{c_dim}CIRCUIT:{res} {c_red}-₹{abs(self.risk_manager.circuit_breaker_loss_limit):,.0f} (-1.8%){res}")
         print(f"{V}{pnl_str}{' ' * max(0, W - ansi_len(pnl_str))}{V}")
 
-        cum_str = (f"  {c_yellow}MONTH-TO-DATE (MTD):{res} {mtd_col}{'+' if mtd_pnl>=0 else ''}₹{mtd_pnl:,.2f} ({mtd_ret:+.2f}%){res}  {VS}  "
-                   f"{c_yellow}YEAR-TO-DATE (YTD):{res} {ytd_col}{'+' if ytd_pnl>=0 else ''}₹{ytd_pnl:,.2f} ({ytd_ret:+.2f}%){res}  {VS}  "
-                   f"{c_dim}CAPITAL:{res} {c_white}₹{total_cap:,.2f}{res}")
+        cum_str = (f"  {c_yellow}MONTH-TO-DATE (MTD):{res} {mtd_col}{'+' if live_mtd>=0 else ''}₹{live_mtd:,.2f} ({mtd_ret:+.2f}%){res}  {VS}  "
+                   f"{c_yellow}YEAR-TO-DATE (YTD):{res} {ytd_col}{'+' if live_ytd>=0 else ''}₹{live_ytd:,.2f} ({ytd_ret:+.2f}%){res}  {VS}  "
+                   f"{c_dim}CAPITAL:{res} {c_white}₹{live_capital:,.2f}{res}")
         print(MID_S)
         print(f"{V}{cum_str}{' ' * max(0, W - ansi_len(cum_str))}{V}")
         print(BOT)
@@ -2802,30 +2859,26 @@ class ExecutionEngine:
                 "atm": atm,
                 "mode": self.mode,
                 "config": {
-                    "session_em_1sd": getattr(self, "session_em_1sd", 0.0),
-                    "capital": CAPITAL,
-                    "qty": self.qty,
                     "kama_period": KAMA_PERIOD,
                     "kama_fast": KAMA_FAST_EMA,
                     "kama_slow": KAMA_SLOW_EMA,
                     "kama_min_slope": KAMA_MIN_SLOPE,
                     "adx_period": ADX_PERIOD,
-                    "adx_gate": ADX_CHOP_THRESHOLD,
-                    "debounce_bars": PREM_SL_DEBOUNCE_BARS,
-                    "strangle_width": BASE_MIN_WIDTH_PTS,
-                    "hedge_dist": HEDGE_WIDTH_PTS,
-                    
+                    "atr_period": ATR_PERIOD,
+                    "strike_width_mult": BASE_ATR_MULTIPLIER,
+                    "circuit_breaker_pct": PORTFOLIO_CIRCUIT_PCT,
+                    "cooldown_minutes": COOLDOWN_MINUTES,
                     "cooldown_min": 0
                 },
                 "indicators": self.current_indicators,
                 "realized_pnl": self.realized_pnl,
                 "unrealized_pnl": unrealized,
-                "total_pnl": total_pnl,
-                "mtd_pnl": mtd_pnl,
+                "total_pnl": today_net_mtm,
+                "mtd_pnl": live_mtd,
                 "mtd_return_pct": mtd_ret,
-                "ytd_pnl": ytd_pnl,
+                "ytd_pnl": live_ytd,
                 "ytd_return_pct": ytd_ret,
-                "total_capital": total_cap,
+                "total_capital": live_capital,
                 "positions": snap_positions,
                 "cooldown": self.cooldown_tracker
             }

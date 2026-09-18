@@ -1,1 +1,8 @@
-{"mtd_pnl": 0.0, "ytd_pnl": 0.0, "current_capital": 195784.0, "today_pnl": 0.0, "last_date": "", "intraday_date": "2026-09-15"}
+{
+  "mtd_pnl": 0.0,
+  "ytd_pnl": 0.0,
+  "current_capital": 195784.0,
+  "today_pnl": 0.0,
+  "last_date": "2026-09-18",
+  "intraday_date": "2026-09-18"
+}
