@@ -12,3 +12,5 @@ data/
 token.txt
 multiplier.txt
 paper_runtime_state.json
+NFO_symbols_*.csv
+MCX_symbols*.csv

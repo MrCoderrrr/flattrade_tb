@@ -79,6 +79,10 @@ import socket
 import select
 import threading
 import traceback
+import glob
+import zipfile
+import io
+import urllib.request
 import requests
 import urllib3.util.connection as urllib3_cn
 from datetime import datetime, timedelta, timezone
@@ -117,7 +121,7 @@ if PROJECT_ROOT not in sys.path:
 
 init(autoreset=True)
 
-# ─── Flattrade Core Integration & Polyfills ────────────────────────────────────
+TOKEN_FILE = 'token.txt'
 global_api = None
 FLATTRADE_CONNECTED = False
 
@@ -313,6 +317,114 @@ class NSEATMStreamer:
         self._last_atm: int = 0
         self._token_cache: Dict[str, Dict[str, Any]] = {}
         self._last_real_lp: Dict[str, float] = {}
+        self._nfo_master: Optional[pd.DataFrame] = None
+        self.is_flattrade_live: bool = False
+        self._last_pub_query: float = 0.0
+        self._last_token_mtime: float = 0.0
+        self._active_token_val: Optional[str] = None
+        self.check_token_reload()
+
+    def check_token_reload(self):
+        token_candidates = [
+            TOKEN_FILE,
+            os.path.join(CURRENT_DIR, "token.txt"),
+            os.path.join(PROJECT_ROOT, "token.txt"),
+            "/home/ubuntu/flattrade_tb/flattrade_tb/token.txt",
+            "/home/ubuntu/flattrade_tb/token.txt"
+        ]
+        token_file = next((tc for tc in token_candidates if os.path.exists(tc) and os.path.getsize(tc) > 0), None)
+        if token_file:
+            try:
+                mtime = os.path.getmtime(token_file)
+                if mtime > getattr(self, "_last_token_mtime", 0.0):
+                    self._last_token_mtime = mtime
+                    with open(token_file, "r") as f:
+                        tok = f.read().strip()
+                    if tok and tok != getattr(self, "_active_token_val", None):
+                        self._active_token_val = tok
+                        if self.api and hasattr(self.api, "set_session"):
+                            try:
+                                from creds import USER_ID
+                                uid = str(USER_ID).strip()
+                            except Exception:
+                                uid = os.getenv("USER_ID", "")
+                            self.api.set_session(userid=uid, password="", usertoken=tok)
+                            limits = self.api.get_limits()
+                            if isinstance(limits, dict) and str(limits.get("stat", "")).lower() in ("ok", "success"):
+                                self.is_flattrade_live = True
+                                log_info(f"✅ Active Flattrade session established from {token_file} for user {uid}!")
+                            else:
+                                self.is_flattrade_live = False
+            except Exception:
+                pass
+
+    def _get_nfo_master(self) -> Optional[pd.DataFrame]:
+        if self._nfo_master is not None and not self._nfo_master.empty:
+            return self._nfo_master
+
+        today_ist = get_ist_now().strftime('%Y-%m-%d')
+        csv_file = os.path.join(CURRENT_DIR, f'NFO_symbols_{today_ist}.csv')
+
+        if not os.path.exists(csv_file):
+            existing = sorted(glob.glob(os.path.join(CURRENT_DIR, "NFO_symbols_*.csv")))
+            if existing:
+                try:
+                    df = pd.read_csv(existing[-1])
+                    self._nfo_master = df[df['Symbol'] == 'NIFTY']
+                    return self._nfo_master
+                except Exception:
+                    pass
+            try:
+                log_info(f"Downloading official NFO contract master from Shoonya/Flattrade ({os.path.basename(csv_file)})...")
+                url = 'https://api.shoonya.com/NFO_symbols.txt.zip'
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                resp = urllib.request.urlopen(req, timeout=15)
+                with zipfile.ZipFile(io.BytesIO(resp.read())) as z:
+                    with z.open('NFO_symbols.txt') as f:
+                        df = pd.read_csv(f)
+                nifty_df = df[df['Symbol'] == 'NIFTY'].copy()
+                nifty_df.to_csv(csv_file, index=False)
+                self._nfo_master = nifty_df
+                return self._nfo_master
+            except Exception as e:
+                log_warn(f"Failed downloading NFO master: {e}")
+                return None
+        else:
+            df = pd.read_csv(csv_file)
+            self._nfo_master = df[df['Symbol'] == 'NIFTY']
+            return self._nfo_master
+
+    def get_option_contract(self, strike: int, option_type: str) -> Optional[Dict[str, Any]]:
+        master = self._get_nfo_master()
+        if master is None or master.empty:
+            return None
+
+        today = get_ist_now().date()
+        sub = master[(master['StrikePrice'] == float(strike)) & (master['OptionType'] == option_type)].copy()
+        if sub.empty:
+            return None
+
+        candidates = []
+        for _, row in sub.iterrows():
+            try:
+                exp_date = datetime.strptime(str(row['Expiry']).strip(), "%d-%b-%Y").date()
+                if exp_date >= today:
+                    candidates.append((exp_date, row))
+            except Exception:
+                continue
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda x: x[0])
+        nearest_expiry, match = candidates[0]
+        return {
+            'token': str(match['Token']).strip(),
+            'tsym': str(match['TradingSymbol']).strip(),
+            'expiry': str(match['Expiry']).strip(),
+            'expiry_date': nearest_expiry,
+            'lot_size': int(match.get('LotSize', LOT_SIZE))
+        }
 
     def get_spot_and_atm(self) -> Tuple[float, int, bool]:
         """
@@ -320,6 +432,7 @@ class NSEATMStreamer:
         Falls back to real-time market data in paper mode if Flattrade session key is expired.
         Returns: (spot, atm, is_stale)
         """
+        self.check_token_reload()
         if self.api and hasattr(self.api, "get_quotes"):
             try:
                 res = self.api.get_quotes(exchange='NSE', token='26000')
@@ -329,6 +442,7 @@ class NSEATMStreamer:
                     if spot > 0:
                         self._last_spot = spot
                         self._last_atm = int(round(spot / 50.0) * 50)
+                        self.is_flattrade_live = True
                         return self._last_spot, self._last_atm, False
             except Exception as e:
                 log_warn(f"Flattrade get_quotes error for Spot: {e}")
@@ -337,7 +451,7 @@ class NSEATMStreamer:
         if PAPER_TRADING_MODE:
             try:
                 now_ts = time.time()
-                if not hasattr(self, "_last_pub_query") or (now_ts - self._last_pub_query) >= 0.8:
+                if (now_ts - getattr(self, "_last_pub_query", 0.0)) >= 0.8:
                     self._last_pub_query = now_ts
                     url = "https://query1.finance.yahoo.com/v8/finance/chart/%5ENSEI?interval=1m"
                     r = requests.get(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}, timeout=3)
@@ -357,101 +471,78 @@ class NSEATMStreamer:
         return self._last_spot, self._last_atm, True
 
     def get_live_quote(self, strike: int, option_type: str) -> Dict[str, Any]:
-        """Fetches live option quote directly from Flattrade with token caching and fallback."""
+        """Fetches live option quote with NFO symbol master resolution and dynamic token caching."""
+        self.check_token_reload()
         cache_key = f"{strike}_{option_type}"
-        
-        # 1. Fast Path: If token is already cached, directly call get_quotes (15-20ms)
         cached = self._token_cache.get(cache_key)
-        if cached and self.api and hasattr(self.api, "get_quotes"):
+
+        if not cached:
+            contract = self.get_option_contract(strike, option_type)
+            if contract:
+                cached = {
+                    'token': contract['token'],
+                    'tsym': contract['tsym'],
+                    'ls': contract['lot_size'],
+                    'expiry': contract['expiry'],
+                    'expiry_date': contract['expiry_date']
+                }
+                self._token_cache[cache_key] = cached
+            elif self.api and hasattr(self.api, "searchscrip"):
+                try:
+                    res = self.api.searchscrip(exchange='NFO', searchtext=f"NIFTY {strike} {option_type}")
+                    if res and isinstance(res, dict) and res.get('stat') == 'Ok' and res.get('values'):
+                        today = get_ist_now().date()
+                        candidates = []
+                        for item in res['values']:
+                            tsym = str(item.get('tsym', '')).upper()
+                            if not tsym.startswith('NIFTY') or tsym.startswith(('BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY')):
+                                continue
+                            if 'exd' in item:
+                                try:
+                                    d = datetime.strptime(item['exd'], "%d-%b-%Y").date()
+                                    if d >= today:
+                                        candidates.append((d, item))
+                                except ValueError:
+                                    continue
+                        if candidates:
+                            candidates.sort(key=lambda x: x[0])
+                            m = candidates[0][1]
+                            cached = {
+                                'token': str(m['token']),
+                                'tsym': str(m['tsym']),
+                                'ls': int(m.get('ls', LOT_SIZE)),
+                                'expiry': m.get('exd', '')
+                            }
+                            self._token_cache[cache_key] = cached
+                except Exception:
+                    pass
+
+        token = cached['token'] if cached else None
+        tsym = cached['tsym'] if cached else f"NIFTY{strike}{option_type}"
+        ls = cached['ls'] if cached else LOT_SIZE
+
+        # Fast path: query live broker quote
+        if token and self.api and hasattr(self.api, "get_quotes"):
             try:
-                quote = self.api.get_quotes(exchange='NFO', token=cached['token'])
-                lp = 0.0
-                if quote and isinstance(quote, dict):
+                quote = self.api.get_quotes(exchange='NFO', token=token)
+                if quote and isinstance(quote, dict) and str(quote.get('stat', '')).lower() in ('ok', 'success'):
                     for field in ('lp', 'ltp', 'c', 'sp1', 'bp1', 'ap'):
                         val = quote.get(field)
                         if val is not None:
                             try:
                                 v_flt = float(val)
                                 if v_flt > 0:
-                                    lp = v_flt
-                                    break
+                                    self._last_real_lp[cache_key] = v_flt
+                                    self.is_flattrade_live = True
+                                    return {"lp": v_flt, "tsym": tsym, "ls": ls}
                             except (ValueError, TypeError):
                                 pass
-                if lp > 0:
-                    self._last_real_lp[cache_key] = lp
-                else:
-                    lp = self._last_real_lp.get(cache_key, 0.0)
-                    if lp <= 0:
-                        diff = abs(self._last_spot - strike)
-                        if diff < 75:
-                            lp = 55.0  # Realistic ATM baseline for near-expiry NIFTY
-                        elif diff < 300:
-                            lp = max(5.0, round(55.0 - (diff * 0.18), 2))
-                        else:
-                            lp = 0.50  # Far OTM hedge baseline
-                return {"lp": lp, "tsym": cached['tsym'], "ls": cached.get('ls', LOT_SIZE)}
-            except Exception as e:
-                log_warn(f"Fast get_quotes error for {cache_key}: {e}")
+            except Exception:
+                pass
 
-        # 2. Slow Path: Search scrip once and cache the contract token
-        today = get_ist_now().date()
-        if self.api and hasattr(self.api, "searchscrip"):
-            try:
-                search_text = f"NIFTY {strike} {option_type}"
-                res = self.api.searchscrip(exchange='NFO', searchtext=search_text)
-                if res and isinstance(res, dict) and res.get('stat') == 'Ok' and res.get('values'):
-                    valid = []
-                    for item in res['values']:
-                        tsym = str(item.get('tsym', '')).upper()
-                        # Strictly match NIFTY 50, exclude BANKNIFTY, FINNIFTY, MIDCPNIFTY
-                        if not tsym.startswith('NIFTY') or tsym.startswith(('BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY')):
-                            continue
-                        if 'exd' in item:
-                            try:
-                                d = datetime.strptime(item['exd'], "%d-%b-%Y").date()
-                                if d >= today:  # Only current or future expiries
-                                    valid.append({'item': item, 'dt': d})
-                            except ValueError:
-                                continue
-                    if valid:
-                        valid.sort(key=lambda x: x['dt'])
-                        match = valid[0]['item']
-                        tsym = match['tsym']
-                        token = str(match['token'])
-                        ls = int(match.get('ls', LOT_SIZE))
-                        # Cache for all subsequent 1-second ticks
-                        self._token_cache[cache_key] = {'token': token, 'tsym': tsym, 'ls': ls}
+        self.is_flattrade_live = False
 
-                        quote = self.api.get_quotes(exchange='NFO', token=token)
-                        lp = 0.0
-                        if quote and isinstance(quote, dict):
-                            for field in ('lp', 'ltp', 'c', 'sp1', 'bp1', 'ap'):
-                                val = quote.get(field)
-                                if val is not None:
-                                    try:
-                                        v_flt = float(val)
-                                        if v_flt > 0:
-                                            lp = v_flt
-                                            break
-                                    except (ValueError, TypeError):
-                                        pass
-                        if lp > 0:
-                            self._last_real_lp[cache_key] = lp
-                        else:
-                            lp = self._last_real_lp.get(cache_key, 0.0)
-                            if lp <= 0:
-                                diff = abs(self._last_spot - strike)
-                                if diff < 75:
-                                    lp = 55.0
-                                elif diff < 300:
-                                    lp = max(5.0, round(55.0 - (diff * 0.18), 2))
-                                else:
-                                    lp = 0.50
-                        return {"lp": lp, "tsym": tsym, "ls": ls}
-            except Exception as e:
-                log_warn(f"get_live_quote searchscrip error: {e}")
-
-        # Ultimate fallback if completely uncached and search fails
+        # Fallback simulation when broker API is unavailable / session expired
         if self._last_spot > 0:
             diff = (self._last_spot - strike) if option_type == "CE" else (strike - self._last_spot)
             intrinsic = max(0.0, diff)
@@ -459,42 +550,26 @@ class NSEATMStreamer:
             lp = round(intrinsic + time_val, 2)
         else:
             lp = 50.0
-        return {"lp": lp, "tsym": f"NIFTY{strike}{option_type}", "ls": LOT_SIZE}
+
+        return {"lp": lp, "tsym": tsym, "ls": ls}
 
     def get_near_expiry_dte(self) -> Tuple[Optional[datetime], float]:
-        """Fetches near expiry date and DTE directly from Flattrade NFO contracts."""
+        """Fetches near expiry date and DTE directly from NFO master or Flattrade contracts."""
         today = get_ist_now().date()
         if self._cached_expiry_date is None or self._cached_expiry_day != today:
-            if self.api and hasattr(self.api, "searchscrip"):
-                try:
-                    res = self.api.searchscrip(exchange='NFO', searchtext='NIFTY')
-                    candidates = []
-                    if res and isinstance(res, dict) and res.get('stat') == 'Ok' and res.get('values'):
-                        for item in res['values']:
-                            tsym = str(item.get('tsym', '')).upper()
-                            # Strictly match NIFTY 50 (Thursday expiry), exclude other indices
-                            if not tsym.startswith('NIFTY') or tsym.startswith(('BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY')):
-                                continue
-                            if 'exd' in item:
-                                try:
-                                    candidates.append(datetime.strptime(item['exd'], "%d-%b-%Y"))
-                                except ValueError:
-                                    continue
-                    future = [d for d in candidates if d.date() >= today]
-                    if future:
-                        self._cached_expiry_date = min(future)
-                    elif candidates:
-                        self._cached_expiry_date = min(candidates)
-                except Exception:
-                    pass
-            if self._cached_expiry_date is None:
-                days_ahead = (3 - get_ist_now().weekday()) % 7
+            contract = self.get_option_contract(self._last_atm or 23300, "CE")
+            if contract and contract.get("expiry_date"):
+                self._cached_expiry_date = datetime.combine(contract["expiry_date"], datetime.min.time())
+                self._cached_expiry_day = today
+            else:
+                days_ahead = (3 - today.weekday()) % 7
                 if days_ahead == 0 and get_ist_now().hour >= 15:
                     days_ahead = 7
-                self._cached_expiry_date = get_ist_now() + timedelta(days=days_ahead)
-            self._cached_expiry_day = today
-        dte = max(0.01, (self._cached_expiry_date - get_ist_now()).total_seconds() / 86400.0)
-        return self._cached_expiry_date, dte
+                self._cached_expiry_date = datetime.combine(today + timedelta(days=days_ahead), datetime.min.time())
+                self._cached_expiry_day = today
+
+        dte = max(0.01, (self._cached_expiry_date.date() - today).days)
+        return self._cached_expiry_date, float(dte)
 
 
 class FlattradeBroker:
@@ -2429,7 +2504,7 @@ class ExecutionEngine:
         import re
         def ansi_len(s): return len(re.sub(r"\x1b\[[0-9;]*m", "", s))
 
-        W = 114
+        W = 126
         c_cyan   = f"{Fore.CYAN}{Style.BRIGHT}"
         c_white  = f"{Fore.WHITE}{Style.BRIGHT}"
         c_dim    = f"{Fore.WHITE}{Style.DIM}"
@@ -2452,6 +2527,9 @@ class ExecutionEngine:
         regime_col = c_mag if ind["regime"] == "CHOP" else (c_cyan if ind["regime"] == "TREND" else c_yellow)
         kama_str = f"{ind['kama']:.2f}" if ind["kama"] else "WARMUP"
         
+        is_live = getattr(self.market_data.streamer, "is_flattrade_live", False)
+        feed_status = f"{c_green}● LIVE FLATTRADE{res}" if is_live else f"{c_yellow}⚠️ SIMULATED (Token Expired){res}"
+
         print()
         print(TOP)
         title_left = f"  {c_cyan}ADAPTIVE KAMA-ADX HEDGED STRANGLE (V2.0){res}  {c_dim}│{res}  {c_yellow}DUAL-SL (SPOT+PREM) ACTIVE{res}  {c_dim}│{res}  {c_green}TYPE 'zxc' TO STOP{res}"
@@ -2460,9 +2538,10 @@ class ExecutionEngine:
         print(f"{V}{title_left}{' ' * pad}{title_right}{V}")
         
         ind_bar = (f"  {c_dim}SPOT:{res} {c_white}{spot:>9.2f}{res}  {c_dim}ATM:{res} {c_yellow}{atm:<5}{res}  "
+                   f"{c_dim}FEED:{res} {feed_status}  "
                    f"{c_dim}ADX(5m):{res} {regime_col}{ind['adx']:>4.1f} ({ind['regime']}){res}  "
                    f"{c_dim}KAMA(1m):{res} {c_white}{kama_str:>8}{res} {trend_col}{trend_str}{res}  "
-                   f"{c_dim}ATR(5m):{res} {c_white}{ind['atr']:>4.1f} pts{res}")
+                   f"{c_dim}ATR:{res} {c_white}{ind['atr']:>4.1f} pts{res}")
         pad_ind = max(0, W - ansi_len(ind_bar))
         print(MID)
         print(f"{V}{ind_bar}{' ' * pad_ind}{V}")
@@ -2474,7 +2553,7 @@ class ExecutionEngine:
             msg = f"  {c_yellow}No open positions. State: {self.mode}{res}"
             print(f"{V}{msg}{' ' * max(0, W - ansi_len(msg))}{V}")
         else:
-            hdr = f"  {'LEG':<10} {VS} {'STRIKE':>7} {VS} {'SIDE':<5} {VS} {'QTY':>3} {VS} {'ENTRY':>7} {VS} {'BEST PREM':>10} {VS} {'LTP':>7} {VS} {'SL':>10} {VS} {'PNL':>10}  "
+            hdr = f"  {'LEG':<10} {VS} {'CONTRACT':<19} {VS} {'STRIKE':>7} {VS} {'SIDE':<5} {VS} {'QTY':>3} {VS} {'ENTRY':>7} {VS} {'BEST PREM':>10} {VS} {'LTP':>7} {VS} {'SL':>10} {VS} {'PNL':>10}  "
             print(f"{V}{hdr}{' ' * max(0, W - ansi_len(hdr))}{V}")
             print(MID_S)
 
@@ -2502,7 +2581,8 @@ class ExecutionEngine:
                     spot_sl_str = "—"
 
                 leg_name = f"{leg}*" if (sl_state and sl_state.get("solo_mode")) else leg
-                row = (f"  {c_white}{leg_name:<10}{res} {VS} {c_white}{pos['strike']:>7}{res} {VS} {side_col}{pos['side']:<5}{res} {VS} "
+                contract_name = pos.get("tsym", f"NIFTY{pos['strike']}{pos['base']}")
+                row = (f"  {c_white}{leg_name:<10}{res} {VS} {c_cyan}{contract_name:<19}{res} {VS} {c_white}{pos['strike']:>7}{res} {VS} {side_col}{pos['side']:<5}{res} {VS} "
                        f"{c_white}{pos['qty']:>3}{res} {VS} "
                        f"{c_white}{pos['entry_price']:>7.2f}{res} {VS} {c_dim}{entry_spot_str:>10}{res} {VS} "
                        f"{c_yellow}{ltp:>7.2f}{res} {VS} {c_mag}{spot_sl_str:>10}{res} {VS} "
