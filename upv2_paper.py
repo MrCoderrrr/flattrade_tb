@@ -79,6 +79,7 @@ import socket
 import select
 import threading
 import traceback
+import requests
 import urllib3.util.connection as urllib3_cn
 from datetime import datetime, timedelta, timezone
 
@@ -316,7 +317,7 @@ class NSEATMStreamer:
     def get_spot_and_atm(self) -> Tuple[float, int, bool]:
         """
         Fetches live NIFTY 50 Spot price directly from Flattrade every second (Token 26000 on NSE).
-        No dependency on yfinance.
+        Falls back to real-time market data in paper mode if Flattrade session key is expired.
         Returns: (spot, atm, is_stale)
         """
         if self.api and hasattr(self.api, "get_quotes"):
@@ -331,6 +332,28 @@ class NSEATMStreamer:
                         return self._last_spot, self._last_atm, False
             except Exception as e:
                 log_warn(f"Flattrade get_quotes error for Spot: {e}")
+
+        # Real-time fallback for paper trading if Flattrade API returns None / token expired
+        if PAPER_TRADING_MODE:
+            try:
+                now_ts = time.time()
+                if not hasattr(self, "_last_pub_query") or (now_ts - self._last_pub_query) >= 0.8:
+                    self._last_pub_query = now_ts
+                    url = "https://query1.finance.yahoo.com/v8/finance/chart/%5ENSEI?interval=1m"
+                    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}, timeout=3)
+                    if r.status_code == 200:
+                        data = r.json()
+                        p = float(data["chart"]["result"][0]["meta"]["regularMarketPrice"])
+                        if p > 0:
+                            self._last_spot = p
+                            self._last_atm = int(round(p / 50.0) * 50)
+                            return self._last_spot, self._last_atm, False
+            except Exception:
+                pass
+
+        if self._last_spot > 0:
+            return self._last_spot, self._last_atm, False
+
         return self._last_spot, self._last_atm, True
 
     def get_live_quote(self, strike: int, option_type: str) -> Dict[str, Any]:
@@ -429,16 +452,14 @@ class NSEATMStreamer:
                 log_warn(f"get_live_quote searchscrip error: {e}")
 
         # Ultimate fallback if completely uncached and search fails
-        lp = self._last_real_lp.get(cache_key, 0.0)
-        if lp <= 0:
-            diff = abs(self._last_spot - strike)
-            if diff < 75:
-                lp = 55.0
-            elif diff < 300:
-                lp = max(5.0, round(55.0 - (diff * 0.18), 2))
-            else:
-                lp = 0.50
-        return {"lp": round(lp, 2), "tsym": f"NIFTY{strike}{option_type}", "ls": LOT_SIZE}
+        if self._last_spot > 0:
+            diff = (self._last_spot - strike) if option_type == "CE" else (strike - self._last_spot)
+            intrinsic = max(0.0, diff)
+            time_val = max(0.50, 65.0 * math.exp(-abs(self._last_spot - strike) / 250.0))
+            lp = round(intrinsic + time_val, 2)
+        else:
+            lp = 50.0
+        return {"lp": lp, "tsym": f"NIFTY{strike}{option_type}", "ls": LOT_SIZE}
 
     def get_near_expiry_dte(self) -> Tuple[Optional[datetime], float]:
         """Fetches near expiry date and DTE directly from Flattrade NFO contracts."""
@@ -1826,7 +1847,7 @@ class ExecutionEngine:
                         return
 
                 try:
-                    if sys.stdin and not sys.stdin.closed:
+                    if sys.stdin and not sys.stdin.closed and hasattr(sys.stdin, "isatty") and sys.stdin.isatty():
                         rlist, _, _ = select.select([sys.stdin], [], [], 0.3)
                         if rlist:
                             line = sys.stdin.readline()
@@ -1839,9 +1860,9 @@ class ExecutionEngine:
                                 self.trigger_emergency_shutdown(reason="EMERGENCY_ZXC")
                                 return
                     else:
-                        time.sleep(0.5)
+                        time.sleep(1.0)
                 except Exception:
-                    time.sleep(0.5)
+                    time.sleep(1.0)
 
         t = threading.Thread(target=listener, daemon=True, name="ZXC_KillSwitch_Listener")
         t.start()
@@ -2020,7 +2041,7 @@ class ExecutionEngine:
             if not os.path.exists(TRADE_LOG_FILE):
                 with open(TRADE_LOG_FILE, "w") as f: f.write("timestamp,action,leg,strike,side,qty,price,pnl,reason\n")
             with open(TRADE_LOG_FILE, "a") as f:
-                ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                ts = get_ist_now().strftime("%Y-%m-%d %H:%M:%S")
                 pnl_str = f"{pnl:.2f}" if pnl is not None else ""
                 f.write(f"{ts},{action},{leg},{strike},{side},{qty},{price:.2f},{pnl_str},{reason}\n")
         except: pass
@@ -2540,7 +2561,7 @@ class ExecutionEngine:
 
         try:
             snap = {
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "timestamp": get_ist_now().strftime("%Y-%m-%d %H:%M:%S"),
                 "spot": spot,
                 "atm": atm,
                 "mode": self.mode,
