@@ -1,7 +1,7 @@
 """mcx_paper_v5.py  —  v5.0 (Continuous Streaming EMA Momentum + Hedged Straddle)
 ================================================================================
 MCX Natural Gas Paper Trading Engine | Version 5.0
-Session Window: 17:00 – 23:24 IST (weekdays & Sundays)
+Session Window: 15:30 – 23:24 IST (weekdays & Sundays)
 Auto Square-Off: 23:24 IST
 
 Key Architecture & Rules:
@@ -73,9 +73,10 @@ def get_ist_now() -> datetime:
 # ─────────────────────────────────────────────
 TOKEN_FILE          = 'token.txt'
 STRIKE_STEP         = 5.0          # Natural Gas strike step
-MCX_ENTRY_HOUR      = 17           # 17:00 IST open
+MCX_ENTRY_HOUR      = 15           # 15:30 IST open (3:30 PM)
+MCX_ENTRY_MINUTE    = 30
 MCX_EXIT_HOUR       = 23
-MCX_EXIT_MINUTE     = 24           # 23:24 IST auto square-off
+MCX_EXIT_MINUTE     = 24           # 23:24 IST auto square-off (11:24 PM)
 LOT_SIZE            = 1250         # 1 lot = 1250 units
 DEFAULT_SL_PCT      = 0.15         # 15% initial stop-loss (fresh straddles)
 REENTRY_SL_PCT      = 0.15         # 15% initial stop-loss for reversal re-entry
@@ -955,11 +956,11 @@ class NaturalGasPaperBot:
         RS  = Style.RESET_ALL
         print()
         print(f'{DIM}{"="*98}{RS}')
-        print(f'{CY}  MCX NATURAL GAS PAPER TRADING BOT  v5.0  |  STREAMING EMA MOMENTUM ENGINE{RS}')
+        print(f'{CY}  MCX NATURAL GAS PAPER TRADING BOT  v5.0  |  15:30 – 23:24 IST (EMA ENGINE){RS}')
         print(f'{DIM}{"="*98}{RS}')
         print(flush=True)
 
-        send_telegram('<pre>MCX Natural Gas\nPaper Trading Bot Online (v5.0 EMA Engine)</pre>')
+        send_telegram('<pre>MCX Natural Gas\nPaper Trading Bot Online (v5.0 EMA Engine)\nSession: 15:30 – 23:24 IST</pre>')
 
         last_wait_msg_ts = 0.0
 
@@ -988,10 +989,10 @@ class NaturalGasPaperBot:
                         f'Final Realized PnL: ₹{self.total_realized_pnl:,.0f}</pre>')
                     break
 
-                if now.hour < MCX_ENTRY_HOUR:
+                if now.hour < MCX_ENTRY_HOUR or (now.hour == MCX_ENTRY_HOUR and now.minute < MCX_ENTRY_MINUTE):
                     if now_ts - last_wait_msg_ts > 60.0:
                         last_wait_msg_ts = now_ts
-                        print(f'[WAIT] Market opens at {MCX_ENTRY_HOUR}:00 IST. '
+                        print(f'[WAIT] Market opens at {MCX_ENTRY_HOUR}:{MCX_ENTRY_MINUTE:02d} IST. '
                               f'Current: {now.strftime("%H:%M:%S")}', flush=True)
                     time.sleep(10)
                     continue

@@ -34,8 +34,8 @@ def is_nifty_session(now: datetime) -> bool:
 
 def is_mcx_session(now: datetime) -> bool:
     hhmm = now.strftime("%H:%M")
-    # Sunday to Friday (Saturday closed): 17:00 to 23:25 IST
-    return now.weekday() != 5 and "17:00" <= hhmm < "23:25"
+    # Monday to Friday: 15:30 to 23:25 IST
+    return now.weekday() < 5 and "15:30" <= hhmm < "23:25"
 
 
 def manage_engine(name: str, script_name: str, log_name: str, should_run: bool, current_proc: subprocess.Popen | None) -> subprocess.Popen | None:
