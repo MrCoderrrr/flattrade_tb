@@ -772,8 +772,8 @@ EXPIRY_NEAR_BONUS           = 0.42    # Extra curvature inside the last 2 days
 
 # Spot-Based Trailing Stop Loss
 PREM_SL_DEBOUNCE_BARS   = 1
-
-# Anti-Whipsaw Re-entry Cooldown: 3-MIN COOLDOWN REMOVED
+COOLDOWN_MINUTES        = 0     # 3-minute cooldown removed as requested
+BASE_ATR_MULTIPLIER     = 1.0   # Base Short Leg width
 
 # --- REVERSION DETECTOR (Multi-Indicator Confluence) ---
 # Signals a reversal when 2 of 3 indicators agree
@@ -2891,18 +2891,15 @@ class ExecutionEngine:
 
         # Send Telegram dashboard every 3 seconds
         try:
-            db_stats  = db.get_strategy_pnl_summary("v2", base_capital=CAPITAL)
-            uncommitted = (self.realized_pnl - db_stats.get("today_pnl", 0.0))
-            uncommitted = uncommitted if abs(uncommitted) > 0.01 else 0.0
             send_telegram_nifty_dashboard(
                 spot=spot, atm=atm, mode=self.mode,
                 positions=snap_positions,
                 realized_pnl=self.realized_pnl,
                 unrealized_pnl=unrealized,
                 ind=ind,
-                total_cap=db_stats.get("current_capital", CAPITAL) + uncommitted,
-                mtd_pnl=db_stats.get("mtd_pnl", 0.0) + uncommitted,
-                ytd_pnl=db_stats.get("ytd_pnl", 0.0) + uncommitted,
+                total_cap=live_capital,
+                mtd_pnl=live_mtd,
+                ytd_pnl=live_ytd,
             )
         except Exception as e:
             log_warn(f"Telegram dashboard dispatch failed: {e}")
