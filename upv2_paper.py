@@ -2153,8 +2153,9 @@ class ExecutionEngine:
 
     def _enter_leg(self, leg: str, strike: int, side: str, spot: float, atr: float, dte_days: float = 2.0) -> bool:
         base = leg.split("_")[0]
+        contract = self.market_data.streamer.get_option_contract(strike, base)
         q = self.market_data.streamer.get_live_quote(strike, base)
-        tsym = q.get("tsym", f"NIFTY{strike}{base}")
+        tsym = contract["tsym"] if contract and contract.get("tsym") else q.get("tsym", f"NIFTY{strike}{base}")
         if not tsym: return False
         ltp = self._get_ltp(strike, leg.split("_")[0])
         if ltp <= 0: return False
@@ -2212,7 +2213,14 @@ class ExecutionEngine:
         
         pos = self.positions[leg]
         base = pos["base"]
-        tsym = pos.get("tsym", f"NIFTY{pos['strike']}{base}")
+        tsym = pos.get("tsym")
+        if not tsym or len(tsym) <= 13:
+            resolved_c = self.market_data.streamer.get_option_contract(pos["strike"], base)
+            if resolved_c and resolved_c.get("tsym"):
+                tsym = resolved_c["tsym"]
+                pos["tsym"] = tsym
+        if not tsym:
+            tsym = f"NIFTY{pos['strike']}{base}"
         close_side = "BUY" if pos["side"] == "SELL" else "SELL"
         
         # Use the actual tracked position quantity
@@ -2581,7 +2589,15 @@ class ExecutionEngine:
                     spot_sl_str = "—"
 
                 leg_name = f"{leg}*" if (sl_state and sl_state.get("solo_mode")) else leg
-                contract_name = pos.get("tsym", f"NIFTY{pos['strike']}{pos['base']}")
+                contract_name = pos.get("tsym")
+                if not contract_name or len(contract_name) <= 13:
+                    resolved_c = self.market_data.streamer.get_option_contract(pos["strike"], pos["base"])
+                    if resolved_c and resolved_c.get("tsym"):
+                        contract_name = resolved_c["tsym"]
+                        pos["tsym"] = contract_name
+                if not contract_name:
+                    contract_name = f"NIFTY{pos['strike']}{pos['base']}"
+
                 row = (f"  {c_white}{leg_name:<10}{res} {VS} {c_cyan}{contract_name:<19}{res} {VS} {c_white}{pos['strike']:>7}{res} {VS} {side_col}{pos['side']:<5}{res} {VS} "
                        f"{c_white}{pos['qty']:>3}{res} {VS} "
                        f"{c_white}{pos['entry_price']:>7.2f}{res} {VS} {c_dim}{entry_spot_str:>10}{res} {VS} "
@@ -2775,6 +2791,14 @@ class ExecutionEngine:
                         log_warn(f"🔧 Reconciled realized PnL from ₹{self.realized_pnl:,.2f} to true trade book PnL ₹{true_trade_pnl:,.2f}")
                         self.realized_pnl = true_trade_pnl
                     self.positions = state.get("positions", {})
+                    # Ensure all position contract symbols use official NFO exchange symbols
+                    for leg_k, pinfo in self.positions.items():
+                        s_val = pinfo.get("strike")
+                        b_val = pinfo.get("base")
+                        if s_val and b_val:
+                            resolved_c = self.market_data.streamer.get_option_contract(s_val, b_val)
+                            if resolved_c and resolved_c.get("tsym"):
+                                pinfo["tsym"] = resolved_c["tsym"]
                     self.cooldown_tracker = state.get("cooldown_tracker", {})
                     self.session_em_1sd = float(state.get("session_em_1sd", 0.0))
                     self.total_reentries_today = int(state.get("total_reentries_today", 0))
