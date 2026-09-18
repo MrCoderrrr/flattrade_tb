@@ -76,7 +76,7 @@ def main() -> None:
             mcx_active = is_mcx_session(now)
 
             proc_nifty = manage_engine("NIFTY", "nifty_paper_v3.py", "nifty.log", nifty_active, proc_nifty)
-            proc_mcx = manage_engine("MCX Natural Gas", "mcx_paper_v4.py", "mcx.log", mcx_active, proc_mcx)
+            proc_mcx = manage_engine("MCX Natural Gas", "mcx_paper_v5.py", "mcx.log", mcx_active, proc_mcx)
 
             time.sleep(15)
     except KeyboardInterrupt:
