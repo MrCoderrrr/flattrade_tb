@@ -1958,6 +1958,20 @@ class RiskManager:
         return False, ""
 class ExecutionEngine:
     def __init__(self):
+        self._lock_file = None
+        try:
+            import fcntl
+            self._lock_file = open("/tmp/nifty_paper_engine.lock", "a+")
+            fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._lock_file.seek(0)
+            self._lock_file.truncate()
+            self._lock_file.write(f"{os.getpid()}\n")
+            self._lock_file.flush()
+        except (IOError, BlockingIOError):
+            print("\n❌ [FATAL] Another instance of NIFTY Paper Trading Engine is already running!", flush=True)
+            print("   Aborting duplicate instance immediately to prevent dual Telegram messages.\n", flush=True)
+            sys.exit(0)
+
         self.state_file = os.path.join(PROJECT_ROOT, "data", "state", "algo_state_v2_paper.json")
         self.cache_file = os.path.join(PROJECT_ROOT, "data", "cache", "spot_cache_paper.csv")
         self.live_snap_file = os.path.join(PROJECT_ROOT, "data", "state", "live_snapshot_v2_paper.json")
