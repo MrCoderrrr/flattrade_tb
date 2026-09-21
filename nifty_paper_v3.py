@@ -15,34 +15,11 @@ Key Rules:
 7. Session Auto Square-off strictly at 15:34 IST.
 ================================================================================
 """
-import fcntl
-import os
 import sys
 from upv2_paper import ExecutionEngine, prompt_user_variables
 
-_lock_file = None
-
-
-def acquire_engine_lock() -> bool:
-    global _lock_file
-    try:
-        _lock_file = open("/tmp/nifty_paper_engine.lock", "a+")
-        fcntl.flock(_lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        _lock_file.seek(0)
-        _lock_file.truncate()
-        _lock_file.write(f"{os.getpid()}\n")
-        _lock_file.flush()
-        return True
-    except (IOError, BlockingIOError):
-        return False
-
 
 def main():
-    if not acquire_engine_lock():
-        print("\n❌ [FATAL] Another instance of NIFTY Paper Trading Engine is already running!", flush=True)
-        print("   Aborting this instance immediately to prevent duplicate orders and dual Telegram messages.\n", flush=True)
-        sys.exit(0)
-
     prompt_user_variables()
     engine = ExecutionEngine()
     engine.run()
