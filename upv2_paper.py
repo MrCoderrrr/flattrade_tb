@@ -2700,6 +2700,90 @@ class ExecutionEngine:
         else:
             log_warn("⚠️ Always-On rule: Could not enter any leg. Will retry next tick.")
 
+    def _rebalance_strangle_in_place(self, solo_leg: str, spot: float, atm: int, atr: float, ltp_premium: float, dte_days: float = 2.0) -> bool:
+        """
+        Smart In-Place Strangle Rebalance:
+        When a solo surviving leg hits its TSL and the target strangle strike is identical to
+        its current strike (atm == strike), we do NOT exit and immediately re-enter this leg.
+        Instead:
+        1. Lock in the solo run's accrued profit into self.realized_pnl and trade log.
+        2. Reset the leg's entry_price to current ltp_premium and SL to a fresh 15% strangle SL.
+        3. Enter ONLY the missing leg at ATM (and ensure its hedge is active).
+        4. Saves 2 unnecessary market orders, bid-ask spreads, and slippage!
+        """
+        pos = self.positions.get(solo_leg)
+        if not pos:
+            return False
+
+        other_leg = "PE" if solo_leg == "CE" else "CE"
+        other_strike = atm
+        other_hedge = f"{other_leg}_HEDGE"
+
+        log_alert(
+            f"🔄 SMART IN-PLACE REBALANCE: {solo_leg} strike {pos['strike']} TSL hit. "
+            f"Next target state is ATM Strangle at {atm}. Preserving {solo_leg} in-place to eliminate exit+re-entry slippage!"
+        )
+
+        # 1. Ensure hedge for the other leg is entered first (margin protection)
+        if other_hedge not in self.positions:
+            hedge_dist = HEDGE_WIDTH_PTS
+            hedge_strike = atm + hedge_dist if other_leg == "CE" else atm - hedge_dist
+            hedge_ok = self._enter_leg(other_hedge, hedge_strike, "BUY", spot, atr, dte_days)
+            if not hedge_ok:
+                log_warn(f"⚠️ Hedge entry failed for {other_hedge}, cannot complete in-place strangle rebalance.")
+                return False
+
+        # 2. Enter ONLY the other (missing) leg
+        other_ok = self._enter_leg(other_leg, other_strike, "SELL", spot, atr, dte_days)
+        if not other_ok:
+            log_warn(f"⚠️ Entry of missing {other_leg} failed, falling back to standard leg exit.")
+            return False
+
+        # 3. Lock in accrued profit for solo_leg
+        old_entry = float(pos.get("entry_price", ltp_premium))
+        close_qty = int(pos.get("qty", self.qty))
+        run_pnl = (old_entry - ltp_premium) * close_qty
+        self.realized_pnl += run_pnl
+
+        col = Fore.GREEN if run_pnl >= 0 else Fore.RED
+        sign = "+" if run_pnl >= 0 else ""
+        log_trade(
+            f"REBALANCE ROLL {solo_leg:10s} Strike: {pos['strike']} @ ₹{ltp_premium:.2f} | "
+            f"Locked P&L: {col}{sign}₹{run_pnl:,.2f}{Style.RESET_ALL} (Saved Exit+Entry Slippage)"
+        )
+        self._log_trade("REBALANCE_ROLL", solo_leg, pos["strike"], "HOLD", close_qty, ltp_premium, pnl=run_pnl, reason="IN_PLACE_STRANGLE_REBALANCE")
+
+        # 4. Reset solo_leg in-place to fresh strangle state
+        pos["entry_price"] = ltp_premium
+        pos["entry_time"] = time.time()
+        pos["peak_premium"] = ltp_premium
+        current_iv = 15.0
+        if getattr(self, 'session_em_1sd', 0) > 0:
+            current_iv = (self.session_em_1sd / spot) * 19.1 * 100.0
+        pos["dual_sl_state"] = self.risk_manager.init_dual_sl(solo_leg, spot, pos["strike"], ltp_premium, atr, current_iv, dte_days)
+
+        # 5. Clear cooldowns & update mode
+        if solo_leg in self.cooldown_tracker:
+            self.cooldown_tracker[solo_leg]["active"] = False
+        if other_leg in self.cooldown_tracker:
+            self.cooldown_tracker[other_leg]["active"] = False
+
+        self.mode = "RUNNING"
+        self._save_state()
+
+        # Send Telegram notification
+        fresh_sl = pos["dual_sl_state"].get("current_premium_sl", round(ltp_premium * 1.15, 2))
+        msg = (
+            f"🔄 <b>IN-PLACE STRANGLE REBALANCE</b>\n"
+            f"• Preserved: <b>{solo_leg} {pos['strike']}</b> @ ₹{ltp_premium:.2f}\n"
+            f"• Locked Solo Run PnL: <b>{sign}₹{run_pnl:,.2f}</b>\n"
+            f"• Entered: <b>{other_leg} {other_strike}</b> SELL\n"
+            f"• Strangle SL Reset: 15% (₹{fresh_sl:.2f})\n"
+            f"• <i>Saved 2 orders & double slippage</i>"
+        )
+        _tg_send(msg)
+        return True
+
     def _ensure_protective_hedges(self, spot: float, atm: int, atr: float, dte_days: float = 2.0):
         """
         Safety integrity check: Guarantees protective OTM hedges (CE_HEDGE and PE_HEDGE)
@@ -3380,9 +3464,21 @@ class ExecutionEngine:
                         )
                         if is_stopped:
                             log_alert(reason)
-                            # Check if this is the LAST open leg — if so, we CANNOT exit without re-entering first
-                            # Instead: widen the SL temporarily by marking this tick as not breached
-                            # Actually for SL: always allow exit — Always-On rule kicks in next tick
+
+                            # ── Smart In-Place Strangle Rebalance Check ──
+                            # When solo leg hits TSL and target strangle strike matches current strike:
+                            other_leg = "PE" if leg == "CE" else "CE"
+                            other_open = (other_leg in self.positions and self.positions[other_leg].get("side") == "SELL")
+                            if not other_open and self.positions[leg]["strike"] == atm:
+                                # Check trend guards: do NOT rebalance into a strangle if market is in runaway trend against this leg
+                                is_against, _ = Indicators.is_trend_strongly_against(leg, self.current_indicators)
+                                ema_sig = self.current_indicators.get("confirmed_signal", 0)
+                                ema_against = (ema_sig == 1 and leg == "CE") or (ema_sig == -1 and leg == "PE")
+
+                                if not is_against and not ema_against:
+                                    if self._rebalance_strangle_in_place(leg, spot, atm, atr, ltp_premium, dte_days):
+                                        continue  # Successfully rebalanced in-place! Skip physical exit.
+
                             self._exit_leg(leg, reason="PREM_SL_HIT")
                             self._trigger_leg_cooldown(leg, spot, reason="PREM_SL_HIT")
                             continue

@@ -627,6 +627,78 @@ class NaturalGasPaperBot:
         for leg in list(self.positions.keys()):
             self._close_leg(leg, reason)
 
+    def _rebalance_strangle_in_place(self, solo_leg: str, spot: float, atm: float, live_ltp: float) -> bool:
+        """
+        Smart In-Place Strangle Rebalance for MCX Natural Gas:
+        When a solo surviving leg hits its TSL and the target strangle strike is identical to
+        its current strike (atm == strike), we do NOT exit and immediately re-enter this leg.
+        Instead:
+        1. Enter ONLY the missing leg at ATM.
+        2. Lock in the solo run's accrued profit into self.total_realized_pnl.
+        3. Reset the leg's entry_price to current live_ltp and SL to a fresh 15% strangle SL.
+        4. Saves 2 unnecessary market orders, bid-ask spreads, and slippage!
+        """
+        pos = self.positions.get(solo_leg)
+        if not pos:
+            return False
+
+        other_leg = 'PE' if solo_leg == 'CE' else 'CE'
+        other_strike = atm
+
+        print(f'[IN-PLACE REBALANCE] {solo_leg} {int(pos["strike"])} TSL reached. Target is ATM Straddle at {int(atm)}. '
+              f'Preserving {solo_leg} in-place to avoid exit+entry slippage!', flush=True)
+
+        # 1. Enter ONLY the missing leg at ATM
+        other_pos = self._enter_leg(other_leg, other_strike, 'SELL', loss_stop_pct=DEFAULT_SL_PCT)
+        if not other_pos:
+            print(f'[WARN] Failed to enter {other_leg} at {other_strike}, falling back to leg close.', flush=True)
+            return False
+
+        # 2. Lock in accrued profit for solo_leg
+        old_entry = pos['entry_price']
+        run_pnl = (old_entry - live_ltp) * pos['qty']
+        self.total_realized_pnl += run_pnl
+
+        sign = '+' if run_pnl >= 0 else ''
+        tot_sign = '+' if self.total_realized_pnl >= 0 else ''
+
+        # 3. Reset solo_leg in-place to fresh strangle state
+        pos['entry_price'] = live_ltp
+        pos['_last_ltp'] = live_ltp
+        pos['loss_stop_pct'] = DEFAULT_SL_PCT
+        pos['tsl_pct'] = DEFAULT_TSL_PCT
+        fresh_sl = round_to_tick(live_ltp * (1.0 + DEFAULT_SL_PCT))
+        pos['sl_state'] = {
+            'lowest_ltp': live_ltp,
+            'current_sl': fresh_sl,
+            'initial_sl': fresh_sl,
+            'loss_stop_pct': DEFAULT_SL_PCT,
+            'tsl_pct': DEFAULT_TSL_PCT,
+            'solo_mode': False
+        }
+
+        self.last_reentry_ts = time.time()
+        self._consume_reversal()
+        self._save_state()
+
+        # 4. Telegram alert
+        tg = '\n'.join([
+            '<pre>',
+            '━━━ MCX IN-PLACE REBALANCE (v5.0) ━━━',
+            '',
+            f'  Preserved: {solo_leg} {int(pos["strike"])} @ {live_ltp:.2f}',
+            f'  Locked Profit: {sign}₹{run_pnl:,.2f}',
+            f'  Entered: {other_leg} {int(other_strike)} SELL',
+            f'  SL Reset: 15% (₹{fresh_sl:.2f})',
+            f'  Total Realized: {tot_sign}₹{self.total_realized_pnl:,.2f}',
+            '',
+            '  *Saved 2 orders & double slippage*',
+            '</pre>'
+        ])
+        print(f'[REBALANCE ROLL] {solo_leg} {int(pos["strike"])} @ ₹{live_ltp:.2f} | Locked: {sign}₹{run_pnl:,.2f} | Reset SL: ₹{fresh_sl:.2f}', flush=True)
+        send_telegram(tg)
+        return True
+
     # ── Update SL/TSL for a single leg ────────
     def _update_leg(self, leg: str, live_ltp: float) -> Tuple[bool, str]:
         pos = self.positions.get(leg)
@@ -1090,6 +1162,14 @@ class NaturalGasPaperBot:
                     live_ltp = self._get_leg_ltp(pos)
                     hit, reason = self._update_leg(leg, live_ltp)
                     if hit:
+                        # ── Smart In-Place Strangle Rebalance Check ──
+                        other_leg = 'PE' if leg == 'CE' else 'CE'
+                        other_open = (other_leg in self.positions and self.positions[other_leg].get('side') == 'SELL')
+                        if not other_open and pos['strike'] == atm:
+                            ema_against = (confirmed_sig == 1 and leg == 'CE') or (confirmed_sig == -1 and leg == 'PE')
+                            if not ema_against:
+                                if self._rebalance_strangle_in_place(leg, spot, atm, live_ltp):
+                                    continue  # Successfully rebalanced in-place! Skip physical exit.
                         legs_to_close.append((leg, reason, live_ltp))
 
                 for leg, reason, exit_px in legs_to_close:
