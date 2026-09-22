@@ -2774,23 +2774,20 @@ class ExecutionEngine:
             log_warn(f"⚠️ Entry of missing {other_leg} failed, falling back to standard leg exit.")
             return False
 
-        # 3. Lock in accrued profit for solo_leg
+        # 3. Log recalibration for solo_leg (PnL stays in the leg, not locked into realized)
         old_entry = float(pos.get("entry_price", ltp_premium))
         close_qty = int(pos.get("qty", self.qty))
-        run_pnl = (old_entry - ltp_premium) * close_qty
-        self.realized_pnl += run_pnl
+        unreal_pnl = (old_entry - ltp_premium) * close_qty
 
-        col = Fore.GREEN if run_pnl >= 0 else Fore.RED
-        sign = "+" if run_pnl >= 0 else ""
+        col = Fore.GREEN if unreal_pnl >= 0 else Fore.RED
+        sign = "+" if unreal_pnl >= 0 else ""
         log_trade(
-            f"REBALANCE ROLL {solo_leg:10s} Strike: {pos['strike']} @ ₹{ltp_premium:.2f} | "
-            f"Locked P&L: {col}{sign}₹{run_pnl:,.2f}{Style.RESET_ALL} (Saved Exit+Entry Slippage)"
+            f"RECALIBRATE ROLL {solo_leg:10s} Strike: {pos['strike']} @ ₹{ltp_premium:.2f} | "
+            f"Unrealized P&L in leg: {col}{sign}₹{unreal_pnl:,.2f}{Style.RESET_ALL} (Saved Exit+Entry Slippage)"
         )
-        self._log_trade("REBALANCE_ROLL", solo_leg, pos["strike"], "HOLD", close_qty, ltp_premium, pnl=run_pnl, reason="IN_PLACE_STRANGLE_REBALANCE")
+        self._log_trade("RECALIBRATE_ROLL", solo_leg, pos["strike"], "HOLD", close_qty, ltp_premium, pnl=unreal_pnl, reason="IN_PLACE_STRANGLE_REBALANCE")
 
-        # 4. Reset solo_leg in-place to fresh strangle state
-        pos["entry_price"] = ltp_premium
-        pos["entry_time"] = time.time()
+        # 4. Refresh solo_leg SL/TSL to fresh strangle state (preserve original entry_price & leg PnL)
         pos["peak_premium"] = ltp_premium
         current_iv = 15.0
         if getattr(self, 'session_em_1sd', 0) > 0:
@@ -2809,12 +2806,12 @@ class ExecutionEngine:
         # Send Telegram notification
         fresh_sl = pos["dual_sl_state"].get("current_premium_sl", round(ltp_premium * 1.15, 2))
         msg = (
-            f"🔄 <b>IN-PLACE STRANGLE REBALANCE</b>\n"
-            f"• Preserved: <b>{solo_leg} {pos['strike']}</b> @ ₹{ltp_premium:.2f}\n"
-            f"• Locked Solo Run PnL: <b>{sign}₹{run_pnl:,.2f}</b>\n"
-            f"• Entered: <b>{other_leg} {other_strike}</b> SELL\n"
-            f"• Strangle SL Reset: 15% (₹{fresh_sl:.2f})\n"
-            f"• <i>Saved 2 orders & double slippage</i>"
+            f"🔄 <b>IN-PLACE STRANGLE RECALIBRATION</b>\n"
+            f"• Preserved Open: <b>{solo_leg} {pos['strike']}</b> (Entry: ₹{old_entry:.2f})\n"
+            f"• Leg Unrealized PnL: <b>{sign}₹{unreal_pnl:,.2f}</b> (kept in leg)\n"
+            f"• Entered Missing Leg: <b>{other_leg} {other_strike}</b> SELL\n"
+            f"• Fresh Strangle SL: 15% (₹{fresh_sl:.2f})\n"
+            f"• <i>Leg kept open • Zero exit/entry slippage</i>"
         )
         _tg_send(msg)
         return True

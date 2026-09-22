@@ -654,16 +654,12 @@ class NaturalGasPaperBot:
             print(f'[WARN] Failed to enter {other_leg} at {other_strike}, falling back to leg close.', flush=True)
             return False
 
-        # 2. Lock in accrued profit for solo_leg
+        # 2. Log recalibration for solo_leg (keep PnL inside the leg, do not lock to realized)
         old_entry = pos['entry_price']
-        run_pnl = (old_entry - live_ltp) * pos['qty']
-        self.total_realized_pnl += run_pnl
+        unreal_pnl = (old_entry - live_ltp) * pos['qty']
+        sign = '+' if unreal_pnl >= 0 else ''
 
-        sign = '+' if run_pnl >= 0 else ''
-        tot_sign = '+' if self.total_realized_pnl >= 0 else ''
-
-        # 3. Reset solo_leg in-place to fresh strangle state
-        pos['entry_price'] = live_ltp
+        # 3. Refresh solo_leg SL/TSL in-place (preserve original entry_price & leg PnL)
         pos['_last_ltp'] = live_ltp
         pos['loss_stop_pct'] = DEFAULT_SL_PCT
         pos['tsl_pct'] = DEFAULT_TSL_PCT
@@ -684,18 +680,17 @@ class NaturalGasPaperBot:
         # 4. Telegram alert
         tg = '\n'.join([
             '<pre>',
-            '━━━ MCX IN-PLACE REBALANCE (v5.0) ━━━',
+            '━━━ MCX IN-PLACE RECALIBRATION (v5.0) ━━━',
             '',
-            f'  Preserved: {solo_leg} {int(pos["strike"])} @ {live_ltp:.2f}',
-            f'  Locked Profit: {sign}₹{run_pnl:,.2f}',
+            f'  Preserved Open: {solo_leg} {int(pos["strike"])} (Entry: {old_entry:.2f})',
+            f'  Unrealized PnL: {sign}₹{unreal_pnl:,.2f} (in leg)',
             f'  Entered: {other_leg} {int(other_strike)} SELL',
             f'  SL Reset: 15% (₹{fresh_sl:.2f})',
-            f'  Total Realized: {tot_sign}₹{self.total_realized_pnl:,.2f}',
             '',
-            '  *Saved 2 orders & double slippage*',
+            '  *Leg kept open • Zero exit/entry slippage*',
             '</pre>'
         ])
-        print(f'[REBALANCE ROLL] {solo_leg} {int(pos["strike"])} @ ₹{live_ltp:.2f} | Locked: {sign}₹{run_pnl:,.2f} | Reset SL: ₹{fresh_sl:.2f}', flush=True)
+        print(f'[RECALIBRATE ROLL] {solo_leg} {int(pos["strike"])} (Entry: {old_entry:.2f}) | Leg PnL: {sign}₹{unreal_pnl:,.2f} | Reset SL: ₹{fresh_sl:.2f}', flush=True)
         send_telegram(tg)
         return True
 
