@@ -952,6 +952,7 @@ def send_telegram_nifty_dashboard(spot: float, atm: int, mode: str, positions: d
                 sign = "+" if pnl >= 0 else ""
                 sl_state = pos.get("dual_sl_state") or {}
                 tsl = sl_state.get("current_premium_sl", 0.0)
+                tsl_str = f"{tsl:>7.2f}" if tsl > 0 else "      —"
                 if leg == "CE_HEDGE":
                     leg_tag = "CE(H)"
                 elif leg == "PE_HEDGE":
