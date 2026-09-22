@@ -884,7 +884,8 @@ def log_trade(msg: str):
 
 def send_telegram_nifty_dashboard(spot: float, atm: int, mode: str, positions: dict,
                                    realized_pnl: float, unrealized_pnl: float,
-                                   ind: dict, total_cap: float, mtd_pnl: float, ytd_pnl: float):
+                                   ind: dict, total_cap: float, mtd_pnl: float, ytd_pnl: float,
+                                   trades_today: int = 0):
     """
     Updates live Nifty dashboard in Telegram.
     Uses editMessageText for live ticker updates without spamming chat.
@@ -914,16 +915,36 @@ def send_telegram_nifty_dashboard(spot: float, atm: int, mode: str, positions: d
         kama_raw = ind.get("kama")
         kama_str = f"{kama_raw:.0f}" if kama_raw is not None else "WARMUP"
         total_pnl = realized_pnl + unrealized_pnl
+        pnl_pct = (total_pnl / total_cap * 100.0) if total_cap > 0 else 0.0
 
-        t = "<pre>"
-        t += f"NIFTY STRANGLE v2  [{now_ist.strftime('%H:%M:%S')}]\n"
-        t += f"Spot {spot:.2f}  ATM {atm}  {mode}\n"
-        t += f"{regime} ({adx:.1f})  KAMA {kama_str}\n"
-        t += "─────────────────────\n"
+        pnl_badge = "🟢" if total_pnl >= 0 else "🔴"
+        trend_val = ind.get("trend", 0)
+        trend_icon = "▲ UP" if trend_val == 1 else ("▼ DOWN" if trend_val == -1 else "━ FLAT")
+        regime_icon = "🦀 CHOP" if regime == "CHOP" else ("📈 TREND" if regime == "TREND" else f"🔄 {regime}")
+
+        has_ce = ("CE" in positions and positions["CE"].get("side") == "SELL")
+        has_pe = ("PE" in positions and positions["PE"].get("side") == "SELL")
+        if has_ce and has_pe:
+            status_str = "🛡️ STRANGLE ACTIVE"
+        elif any(p.get("dual_sl_state", {}).get("solo_mode") for p in positions.values()):
+            status_str = "🎯 SOLO TRAILING"
+        elif has_ce or has_pe:
+            status_str = "🎯 1-LEG ACTIVE"
+        else:
+            status_str = f"⚙️ {mode}"
+
+        t = f"⚡ <b>NIFTY 50 ALGO DASHBOARD</b> • <code>{now_ist.strftime('%H:%M:%S IST')}</code>\n"
+        t += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        t += f"<b>SPOT:</b> <code>{spot:,.2f}</code> │ <b>ATM:</b> <code>{atm}</code> │ <b>FEED:</b> 🟢 LIVE\n"
+        t += f"<b>REGIME:</b> {regime_icon} ({adx:.1f}) │ <b>TREND:</b> {trend_icon}\n"
+        t += f"<b>STATUS:</b> {status_str} │ 🎯 <b>TRADES:</b> <code>{trades_today}</code>\n"
+        t += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        t += "<pre>\n"
+        t += f"{'LEG':<7} {'STRIKE':>6} {'ENTRY':>7} {'LTP':>7} {'SL':>7} {'PNL':>9}\n"
+        t += "─────────────────────────────────────────\n"
 
         if positions:
             for leg, pos in positions.items():
-                side = "SELL" if pos.get("side") == "SELL" else "BUY"
                 strike = pos.get("strike", 0)
                 entry = pos.get("entry_price", 0.0)
                 ltp = pos.get("ltp", entry)
@@ -931,27 +952,28 @@ def send_telegram_nifty_dashboard(spot: float, atm: int, mode: str, positions: d
                 sign = "+" if pnl >= 0 else ""
                 sl_state = pos.get("dual_sl_state") or {}
                 tsl = sl_state.get("current_premium_sl", 0.0)
-                solo_tag = " (SOLO)" if sl_state.get("solo_mode") else ""
-                tsl_str = f"  SL {tsl:>5.2f}{solo_tag}" if tsl > 0 else ""
+                tsl_str = f"{tsl:>7.2f}" if tsl > 0 else "      —"
+                leg_tag = "PE*" if sl_state.get("solo_mode") and leg == "PE" else ("CE*" if sl_state.get("solo_mode") and leg == "CE" else leg)
 
-                t += f"{leg:<8} {side:>4} {strike}\n"
-                t += f"  E {entry:>7.2f}  L {ltp:>7.2f}{tsl_str}\n"
-                t += f"  PnL {sign}{pnl:>9,.0f}\n"
+                t += f"{leg_tag:<7} {strike:>6} {entry:>7.2f} {ltp:>7.2f} {tsl_str} {sign}{pnl:>8,.0f}\n"
         else:
             t += "  No Open Positions\n"
 
-        t += "─────────────────────\n"
-        t += f"Realized {'+' if realized_pnl >= 0 else ''}{realized_pnl:>10,.0f}\n"
-        t += f"Unreal   {'+' if unrealized_pnl >= 0 else ''}{unrealized_pnl:>10,.0f}\n"
-        t += f"Net MTM  {'+' if total_pnl >= 0 else ''}{total_pnl:>10,.0f}\n"
-        
-        if is_eod:
-            t += "─────────────────────\n"
-            t += f"MTD {'+' if mtd_pnl >= 0 else ''}{mtd_pnl:>8,.0f}"
-            t += f"  YTD {'+' if ytd_pnl >= 0 else ''}{ytd_pnl:>8,.0f}\n"
-            t += f"Capital {total_cap:>12,.0f}\n"
-            
-        t += "</pre>"
+        t += "─────────────────────────────────────────\n"
+        r_sign = "+" if realized_pnl >= 0 else ""
+        u_sign = "+" if unrealized_pnl >= 0 else ""
+        n_sign = "+" if total_pnl >= 0 else ""
+        t += f"Realized PnL:               {r_sign}₹{realized_pnl:>10,.2f}\n"
+        t += f"Unrealized MTM:             {u_sign}₹{unrealized_pnl:>10,.2f}\n"
+        t += "─────────────────────────────────────────\n"
+        t += f"NET MTM:         {n_sign}₹{total_pnl:>10,.2f} ({pnl_pct:+.2f}%)\n"
+        t += "</pre>\n"
+        t += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        circuit_val = round(-total_cap * 0.018, 0)
+        t += f"💰 <b>Capital:</b> <code>₹{total_cap:,.0f}</code> │ ⚡ <b>Circuit:</b> <code>₹{circuit_val:,.0f}</code>\n"
+        mtd_sign = "+" if mtd_pnl >= 0 else ""
+        ytd_sign = "+" if ytd_pnl >= 0 else ""
+        t += f"📅 <b>MTD:</b> <code>{mtd_sign}₹{mtd_pnl:,.0f}</code> │ <b>YTD:</b> <code>{ytd_sign}₹{ytd_pnl:,.0f}</code>"
 
         is_refresh_cycle = (now_ts - _last_tg_dashboard_new_msg_ts) >= 60.0 or is_eod
 
@@ -2012,6 +2034,7 @@ class ExecutionEngine:
             "PE": {"stopped_time": 0.0,  "active": False}
         }
         self.total_reentries_today = 0
+        self.trades_today = 0
         
         self.last_reconciliation = 0
         self.last_feed_tick = 0
@@ -2300,6 +2323,8 @@ class ExecutionEngine:
                 ts = get_ist_now().strftime("%Y-%m-%d %H:%M:%S")
                 pnl_str = f"{pnl:.2f}" if pnl is not None else ""
                 f.write(f"{ts},{action},{leg},{strike},{side},{qty},{price:.2f},{pnl_str},{reason}\n")
+            if action == "ENTRY":
+                self.trades_today = getattr(self, "trades_today", 0) + 1
         except: pass
 
     def _get_ltp(self, strike: int, option_type: str) -> float:
@@ -3045,6 +3070,7 @@ class ExecutionEngine:
                 total_cap=live_capital,
                 mtd_pnl=live_mtd,
                 ytd_pnl=live_ytd,
+                trades_today=getattr(self, "trades_today", 0),
             )
         except Exception as e:
             log_warn(f"Telegram dashboard dispatch failed: {e}")
@@ -3083,6 +3109,7 @@ class ExecutionEngine:
                 "session_em_1sd": getattr(self, "session_em_1sd", 0.0),
                 "total_reentries_today": getattr(self, "total_reentries_today", 0),
                 "strangle_resets_today": getattr(self, "strangle_resets_today", 0),
+                "trades_today": getattr(self, "trades_today", 0),
                 "spot_at_0915": getattr(self, "spot_at_0915", None),
                 "spot_at_0918": getattr(self, "spot_at_0918", None),
                 "initial_entry_done": getattr(self, "initial_entry_done", False)
@@ -3140,6 +3167,18 @@ class ExecutionEngine:
                     self.session_em_1sd = float(state.get("session_em_1sd", 0.0))
                     self.total_reentries_today = int(state.get("total_reentries_today", 0))
                     self.strangle_resets_today = int(state.get("strangle_resets_today", 0))
+                    self.trades_today = int(state.get("trades_today", 0))
+                    if trade_book_found:
+                        today_entry_count = 0
+                        try:
+                            with open(TRADE_LOG_FILE, "r") as tf:
+                                reader = csv.DictReader(tf)
+                                for row in reader:
+                                    if row.get("timestamp", "").startswith(today_str) and row.get("action") == "ENTRY":
+                                        today_entry_count += 1
+                            self.trades_today = max(self.trades_today, today_entry_count)
+                        except Exception:
+                            pass
                     self.spot_at_0915 = state.get("spot_at_0915")
                     self.spot_at_0918 = state.get("spot_at_0918")
                     self.initial_entry_done = state.get("initial_entry_done", False)

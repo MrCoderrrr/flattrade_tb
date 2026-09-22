@@ -961,36 +961,51 @@ class NaturalGasPaperBot:
             sig   = ema_snap.get("confirmed_signal", 0)
             sig_txt = "▲ UP" if sig > 0 else ("▼ DOWN" if sig < 0 else "━ FLAT")
 
-            lines = [
-                '<pre>',
-                f'MCX NATURAL GAS [v5.0] [{now.strftime("%H:%M:%S")}]',
-                f'Spot {spot:.2f}   ATM {int(atm)}',
-                f'EMA15: {ema15:.2f}  EMA90: {ema90:.2f}',
-                f'Slope: {slope:+.3f}  VR: {vr:.2f}  Signal: {sig_txt}',
-                '─────────────────────',
-            ]
+            has_ce = 'CE' in self.positions
+            has_pe = 'PE' in self.positions
+            if has_ce and has_pe:
+                status_str = "🛡️ STRANGLE ACTIVE"
+            elif any(r.get('solo_mode') for r in snap_rows):
+                status_str = "🎯 SOLO TRAILING"
+            elif has_ce or has_pe:
+                status_str = "🎯 1-LEG ACTIVE"
+            elif self.cooldown_until > now_ts:
+                rem_cd = int(self.cooldown_until - now_ts)
+                status_str = f"⏳ COOLDOWN ({rem_cd}s)"
+            else:
+                status_str = "⚙️ SCANNING"
+
+            t = f"⚡ <b>NATGAS ALGO DASHBOARD</b> • <code>{now.strftime('%H:%M:%S IST')}</code>\n"
+            t += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            t += f"<b>SPOT:</b> <code>{spot:,.2f}</code> │ <b>ATM:</b> <code>{int(atm)}</code> │ <b>FEED:</b> 🟢 LIVE\n"
+            t += f"<b>SIGNAL:</b> {sig_txt} │ <b>VR:</b> <code>{vr:.2f}</code> │ <b>SLOPE:</b> <code>{slope:+.3f}</code>\n"
+            t += f"<b>STATUS:</b> {status_str} │ 🎯 <b>TRADES:</b> <code>{self.trades_today}</code>\n"
+            t += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            t += "<pre>\n"
+            t += f"{'LEG':<7} {'STRIKE':>6} {'ENTRY':>7} {'LTP':>7} {'SL':>7} {'PNL':>9}\n"
+            t += "─────────────────────────────────────────\n"
+
             if snap_rows:
                 for r in snap_rows:
                     pnl_sign = '+' if r['pnl'] >= 0 else ''
-                    lines.append(f'{r["leg"]:<3} SELL {int(r["strike"]):<4}  PnL {pnl_sign}₹{r["pnl"]:>8,.2f}')
-                    lines.append(f'  E {r["entry"]:>6.2f}  L {r["ltp"]:>6.2f}  SL {r["sl"]:>6.2f}')
+                    sl_val = r.get('sl', 0.0)
+                    sl_str = f"{sl_val:>7.2f}" if sl_val > 0 else "      —"
+                    leg_tag = f"{r['leg']}*" if r.get('solo_mode') else r['leg']
+                    t += f"{leg_tag:<7} {int(r['strike']):>6} {r['entry']:>7.2f} {r['ltp']:>7.2f} {sl_str} {pnl_sign}{r['pnl']:>8,.0f}\n"
             else:
-                lines.append('  No Open Positions')
+                t += "  No Open Positions\n"
 
-            lines += [
-                '─────────────────────',
-            ]
+            t += "─────────────────────────────────────────\n"
             r_sign = '+' if self.total_realized_pnl >= 0 else ''
             u_sign = '+' if total_unreal >= 0 else ''
             n_sign = '+' if net >= 0 else ''
-            lines += [
-                f'Realized  {r_sign}₹{self.total_realized_pnl:>9,.2f}',
-                f'Unreal    {u_sign}₹{total_unreal:>9,.2f}',
-                f'Net MTM   {n_sign}₹{net:>9,.2f}',
-                f'Trades    {self.trades_today}',
-                '</pre>',
-            ]
-            t = '\n'.join(lines)
+            t += f"Realized PnL:               {r_sign}₹{self.total_realized_pnl:>10,.2f}\n"
+            t += f"Unrealized MTM:             {u_sign}₹{total_unreal:>10,.2f}\n"
+            t += "─────────────────────────────────────────\n"
+            t += f"NET MTM:                    {n_sign}₹{net:>10,.2f}\n"
+            t += "</pre>\n"
+            t += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            t += f"⚡ <b>MCX V5.0</b> │ <b>LOTS:</b> <code>1 ({LOT_SIZE}u)</code> │ <b>MODE:</b> <code>PAPER</code>"
 
             chat_ids   = _get_tg_chat_ids()
             is_refresh = (now_ts - _last_tg_dash_new_msg_ts) >= 60.0
