@@ -50,6 +50,29 @@ IST = timezone(timedelta(hours=5, minutes=30))
 def get_ist_now() -> datetime:
     return datetime.now(IST)
 
+def is_expiry_week(today_date: Any, expiry_date: Any) -> bool:
+    """
+    Determines whether today falls within the expiry week of the given expiry date.
+    Returns True if:
+      1. today is in the same calendar week (Monday to Sunday) as expiry_date, OR
+      2. Days to expiration (DTE) <= 4 calendar days (safeguards weekend rollovers before Mon/Tue expiries).
+    """
+    if hasattr(expiry_date, 'date'):
+        expiry_date = expiry_date.date()
+    if hasattr(today_date, 'date'):
+        today_date = today_date.date()
+
+    days_to_expiry = (expiry_date - today_date).days
+    if days_to_expiry < 0:
+        return False
+
+    monday_of_expiry_week = expiry_date - timedelta(days=expiry_date.weekday())
+    sunday_of_expiry_week = monday_of_expiry_week + timedelta(days=6)
+
+    in_calendar_week = (monday_of_expiry_week <= today_date <= sunday_of_expiry_week)
+    within_dte_window = (days_to_expiry <= 4)
+    return in_calendar_week or within_dte_window
+
 # ─────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────
@@ -155,6 +178,9 @@ class NaturalGasPaperBot:
         self._last_console_dash_ts = 0.0
         self.front_month_futs_token: Optional[str] = None
         self.front_month_futs_symbol: Optional[str] = None
+        self.target_opt_expiry_ts: Optional[Any] = None
+        self.target_opt_expiry_str: str = ""
+        self.is_rolled_over: bool = False
 
         # Reversal tracking state
         self._spot_history: deque  = deque(maxlen=60)
@@ -269,17 +295,55 @@ class NaturalGasPaperBot:
             df['ExpiryDate'] = pd.to_datetime(df['Expiry'], format='%d-%b-%Y', errors='coerce')
             self._mcx_master = df
 
-            futs      = df[(df['Symbol'] == 'NATURALGAS') & (df['Instrument'] == 'FUTCOM')]
-            today_ts  = pd.Timestamp(get_ist_now().date())
-            future_f  = futs[futs['ExpiryDate'] >= today_ts]
+            today_date = get_ist_now().date()
+            today_ts   = pd.Timestamp(today_date)
+
+            # ── 1. Determine Target Option Expiry (Rollover if in Expiry Week) ──
+            opt_df = df[(df['Symbol'] == 'NATURALGAS') & (df['Instrument'] == 'OPTFUT')]
+            avail_opts = opt_df[opt_df['ExpiryDate'] >= today_ts]
+            sorted_opt_expiries = sorted(avail_opts['ExpiryDate'].dropna().unique())
+            if not sorted_opt_expiries:
+                sorted_opt_expiries = sorted(opt_df['ExpiryDate'].dropna().unique())
+
+            if sorted_opt_expiries:
+                curr_opt_expiry_ts   = sorted_opt_expiries[0]
+                curr_opt_expiry_date = pd.to_datetime(curr_opt_expiry_ts).date()
+
+                if is_expiry_week(today_date, curr_opt_expiry_date) and len(sorted_opt_expiries) > 1:
+                    target_opt_expiry_ts = sorted_opt_expiries[1]
+                    self.is_rolled_over  = True
+                    dte = (curr_opt_expiry_date - today_date).days
+                    print(f'[EXPIRY ROLLOVER] Today ({today_date}) is in Expiry Week of current expiry '
+                          f'{curr_opt_expiry_date.strftime("%d-%b-%Y")} (DTE: {dte}d). '
+                          f'--> Rolled over to NEXT MONTH expiry: {pd.to_datetime(target_opt_expiry_ts).strftime("%d-%b-%Y")}', flush=True)
+                else:
+                    target_opt_expiry_ts = sorted_opt_expiries[0]
+                    self.is_rolled_over  = False
+                    dte = (curr_opt_expiry_date - today_date).days
+                    print(f'[EXPIRY] Using Front-Month Option Expiry: {curr_opt_expiry_date.strftime("%d-%b-%Y")} '
+                          f'(DTE: {dte}d)', flush=True)
+
+                self.target_opt_expiry_ts  = target_opt_expiry_ts
+                self.target_opt_expiry_str = pd.to_datetime(target_opt_expiry_ts).strftime('%d-%b-%Y')
+            else:
+                self.target_opt_expiry_ts  = today_ts
+                self.target_opt_expiry_str = today_date.strftime('%d-%b-%Y')
+                self.is_rolled_over        = False
+
+            # ── 2. Determine Underlying Tracking Future ──
+            futs = df[(df['Symbol'] == 'NATURALGAS') & (df['Instrument'] == 'FUTCOM')]
+            future_f = futs[futs['ExpiryDate'] >= self.target_opt_expiry_ts]
+            if future_f.empty:
+                future_f = futs[futs['ExpiryDate'] >= today_ts]
             if future_f.empty:
                 future_f = futs
             if not future_f.empty:
                 row = future_f.sort_values('ExpiryDate').iloc[0]
                 self.front_month_futs_token  = str(row['Token'])
                 self.front_month_futs_symbol = str(row['TradingSymbol'])
-                print(f'[INFO] Front-month Future: {self.front_month_futs_symbol} '
-                      f'(Token: {self.front_month_futs_token})', flush=True)
+                fut_exp_str = pd.to_datetime(row['ExpiryDate']).strftime('%d-%b-%Y')
+                print(f'[INFO] Tracking Underlying Future: {self.front_month_futs_symbol} '
+                      f'(Token: {self.front_month_futs_token}, Expiry: {fut_exp_str})', flush=True)
             return self._mcx_master
         except Exception as e:
             print(f'[ERROR] Failed loading {csv_file}: {e}', flush=True)
@@ -329,7 +393,6 @@ class NaturalGasPaperBot:
         if df is None:
             return None
         try:
-            today_ts = pd.Timestamp(get_ist_now().date())
             opt_df   = df[
                 (df['Symbol']      == 'NATURALGAS') &
                 (df['Instrument']  == 'OPTFUT') &
@@ -338,10 +401,21 @@ class NaturalGasPaperBot:
             ]
             if opt_df.empty:
                 return None
-            future_opts = opt_df[opt_df['ExpiryDate'] >= today_ts]
-            if future_opts.empty:
-                future_opts = opt_df
-            row   = future_opts.sort_values('ExpiryDate').iloc[0]
+
+            # Filter for target option expiry
+            if getattr(self, 'target_opt_expiry_ts', None) is not None:
+                target_opts = opt_df[opt_df['ExpiryDate'] == self.target_opt_expiry_ts]
+            else:
+                today_ts = pd.Timestamp(get_ist_now().date())
+                target_opts = opt_df[opt_df['ExpiryDate'] >= today_ts]
+
+            if target_opts.empty:
+                today_ts = pd.Timestamp(get_ist_now().date())
+                target_opts = opt_df[opt_df['ExpiryDate'] >= today_ts]
+                if target_opts.empty:
+                    target_opts = opt_df
+
+            row   = target_opts.sort_values('ExpiryDate').iloc[0]
             token = str(row['Token'])
             tsym  = str(row['TradingSymbol'])
             lp    = 0.0

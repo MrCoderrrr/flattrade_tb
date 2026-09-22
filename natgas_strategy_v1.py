@@ -88,6 +88,29 @@ CAPITAL = 250_000 # Example placeholder for paper mode, user is prompted in live
 def get_ist_now() -> dt_module:
     return dt_module.now(timezone.utc) + timedelta(hours=5, minutes=30)
 
+def is_expiry_week(today_date: Any, expiry_date: Any) -> bool:
+    """
+    Determines whether today falls within the expiry week of the given expiry date.
+    Returns True if:
+      1. today is in the same calendar week (Monday to Sunday) as expiry_date, OR
+      2. Days to expiration (DTE) <= 4 calendar days (safeguards weekend rollovers before Mon/Tue expiries).
+    """
+    if hasattr(expiry_date, 'date'):
+        expiry_date = expiry_date.date()
+    if hasattr(today_date, 'date'):
+        today_date = today_date.date()
+
+    days_to_expiry = (expiry_date - today_date).days
+    if days_to_expiry < 0:
+        return False
+
+    monday_of_expiry_week = expiry_date - timedelta(days=expiry_date.weekday())
+    sunday_of_expiry_week = monday_of_expiry_week + timedelta(days=6)
+
+    in_calendar_week = (monday_of_expiry_week <= today_date <= sunday_of_expiry_week)
+    within_dte_window = (days_to_expiry <= 4)
+    return in_calendar_week or within_dte_window
+
 def log_info(msg: str):
     print(f"[{get_ist_now().strftime('%H:%M:%S')} INFO]  {msg}")
 
@@ -249,22 +272,41 @@ class MarketData:
         try:
             df = self._get_mcx_master()
             if not df.empty:
-                # Find Futures (FUTCOM) for NATURALGAS
-                fut_df = df[(df['Symbol'] == 'NATURALGAS') & (df['Instrument'] == 'FUTCOM')]
-                if not fut_df.empty:
-                    # Sort by expiry to get nearest
-                    fut_df = fut_df.copy()
-                    fut_df['ExpiryDate'] = pd.to_datetime(fut_df['Expiry'], format='%d-%b-%Y')
-                    fut_df = fut_df[fut_df['ExpiryDate'].dt.date >= get_ist_now().date()]
-                    fut_df = fut_df.sort_values('ExpiryDate')
-                    
-                    if not fut_df.empty:
-                        best_cand = fut_df.iloc[0]
-                        self.spot_token = str(best_cand['Token'])
-                        self.spot_tsym = str(best_cand['TradingSymbol']).upper()
-                        log_info(f"Resolved Spot Symbol (Nearest Expiry {best_cand['Expiry']}): {self.spot_tsym} (Token: {self.spot_token})")
+                today_date = get_ist_now().date()
+                today_ts   = pd.Timestamp(today_date)
+
+                # Check option expiries first to detect expiry week
+                opt_df = df[(df['Symbol'] == 'NATURALGAS') & (df['Instrument'] == 'OPTFUT')].copy()
+                opt_df['ExpiryDate'] = pd.to_datetime(opt_df['Expiry'], format='%d-%b-%Y')
+                avail_opts = opt_df[opt_df['ExpiryDate'].dt.date >= today_date]
+                sorted_opt_expiries = sorted(avail_opts['ExpiryDate'].dropna().unique())
+
+                self.is_rolled_over = False
+                if sorted_opt_expiries:
+                    curr_opt_expiry_date = pd.to_datetime(sorted_opt_expiries[0]).date()
+                    if is_expiry_week(today_date, curr_opt_expiry_date) and len(sorted_opt_expiries) > 1:
+                        self.target_opt_expiry_ts = sorted_opt_expiries[1]
+                        self.is_rolled_over = True
+                        log_info(f"MCX Expiry Week Active -> Rolling over to NEXT MONTH option expiry: {pd.to_datetime(self.target_opt_expiry_ts).strftime('%d-%b-%Y')}")
                     else:
-                        log_warn("No valid unexpired futures found for NATURALGAS in master.")
+                        self.target_opt_expiry_ts = sorted_opt_expiries[0]
+                else:
+                    self.target_opt_expiry_ts = today_ts
+
+                # Find Futures (FUTCOM) for NATURALGAS matching target option expiry
+                fut_df = df[(df['Symbol'] == 'NATURALGAS') & (df['Instrument'] == 'FUTCOM')].copy()
+                fut_df['ExpiryDate'] = pd.to_datetime(fut_df['Expiry'], format='%d-%b-%Y')
+                future_f = fut_df[fut_df['ExpiryDate'] >= self.target_opt_expiry_ts].sort_values('ExpiryDate')
+                if future_f.empty:
+                    future_f = fut_df[fut_df['ExpiryDate'].dt.date >= today_date].sort_values('ExpiryDate')
+
+                if not future_f.empty:
+                    best_cand = future_f.iloc[0]
+                    self.spot_token = str(best_cand['Token'])
+                    self.spot_tsym = str(best_cand['TradingSymbol']).upper()
+                    log_info(f"Resolved Spot Symbol (Tracking Future Expiry {best_cand['Expiry']}): {self.spot_tsym} (Token: {self.spot_token})")
+                else:
+                    log_warn("No valid unexpired futures found for NATURALGAS in master.")
             else:
                 log_warn("MCX master dataframe is empty. Cannot resolve spot token.")
         except Exception as e:
@@ -372,14 +414,20 @@ class MarketData:
                             (df['StrikePrice'] == float(strike))]
                 
                 if not opt_df.empty:
-                    # Sort by expiry to get nearest
                     opt_df = opt_df.copy()
                     opt_df['ExpiryDate'] = pd.to_datetime(opt_df['Expiry'], format='%d-%b-%Y')
-                    opt_df = opt_df[opt_df['ExpiryDate'].dt.date >= get_ist_now().date()]
-                    opt_df = opt_df.sort_values('ExpiryDate')
+                    if getattr(self, 'target_opt_expiry_ts', None) is not None:
+                        target_opts = opt_df[opt_df['ExpiryDate'] == self.target_opt_expiry_ts]
+                    else:
+                        target_opts = opt_df[opt_df['ExpiryDate'].dt.date >= get_ist_now().date()]
+                    if target_opts.empty:
+                        target_opts = opt_df[opt_df['ExpiryDate'].dt.date >= get_ist_now().date()]
+                    if target_opts.empty:
+                        target_opts = opt_df
+                    target_opts = target_opts.sort_values('ExpiryDate')
                     
-                    if not opt_df.empty:
-                        best_cand = opt_df.iloc[0]
+                    if not target_opts.empty:
+                        best_cand = target_opts.iloc[0]
                         token = str(best_cand['Token'])
                         tsym = str(best_cand['TradingSymbol']).upper()
                         

@@ -68,6 +68,29 @@ IST = timezone(timedelta(hours=5, minutes=30))
 def get_ist_now() -> datetime:
     return datetime.now(IST)
 
+def is_expiry_week(today_date: Any, expiry_date: Any) -> bool:
+    """
+    Determines whether today falls within the expiry week of the given expiry date.
+    Returns True if:
+      1. today is in the same calendar week (Monday to Sunday) as expiry_date, OR
+      2. Days to expiration (DTE) <= 4 calendar days (safeguards weekend rollovers before Mon/Tue expiries).
+    """
+    if hasattr(expiry_date, 'date'):
+        expiry_date = expiry_date.date()
+    if hasattr(today_date, 'date'):
+        today_date = today_date.date()
+
+    days_to_expiry = (expiry_date - today_date).days
+    if days_to_expiry < 0:
+        return False
+
+    monday_of_expiry_week = expiry_date - timedelta(days=expiry_date.weekday())
+    sunday_of_expiry_week = monday_of_expiry_week + timedelta(days=6)
+
+    in_calendar_week = (monday_of_expiry_week <= today_date <= sunday_of_expiry_week)
+    within_dte_window = (days_to_expiry <= 4)
+    return in_calendar_week or within_dte_window
+
 # ─────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────
@@ -298,6 +321,9 @@ class NaturalGasPaperBot:
         self._last_console_dash_ts = 0.0
         self.front_month_futs_token: Optional[str] = None
         self.front_month_futs_symbol: Optional[str] = None
+        self.target_opt_expiry_ts: Optional[Any] = None
+        self.target_opt_expiry_str: str = ""
+        self.is_rolled_over: bool = False
 
         # Reversal tracking state
         self._spot_history: deque  = deque(maxlen=60)
@@ -411,17 +437,55 @@ class NaturalGasPaperBot:
             df['ExpiryDate'] = pd.to_datetime(df['Expiry'], format='%d-%b-%Y', errors='coerce')
             self._mcx_master = df
 
-            futs      = df[(df['Symbol'] == 'NATURALGAS') & (df['Instrument'] == 'FUTCOM')]
-            today_ts  = pd.Timestamp(get_ist_now().date())
-            future_f  = futs[futs['ExpiryDate'] >= today_ts]
+            today_date = get_ist_now().date()
+            today_ts   = pd.Timestamp(today_date)
+
+            # ── 1. Determine Target Option Expiry (Rollover if in Expiry Week) ──
+            opt_df = df[(df['Symbol'] == 'NATURALGAS') & (df['Instrument'] == 'OPTFUT')]
+            avail_opts = opt_df[opt_df['ExpiryDate'] >= today_ts]
+            sorted_opt_expiries = sorted(avail_opts['ExpiryDate'].dropna().unique())
+            if not sorted_opt_expiries:
+                sorted_opt_expiries = sorted(opt_df['ExpiryDate'].dropna().unique())
+
+            if sorted_opt_expiries:
+                curr_opt_expiry_ts   = sorted_opt_expiries[0]
+                curr_opt_expiry_date = pd.to_datetime(curr_opt_expiry_ts).date()
+
+                if is_expiry_week(today_date, curr_opt_expiry_date) and len(sorted_opt_expiries) > 1:
+                    target_opt_expiry_ts = sorted_opt_expiries[1]
+                    self.is_rolled_over  = True
+                    dte = (curr_opt_expiry_date - today_date).days
+                    print(f'[EXPIRY ROLLOVER] Today ({today_date}) is in Expiry Week of current expiry '
+                          f'{curr_opt_expiry_date.strftime("%d-%b-%Y")} (DTE: {dte}d). '
+                          f'--> Rolled over to NEXT MONTH expiry: {pd.to_datetime(target_opt_expiry_ts).strftime("%d-%b-%Y")}', flush=True)
+                else:
+                    target_opt_expiry_ts = sorted_opt_expiries[0]
+                    self.is_rolled_over  = False
+                    dte = (curr_opt_expiry_date - today_date).days
+                    print(f'[EXPIRY] Using Front-Month Option Expiry: {curr_opt_expiry_date.strftime("%d-%b-%Y")} '
+                          f'(DTE: {dte}d)', flush=True)
+
+                self.target_opt_expiry_ts  = target_opt_expiry_ts
+                self.target_opt_expiry_str = pd.to_datetime(target_opt_expiry_ts).strftime('%d-%b-%Y')
+            else:
+                self.target_opt_expiry_ts  = today_ts
+                self.target_opt_expiry_str = today_date.strftime('%d-%b-%Y')
+                self.is_rolled_over        = False
+
+            # ── 2. Determine Underlying Tracking Future ──
+            futs = df[(df['Symbol'] == 'NATURALGAS') & (df['Instrument'] == 'FUTCOM')]
+            future_f = futs[futs['ExpiryDate'] >= self.target_opt_expiry_ts]
+            if future_f.empty:
+                future_f = futs[futs['ExpiryDate'] >= today_ts]
             if future_f.empty:
                 future_f = futs
             if not future_f.empty:
                 row = future_f.sort_values('ExpiryDate').iloc[0]
                 self.front_month_futs_token  = str(row['Token'])
                 self.front_month_futs_symbol = str(row['TradingSymbol'])
-                print(f'[INFO] Front-month Future: {self.front_month_futs_symbol} '
-                      f'(Token: {self.front_month_futs_token})', flush=True)
+                fut_exp_str = pd.to_datetime(row['ExpiryDate']).strftime('%d-%b-%Y')
+                print(f'[INFO] Tracking Underlying Future: {self.front_month_futs_symbol} '
+                      f'(Token: {self.front_month_futs_token}, Expiry: {fut_exp_str})', flush=True)
             return self._mcx_master
         except Exception as e:
             print(f'[ERROR] Failed loading {csv_file}: {e}', flush=True)
@@ -471,7 +535,6 @@ class NaturalGasPaperBot:
         if df is None:
             return None
         try:
-            today_ts = pd.Timestamp(get_ist_now().date())
             opt_df   = df[
                 (df['Symbol']      == 'NATURALGAS') &
                 (df['Instrument']  == 'OPTFUT') &
@@ -480,10 +543,21 @@ class NaturalGasPaperBot:
             ]
             if opt_df.empty:
                 return None
-            future_opts = opt_df[opt_df['ExpiryDate'] >= today_ts]
-            if future_opts.empty:
-                future_opts = opt_df
-            row   = future_opts.sort_values('ExpiryDate').iloc[0]
+
+            # Filter for target option expiry
+            if getattr(self, 'target_opt_expiry_ts', None) is not None:
+                target_opts = opt_df[opt_df['ExpiryDate'] == self.target_opt_expiry_ts]
+            else:
+                today_ts = pd.Timestamp(get_ist_now().date())
+                target_opts = opt_df[opt_df['ExpiryDate'] >= today_ts]
+
+            if target_opts.empty:
+                today_ts = pd.Timestamp(get_ist_now().date())
+                target_opts = opt_df[opt_df['ExpiryDate'] >= today_ts]
+                if target_opts.empty:
+                    target_opts = opt_df
+
+            row   = target_opts.sort_values('ExpiryDate').iloc[0]
             token = str(row['Token'])
             tsym  = str(row['TradingSymbol'])
             lp    = 0.0
@@ -654,12 +728,15 @@ class NaturalGasPaperBot:
             print(f'[WARN] Failed to enter {other_leg} at {other_strike}, falling back to leg close.', flush=True)
             return False
 
-        # 2. Log recalibration for solo_leg (keep PnL inside the leg, do not lock to realized)
+        # 2. Lock in accrued profit for solo_leg & update entry price
         old_entry = pos['entry_price']
-        unreal_pnl = (old_entry - live_ltp) * pos['qty']
-        sign = '+' if unreal_pnl >= 0 else ''
+        run_pnl = (old_entry - live_ltp) * pos['qty']
+        self.total_realized_pnl += run_pnl
+        sign = '+' if run_pnl >= 0 else ''
+        tot_sign = '+' if self.total_realized_pnl >= 0 else ''
 
-        # 3. Refresh solo_leg SL/TSL in-place (preserve original entry_price & leg PnL)
+        # 3. Update entry_price to current live_ltp and refresh SL/TSL in-place
+        pos['entry_price'] = live_ltp
         pos['_last_ltp'] = live_ltp
         pos['loss_stop_pct'] = DEFAULT_SL_PCT
         pos['tsl_pct'] = DEFAULT_TSL_PCT
@@ -682,15 +759,16 @@ class NaturalGasPaperBot:
             '<pre>',
             '━━━ MCX IN-PLACE RECALIBRATION (v5.0) ━━━',
             '',
-            f'  Preserved Open: {solo_leg} {int(pos["strike"])} (Entry: {old_entry:.2f})',
-            f'  Unrealized PnL: {sign}₹{unreal_pnl:,.2f} (in leg)',
+            f'  Preserved Open: {solo_leg} {int(pos["strike"])} (Entry: {old_entry:.2f} -> {live_ltp:.2f})',
+            f'  Locked Profit: {sign}₹{run_pnl:,.2f}',
             f'  Entered: {other_leg} {int(other_strike)} SELL',
             f'  SL Reset: 15% (₹{fresh_sl:.2f})',
+            f'  Total Realized: {tot_sign}₹{self.total_realized_pnl:,.2f}',
             '',
-            '  *Leg kept open • Zero exit/entry slippage*',
+            '  *Entry price updated • Zero exit/entry slippage*',
             '</pre>'
         ])
-        print(f'[RECALIBRATE ROLL] {solo_leg} {int(pos["strike"])} (Entry: {old_entry:.2f}) | Leg PnL: {sign}₹{unreal_pnl:,.2f} | Reset SL: ₹{fresh_sl:.2f}', flush=True)
+        print(f'[RECALIBRATE ROLL] {solo_leg} {int(pos["strike"])} (Entry: {old_entry:.2f} -> {live_ltp:.2f}) | Locked: {sign}₹{run_pnl:,.2f} | Reset SL: ₹{fresh_sl:.2f}', flush=True)
         send_telegram(tg)
         return True
 
@@ -880,9 +958,10 @@ class NaturalGasPaperBot:
             print(f'{V}{title_l}{" " * pad_top}{title_r}{V}')
 
             print(MID)
+            exp_badge = f"{YL}{self.target_opt_expiry_str}{RS} ({CY}NEXT MONTH ROLLOVER{RS})" if self.is_rolled_over else f"{WH}{self.target_opt_expiry_str}{RS}"
             ind_row = (f'  {DIM}SPOT:{RS} {WH}{spot:>8.2f}{RS}  '
                        f'{DIM}ATM:{RS} {YL}{int(atm):<5}{RS}  '
-                       f'{DIM}FEED:{RS} {GR}● LIVE FLATTRADE{RS}  '
+                       f'{DIM}EXPIRY:{RS} {exp_badge}  '
                        f'{DIM}TRADES:{RS} {WH}{self.trades_today}{RS}{reversal_tag}{cooldown_tag}')
             print(f'{V}{_pad(ind_row, W)}{V}')
 
@@ -972,7 +1051,8 @@ class NaturalGasPaperBot:
 
             t = f"⚡ <b>NATGAS ALGO DASHBOARD</b> • <code>{now.strftime('%H:%M:%S IST')}</code>\n"
             t += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            t += f"<b>SPOT:</b> <code>{spot:,.2f}</code> │ <b>ATM:</b> <code>{int(atm)}</code> │ <b>FEED:</b> 🟢 LIVE\n"
+            roll_tag = " (NEXT MO)" if self.is_rolled_over else ""
+            t += f"<b>SPOT:</b> <code>{spot:,.2f}</code> │ <b>ATM:</b> <code>{int(atm)}</code> │ <b>EXP:</b> <code>{self.target_opt_expiry_str}{roll_tag}</code>\n"
             t += f"<b>SIGNAL:</b> {sig_txt} │ <b>VR:</b> <code>{vr:.2f}</code> │ <b>SLOPE:</b> <code>{slope:+.3f}</code>\n"
             t += f"<b>STATUS:</b> {status_str} │ 🎯 <b>TRADES:</b> <code>{self.trades_today}</code>\n"
             t += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1056,7 +1136,8 @@ class NaturalGasPaperBot:
         print(f'{DIM}{"="*98}{RS}')
         print(flush=True)
 
-        send_telegram('<pre>MCX Natural Gas\nPaper Trading Bot Online (v5.0 EMA Engine)\nSession: 15:30 – 23:24 IST</pre>')
+        exp_note = f"\nTarget Expiry: {self.target_opt_expiry_str}" + (" (Next Month Rollover Active)" if self.is_rolled_over else "")
+        send_telegram(f'<pre>MCX Natural Gas\nPaper Trading Bot Online (v5.0 EMA Engine)\nSession: 15:30 – 23:24 IST{exp_note}</pre>')
 
         last_wait_msg_ts = 0.0
 
@@ -1162,6 +1243,30 @@ class NaturalGasPaperBot:
                         if self._enter_leg(missing_leg, reentry_strike, 'SELL', loss_stop_pct=REENTRY_SL_PCT):
                             self.last_reentry_ts = now_ts
                             self._consume_reversal()
+
+                            # Reshape surviving leg & update entry price to current LTP
+                            surv_pos = self.positions.get(surviving_leg)
+                            if surv_pos:
+                                surv_ltp = self._get_leg_ltp(surv_pos)
+                                surv_old_entry = surv_pos.get('entry_price', surv_ltp)
+                                surv_run_pnl = (surv_old_entry - surv_ltp) * surv_pos['qty']
+                                self.total_realized_pnl += surv_run_pnl
+                                surv_pos['entry_price'] = surv_ltp
+                                surv_pos['_last_ltp'] = surv_ltp
+                                surv_pos['loss_stop_pct'] = DEFAULT_SL_PCT
+                                surv_pos['tsl_pct'] = DEFAULT_TSL_PCT
+                                fresh_surv_sl = round_to_tick(surv_ltp * (1.0 + DEFAULT_SL_PCT))
+                                surv_pos['sl_state'] = {
+                                    'lowest_ltp': surv_ltp,
+                                    'current_sl': fresh_surv_sl,
+                                    'initial_sl': fresh_surv_sl,
+                                    'loss_stop_pct': DEFAULT_SL_PCT,
+                                    'tsl_pct': DEFAULT_TSL_PCT,
+                                    'solo_mode': False
+                                }
+                                print(f'[RESHAPE SURVIVOR] {surviving_leg} {int(surviving_strike)} entry reset {surv_old_entry:.2f} -> {surv_ltp:.2f} | '
+                                      f'Locked PnL: ₹{surv_run_pnl:,.2f} | Fresh SL: ₹{fresh_surv_sl:.2f}', flush=True)
+                                self._save_state()
 
                 # ── STEP 4: CHECK TSL/SL FOR ALL OPEN LEGS ───
                 legs_to_close: List[Tuple[str, str, float]] = []
