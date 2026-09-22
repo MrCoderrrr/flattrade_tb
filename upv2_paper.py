@@ -2042,6 +2042,7 @@ class ExecutionEngine:
             "PE": {"stopped_time": 0.0,  "active": False}
         }
         self.total_reentries_today = 0
+        self.strangle_resets_today = 0
         self.trades_today = 0
         
         self.last_reconciliation = 0
@@ -2633,7 +2634,7 @@ class ExecutionEngine:
         Runs EVERY TICK (1 second). Checks 1m KAMA reversal for each
         stopped leg and re-enters at ATM when signal fires.
         """
-        if self.strangle_resets_today >= MAX_STRANGLE_RESETS:
+        if getattr(self, "strangle_resets_today", 0) >= MAX_STRANGLE_RESETS:
             return
 
         now = get_ist_now()
