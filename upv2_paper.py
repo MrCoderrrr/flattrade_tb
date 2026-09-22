@@ -3520,7 +3520,7 @@ class ExecutionEngine:
                             other_open = (other_leg in self.positions and self.positions[other_leg].get("side") == "SELL")
                             if not other_open and self.positions[leg]["strike"] == atm:
                                 # Check trend guards: do NOT rebalance into a strangle if market is in runaway trend against this leg
-                                is_against, _ = Indicators.is_trend_strongly_against(leg, self.current_indicators)
+                                is_against, _ = ReversionDetector.is_trend_strongly_against(leg, self.current_indicators)
                                 ema_sig = self.current_indicators.get("confirmed_signal", 0)
                                 ema_against = (ema_sig == 1 and leg == "CE") or (ema_sig == -1 and leg == "PE")
 
