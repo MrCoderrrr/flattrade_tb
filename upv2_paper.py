@@ -952,8 +952,16 @@ def send_telegram_nifty_dashboard(spot: float, atm: int, mode: str, positions: d
                 sign = "+" if pnl >= 0 else ""
                 sl_state = pos.get("dual_sl_state") or {}
                 tsl = sl_state.get("current_premium_sl", 0.0)
-                tsl_str = f"{tsl:>7.2f}" if tsl > 0 else "      —"
-                leg_tag = "PE*" if sl_state.get("solo_mode") and leg == "PE" else ("CE*" if sl_state.get("solo_mode") and leg == "CE" else leg)
+                if leg == "CE_HEDGE":
+                    leg_tag = "CE(H)"
+                elif leg == "PE_HEDGE":
+                    leg_tag = "PE(H)"
+                elif sl_state.get("solo_mode") and leg == "PE":
+                    leg_tag = "PE*"
+                elif sl_state.get("solo_mode") and leg == "CE":
+                    leg_tag = "CE*"
+                else:
+                    leg_tag = leg
 
                 t += f"{leg_tag:<7} {strike:>6} {entry:>7.2f} {ltp:>7.2f} {tsl_str} {sign}{pnl:>8,.0f}\n"
         else:
@@ -2323,7 +2331,7 @@ class ExecutionEngine:
                 ts = get_ist_now().strftime("%Y-%m-%d %H:%M:%S")
                 pnl_str = f"{pnl:.2f}" if pnl is not None else ""
                 f.write(f"{ts},{action},{leg},{strike},{side},{qty},{price:.2f},{pnl_str},{reason}\n")
-            if action == "ENTRY":
+            if action == "ENTRY" and leg in ("CE", "PE"):
                 self.trades_today = getattr(self, "trades_today", 0) + 1
         except: pass
 
@@ -3174,7 +3182,7 @@ class ExecutionEngine:
                             with open(TRADE_LOG_FILE, "r") as tf:
                                 reader = csv.DictReader(tf)
                                 for row in reader:
-                                    if row.get("timestamp", "").startswith(today_str) and row.get("action") == "ENTRY":
+                                    if row.get("timestamp", "").startswith(today_str) and row.get("action") == "ENTRY" and row.get("leg") in ("CE", "PE"):
                                         today_entry_count += 1
                             self.trades_today = max(self.trades_today, today_entry_count)
                         except Exception:
