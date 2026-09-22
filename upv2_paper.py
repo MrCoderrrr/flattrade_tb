@@ -722,20 +722,20 @@ IVR_ACTION                = "SKIP"
 # --- DYNAMIC STRIKE & HEDGE ---
 
 # --- PREMIUM SL (percentage of entry premium) ---
-PREM_SL_INITIAL_PCT       = 0.12   # 12% initial SL on standard days — gives ATM options room to breathe
-PREM_SL_INITIAL_PCT_EXPIRY= 0.12   # 12% initial SL on Expiry Day (0 DTE)
-PREM_SL_MIN_PCT          = 0.07   # 7% tight trail baseline when deep in profit
-PREM_SL_MAX_PCT          = 0.12   # 12% trail ceiling at breakeven, ratchets down as profit grows
+PREM_SL_INITIAL_PCT       = 0.15   # 15% initial SL (was 12%) — gives ATM options room to breathe
+PREM_SL_INITIAL_PCT_EXPIRY= 0.12   # 12% initial SL on Expiry Day afternoon
+PREM_SL_MIN_PCT          = 0.085  # 8.5% tight trail baseline when deep in profit (was 7%)
+PREM_SL_MAX_PCT          = 0.15   # 15% trail ceiling at breakeven (was 12%)
 
 # --- THETA ACCELERATION & EXPIRY DAY (0 DTE) TUNING ---
 AFTERNOON_TSL_HOUR        = 13     # 1:00 PM IST — theta decay accelerates (~60% of daily decay)
 AFTERNOON_TSL_MINUTE      = 0
-AFTERNOON_TSL_PCT         = 0.05   # 5% tight TSL after 1:00 PM IST to lock in theta decay
+AFTERNOON_TSL_PCT         = 0.06   # 6% tight TSL after 1:00 PM IST to lock in theta decay (was 5%)
 EXPIRY_0DTE_THRESHOLD     = 1.0    # <= 1.0 DTE is classified as Expiry Day
-EXPIRY_TSL_PCT            = 0.05   # 5% TSL on Expiry Day (0 DTE)
+EXPIRY_TSL_PCT            = 0.06   # 6% TSL on Expiry Day afternoon (was 5%)
 
 # --- SOLO LEG TRAILING SL (when other leg exits) ---
-SOLO_LEG_TSL_PCT          = 0.07   # 7% TSL anchored to LTP when other leg exits (5% after 1 PM/0 DTE)
+SOLO_LEG_TSL_PCT          = 0.09   # 9% TSL anchored to LTP when other leg exits (was 7%, then was 5% on 0 DTE)
 
 # --- OPENING NOISE SHIELD (9:15–9:25 IST) ---
 OPENING_NOISE_SHIELD_HOUR   = 9
@@ -785,7 +785,7 @@ REVERSAL_DI_GAP_MIN            = 2.0   # min gap between +DI and -DI to confirm 
 # When a leg is losing AND market is trending strongly against it, exit early
 PROACTIVE_EXIT_ENABLED         = True
 PROACTIVE_EXIT_TREND_ADX       = 32.0  # ADX above this = genuinely strong trend (exit early)
-PROACTIVE_EXIT_LOSS_PCT        = 0.07  # 7% loss threshold: if LTP > entry*(1+this), check early exit
+PROACTIVE_EXIT_LOSS_PCT        = 0.095 # 9.5% loss threshold: if LTP > entry*(1+this), check early exit (was 7%)
 PROACTIVE_EXIT_DI_GAP_MIN      = 8.0   # min DI gap for proactive exit (avoids noise-driven exits)
 
 # --- ALWAYS-ON 1-LEG RULE ---
@@ -1830,22 +1830,22 @@ class RiskManager:
     def get_active_tsl_pct(self, now_ist: datetime, dte_days: float = 2.0, is_solo: bool = False) -> float:
         """
         Determines the active trailing stop loss percentage:
-        - Afternoon theta acceleration window (after 1:00 PM IST): 5% (0.05)
-        - Expiry Day (0 DTE, dte_days <= EXPIRY_0DTE_THRESHOLD): 5% (0.05)
-        - Solo leg (when other leg has exited): 7% (0.07) or 5% if afternoon/expiry
-        - Standard dual leg deep profit floor: 7% (0.07) or 5% if afternoon/expiry
+        - Afternoon theta acceleration window (after 1:00 PM IST): 6% (0.06)
+        - Morning session (09:15-13:00 IST): 8.5% - 9.0% to provide optimal breathing room
+        - Standard dual leg deep profit floor: 8.5% (0.085)
         """
         is_after_1pm = (now_ist.hour > AFTERNOON_TSL_HOUR or (now_ist.hour == AFTERNOON_TSL_HOUR and now_ist.minute >= AFTERNOON_TSL_MINUTE))
-        is_expiry = (dte_days <= EXPIRY_0DTE_THRESHOLD)
-        if is_after_1pm or is_expiry:
-            return AFTERNOON_TSL_PCT   # 0.05 (5%)
+        if is_after_1pm:
+            return AFTERNOON_TSL_PCT   # 0.06 (6%)
         if is_solo:
-            return SOLO_LEG_TSL_PCT    # 0.07 (7%)
-        return PREM_SL_MIN_PCT         # 0.07 (7%)
+            return SOLO_LEG_TSL_PCT    # 0.09 (9%)
+        return PREM_SL_MIN_PCT         # 0.085 (8.5%)
 
     def init_dual_sl(self, leg: str, entry_spot: float, strike: float, entry_premium: float, atr: float, iv: float, dte_days: float = 2.0) -> dict:
+        now_ist = get_ist_now()
+        is_after_1pm = (now_ist.hour > AFTERNOON_TSL_HOUR or (now_ist.hour == AFTERNOON_TSL_HOUR and now_ist.minute >= AFTERNOON_TSL_MINUTE))
         is_expiry = (dte_days <= EXPIRY_0DTE_THRESHOLD)
-        initial_pct = PREM_SL_INITIAL_PCT_EXPIRY if is_expiry else PREM_SL_INITIAL_PCT
+        initial_pct = PREM_SL_INITIAL_PCT_EXPIRY if (is_expiry and is_after_1pm) else PREM_SL_INITIAL_PCT
         initial_sl = round(entry_premium * (1.0 + initial_pct), 2)
         return {
             "entry_spot": entry_spot,
@@ -1907,10 +1907,10 @@ class RiskManager:
 
         best_prem = sl_state.get("best_premium", entry_prem)
 
-        # 2. Calculate Initial SL:
-        # 12% initial SL (both standard days and expiry day)
+        # 15% initial SL (gives options room to breathe)
+        is_after_1pm = (now_ist.hour > AFTERNOON_TSL_HOUR or (now_ist.hour == AFTERNOON_TSL_HOUR and now_ist.minute >= AFTERNOON_TSL_MINUTE))
         is_expiry = (dte_days <= EXPIRY_0DTE_THRESHOLD)
-        initial_pct = PREM_SL_INITIAL_PCT_EXPIRY if is_expiry else PREM_SL_INITIAL_PCT
+        initial_pct = PREM_SL_INITIAL_PCT_EXPIRY if (is_expiry and is_after_1pm) else PREM_SL_INITIAL_PCT
         initial_sl = round(entry_prem * (1.0 + initial_pct), 2)
 
         if best_prem >= entry_prem:
