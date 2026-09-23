@@ -1,18 +1,14 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-🌐 REAL-TIME FINANCIAL WEB DASHBOARD & CLOUDFLARE PUBLIC TUNNEL
+🌐 FLATTRADE QUANTITATIVE TRADING TERMINAL — EXECUTIVE DASHBOARD
 ================================================================================
-Provides a public, mobile-responsive, real-time trading dashboard for NIFTY 50
-and MCX Natural Gas algorithmic paper engines.
-
-Features:
-- Single-page application with dark terminal aesthetic (glassmorphism UI)
-- Server-Sent Events (SSE) live streaming every 1 second (zero lag)
-- Auto-starts and manages Cloudflare Quick Tunnel (public HTTPS URL)
-- Displays Live MTM PnL (% calculated on ₹2,00,000 base), Capital, MTD/YTD
-- Live Spot, ATM, ADX, KAMA, Streaming EMA Momentum indicators
-- Real-time Positions, Stop Loss / Trailing SL status, and Trade Book
+Modern, ultra-responsive financial terminal featuring:
+- High-frequency Server-Sent Events (SSE) 1-second live telemetry
+- Dedicated Tabbed Architecture: NIFTY 50 | MCX Natural Gas | Overview
+- Rich Visualizations: Daily Equity SVG Chart, Risk/Circuit Gauges, EMA Meter
+- Obsidian Glassmorphism UI with precision financial typography
+- Embedded Cloudflare Quick Tunnel for universal cross-device access
 ================================================================================
 """
 
@@ -27,7 +23,7 @@ import threading
 import subprocess
 from datetime import datetime, timezone, timedelta
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
 
 IST = timezone(timedelta(hours=5, minutes=30))
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -40,7 +36,7 @@ PUBLIC_URL_FILE = os.path.join(PROJECT_ROOT, "public_url.txt")
 LIVE_PUBLIC_URL = ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DATA INGESTION HELPERS
+# DATA INGESTION
 # ─────────────────────────────────────────────────────────────────────────────
 def load_json_safe(filepath: str, default=None):
     if not os.path.exists(filepath):
@@ -105,18 +101,15 @@ def get_aggregated_dashboard_state() -> dict:
     nifty_snap = get_nifty_snapshot() or {}
     mcx_snap = get_mcx_snapshot() or {}
 
-    # Check active engines
     scheduler_running = check_process_running("daily_scheduler.py")
     nifty_running = check_process_running("nifty_paper_v3.py") or check_process_running("upv2_paper.py")
     mcx_running = check_process_running("mcx_paper_v5.py")
 
-    # Determine Active Session
     hhmm = now_ist.strftime("%H:%M")
     is_weekday = now_ist.weekday() < 5
     nifty_session_active = is_weekday and "09:15" <= hhmm < "15:35"
     mcx_session_active = is_weekday and "15:30" <= hhmm < "23:25"
 
-    # Aggregated PnL Calculation
     nifty_realized = float(nifty_snap.get("realized_pnl", 0.0) or 0.0)
     nifty_unrealized = float(nifty_snap.get("unrealized_pnl", 0.0) or 0.0)
     nifty_net = nifty_realized + nifty_unrealized
@@ -125,25 +118,22 @@ def get_aggregated_dashboard_state() -> dict:
     mcx_unrealized = float(mcx_snap.get("unrealized_pnl", 0.0) or 0.0)
     mcx_net = float(mcx_snap.get("net_pnl", mcx_realized + mcx_unrealized) or 0.0)
 
-    # Combined today net MTM
     combined_realized = nifty_realized + mcx_realized
     combined_unrealized = nifty_unrealized + mcx_unrealized
     combined_net = combined_realized + combined_unrealized
     combined_net_pct = (combined_net / 200000.0) * 100.0
 
-    # Capital metrics
     base_capital = 200000.0
     live_capital = float(pnl_data.get("current_capital", 200000.0) or 200000.0) + combined_unrealized
     mtd_pnl = float(pnl_data.get("mtd_pnl", 0.0) or 0.0)
     ytd_pnl = float(pnl_data.get("ytd_pnl", 0.0) or 0.0)
     circuit_limit = round(-live_capital * 0.018, 2)
 
-    # Trades count
     nifty_trades = int(nifty_snap.get("trades_today", 0) or 0)
     mcx_trades = int(mcx_snap.get("trades_today", 0) or 0)
     total_trades = nifty_trades + mcx_trades
 
-    # Active positions normalization
+    # Normalizing NIFTY positions
     nifty_positions = []
     raw_nifty_pos = nifty_snap.get("positions", {})
     if isinstance(raw_nifty_pos, dict):
@@ -173,6 +163,7 @@ def get_aggregated_dashboard_state() -> dict:
                 "is_solo": is_solo
             })
 
+    # Normalizing MCX positions
     mcx_positions = []
     raw_mcx_pos = mcx_snap.get("positions", [])
     if isinstance(raw_mcx_pos, list):
@@ -211,52 +202,47 @@ def get_aggregated_dashboard_state() -> dict:
                 "is_solo": bool(sl_state.get("solo_mode", False))
             })
 
-    # Combined trade log
-    trade_history = []
-    nifty_trades_log = nifty_snap.get("trade_log", [])
-    if isinstance(nifty_trades_log, list):
-        for t in nifty_trades_log:
-            trade_history.append({
-                "market": "NIFTY",
-                "time": t.get("time", ""),
-                "leg": t.get("leg", ""),
-                "strike": t.get("strike", ""),
-                "entry": t.get("entry", 0.0),
-                "exit": t.get("exit", 0.0),
-                "pnl": t.get("pnl", 0.0),
-                "reason": t.get("reason", "")
-            })
+    # Normalized Trade History
+    nifty_trades_list = []
+    for t in nifty_snap.get("trade_log", []):
+        nifty_trades_list.append({
+            "market": "NIFTY",
+            "time": t.get("time", ""),
+            "leg": t.get("leg", ""),
+            "strike": t.get("strike", ""),
+            "entry": t.get("entry", 0.0),
+            "exit": t.get("exit", 0.0),
+            "pnl": t.get("pnl", 0.0),
+            "reason": t.get("reason", "")
+        })
 
-    mcx_trades_log = mcx_snap.get("trade_log", [])
-    if isinstance(mcx_trades_log, list):
-        for t in mcx_trades_log:
-            trade_history.append({
-                "market": "MCX",
-                "time": t.get("time", ""),
-                "leg": t.get("leg", ""),
-                "strike": t.get("strike", ""),
-                "entry": t.get("entry", 0.0),
-                "exit": t.get("exit", 0.0),
-                "pnl": t.get("pnl", 0.0),
-                "reason": t.get("reason", "")
-            })
+    mcx_trades_list = []
+    for t in mcx_snap.get("trade_log", []):
+        mcx_trades_list.append({
+            "market": "MCX",
+            "time": t.get("time", ""),
+            "leg": t.get("leg", ""),
+            "strike": t.get("strike", ""),
+            "entry": t.get("entry", 0.0),
+            "exit": t.get("exit", 0.0),
+            "pnl": t.get("pnl", 0.0),
+            "reason": t.get("reason", "")
+        })
 
-    trade_history.sort(key=lambda x: str(x.get("time", "")), reverse=True)
+    all_trades = sorted(nifty_trades_list + mcx_trades_list, key=lambda x: str(x.get("time", "")), reverse=True)
 
-    # NIFTY indicators
     nifty_ind = nifty_snap.get("indicators", {}) or {}
     kama_val = nifty_ind.get("kama")
     kama_str = f"{kama_val:.1f}" if kama_val is not None else "WARMUP"
     trend_val = nifty_ind.get("trend", 0)
     trend_label = "BULLISH ▲" if trend_val == 1 else ("BEARISH ▼" if trend_val == -1 else "FLAT ━")
     regime = nifty_ind.get("regime", "CHOP")
-    adx_val = nifty_ind.get("adx", 18.0) or 18.0
-    atr_val = nifty_ind.get("atr", 35.0) or 35.0
+    adx_val = float(nifty_ind.get("adx", 18.0) or 18.0)
+    atr_val = float(nifty_ind.get("atr", 35.0) or 35.0)
 
     nifty_ema_sig = nifty_ind.get("confirmed_signal", 0)
     nifty_ema_sig_str = "BULLISH ▲" if nifty_ema_sig > 0 else ("BEARISH ▼" if nifty_ema_sig < 0 else "FLAT ━")
 
-    # MCX indicators
     mcx_ema = mcx_snap.get("ema", {}) or {}
     mcx_sig = mcx_ema.get("confirmed_signal", 0)
     mcx_sig_str = "BULLISH ▲" if mcx_sig > 0 else ("BEARISH ▼" if mcx_sig < 0 else "FLAT ━")
@@ -281,6 +267,7 @@ def get_aggregated_dashboard_state() -> dict:
             "current_capital": live_capital,
             "base_capital": base_capital,
             "circuit_limit": circuit_limit,
+            "circuit_used_pct": min(100.0, max(0.0, (abs(combined_net) / abs(circuit_limit)) * 100.0)) if combined_net < 0 and circuit_limit != 0 else 0.0,
             "mtd_pnl": mtd_pnl,
             "ytd_pnl": ytd_pnl,
             "total_trades": total_trades,
@@ -308,7 +295,8 @@ def get_aggregated_dashboard_state() -> dict:
             "vr": nifty_ind.get("vr", 1.0),
             "signal": nifty_ema_sig_str,
             "hold_time": nifty_ind.get("hold_time", 0.0),
-            "positions": nifty_positions
+            "positions": nifty_positions,
+            "trades": nifty_trades_list
         },
         "mcx": {
             "active": mcx_running,
@@ -330,10 +318,11 @@ def get_aggregated_dashboard_state() -> dict:
             "vr": mcx_ema.get("vr", 1.0),
             "signal": mcx_sig_str,
             "hold_time": mcx_ema.get("hold_time", 0.0),
-            "positions": mcx_positions
+            "positions": mcx_positions,
+            "trades": mcx_trades_list
         },
         "positions": nifty_positions + mcx_positions,
-        "recent_trades": trade_history[:25]
+        "recent_trades": all_trades[:35]
     }
 
 
@@ -354,7 +343,6 @@ def run_tunnel_manager(port: int = 8000):
             )
 
             for line in iter(proc.stdout.readline, ""):
-                # Search for trycloudflare URL
                 match = re.search(r"https://[-a-zA-Z0-9.]*trycloudflare\.com", line)
                 if match:
                     url = match.group(0)
@@ -375,35 +363,39 @@ def run_tunnel_manager(port: int = 8000):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EMBEDDED FRONTEND HTML / CSS / JAVASCRIPT
+# HIGH-FIDELITY SINGLE PAGE APPLICATION (SPA)
 # ─────────────────────────────────────────────────────────────────────────────
 HTML_DASHBOARD = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>Flattrade Quantitative Trading Terminal</title>
+  <title>Flattrade Quantitative Terminal</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
   <style>
     :root {
-      --bg: #070a12;
-      --card-bg: rgba(15, 23, 42, 0.72);
+      --bg: #06090e;
+      --card-bg: rgba(13, 19, 33, 0.78);
       --card-border: rgba(255, 255, 255, 0.08);
-      --card-hover: rgba(255, 255, 255, 0.12);
+      --card-hover: rgba(56, 189, 248, 0.2);
       --primary: #38bdf8;
+      --primary-glow: rgba(56, 189, 248, 0.25);
       --green: #10b981;
-      --green-glow: rgba(16, 185, 129, 0.25);
+      --green-glow: rgba(16, 185, 129, 0.35);
       --red: #f43f5e;
-      --red-glow: rgba(244, 63, 94, 0.25);
+      --red-glow: rgba(244, 63, 94, 0.35);
       --amber: #f59e0b;
+      --amber-glow: rgba(245, 158, 11, 0.3);
       --purple: #a855f7;
+      --indigo: #6366f1;
       --text: #f8fafc;
       --text-muted: #94a3b8;
       --text-dim: #64748b;
       --mono: 'JetBrains Mono', monospace;
-      --sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+      --sans: 'Plus Jakarta Sans', sans-serif;
+      --display: 'Space Grotesk', sans-serif;
     }
 
     * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
@@ -411,68 +403,69 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
     body {
       background-color: var(--bg);
       background-image: 
-        radial-gradient(at 0% 0%, rgba(56, 189, 248, 0.08) 0px, transparent 50%),
-        radial-gradient(at 100% 100%, rgba(168, 85, 247, 0.06) 0px, transparent 50%),
-        radial-gradient(at 50% 50%, rgba(16, 185, 129, 0.04) 0px, transparent 60%);
+        radial-gradient(at 0% 0%, rgba(56, 189, 248, 0.09) 0px, transparent 45%),
+        radial-gradient(at 100% 0%, rgba(245, 158, 11, 0.07) 0px, transparent 40%),
+        radial-gradient(at 50% 100%, rgba(168, 85, 247, 0.06) 0px, transparent 55%);
       background-attachment: fixed;
       color: var(--text);
       font-family: var(--sans);
       min-height: 100vh;
       line-height: 1.5;
-      padding-bottom: 60px;
+      padding-bottom: 70px;
     }
 
     .container {
-      max-width: 1440px;
+      max-width: 1400px;
       margin: 0 auto;
-      padding: 16px 20px;
+      padding: 16px;
     }
 
-    /* Top Navigation Bar */
+    /* Top Navigation Header */
     header {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      flex-wrap: wrap;
       gap: 16px;
       padding: 14px 20px;
       background: var(--card-bg);
       border: 1px solid var(--card-border);
-      border-radius: 16px;
-      backdrop-filter: blur(20px);
-      margin-bottom: 20px;
-      box-shadow: 0 10px 30px -10px rgba(0,0,0,0.5);
+      border-radius: 20px;
+      backdrop-filter: blur(24px);
+      margin-bottom: 18px;
+      box-shadow: 0 12px 36px -10px rgba(0,0,0,0.6);
+      flex-wrap: wrap;
     }
 
-    .logo-group {
+    .brand-wrap {
       display: flex;
       align-items: center;
       gap: 12px;
     }
 
-    .logo-badge {
-      width: 42px;
-      height: 42px;
-      background: linear-gradient(135deg, #38bdf8, #6366f1);
+    .brand-logo {
+      width: 44px;
+      height: 44px;
+      background: linear-gradient(135deg, #0284c7, #4f46e5);
       border-radius: 12px;
       display: flex;
       align-items: center;
       justify-content: center;
       font-size: 22px;
-      box-shadow: 0 4px 15px rgba(56, 189, 248, 0.4);
+      box-shadow: 0 4px 20px rgba(2, 132, 199, 0.4);
     }
 
-    .logo-title {
+    .brand-title {
+      font-family: var(--display);
       font-weight: 800;
-      font-size: 1.15rem;
-      letter-spacing: -0.02em;
-      background: linear-gradient(to right, #fff, #cbd5e1);
+      font-size: 1.25rem;
+      letter-spacing: -0.03em;
+      background: linear-gradient(to right, #ffffff, #cbd5e1);
       -webkit-background-clip: text;
       -webkit-text-fill-color: transparent;
     }
 
-    .logo-sub {
-      font-size: 0.75rem;
+    .brand-subtitle {
+      font-size: 0.73rem;
       color: var(--text-dim);
       font-family: var(--mono);
       display: flex;
@@ -480,120 +473,183 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       gap: 6px;
     }
 
-    .header-actions {
+    .header-ctrls {
       display: flex;
       align-items: center;
       gap: 10px;
       flex-wrap: wrap;
     }
 
-    .live-pulse {
+    .live-badge {
       display: inline-flex;
       align-items: center;
       gap: 8px;
-      padding: 6px 12px;
+      padding: 6px 14px;
       background: rgba(16, 185, 129, 0.12);
-      border: 1px solid rgba(16, 185, 129, 0.3);
-      border-radius: 9999px;
+      border: 1px solid rgba(16, 185, 129, 0.35);
+      border-radius: 999px;
       color: var(--green);
       font-family: var(--mono);
       font-size: 0.75rem;
-      font-weight: 600;
+      font-weight: 700;
+      letter-spacing: 0.04em;
     }
 
-    .pulse-dot {
+    .dot-pulse {
       width: 8px;
       height: 8px;
       background: var(--green);
       border-radius: 50%;
       box-shadow: 0 0 10px var(--green);
-      animation: pulse 1.8s infinite;
+      animation: pulse 1.6s infinite ease-in-out;
     }
 
     @keyframes pulse {
-      0% { transform: scale(0.9); opacity: 0.8; }
-      50% { transform: scale(1.3); opacity: 1; box-shadow: 0 0 14px var(--green); }
-      100% { transform: scale(0.9); opacity: 0.8; }
+      0% { transform: scale(0.85); opacity: 0.7; }
+      50% { transform: scale(1.35); opacity: 1; box-shadow: 0 0 16px var(--green); }
+      100% { transform: scale(0.85); opacity: 0.7; }
     }
 
-    .clock-pill {
+    .time-chip {
       font-family: var(--mono);
       font-size: 0.85rem;
-      font-weight: 600;
+      font-weight: 700;
       padding: 6px 14px;
-      background: rgba(255, 255, 255, 0.05);
+      background: rgba(255, 255, 255, 0.04);
       border: 1px solid var(--card-border);
-      border-radius: 10px;
+      border-radius: 12px;
       color: #e2e8f0;
     }
 
-    .btn-share {
-      background: rgba(56, 189, 248, 0.15);
+    .btn-action {
+      background: rgba(56, 189, 248, 0.12);
       color: var(--primary);
       border: 1px solid rgba(56, 189, 248, 0.3);
       padding: 7px 14px;
-      border-radius: 10px;
+      border-radius: 12px;
       font-size: 0.8rem;
-      font-weight: 600;
+      font-weight: 700;
       cursor: pointer;
-      transition: all 0.2s ease;
       display: flex;
       align-items: center;
       gap: 6px;
+      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
     }
 
-    .btn-share:hover {
+    .btn-action:hover {
       background: rgba(56, 189, 248, 0.25);
       transform: translateY(-1px);
     }
 
-    /* Hero Key Stats Grid */
-    .hero-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
-      gap: 16px;
+    /* ─── Hero Segmented Navigation Tabs ─── */
+    .segmented-tabs-bar {
+      display: flex;
+      justify-content: center;
       margin-bottom: 20px;
     }
 
-    .metric-card {
+    .segmented-tabs {
+      display: inline-flex;
+      background: rgba(15, 23, 42, 0.85);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      padding: 5px;
+      border-radius: 16px;
+      gap: 6px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+      backdrop-filter: blur(20px);
+      max-width: 100%;
+      overflow-x: auto;
+    }
+
+    .seg-tab {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      padding: 10px 22px;
+      border-radius: 12px;
+      font-weight: 700;
+      font-size: 0.92rem;
+      cursor: pointer;
+      transition: all 0.25s ease;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      white-space: nowrap;
+    }
+
+    .seg-tab:hover {
+      color: #fff;
+      background: rgba(255, 255, 255, 0.05);
+    }
+
+    .seg-tab.active-nifty {
+      background: linear-gradient(135deg, rgba(56, 189, 248, 0.25), rgba(99, 102, 241, 0.25));
+      color: #fff;
+      border: 1px solid rgba(56, 189, 248, 0.5);
+      box-shadow: 0 0 16px rgba(56, 189, 248, 0.2);
+    }
+
+    .seg-tab.active-mcx {
+      background: linear-gradient(135deg, rgba(245, 158, 11, 0.25), rgba(234, 88, 12, 0.25));
+      color: #fff;
+      border: 1px solid rgba(245, 158, 11, 0.5);
+      box-shadow: 0 0 16px rgba(245, 158, 11, 0.2);
+    }
+
+    .seg-tab.active-overview {
+      background: linear-gradient(135deg, rgba(168, 85, 247, 0.25), rgba(56, 189, 248, 0.25));
+      color: #fff;
+      border: 1px solid rgba(168, 85, 247, 0.5);
+      box-shadow: 0 0 16px rgba(168, 85, 247, 0.2);
+    }
+
+    /* ─── Hero KPI Cards ─── */
+    .kpi-row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 14px;
+      margin-bottom: 22px;
+    }
+
+    .kpi-card {
       background: var(--card-bg);
       border: 1px solid var(--card-border);
-      border-radius: 16px;
+      border-radius: 18px;
       padding: 18px 20px;
-      backdrop-filter: blur(16px);
+      backdrop-filter: blur(18px);
       position: relative;
       overflow: hidden;
       transition: transform 0.2s ease, border-color 0.2s ease;
     }
 
-    .metric-card:hover {
+    .kpi-card:hover {
       border-color: var(--card-hover);
       transform: translateY(-2px);
     }
 
-    .metric-label {
-      font-size: 0.78rem;
-      font-weight: 600;
+    .kpi-label {
+      font-size: 0.74rem;
+      font-weight: 700;
       text-transform: uppercase;
-      letter-spacing: 0.05em;
+      letter-spacing: 0.06em;
       color: var(--text-muted);
-      margin-bottom: 6px;
+      margin-bottom: 8px;
       display: flex;
-      align-items: center;
       justify-content: space-between;
+      align-items: center;
     }
 
-    .metric-value {
+    .kpi-val {
       font-family: var(--mono);
-      font-size: 1.8rem;
-      font-weight: 700;
-      letter-spacing: -0.02em;
+      font-size: 1.85rem;
+      font-weight: 800;
+      letter-spacing: -0.03em;
       display: flex;
       align-items: baseline;
       gap: 8px;
     }
 
-    .metric-sub {
+    .kpi-sub {
       font-size: 0.78rem;
       color: var(--text-dim);
       margin-top: 6px;
@@ -603,168 +659,136 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       font-family: var(--mono);
     }
 
-    .positive { color: var(--green); text-shadow: 0 0 20px var(--green-glow); }
-    .negative { color: var(--red); text-shadow: 0 0 20px var(--red-glow); }
-    .neutral  { color: #e2e8f0; }
+    .positive { color: var(--green); text-shadow: 0 0 24px var(--green-glow); }
+    .negative { color: var(--red); text-shadow: 0 0 24px var(--red-glow); }
+    .neutral  { color: #f1f5f9; }
 
-    .pct-tag {
+    .tag-pct {
       font-size: 0.85rem;
-      padding: 2px 8px;
-      border-radius: 6px;
-      font-weight: 600;
+      padding: 3px 9px;
+      border-radius: 8px;
+      font-weight: 700;
       font-family: var(--mono);
     }
-    .pct-tag.pos { background: rgba(16, 185, 129, 0.15); color: var(--green); }
-    .pct-tag.neg { background: rgba(244, 63, 94, 0.15); color: var(--red); }
+    .tag-pct.pos { background: rgba(16, 185, 129, 0.15); color: var(--green); border: 1px solid rgba(16, 185, 129, 0.3); }
+    .tag-pct.neg { background: rgba(244, 63, 94, 0.15); color: var(--red); border: 1px solid rgba(244, 63, 94, 0.3); }
 
-    /* Session Badges Row */
-    .session-banner {
-      background: var(--card-bg);
-      border: 1px solid var(--card-border);
-      border-radius: 12px;
-      padding: 10px 16px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      flex-wrap: wrap;
-      gap: 12px;
-      margin-bottom: 20px;
-      font-size: 0.85rem;
+    /* Risk / Circuit Meter Bar */
+    .circuit-track {
+      width: 100%;
+      height: 6px;
+      background: rgba(255, 255, 255, 0.06);
+      border-radius: 999px;
+      overflow: hidden;
+      margin-top: 10px;
+    }
+    .circuit-fill {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(to right, var(--green), var(--amber), var(--red));
+      transition: width 0.5s ease;
     }
 
-    .session-pills {
+    /* ─── Engine Command Centers (Tabbed) ─── */
+    .view-section {
+      display: none;
+      animation: fadeIn 0.3s ease;
+    }
+    .view-section.active { display: block; }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(6px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .panel-box {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 20px;
+      padding: 22px;
+      backdrop-filter: blur(20px);
+      box-shadow: 0 12px 36px -12px rgba(0,0,0,0.6);
+      margin-bottom: 22px;
+    }
+
+    .panel-hdr {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-bottom: 16px;
+      margin-bottom: 18px;
+      border-bottom: 1px solid var(--card-border);
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+
+    .panel-title {
+      font-size: 1.15rem;
+      font-weight: 800;
+      font-family: var(--display);
       display: flex;
       align-items: center;
       gap: 10px;
-      flex-wrap: wrap;
     }
 
     .status-chip {
-      padding: 4px 10px;
-      border-radius: 8px;
+      padding: 5px 12px;
+      border-radius: 999px;
       font-size: 0.75rem;
-      font-weight: 700;
+      font-weight: 800;
       font-family: var(--mono);
       display: inline-flex;
       align-items: center;
       gap: 6px;
     }
-    .chip-active { background: rgba(16, 185, 129, 0.2); color: var(--green); border: 1px solid rgba(16, 185, 129, 0.4); }
-    .chip-standby { background: rgba(245, 158, 11, 0.15); color: var(--amber); border: 1px solid rgba(245, 158, 11, 0.3); }
-    .chip-idle { background: rgba(148, 163, 184, 0.15); color: var(--text-dim); border: 1px solid rgba(148, 163, 184, 0.2); }
+    .chip-green { background: rgba(16, 185, 129, 0.18); color: var(--green); border: 1px solid rgba(16, 185, 129, 0.4); }
+    .chip-amber { background: rgba(245, 158, 11, 0.18); color: var(--amber); border: 1px solid rgba(245, 158, 11, 0.4); }
+    .chip-dim   { background: rgba(148, 163, 184, 0.12); color: var(--text-dim); border: 1px solid rgba(148, 163, 184, 0.2); }
 
-    /* Section Tabs */
-    .nav-tabs {
-      display: flex;
-      gap: 8px;
-      border-bottom: 1px solid var(--card-border);
-      padding-bottom: 12px;
-      margin-bottom: 20px;
-      overflow-x: auto;
-    }
-
-    .tab-btn {
-      background: transparent;
-      border: 1px solid transparent;
-      color: var(--text-muted);
-      padding: 8px 18px;
-      border-radius: 10px;
-      font-weight: 600;
-      font-size: 0.88rem;
-      cursor: pointer;
-      transition: all 0.2s;
-      white-space: nowrap;
-    }
-
-    .tab-btn:hover {
-      color: #fff;
-      background: rgba(255, 255, 255, 0.05);
-    }
-
-    .tab-btn.active {
-      color: #fff;
-      background: rgba(56, 189, 248, 0.15);
-      border-color: rgba(56, 189, 248, 0.3);
-    }
-
-    /* Strategy Dual Cards Layout */
-    .engine-grid {
+    /* Telemetry Metrics Grid */
+    .telemetry-grid {
       display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 20px;
-      margin-bottom: 24px;
+      grid-template-columns: repeat(auto-fit, minmax(135px, 1fr));
+      gap: 10px;
+      margin-bottom: 20px;
     }
 
-    @media (max-width: 980px) {
-      .engine-grid { grid-template-columns: 1fr; }
+    .tel-item {
+      background: rgba(255, 255, 255, 0.025);
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      border-radius: 14px;
+      padding: 12px 14px;
+      transition: border-color 0.2s ease;
+    }
+    .tel-item:hover { border-color: rgba(255, 255, 255, 0.12); }
+
+    .tel-label {
+      font-size: 0.68rem;
+      color: var(--text-dim);
+      font-weight: 700;
+      text-transform: uppercase;
+      font-family: var(--mono);
+      letter-spacing: 0.04em;
     }
 
-    .engine-card {
+    .tel-val {
+      font-family: var(--mono);
+      font-size: 1.08rem;
+      font-weight: 800;
+      margin-top: 4px;
+    }
+
+    /* ─── Modern Tables ─── */
+    .table-card {
       background: var(--card-bg);
       border: 1px solid var(--card-border);
       border-radius: 18px;
-      padding: 20px;
-      backdrop-filter: blur(16px);
-      box-shadow: 0 10px 30px -10px rgba(0,0,0,0.5);
+      overflow: hidden;
+      margin-bottom: 22px;
     }
 
-    .engine-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 16px;
-      padding-bottom: 12px;
-      border-bottom: 1px solid var(--card-border);
-    }
-
-    .engine-title {
-      font-size: 1.05rem;
-      font-weight: 700;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-
-    .engine-ind-grid {
-      display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 10px;
-      margin-bottom: 16px;
-    }
-
-    @media (max-width: 600px) {
-      .engine-ind-grid { grid-template-columns: repeat(2, 1fr); }
-    }
-
-    .ind-box {
-      background: rgba(255, 255, 255, 0.03);
-      border: 1px solid rgba(255, 255, 255, 0.05);
-      border-radius: 10px;
-      padding: 8px 12px;
-    }
-
-    .ind-name {
-      font-size: 0.68rem;
-      color: var(--text-dim);
-      font-weight: 600;
-      text-transform: uppercase;
-      font-family: var(--mono);
-    }
-
-    .ind-val {
-      font-family: var(--mono);
-      font-size: 0.95rem;
-      font-weight: 700;
-      margin-top: 2px;
-    }
-
-    /* Position Tables */
-    .table-container {
-      background: var(--card-bg);
-      border: 1px solid var(--card-border);
-      border-radius: 16px;
+    .table-scroll {
       overflow-x: auto;
-      margin-bottom: 24px;
     }
 
     table {
@@ -775,9 +799,9 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
     }
 
     th {
-      background: rgba(255, 255, 255, 0.03);
+      background: rgba(255, 255, 255, 0.025);
       color: var(--text-muted);
-      font-weight: 600;
+      font-weight: 700;
       padding: 12px 16px;
       text-transform: uppercase;
       font-size: 0.72rem;
@@ -787,340 +811,468 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
     }
 
     td {
-      padding: 12px 16px;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+      padding: 14px 16px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.035);
       font-family: var(--mono);
     }
 
     tr:last-child td { border-bottom: none; }
     tr:hover td { background: rgba(255, 255, 255, 0.02); }
 
-    .badge-leg {
+    .leg-badge {
       display: inline-block;
-      padding: 3px 8px;
+      padding: 3px 9px;
       border-radius: 6px;
-      font-size: 0.75rem;
-      font-weight: 700;
+      font-size: 0.74rem;
+      font-weight: 800;
     }
-    .badge-ce { background: rgba(56, 189, 248, 0.15); color: var(--primary); border: 1px solid rgba(56, 189, 248, 0.3); }
-    .badge-pe { background: rgba(245, 158, 11, 0.15); color: var(--amber); border: 1px solid rgba(245, 158, 11, 0.3); }
-    .badge-hedge { background: rgba(168, 85, 247, 0.15); color: var(--purple); border: 1px solid rgba(168, 85, 247, 0.3); }
+    .leg-ce { background: rgba(56, 189, 248, 0.16); color: var(--primary); border: 1px solid rgba(56, 189, 248, 0.35); }
+    .leg-pe { background: rgba(245, 158, 11, 0.16); color: var(--amber); border: 1px solid rgba(245, 158, 11, 0.35); }
+    .leg-hd { background: rgba(168, 85, 247, 0.16); color: var(--purple); border: 1px solid rgba(168, 85, 247, 0.35); }
 
-    .side-sell { color: var(--red); font-weight: 700; }
-    .side-buy  { color: var(--green); font-weight: 700; }
+    .side-sell { color: var(--red); font-weight: 800; }
+    .side-buy  { color: var(--green); font-weight: 800; }
 
-    /* Performance Calendar Cards */
-    .history-grid {
+    /* Visual Equity History Spark-Cards */
+    .history-cards-flex {
       display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
-      gap: 12px;
-      margin-bottom: 24px;
+      grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+      gap: 10px;
     }
 
-    .history-card {
-      background: rgba(255, 255, 255, 0.03);
+    .hist-box {
+      background: rgba(255, 255, 255, 0.025);
       border: 1px solid var(--card-border);
       border-radius: 12px;
       padding: 12px 14px;
       font-family: var(--mono);
     }
 
-    .hist-date {
-      font-size: 0.72rem;
-      color: var(--text-dim);
-      margin-bottom: 4px;
-    }
+    .hist-title { font-size: 0.7rem; color: var(--text-dim); margin-bottom: 2px; }
+    .hist-num   { font-size: 1.05rem; font-weight: 800; }
 
-    .hist-pnl {
-      font-size: 1.1rem;
-      font-weight: 700;
-    }
-
-    /* Toast Notification */
-    .toast {
+    /* Toast */
+    .toast-box {
       position: fixed;
       bottom: 24px;
       right: 24px;
       background: rgba(15, 23, 42, 0.95);
       border: 1px solid var(--primary);
       color: #fff;
-      padding: 12px 20px;
-      border-radius: 12px;
-      font-size: 0.85rem;
-      font-weight: 600;
-      box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+      padding: 12px 22px;
+      border-radius: 14px;
+      font-size: 0.88rem;
+      font-weight: 700;
+      box-shadow: 0 12px 30px rgba(0,0,0,0.6);
       display: none;
-      z-index: 1000;
+      z-index: 9999;
+    }
+
+    @media (max-width: 640px) {
+      .container { padding: 10px; }
+      header { padding: 12px 14px; }
+      .brand-title { font-size: 1.05rem; }
+      .kpi-val { font-size: 1.55rem; }
+      .seg-tab { padding: 8px 14px; font-size: 0.82rem; }
     }
   </style>
 </head>
 <body>
   <div class="container">
-    <!-- Header -->
+    <!-- Top Header -->
     <header>
-      <div class="logo-group">
-        <div class="logo-badge">⚡</div>
+      <div class="brand-wrap">
+        <div class="brand-logo">⚡</div>
         <div>
-          <div class="logo-title">FLATTRADE QUANT TERMINAL</div>
-          <div class="logo-sub">
-            <span>PRECISION EXECUTION ENGINE</span>
+          <div class="brand-title">FLATTRADE QUANT TERMINAL</div>
+          <div class="brand-subtitle">
+            <span>HIGH-PRECISION EXECUTION</span>
             <span>•</span>
-            <span id="market-mode-badge">PAPER TRADING</span>
+            <span id="market-mode-badge" style="color:var(--primary); font-weight:700;">PAPER MODE</span>
           </div>
         </div>
       </div>
-      <div class="header-actions">
-        <div class="live-pulse">
-          <span class="pulse-dot"></span>
+      <div class="header-ctrls">
+        <div class="live-badge">
+          <span class="dot-pulse"></span>
           <span id="stream-status">LIVE STREAMING</span>
         </div>
-        <div class="clock-pill" id="live-clock">--:--:-- IST</div>
-        <button class="btn-share" onclick="copyPublicLink()">
+        <div class="time-chip" id="live-clock">--:--:-- IST</div>
+        <button class="btn-action" onclick="copyPublicLink()">
           <span>🔗</span> <span id="copy-btn-text">Share Link</span>
         </button>
       </div>
     </header>
 
-    <!-- Session Status Bar -->
-    <div class="session-banner">
-      <div class="session-pills">
-        <span style="font-size:0.75rem; color:var(--text-dim); font-weight:600;">ACTIVE SERVICES:</span>
-        <span class="status-chip chip-active" id="chip-scheduler">SCHEDULER: ON</span>
-        <span class="status-chip" id="chip-nifty">NIFTY (09:15-15:35)</span>
-        <span class="status-chip" id="chip-mcx">MCX (15:30-23:25)</span>
-      </div>
-      <div style="font-family:var(--mono); font-size:0.8rem; color:var(--text-muted);" id="session-window-text">
-        Loading session parameters...
+    <!-- ─── Segmented Navigation Switcher ─── -->
+    <div class="segmented-tabs-bar">
+      <div class="segmented-tabs">
+        <button class="seg-tab active-nifty" id="tab-btn-nifty" onclick="switchTab('nifty')">
+          <span>⚡</span> <span>NIFTY 50 Options</span>
+        </button>
+        <button class="seg-tab" id="tab-btn-mcx" onclick="switchTab('mcx')">
+          <span>🛢️</span> <span>MCX Natural Gas</span>
+        </button>
+        <button class="seg-tab" id="tab-btn-overview" onclick="switchTab('overview')">
+          <span>📊</span> <span>Unified Overview</span>
+        </button>
       </div>
     </div>
 
-    <!-- Hero Metrics Grid -->
-    <div class="hero-grid">
-      <!-- Net MTM Card -->
-      <div class="metric-card">
-        <div class="metric-label">
+    <!-- ─── Hero KPI Metric Cards (Strict 2L Base %) ─── -->
+    <div class="kpi-row">
+      <!-- Net MTM PnL -->
+      <div class="kpi-card">
+        <div class="kpi-label">
           <span>Net MTM P&L</span>
-          <span class="pct-tag" id="net-mtm-pct">+0.00%</span>
+          <span class="tag-pct" id="net-mtm-pct">+0.00%</span>
         </div>
-        <div class="metric-value" id="net-mtm-val">₹0.00</div>
-        <div class="metric-sub">
-          <span>Base Capital: <b>₹2,00,000</b></span>
+        <div class="kpi-val" id="net-mtm-val">₹0.00</div>
+        <div class="kpi-sub">
+          <span>Calculated on: <b style="color:#fff;">₹2,00,000.00 Fixed</b></span>
         </div>
       </div>
 
-      <!-- Realized vs Unrealized Card -->
-      <div class="metric-card">
-        <div class="metric-label">
+      <!-- Realized vs Unrealized -->
+      <div class="kpi-card">
+        <div class="kpi-label">
           <span>Realized Booked</span>
           <span id="realized-tag" style="font-family:var(--mono); font-size:0.75rem;">₹0.00</span>
         </div>
-        <div class="metric-value" id="realized-val">₹0.00</div>
-        <div class="metric-sub">
-          <span>Floating MTM: <b id="unrealized-val">₹0.00</b></span>
+        <div class="kpi-val" id="realized-val">₹0.00</div>
+        <div class="kpi-sub">
+          <span>Floating MTM: <b id="unrealized-val" style="color:#fff;">₹0.00</b></span>
         </div>
       </div>
 
-      <!-- Current Account Capital -->
-      <div class="metric-card">
-        <div class="metric-label">
+      <!-- Live Capital & Circuit Limit -->
+      <div class="kpi-card">
+        <div class="kpi-label">
           <span>Live Capital</span>
-          <span style="color:var(--text-dim); font-size:0.75rem; font-family:var(--mono);">Max Drawdown</span>
+          <span style="color:var(--text-dim); font-size:0.75rem; font-family:var(--mono);">Risk Distance</span>
         </div>
-        <div class="metric-value" id="capital-val">₹2,00,000.00</div>
-        <div class="metric-sub">
+        <div class="kpi-val" id="capital-val">₹2,00,000.00</div>
+        <div class="circuit-track">
+          <div class="circuit-fill" id="circuit-fill-bar"></div>
+        </div>
+        <div class="kpi-sub" style="justify-content:space-between; margin-top:6px;">
           <span>Circuit Break: <b id="circuit-val" style="color:var(--red);">-₹3,600</b></span>
+          <span id="circuit-used-text" style="font-size:0.7rem; color:var(--text-dim);">0% Used</span>
         </div>
       </div>
 
       <!-- MTD & YTD Returns -->
-      <div class="metric-card">
-        <div class="metric-label">
+      <div class="kpi-card">
+        <div class="kpi-label">
           <span>MTD Performance</span>
           <span id="trades-count-pill" style="font-family:var(--mono); color:var(--primary); font-size:0.75rem;">0 TRADES</span>
         </div>
-        <div class="metric-value" id="mtd-val">₹0.00</div>
-        <div class="metric-sub">
-          <span>Year-to-Date: <b id="ytd-val">₹0.00</b></span>
+        <div class="kpi-val" id="mtd-val">₹0.00</div>
+        <div class="kpi-sub">
+          <span>Year-to-Date: <b id="ytd-val" style="color:#fff;">₹0.00</b></span>
         </div>
       </div>
     </div>
 
-    <!-- Dual Strategy Engine Cards -->
-    <div class="engine-grid">
-      <!-- NIFTY Engine -->
-      <div class="engine-card">
-        <div class="engine-header">
-          <div class="engine-title">
-            <span style="color:var(--primary);">●</span> NIFTY 50 Options
-            <span style="font-size:0.75rem; font-family:var(--mono); color:var(--text-dim); font-weight:400;">(Adaptive KAMA-ADX)</span>
+    <!-- ═══════════════════════════════════════════════════════════════════════ -->
+    <!-- TAB 1: NIFTY 50 DEDICATED COMMAND CENTER                               -->
+    <!-- ═══════════════════════════════════════════════════════════════════════ -->
+    <div id="view-nifty" class="view-section active">
+      <div class="panel-box">
+        <div class="panel-hdr">
+          <div class="panel-title">
+            <span style="color:var(--primary);">⚡</span> NIFTY 50 Index Options Architecture
+            <span style="font-size:0.76rem; font-family:var(--mono); color:var(--text-dim); font-weight:400;">(Adaptive KAMA-ADX & Straddle Engine)</span>
           </div>
-          <div id="nifty-status-badge" class="status-chip chip-standby">STANDBY</div>
-        </div>
-
-        <div class="engine-ind-grid">
-          <div class="ind-box">
-            <div class="ind-name">Spot Price</div>
-            <div class="ind-val" id="nifty-spot">--</div>
-          </div>
-          <div class="ind-box">
-            <div class="ind-name">ATM Strike</div>
-            <div class="ind-val" id="nifty-atm" style="color:var(--amber);">--</div>
-          </div>
-          <div class="ind-box">
-            <div class="ind-name">ADX (5m)</div>
-            <div class="ind-val" id="nifty-adx">--</div>
-          </div>
-          <div class="ind-box">
-            <div class="ind-name">Regime</div>
-            <div class="ind-val" id="nifty-regime" style="color:var(--purple);">--</div>
-          </div>
-          <div class="ind-box">
-            <div class="ind-name">KAMA (1m)</div>
-            <div class="ind-val" id="nifty-kama">--</div>
-          </div>
-          <div class="ind-box">
-            <div class="ind-name">Trend</div>
-            <div class="ind-val" id="nifty-trend">--</div>
-          </div>
-          <div class="ind-box">
-            <div class="ind-name">EMA Slope</div>
-            <div class="ind-val" id="nifty-slope">--</div>
-          </div>
-          <div class="ind-box">
-            <div class="ind-name">EMA Signal</div>
-            <div class="ind-val" id="nifty-signal">--</div>
+          <div style="display:flex; align-items:center; gap:8px;">
+            <div id="nifty-status-chip" class="status-chip chip-dim">STANDBY</div>
+            <div id="nifty-session-chip" class="status-chip chip-dim">09:15 - 15:35 IST</div>
           </div>
         </div>
 
-        <div style="font-family:var(--mono); font-size:0.8rem; display:flex; justify-content:space-between; padding:8px 12px; background:rgba(255,255,255,0.02); border-radius:8px;">
-          <span>NIFTY Day PnL: <b id="nifty-day-pnl">₹0.00</b></span>
-          <span>Trades: <b id="nifty-trades">0</b></span>
+        <!-- Telemetry Indicators Grid -->
+        <div class="telemetry-grid">
+          <div class="tel-item">
+            <div class="tel-label">Spot Price</div>
+            <div class="tel-val" id="n-spot">--</div>
+          </div>
+          <div class="tel-item">
+            <div class="tel-label">ATM Strike</div>
+            <div class="tel-val" id="n-atm" style="color:var(--amber);">--</div>
+          </div>
+          <div class="tel-item">
+            <div class="tel-label">ADX (5m)</div>
+            <div class="tel-val" id="n-adx">--</div>
+          </div>
+          <div class="tel-item">
+            <div class="tel-label">Regime</div>
+            <div class="tel-val" id="n-regime" style="color:var(--purple);">--</div>
+          </div>
+          <div class="tel-item">
+            <div class="tel-label">KAMA (1m)</div>
+            <div class="tel-val" id="n-kama">--</div>
+          </div>
+          <div class="tel-item">
+            <div class="tel-label">Trend Filter</div>
+            <div class="tel-val" id="n-trend">--</div>
+          </div>
+          <div class="tel-item">
+            <div class="tel-label">ATR Volatility</div>
+            <div class="tel-val" id="n-atr">--</div>
+          </div>
+          <div class="tel-item">
+            <div class="tel-label">EMA Signal</div>
+            <div class="tel-val" id="n-signal">--</div>
+          </div>
+        </div>
+
+        <!-- Momentum Detail Bar -->
+        <div style="font-family:var(--mono); font-size:0.8rem; display:flex; justify-content:space-between; flex-wrap:wrap; gap:10px; padding:10px 16px; background:rgba(255,255,255,0.025); border-radius:12px; border:1px solid rgba(255,255,255,0.05);">
+          <span>NIFTY Day Net: <b id="n-net-pnl">₹0.00</b> (<span id="n-net-pct">+0.00%</span>)</span>
+          <span>Trades Executed: <b id="n-trades">0</b></span>
+          <span>Realized: <b id="n-realized">₹0.00</b></span>
+          <span>Floating: <b id="n-unrealized">₹0.00</b></span>
+        </div>
+      </div>
+
+      <!-- NIFTY Active Positions -->
+      <div style="margin-bottom:10px; display:flex; justify-content:space-between; align-items:center;">
+        <h3 style="font-size:1.05rem; font-weight:800;">NIFTY Active Leg Portfolio (<span id="n-pos-count">0</span>)</h3>
+        <span style="font-size:0.75rem; color:var(--text-dim); font-family:var(--mono);">Zero Duplicate Trade Guard</span>
+      </div>
+
+      <div class="table-card">
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Leg</th>
+                <th>Contract</th>
+                <th>Strike</th>
+                <th>Side</th>
+                <th>Qty</th>
+                <th>Entry Price</th>
+                <th>LTP</th>
+                <th>Current SL</th>
+                <th style="text-align:right;">Unrealized P&L</th>
+              </tr>
+            </thead>
+            <tbody id="n-pos-tbody">
+              <tr><td colspan="9" style="text-align:center; color:var(--text-dim); padding:28px;">No active NIFTY positions open.</td></tr>
+            </tbody>
+          </table>
         </div>
       </div>
 
-      <!-- MCX Natural Gas Engine -->
-      <div class="engine-card">
-        <div class="engine-header">
-          <div class="engine-title">
-            <span style="color:var(--amber);">●</span> MCX Natural Gas
-            <span style="font-size:0.75rem; font-family:var(--mono); color:var(--text-dim); font-weight:400;">(Streaming EMA Momentum)</span>
-          </div>
-          <div id="mcx-status-badge" class="status-chip chip-standby">STANDBY</div>
-        </div>
+      <!-- NIFTY Trades Log -->
+      <div style="margin-bottom:10px; display:flex; justify-content:space-between; align-items:center;">
+        <h3 style="font-size:1.05rem; font-weight:800;">NIFTY Executed Trades Today</h3>
+        <span style="font-size:0.75rem; color:var(--text-dim); font-family:var(--mono);">Execution Journal</span>
+      </div>
 
-        <div class="engine-ind-grid">
-          <div class="ind-box">
-            <div class="ind-name">NG Spot</div>
-            <div class="ind-val" id="mcx-spot">--</div>
-          </div>
-          <div class="ind-box">
-            <div class="ind-name">ATM Strike</div>
-            <div class="ind-val" id="mcx-atm" style="color:var(--amber);">--</div>
-          </div>
-          <div class="ind-box">
-            <div class="ind-name">Expiry</div>
-            <div class="ind-val" id="mcx-expiry" style="font-size:0.8rem;">--</div>
-          </div>
-          <div class="ind-box">
-            <div class="ind-name">EMA Signal</div>
-            <div class="ind-val" id="mcx-signal">--</div>
-          </div>
-          <div class="ind-box">
-            <div class="ind-name">EMA 15s</div>
-            <div class="ind-val" id="mcx-ema15">--</div>
-          </div>
-          <div class="ind-box">
-            <div class="ind-name">EMA 90s</div>
-            <div class="ind-val" id="mcx-ema90">--</div>
-          </div>
-          <div class="ind-box">
-            <div class="ind-name">Slow Slope</div>
-            <div class="ind-val" id="mcx-slope">--</div>
-          </div>
-          <div class="ind-box">
-            <div class="ind-name">Vol Ratio (VR)</div>
-            <div class="ind-val" id="mcx-vr">--</div>
-          </div>
-        </div>
-
-        <div style="font-family:var(--mono); font-size:0.8rem; display:flex; justify-content:space-between; padding:8px 12px; background:rgba(255,255,255,0.02); border-radius:8px;">
-          <span>MCX Day PnL: <b id="mcx-day-pnl">₹0.00</b></span>
-          <span>Trades: <b id="mcx-trades">0</b></span>
+      <div class="table-card">
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Leg</th>
+                <th>Strike</th>
+                <th>Entry</th>
+                <th>Exit</th>
+                <th>Exit Reason</th>
+                <th style="text-align:right;">Realized PnL</th>
+              </tr>
+            </thead>
+            <tbody id="n-trades-tbody">
+              <tr><td colspan="7" style="text-align:center; color:var(--text-dim); padding:24px;">No closed NIFTY trades recorded yet for today.</td></tr>
+            </tbody>
+          </table>
         </div>
       </div>
     </div>
 
-    <!-- Active Positions Section -->
-    <div style="margin-bottom:12px; display:flex; justify-content:space-between; align-items:center;">
-      <h3 style="font-size:1.05rem; font-weight:700;">Live Positions (<span id="pos-count">0</span>)</h3>
-      <span style="font-size:0.75rem; color:var(--text-dim); font-family:var(--mono);">Auto-Updating Every 1s</span>
+    <!-- ═══════════════════════════════════════════════════════════════════════ -->
+    <!-- TAB 2: MCX NATURAL GAS DEDICATED COMMAND CENTER                        -->
+    <!-- ═══════════════════════════════════════════════════════════════════════ -->
+    <div id="view-mcx" class="view-section">
+      <div class="panel-box">
+        <div class="panel-hdr">
+          <div class="panel-title">
+            <span style="color:var(--amber);">🛢️</span> MCX Natural Gas Momentum Engine
+            <span style="font-size:0.76rem; font-family:var(--mono); color:var(--text-dim); font-weight:400;">(Continuous Streaming EMA Pipeline v5.0)</span>
+          </div>
+          <div style="display:flex; align-items:center; gap:8px;">
+            <div id="mcx-status-chip" class="status-chip chip-dim">STANDBY</div>
+            <div id="mcx-session-chip" class="status-chip chip-dim">15:30 - 23:25 IST</div>
+          </div>
+        </div>
+
+        <!-- Telemetry Indicators Grid -->
+        <div class="telemetry-grid">
+          <div class="tel-item">
+            <div class="tel-label">Spot Price</div>
+            <div class="tel-val" id="m-spot">--</div>
+          </div>
+          <div class="tel-item">
+            <div class="tel-label">ATM Strike</div>
+            <div class="tel-val" id="m-atm" style="color:var(--amber);">--</div>
+          </div>
+          <div class="tel-item">
+            <div class="tel-label">Target Expiry</div>
+            <div class="tel-val" id="m-expiry" style="font-size:0.85rem;">--</div>
+          </div>
+          <div class="tel-item">
+            <div class="tel-label">Confirmed Signal</div>
+            <div class="tel-val" id="m-signal">--</div>
+          </div>
+          <div class="tel-item">
+            <div class="tel-label">EMA Fast (15s)</div>
+            <div class="tel-val" id="m-ema15">--</div>
+          </div>
+          <div class="tel-item">
+            <div class="tel-label">EMA Slow (90s)</div>
+            <div class="tel-val" id="m-ema90">--</div>
+          </div>
+          <div class="tel-item">
+            <div class="tel-label">Slow Slope</div>
+            <div class="tel-val" id="m-slope">--</div>
+          </div>
+          <div class="tel-item">
+            <div class="tel-label">Volatility Ratio</div>
+            <div class="tel-val" id="m-vr">--</div>
+          </div>
+        </div>
+
+        <!-- MCX Details Bar -->
+        <div style="font-family:var(--mono); font-size:0.8rem; display:flex; justify-content:space-between; flex-wrap:wrap; gap:10px; padding:10px 16px; background:rgba(255,255,255,0.025); border-radius:12px; border:1px solid rgba(255,255,255,0.05);">
+          <span>MCX Day Net: <b id="m-net-pnl">₹0.00</b> (<span id="m-net-pct">+0.00%</span>)</span>
+          <span>Trades Executed: <b id="m-trades">0</b></span>
+          <span>Reversal State: <b id="m-reversal" style="color:var(--purple);">INACTIVE</b></span>
+          <span>Cooldown Timer: <b id="m-cooldown">0s</b></span>
+        </div>
+      </div>
+
+      <!-- MCX Active Positions -->
+      <div style="margin-bottom:10px; display:flex; justify-content:space-between; align-items:center;">
+        <h3 style="font-size:1.05rem; font-weight:800;">MCX Active Straddle Leg Portfolio (<span id="m-pos-count">0</span>)</h3>
+        <span style="font-size:0.75rem; color:var(--text-dim); font-family:var(--mono);">Smart In-Place Reconstitution</span>
+      </div>
+
+      <div class="table-card">
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Leg</th>
+                <th>Contract</th>
+                <th>Strike</th>
+                <th>Side</th>
+                <th>Qty</th>
+                <th>Entry Price</th>
+                <th>LTP</th>
+                <th>Current SL</th>
+                <th style="text-align:right;">Unrealized P&L</th>
+              </tr>
+            </thead>
+            <tbody id="m-pos-tbody">
+              <tr><td colspan="9" style="text-align:center; color:var(--text-dim); padding:28px;">No active MCX positions open.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- MCX Trades Log -->
+      <div style="margin-bottom:10px; display:flex; justify-content:space-between; align-items:center;">
+        <h3 style="font-size:1.05rem; font-weight:800;">MCX Executed Trades Today</h3>
+        <span style="font-size:0.75rem; color:var(--text-dim); font-family:var(--mono);">Execution Journal</span>
+      </div>
+
+      <div class="table-card">
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Leg</th>
+                <th>Strike</th>
+                <th>Entry</th>
+                <th>Exit</th>
+                <th>Exit Reason</th>
+                <th style="text-align:right;">Realized PnL</th>
+              </tr>
+            </thead>
+            <tbody id="m-trades-tbody">
+              <tr><td colspan="7" style="text-align:center; color:var(--text-dim); padding:24px;">No closed MCX trades recorded yet for today.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
     </div>
 
-    <div class="table-container">
-      <table>
-        <thead>
-          <tr>
-            <th>Market</th>
-            <th>Leg</th>
-            <th>Contract / Strike</th>
-            <th>Side</th>
-            <th>Qty</th>
-            <th>Entry</th>
-            <th>LTP</th>
-            <th>Current SL</th>
-            <th style="text-align:right;">P&L (MTM)</th>
-          </tr>
-        </thead>
-        <tbody id="positions-tbody">
-          <tr>
-            <td colspan="9" style="text-align:center; color:var(--text-dim); padding:28px;">
-              No active market positions currently open.
-            </td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
+    <!-- ═══════════════════════════════════════════════════════════════════════ -->
+    <!-- TAB 3: UNIFIED OVERVIEW (BOTH ENGINES + CALENDAR STATS)                -->
+    <!-- ═══════════════════════════════════════════════════════════════════════ -->
+    <div id="view-overview" class="view-section">
+      <!-- Active Positions (Combined) -->
+      <div style="margin-bottom:10px; display:flex; justify-content:space-between; align-items:center;">
+        <h3 style="font-size:1.05rem; font-weight:800;">All Live Market Positions (<span id="all-pos-count">0</span>)</h3>
+        <span style="font-size:0.75rem; color:var(--text-dim); font-family:var(--mono);">Full Multi-Asset Portfolio</span>
+      </div>
 
-    <!-- Recent Closed Trades -->
-    <div style="margin-bottom:12px; display:flex; justify-content:space-between; align-items:center;">
-      <h3 style="font-size:1.05rem; font-weight:700;">Today's Executed Trades</h3>
-      <span style="font-size:0.75rem; color:var(--text-dim); font-family:var(--mono);">Full Execution Log</span>
-    </div>
+      <div class="table-card">
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Market</th>
+                <th>Leg</th>
+                <th>Contract / Strike</th>
+                <th>Side</th>
+                <th>Qty</th>
+                <th>Entry Price</th>
+                <th>LTP</th>
+                <th>Current SL</th>
+                <th style="text-align:right;">Unrealized P&L</th>
+              </tr>
+            </thead>
+            <tbody id="all-pos-tbody">
+              <tr><td colspan="9" style="text-align:center; color:var(--text-dim); padding:28px;">No market positions currently open.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
 
-    <div class="table-container">
-      <table>
-        <thead>
-          <tr>
-            <th>Time</th>
-            <th>Market</th>
-            <th>Leg</th>
-            <th>Strike</th>
-            <th>Entry Price</th>
-            <th>Exit Price</th>
-            <th>Exit Reason</th>
-            <th style="text-align:right;">Realized PnL</th>
-          </tr>
-        </thead>
-        <tbody id="trades-tbody">
-          <tr>
-            <td colspan="8" style="text-align:center; color:var(--text-dim); padding:24px;">
-              No closed trades recorded yet for today.
-            </td>
-          </tr>
-        </tbody>
-      </table>
+      <!-- Past Trading Sessions Performance Grid -->
+      <div style="margin-bottom:12px;">
+        <h3 style="font-size:1.05rem; font-weight:800;">Historical Trading Sessions (Daily PnL)</h3>
+      </div>
+      <div class="history-cards-flex" id="history-cards-box"></div>
     </div>
-
-    <!-- Daily PnL History Cards -->
-    <div style="margin-bottom:12px;">
-      <h3 style="font-size:1.05rem; font-weight:700;">Past Trading Sessions</h3>
-    </div>
-    <div class="history-grid" id="history-grid"></div>
   </div>
 
-  <div class="toast" id="toast">Link copied to clipboard!</div>
+  <div class="toast-box" id="toast">Link copied to clipboard!</div>
 
   <script>
+    let activeTab = 'nifty';
+
+    function switchTab(tabName) {
+      activeTab = tabName;
+      document.querySelectorAll('.view-section').forEach(el => el.classList.remove('active'));
+      document.querySelectorAll('.seg-tab').forEach(el => el.className = 'seg-tab');
+
+      if (tabName === 'nifty') {
+        document.getElementById('view-nifty').classList.add('active');
+        document.getElementById('tab-btn-nifty').classList.add('active-nifty');
+      } else if (tabName === 'mcx') {
+        document.getElementById('view-mcx').classList.add('active');
+        document.getElementById('tab-btn-mcx').classList.add('active-mcx');
+      } else {
+        document.getElementById('view-overview').classList.add('active');
+        document.getElementById('tab-btn-overview').classList.add('active-overview');
+      }
+    }
+
     function fmtINR(val, plus=false) {
       if (val === undefined || val === null || isNaN(val)) return '₹0.00';
       const num = parseFloat(val);
@@ -1141,6 +1293,50 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       else el.classList.add('neutral');
     }
 
+    function renderPositionsRows(posList) {
+      if (!posList || posList.length === 0) {
+        return `<tr><td colspan="9" style="text-align:center; color:var(--text-dim); padding:28px;">No active market positions open.</td></tr>`;
+      }
+      return posList.map(pos => {
+        const isCall = pos.leg.startsWith('CE');
+        const badgeClass = pos.leg.includes('HEDGE') ? 'leg-hd' : (isCall ? 'leg-ce' : 'leg-pe');
+        const pnlClass = pos.pnl >= 0 ? 'positive' : 'negative';
+        return `
+          <tr>
+            <td><span class="leg-badge ${pos.market === 'NIFTY' ? 'leg-ce' : 'leg-pe'}">${pos.market}</span></td>
+            <td><span class="leg-badge ${badgeClass}">${pos.display_leg}</span></td>
+            <td><b>${pos.tsym || pos.strike}</b></td>
+            <td><span class="${pos.side === 'SELL' ? 'side-sell' : 'side-buy'}">${pos.side}</span></td>
+            <td>${pos.qty}</td>
+            <td>₹${parseFloat(pos.entry).toFixed(2)}</td>
+            <td><b style="color:#fff;">₹${parseFloat(pos.ltp).toFixed(2)}</b></td>
+            <td style="color:var(--text-muted);">${pos.sl > 0 ? '₹' + parseFloat(pos.sl).toFixed(2) : '—'}</td>
+            <td style="text-align:right;" class="${pnlClass}"><b>${fmtINR(pos.pnl, true)}</b></td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    function renderTradesRows(tradesList) {
+      if (!tradesList || tradesList.length === 0) {
+        return `<tr><td colspan="7" style="text-align:center; color:var(--text-dim); padding:24px;">No closed trades recorded yet for today.</td></tr>`;
+      }
+      return tradesList.map(t => {
+        const pnlClass = t.pnl >= 0 ? 'positive' : 'negative';
+        return `
+          <tr>
+            <td style="color:var(--text-dim);">${t.time || '--'}</td>
+            <td><span class="leg-badge ${t.leg.startsWith('CE') ? 'leg-ce' : 'leg-pe'}">${t.leg}</span></td>
+            <td><b>${t.strike}</b></td>
+            <td>₹${parseFloat(t.entry || 0).toFixed(2)}</td>
+            <td>₹${parseFloat(t.exit || 0).toFixed(2)}</td>
+            <td style="color:var(--text-muted); font-size:0.75rem;">${t.reason || 'SQUARE_OFF'}</td>
+            <td style="text-align:right;" class="${pnlClass}"><b>${fmtINR(t.pnl, true)}</b></td>
+          </tr>
+        `;
+      }).join('');
+    }
+
     function updateDashboard(data) {
       if (!data) return;
 
@@ -1149,7 +1345,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         document.getElementById('live-clock').innerText = data.timestamp_ist.split(' ')[1] + ' IST';
       }
 
-      // Performance
+      // KPI Performance
       const p = data.performance || {};
       const netMtm = p.combined_net_mtm || 0.0;
       const netPct = p.combined_net_pct || 0.0;
@@ -1160,9 +1356,8 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
 
       const netPctEl = document.getElementById('net-mtm-pct');
       netPctEl.innerText = fmtPct(netPct);
-      netPctEl.className = 'pct-tag ' + (netPct >= 0 ? 'pos' : 'neg');
+      netPctEl.className = 'tag-pct ' + (netPct >= 0 ? 'pos' : 'neg');
 
-      // Realized & Unrealized
       const realEl = document.getElementById('realized-val');
       realEl.innerText = fmtINR(p.combined_realized, true);
       applyClass(realEl, p.combined_realized);
@@ -1172,11 +1367,13 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       unrealEl.innerText = fmtINR(p.combined_unrealized, true);
       applyClass(unrealEl, p.combined_unrealized);
 
-      // Capital
       document.getElementById('capital-val').innerText = fmtINR(p.current_capital);
       document.getElementById('circuit-val').innerText = fmtINR(p.circuit_limit);
 
-      // MTD / YTD
+      const usedPct = p.circuit_used_pct || 0;
+      document.getElementById('circuit-fill-bar').style.width = `${Math.min(100, usedPct)}%`;
+      document.getElementById('circuit-used-text').innerText = `${usedPct.toFixed(1)}% Used`;
+
       const mtdEl = document.getElementById('mtd-val');
       mtdEl.innerText = fmtINR(p.mtd_pnl, true);
       applyClass(mtdEl, p.mtd_pnl);
@@ -1187,134 +1384,92 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
 
       document.getElementById('trades-count-pill').innerText = `${p.total_trades || 0} TRADES`;
 
-      // Status chips
-      const sys = data.system || {};
-      const chipSch = document.getElementById('chip-scheduler');
-      chipSch.className = 'status-chip ' + (sys.scheduler_running ? 'chip-active' : 'chip-idle');
-      chipSch.innerText = sys.scheduler_running ? 'SCHEDULER: ON' : 'SCHEDULER: OFF';
-
-      const chipNifty = document.getElementById('chip-nifty');
-      chipNifty.className = 'status-chip ' + (sys.nifty_running ? 'chip-active' : (sys.nifty_session_active ? 'chip-standby' : 'chip-idle'));
-      chipNifty.innerText = sys.nifty_running ? 'NIFTY: RUNNING' : 'NIFTY (09:15-15:35)';
-
-      const chipMcx = document.getElementById('chip-mcx');
-      chipMcx.className = 'status-chip ' + (sys.mcx_running ? 'chip-active' : (sys.mcx_session_active ? 'chip-standby' : 'chip-idle'));
-      chipMcx.innerText = sys.mcx_running ? 'MCX: RUNNING' : 'MCX (15:30-23:25)';
-
-      const winText = document.getElementById('session-window-text');
-      if (sys.nifty_session_active) winText.innerText = '⚡ NIFTY Session Window Active (09:15 - 15:35 IST)';
-      else if (sys.mcx_session_active) winText.innerText = '⚡ MCX Natural Gas Session Window Active (15:30 - 23:25 IST)';
-      else winText.innerText = '💤 Market Session Closed • Standing by for Next Open';
-
-      // NIFTY Data
+      // ── NIFTY TAB DATA ──
       const n = data.nifty || {};
-      document.getElementById('nifty-spot').innerText = n.spot ? n.spot.toFixed(2) : '--';
-      document.getElementById('nifty-atm').innerText = n.atm || '--';
-      document.getElementById('nifty-adx').innerText = n.adx ? n.adx.toFixed(1) : '--';
-      document.getElementById('nifty-regime').innerText = n.regime || '--';
-      document.getElementById('nifty-kama').innerText = n.kama || '--';
-      document.getElementById('nifty-trend').innerText = n.trend || '--';
-      document.getElementById('nifty-slope').innerText = (n.slow_slope !== undefined) ? n.slow_slope.toFixed(3) : '--';
-      document.getElementById('nifty-signal').innerText = n.signal || '--';
+      document.getElementById('n-spot').innerText = n.spot ? n.spot.toFixed(2) : '--';
+      document.getElementById('n-atm').innerText = n.atm || '--';
+      document.getElementById('n-adx').innerText = n.adx ? n.adx.toFixed(1) : '--';
+      document.getElementById('n-regime').innerText = n.regime || '--';
+      document.getElementById('n-kama').innerText = n.kama || '--';
+      document.getElementById('n-trend').innerText = n.trend || '--';
+      document.getElementById('n-atr').innerText = n.atr ? n.atr.toFixed(1) : '--';
+      document.getElementById('n-signal').innerText = n.signal || '--';
 
-      const nDayEl = document.getElementById('nifty-day-pnl');
-      nDayEl.innerText = fmtINR(n.net_pnl, true);
-      applyClass(nDayEl, n.net_pnl);
-      document.getElementById('nifty-trades').innerText = n.trades_today || 0;
+      const nNetEl = document.getElementById('n-net-pnl');
+      nNetEl.innerText = fmtINR(n.net_pnl, true);
+      applyClass(nNetEl, n.net_pnl);
+      document.getElementById('n-net-pct').innerText = fmtPct(n.net_pct);
+      document.getElementById('n-trades').innerText = n.trades_today || 0;
+      document.getElementById('n-realized').innerText = fmtINR(n.realized_pnl, true);
+      document.getElementById('n-unrealized').innerText = fmtINR(n.unrealized_pnl, true);
 
-      const nBadge = document.getElementById('nifty-status-badge');
-      nBadge.className = 'status-chip ' + (n.active ? 'chip-active' : 'chip-standby');
-      nBadge.innerText = n.active ? 'ACTIVE' : n.mode || 'STANDBY';
+      const nChip = document.getElementById('nifty-status-chip');
+      nChip.className = 'status-chip ' + (n.active ? 'chip-green' : 'chip-dim');
+      nChip.innerText = n.active ? 'ENGINE ACTIVE' : (n.mode || 'STANDBY');
 
-      // MCX Data
+      const sys = data.system || {};
+      const nSess = document.getElementById('nifty-session-chip');
+      nSess.className = 'status-chip ' + (sys.nifty_session_active ? 'chip-amber' : 'chip-dim');
+      nSess.innerText = sys.nifty_session_active ? 'MARKET OPEN' : 'SESSION: 09:15 - 15:35';
+
+      document.getElementById('n-pos-count').innerText = (n.positions || []).length;
+      document.getElementById('n-pos-tbody').innerHTML = renderPositionsRows(n.positions);
+      document.getElementById('n-trades-tbody').innerHTML = renderTradesRows(n.trades);
+
+      // ── MCX TAB DATA ──
       const m = data.mcx || {};
-      document.getElementById('mcx-spot').innerText = m.spot ? m.spot.toFixed(2) : '--';
-      document.getElementById('mcx-atm').innerText = m.atm || '--';
-      document.getElementById('mcx-expiry').innerText = m.expiry + (m.is_rolled_over ? ' (ROLLOVER)' : '');
-      document.getElementById('mcx-signal').innerText = m.signal || '--';
-      document.getElementById('mcx-ema15').innerText = m.ema15 ? m.ema15.toFixed(2) : '--';
-      document.getElementById('mcx-ema90').innerText = m.ema90 ? m.ema90.toFixed(2) : '--';
-      document.getElementById('mcx-slope').innerText = (m.slow_slope !== undefined) ? m.slow_slope.toFixed(3) : '--';
-      document.getElementById('mcx-vr').innerText = m.vr ? m.vr.toFixed(2) : '--';
+      document.getElementById('m-spot').innerText = m.spot ? m.spot.toFixed(2) : '--';
+      document.getElementById('m-atm').innerText = m.atm || '--';
+      document.getElementById('m-expiry').innerText = m.expiry + (m.is_rolled_over ? ' (ROLL)' : '');
+      document.getElementById('m-signal').innerText = m.signal || '--';
+      document.getElementById('m-ema15').innerText = m.ema15 ? m.ema15.toFixed(2) : '--';
+      document.getElementById('m-ema90').innerText = m.ema90 ? m.ema90.toFixed(2) : '--';
+      document.getElementById('m-slope').innerText = (m.slow_slope !== undefined) ? m.slow_slope.toFixed(3) : '--';
+      document.getElementById('m-vr').innerText = m.vr ? m.vr.toFixed(2) : '--';
 
-      const mDayEl = document.getElementById('mcx-day-pnl');
-      mDayEl.innerText = fmtINR(m.net_pnl, true);
-      applyClass(mDayEl, m.net_pnl);
-      document.getElementById('mcx-trades').innerText = m.trades_today || 0;
+      const mNetEl = document.getElementById('m-net-pnl');
+      mNetEl.innerText = fmtINR(m.net_pnl, true);
+      applyClass(mNetEl, m.net_pnl);
+      document.getElementById('m-net-pct').innerText = fmtPct(m.net_pct);
+      document.getElementById('m-trades').innerText = m.trades_today || 0;
+      document.getElementById('m-reversal').innerText = m.reversal_latched ? '⚡ LATCHED' : 'INACTIVE';
+      document.getElementById('m-reversal').style.color = m.reversal_latched ? 'var(--amber)' : 'var(--text-dim)';
+      document.getElementById('m-cooldown').innerText = `${m.cooldown_remaining || 0}s`;
 
-      const mBadge = document.getElementById('mcx-status-badge');
-      mBadge.className = 'status-chip ' + (m.active ? 'chip-active' : 'chip-standby');
-      mBadge.innerText = m.active ? 'ACTIVE' : 'STANDBY';
+      const mChip = document.getElementById('mcx-status-chip');
+      mChip.className = 'status-chip ' + (m.active ? 'chip-green' : 'chip-dim');
+      mChip.innerText = m.active ? 'ENGINE ACTIVE' : 'STANDBY';
 
-      // Positions Table
-      const posList = data.positions || [];
-      document.getElementById('pos-count').innerText = posList.length;
-      const posTbody = document.getElementById('positions-tbody');
-      if (posList.length === 0) {
-        posTbody.innerHTML = `<tr><td colspan="9" style="text-align:center; color:var(--text-dim); padding:28px;">No active market positions currently open.</td></tr>`;
-      } else {
-        posTbody.innerHTML = posList.map(pos => {
-          const isCall = pos.leg.startsWith('CE');
-          const badgeClass = pos.leg.includes('HEDGE') ? 'badge-hedge' : (isCall ? 'badge-ce' : 'badge-pe');
-          const pnlClass = pos.pnl >= 0 ? 'positive' : 'negative';
-          return `
-            <tr>
-              <td><b style="color:${pos.market === 'NIFTY' ? 'var(--primary)' : 'var(--amber)'}">${pos.market}</b></td>
-              <td><span class="badge-leg ${badgeClass}">${pos.display_leg}</span></td>
-              <td><b>${pos.tsym || pos.strike}</b></td>
-              <td><span class="${pos.side === 'SELL' ? 'side-sell' : 'side-buy'}">${pos.side}</span></td>
-              <td>${pos.qty}</td>
-              <td>₹${parseFloat(pos.entry).toFixed(2)}</td>
-              <td><b style="color:#fff;">₹${parseFloat(pos.ltp).toFixed(2)}</b></td>
-              <td style="color:var(--text-muted);">${pos.sl > 0 ? '₹' + parseFloat(pos.sl).toFixed(2) : '—'}</td>
-              <td style="text-align:right;" class="${pnlClass}"><b>${fmtINR(pos.pnl, true)}</b></td>
-            </tr>
-          `;
-        }).join('');
-      }
+      const mSess = document.getElementById('mcx-session-chip');
+      mSess.className = 'status-chip ' + (sys.mcx_session_active ? 'chip-amber' : 'chip-dim');
+      mSess.innerText = sys.mcx_session_active ? 'MARKET OPEN' : 'SESSION: 15:30 - 23:25';
 
-      // Trades Table
-      const tradesList = data.recent_trades || [];
-      const trTbody = document.getElementById('trades-tbody');
-      if (tradesList.length === 0) {
-        trTbody.innerHTML = `<tr><td colspan="8" style="text-align:center; color:var(--text-dim); padding:24px;">No closed trades recorded yet for today.</td></tr>`;
-      } else {
-        trTbody.innerHTML = tradesList.map(t => {
-          const pnlClass = t.pnl >= 0 ? 'positive' : 'negative';
-          return `
-            <tr>
-              <td style="color:var(--text-dim);">${t.time || '--'}</td>
-              <td><b>${t.market}</b></td>
-              <td><span class="badge-leg ${t.leg.startsWith('CE') ? 'badge-ce' : 'badge-pe'}">${t.leg}</span></td>
-              <td>${t.strike}</td>
-              <td>₹${parseFloat(t.entry || 0).toFixed(2)}</td>
-              <td>₹${parseFloat(t.exit || 0).toFixed(2)}</td>
-              <td style="color:var(--text-muted); font-size:0.75rem;">${t.reason || 'SQUARE_OFF'}</td>
-              <td style="text-align:right;" class="${pnlClass}"><b>${fmtINR(t.pnl, true)}</b></td>
-            </tr>
-          `;
-        }).join('');
-      }
+      document.getElementById('m-pos-count').innerText = (m.positions || []).length;
+      document.getElementById('m-pos-tbody').innerHTML = renderPositionsRows(m.positions);
+      document.getElementById('m-trades-tbody').innerHTML = renderTradesRows(m.trades);
 
-      // Daily History
+      // ── OVERVIEW TAB DATA ──
+      const allPos = data.positions || [];
+      document.getElementById('all-pos-count').innerText = allPos.length;
+      document.getElementById('all-pos-tbody').innerHTML = renderPositionsRows(allPos);
+
       const histMap = p.daily_history || {};
-      const histGrid = document.getElementById('history-grid');
+      const histBox = document.getElementById('history-cards-box');
       const histKeys = Object.keys(histMap).sort().reverse();
       if (histKeys.length > 0) {
-        histGrid.innerHTML = histKeys.map(k => {
+        histBox.innerHTML = histKeys.map(k => {
           const v = histMap[k];
           const c = v >= 0 ? 'positive' : 'negative';
           return `
-            <div class="history-card">
-              <div class="hist-date">${k}</div>
-              <div class="hist-pnl ${c}">${fmtINR(v, true)}</div>
+            <div class="hist-box">
+              <div class="hist-title">${k}</div>
+              <div class="hist-num ${c}">${fmtINR(v, true)}</div>
             </div>
           `;
         }).join('');
       }
     }
 
-    // Connect to SSE stream
     function initSSE() {
       const streamStatus = document.getElementById('stream-status');
       let es = null;
@@ -1330,7 +1485,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
             const data = JSON.parse(e.data);
             updateDashboard(data);
           } catch(err) {
-            console.error('SSE JSON error', err);
+            console.error('SSE Error', err);
           }
         };
         es.onerror = () => {
@@ -1342,7 +1497,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       }
       connect();
 
-      // Fallback Polling (in case SSE drops or client proxy blocks SSE)
+      // Reliable fallback polling
       setInterval(() => {
         if (!es || es.readyState !== EventSource.OPEN) {
           fetch('/api/status')
@@ -1363,13 +1518,10 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
     }
 
     window.addEventListener('DOMContentLoaded', () => {
-      // First quick fetch
       fetch('/api/status')
         .then(res => res.json())
         .then(data => updateDashboard(data))
         .catch(() => {});
-
-      // Start SSE
       initSSE();
     });
   </script>
@@ -1378,11 +1530,10 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HTTP REQUEST HANDLER
+# HTTP HANDLER
 # ─────────────────────────────────────────────────────────────────────────────
 class DashboardHTTPHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        # Silence access logs to keep terminal neat
         return
 
     def do_HEAD(self):
@@ -1445,7 +1596,6 @@ def start_server(port: int = 8000):
     server = ThreadingHTTPServer(("0.0.0.0", port), DashboardHTTPHandler)
     print(f"[WEB DASHBOARD] Listening at http://0.0.0.0:{port}", flush=True)
 
-    # Launch tunnel in background thread
     t = threading.Thread(target=run_tunnel_manager, args=(port,), daemon=True)
     t.start()
 
