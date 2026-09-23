@@ -104,8 +104,8 @@ LOT_SIZE            = 1250         # 1 lot = 1250 units
 DEFAULT_SL_PCT      = 0.15         # 15% initial stop-loss (fresh straddles)
 REENTRY_SL_PCT      = 0.15         # 15% initial stop-loss for reversal re-entry
 DEFAULT_TSL_PCT     = 0.08         # 8% trailing stop-loss
-POST_CLOSE_COOLDOWN = 5.0          # Seconds to wait after any close before re-entry
-REENTRY_COOLDOWN_S  = 10.0         # Min seconds between single-leg re-entries
+POST_CLOSE_COOLDOWN = 60.0         # Seconds to wait after any close before re-entry (60s to let market breathe)
+REENTRY_COOLDOWN_S  = 30.0         # Min seconds between single-leg re-entries
 SWING_REVERSAL_PTS  = 0.80         # Fallback swing reversal pullback threshold
 
 TELEGRAM_TOKEN = '8850507396:AAFwFm2_WxPdSM52JcCpJUj8V1rz9x3G-kE'
@@ -205,10 +205,16 @@ class ContinuousEMAEngine:
             self.confirmed_signal = 0
 
         hold_time = (now_ts - self.signal_start_ts) if self.signal_start_ts else 0.0
+        prev_confirmed = self.confirmed_signal
         if self.raw_signal != 0 and hold_time >= p_req:
             self.confirmed_signal = self.raw_signal
         else:
             self.confirmed_signal = 0
+
+        if self.confirmed_signal != prev_confirmed:
+            direction = {1: "BULLISH▲", -1: "BEARISH▼", 0: "FLAT━"}
+            print(f"[EMA SIGNAL] Confirmed signal changed: {direction.get(prev_confirmed,'?')} → {direction.get(self.confirmed_signal,'?')}  "
+                  f"(EMA15={fast_val:.2f} EMA90={slow_val:.2f} slope={slow_slope:+.3f} VR={vr:.2f} hold={hold_time:.1f}s)", flush=True)
 
         self.latest_snapshot = {
             "ema_15": fast_val,
@@ -1045,48 +1051,63 @@ class NaturalGasPaperBot:
                 status_str = "🎯 SOLO TRAILING"
             elif has_ce or has_pe:
                 status_str = "🎯 1-LEG ACTIVE"
-            elif self.cooldown_until > now_ts:
-                rem_cd = int(self.cooldown_until - now_ts)
+            elif (now_ts - self.last_any_close_ts) < POST_CLOSE_COOLDOWN:
+                rem_cd = int(POST_CLOSE_COOLDOWN - (now_ts - self.last_any_close_ts))
                 status_str = f"⏳ COOLDOWN ({rem_cd}s)"
             else:
                 status_str = "⚙️ SCANNING"
 
-            t = f"⚡ <b>NATGAS ALGO DASHBOARD</b> • <code>{now.strftime('%H:%M:%S IST')}</code>\n"
-            t += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            roll_tag = " (NEXT MO)" if self.is_rolled_over else ""
-            t += f"<b>SPOT:</b> <code>{spot:,.2f}</code> │ <b>ATM:</b> <code>{int(atm)}</code> │ <b>EXP:</b> <code>{self.target_opt_expiry_str}{roll_tag}</code>\n"
-            t += f"<b>SIGNAL:</b> {sig_txt} │ <b>VR:</b> <code>{vr:.2f}</code> │ <b>SLOPE:</b> <code>{slope:+.3f}</code>\n"
-            t += f"<b>STATUS:</b> {status_str} │ 🎯 <b>TRADES:</b> <code>{self.trades_today}</code>\n"
-            t += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            t += "<pre>\n"
-            t += f"{'LEG':<7} {'STRIKE':>6} {'ENTRY':>7} {'LTP':>7} {'SL':>7} {'PNL':>9}\n"
-            t += "─────────────────────────────────────────\n"
+            # ── Redesigned clean Telegram dashboard ──────────────────────────────
+            roll_tag = " ⟳NEXT MO" if self.is_rolled_over else ""
+            r_sign = '+' if self.total_realized_pnl >= 0 else ''
+            u_sign = '+' if total_unreal >= 0 else ''
+            n_sign = '+' if net >= 0 else ''
+            net_pct_tg = (net / 200_000.0) * 100.0
+            pnl_badge  = "🟢" if net >= 0 else "🔴"
+            rev_tag    = " 🔄REVERSAL" if self._reversal_latched else ""
+            cd_tag     = f" ⏳{int(POST_CLOSE_COOLDOWN-(now_ts-self.last_any_close_ts))}s" if (now_ts - self.last_any_close_ts) < POST_CLOSE_COOLDOWN else ""
 
+            t  = f"<b>⚡ MCX NATGAS · PAPER TRADING</b>\n"
+            t += f"<code>🕐 {now.strftime('%H:%M:%S IST')}</code>\n"
+            t += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            t += f"<b>SPOT:</b>   <code>{spot:>8.2f}</code>  <b>ATM:</b> <code>{int(atm)}</code>\n"
+            t += f"<b>EXPIRY:</b> <code>{self.target_opt_expiry_str}{roll_tag}</code>\n"
+            t += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            t += f"<b>EMA MOMENTUM ENGINE</b>\n"
+            t += f"<pre>"
+            t += f"  EMA15 : {ema15:>8.2f}\n"
+            t += f"  EMA90 : {ema90:>8.2f}\n"
+            t += f"  SLOPE : {slope:>+8.3f}\n"
+            t += f"  VR    : {vr:>8.2f}  P_REQ: {ema_snap.get('persistence_req',10.0):.1f}s\n"
+            t += f"  SIGNAL: {sig_txt:>8}  HOLD:  {ema_snap.get('hold_time',0.0):.1f}s\n"
+            t += f"</pre>"
+            t += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            t += f"<b>STATUS:</b> {status_str}{rev_tag}{cd_tag}  <b>TRADES:</b> <code>{self.trades_today}</code>\n"
+            t += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            t += "<pre>"
+            t += f"{'LEG':<6} {'STRIKE':>7} {'ENTRY':>7} {'LTP':>7} {'SL':>8} {'PnL':>10}\n"
+            t += f"{'─'*6} {'─'*7} {'─'*7} {'─'*7} {'─'*8} {'─'*10}\n"
             if snap_rows:
                 for r in snap_rows:
                     pnl_sign = '+' if r['pnl'] >= 0 else ''
                     sl_val = r.get('sl', 0.0)
-                    sl_str = f"{sl_val:>7.2f}" if sl_val > 0 else "      —"
+                    sl_str = f"{sl_val:>8.2f}" if sl_val > 0 else "       —"
                     leg_tag = f"{r['leg']}*" if r.get('solo_mode') else r['leg']
-                    t += f"{leg_tag:<7} {int(r['strike']):>6} {r['entry']:>7.2f} {r['ltp']:>7.2f} {sl_str} {pnl_sign}{r['pnl']:>8,.0f}\n"
+                    t += f"{leg_tag:<6} {int(r['strike']):>7} {r['entry']:>7.2f} {r['ltp']:>7.2f} {sl_str} {pnl_sign}{r['pnl']:>9,.0f}\n"
             else:
-                t += "  No Open Positions\n"
-
-            t += "─────────────────────────────────────────\n"
-            r_sign = '+' if self.total_realized_pnl >= 0 else ''
-            u_sign = '+' if total_unreal >= 0 else ''
-            n_sign = '+' if net >= 0 else ''
-            t += f"Realized PnL:               {r_sign}₹{self.total_realized_pnl:>10,.2f}\n"
-            t += f"Unrealized MTM:             {u_sign}₹{total_unreal:>10,.2f}\n"
-            t += "─────────────────────────────────────────\n"
-            net_pct = (net / 200_000.0) * 100.0
-            t += f"NET MTM:         {n_sign}₹{net:>10,.2f} ({net_pct:+.2f}%)\n"
-            t += "</pre>\n"
+                t += "  — No Open Positions —\n"
+            t += f"{'─'*48}\n"
+            t += f"{'Realized':>16}: {r_sign}₹{self.total_realized_pnl:>10,.2f}\n"
+            t += f"{'Unrealized':>16}: {u_sign}₹{total_unreal:>10,.2f}\n"
+            t += f"{'─'*48}\n"
+            t += f"{'NET MTM':>16}: {pnl_badge}{n_sign}₹{net:>9,.2f} ({net_pct_tg:+.2f}%)\n"
+            t += "</pre>"
             t += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            t += f"⚡ <b>MCX V5.0</b> │ <b>LOTS:</b> <code>1 ({LOT_SIZE}u)</code> │ <b>MODE:</b> <code>PAPER</code>"
+            t += f"<b>MODE:</b> <code>PAPER</code>  <b>LOT:</b> <code>1×{LOT_SIZE}u</code>  <b>SL:</b> <code>{DEFAULT_SL_PCT*100:.0f}%</code>  <b>TSL:</b> <code>{DEFAULT_TSL_PCT*100:.0f}%</code>"
 
             chat_ids   = _get_tg_chat_ids()
-            is_refresh = (now_ts - _last_tg_dash_new_msg_ts) >= 60.0
+            # Refresh every 15 seconds (new message) or edit in-place
+            is_refresh = (now_ts - _last_tg_dash_new_msg_ts) >= 15.0
 
             for cid in chat_ids:
                 msg_id = _last_tg_dash_msg_ids.get(cid)
@@ -1107,7 +1128,7 @@ class NaturalGasPaperBot:
                     except Exception:
                         pass
 
-                if not edited and (msg_id is None or is_refresh):
+                if not edited:
                     try:
                         r = requests.post(
                             f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage',
@@ -1124,6 +1145,7 @@ class NaturalGasPaperBot:
 
             if is_refresh:
                 _last_tg_dash_new_msg_ts = now_ts
+
 
     # ── Main run loop ─────────────────────────
     def run(self):

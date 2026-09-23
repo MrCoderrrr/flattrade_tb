@@ -901,7 +901,7 @@ def send_telegram_nifty_dashboard(spot: float, atm: int, mode: str, positions: d
     now_ist = get_ist_now()
     is_eod = (now_ist.hour > 15 or (now_ist.hour == 15 and now_ist.minute >= 34))
 
-    # Throttle edits to at most once per 3.0s to respect Telegram rate limits
+    # Throttle edits: at most once per 3s to respect Telegram rate limits
     if (now_ts - _last_tg_dashboard_edit_ts) < 3.0:
         return
     if time.time() < _tg_rate_limited_until:
@@ -910,17 +910,28 @@ def send_telegram_nifty_dashboard(spot: float, atm: int, mode: str, positions: d
 
     try:
         import requests
-        regime = ind.get("regime", "?")
-        adx    = ind.get("adx", 0.0) or 0.0
+        regime   = ind.get("regime", "?")
+        adx      = ind.get("adx", 0.0) or 0.0
         kama_raw = ind.get("kama")
         kama_str = f"{kama_raw:.0f}" if kama_raw is not None else "WARMUP"
         total_pnl = realized_pnl + unrealized_pnl
-        pnl_pct = (total_pnl / 200_000.0 * 100.0)
+        pnl_pct  = (total_pnl / 200_000.0 * 100.0)
 
-        pnl_badge = "🟢" if total_pnl >= 0 else "🔴"
-        trend_val = ind.get("trend", 0)
-        trend_icon = "▲ UP" if trend_val == 1 else ("▼ DOWN" if trend_val == -1 else "━ FLAT")
-        regime_icon = "🦀 CHOP" if regime == "CHOP" else ("📈 TREND" if regime == "TREND" else f"🔄 {regime}")
+        pnl_badge    = "🟢" if total_pnl >= 0 else "🔴"
+        trend_val    = ind.get("trend", 0)
+        trend_icon   = "▲ UP" if trend_val == 1 else ("▼ DOWN" if trend_val == -1 else "━ FLAT")
+        regime_icon  = "🦀 CHOP" if regime == "CHOP" else ("📈 TREND" if regime == "TREND" else f"🔄 {regime}")
+
+        # EMA snapshot from indicators dict (populated by MarketData.ema_engine)
+        ema15  = ind.get("ema_15", 0.0)
+        ema90  = ind.get("ema_90", 0.0)
+        ema300 = ind.get("ema_300", 0.0)
+        ema_slope  = ind.get("slow_slope", 0.0)
+        ema_vr     = ind.get("vr", 1.0)
+        ema_sig    = ind.get("confirmed_signal", 0)
+        ema_hold   = ind.get("hold_time", 0.0)
+        ema_preq   = ind.get("persistence_req", 10.0)
+        ema_sigtxt = "▲ UP" if ema_sig > 0 else ("▼ DOWN" if ema_sig < 0 else "━ FLAT")
 
         has_ce = ("CE" in positions and positions["CE"].get("side") == "SELL")
         has_pe = ("PE" in positions and positions["PE"].get("side") == "SELL")
@@ -935,26 +946,49 @@ def send_telegram_nifty_dashboard(spot: float, atm: int, mode: str, positions: d
         else:
             status_str = f"⚙️ {mode}"
 
-        t = f"⚡ <b>NIFTY 50 ALGO DASHBOARD</b> • <code>{now_ist.strftime('%H:%M:%S IST')}</code>\n"
+        r_sign = "+" if realized_pnl >= 0 else ""
+        u_sign = "+" if unrealized_pnl >= 0 else ""
+        n_sign = "+" if total_pnl >= 0 else ""
+        mtd_sign = "+" if mtd_pnl >= 0 else ""
+        ytd_sign = "+" if ytd_pnl >= 0 else ""
+        circuit_val = round(-total_cap * 0.018, 0)
+
+        t  = f"<b>⚡ NIFTY 50 · ALGO DASHBOARD</b>\n"
+        t += f"<code>🕐 {now_ist.strftime('%H:%M:%S IST')}</code>\n"
         t += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        t += f"<b>SPOT:</b> <code>{spot:,.2f}</code> │ <b>ATM:</b> <code>{atm}</code> │ <b>FEED:</b> 🟢 LIVE\n"
-        t += f"<b>REGIME:</b> {regime_icon} ({adx:.1f}) │ <b>TREND:</b> {trend_icon}\n"
-        t += f"<b>STATUS:</b> {status_str} │ 🎯 <b>TRADES:</b> <code>{trades_today}</code>\n"
+        t += f"<b>SPOT:</b>  <code>{spot:>9,.2f}</code>  <b>ATM:</b> <code>{atm}</code>\n"
+        t += f"<b>REGIME:</b> {regime_icon} (ADX {adx:.1f})  <b>KAMA:</b> <code>{kama_str}</code>\n"
+        t += f"<b>TREND:</b>  <code>{trend_icon}</code>\n"
         t += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        t += "<pre>\n"
-        t += f"{'LEG':<7} {'STRIKE':>6} {'ENTRY':>7} {'LTP':>7} {'SL':>7} {'PNL':>9}\n"
-        t += "─────────────────────────────────────────\n"
+        t += f"<b>EMA MOMENTUM ENGINE</b>\n"
+        t += "<pre>"
+        if ema15 > 0:
+            t += f"  EMA15 : {ema15:>9.2f}\n"
+            t += f"  EMA90 : {ema90:>9.2f}\n"
+            t += f"  EMA300: {ema300:>9.2f}\n"
+            t += f"  SLOPE : {ema_slope:>+9.3f}\n"
+            t += f"  VR    : {ema_vr:>9.2f}  P_REQ: {ema_preq:.1f}s\n"
+            t += f"  SIGNAL: {ema_sigtxt:>9}  HOLD:  {ema_hold:.1f}s\n"
+        else:
+            t += "  EMA warming up...\n"
+        t += "</pre>"
+        t += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        t += f"<b>STATUS:</b> {status_str}  <b>TRADES:</b> <code>{trades_today}</code>\n"
+        t += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        t += "<pre>"
+        t += f"{'LEG':<6} {'STRIKE':>7} {'ENTRY':>7} {'LTP':>7} {'SL':>8} {'PnL':>10}\n"
+        t += f"{'─'*6} {'─'*7} {'─'*7} {'─'*7} {'─'*8} {'─'*10}\n"
 
         if positions:
             for leg, pos in positions.items():
                 strike = pos.get("strike", 0)
-                entry = pos.get("entry_price", 0.0)
-                ltp = pos.get("ltp", entry)
-                pnl = pos.get("pnl", 0.0)
-                sign = "+" if pnl >= 0 else ""
+                entry  = pos.get("entry_price", 0.0)
+                ltp    = pos.get("ltp", entry)
+                pnl    = pos.get("pnl", 0.0)
+                p_sign = "+" if pnl >= 0 else ""
                 sl_state = pos.get("dual_sl_state") or {}
                 tsl = sl_state.get("current_premium_sl", 0.0)
-                tsl_str = f"{tsl:>7.2f}" if tsl > 0 else "      —"
+                sl_str = f"{tsl:>8.2f}" if tsl > 0 else "       —"
                 if leg == "CE_HEDGE":
                     leg_tag = "CE(H)"
                 elif leg == "PE_HEDGE":
@@ -965,28 +999,22 @@ def send_telegram_nifty_dashboard(spot: float, atm: int, mode: str, positions: d
                     leg_tag = "CE*"
                 else:
                     leg_tag = leg
-
-                t += f"{leg_tag:<7} {strike:>6} {entry:>7.2f} {ltp:>7.2f} {tsl_str} {sign}{pnl:>8,.0f}\n"
+                t += f"{leg_tag:<6} {strike:>7} {entry:>7.2f} {ltp:>7.2f} {sl_str} {p_sign}{pnl:>9,.0f}\n"
         else:
-            t += "  No Open Positions\n"
+            t += "  — No Open Positions —\n"
 
-        t += "─────────────────────────────────────────\n"
-        r_sign = "+" if realized_pnl >= 0 else ""
-        u_sign = "+" if unrealized_pnl >= 0 else ""
-        n_sign = "+" if total_pnl >= 0 else ""
-        t += f"Realized PnL:               {r_sign}₹{realized_pnl:>10,.2f}\n"
-        t += f"Unrealized MTM:             {u_sign}₹{unrealized_pnl:>10,.2f}\n"
-        t += "─────────────────────────────────────────\n"
-        t += f"NET MTM:         {n_sign}₹{total_pnl:>10,.2f} ({pnl_pct:+.2f}%)\n"
-        t += "</pre>\n"
+        t += f"{'─'*48}\n"
+        t += f"{'Realized':>16}: {r_sign}₹{realized_pnl:>10,.2f}\n"
+        t += f"{'Unrealized':>16}: {u_sign}₹{unrealized_pnl:>10,.2f}\n"
+        t += f"{'─'*48}\n"
+        t += f"{'NET MTM':>16}: {pnl_badge}{n_sign}₹{total_pnl:>9,.2f} ({pnl_pct:+.2f}%)\n"
+        t += "</pre>"
         t += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        circuit_val = round(-total_cap * 0.018, 0)
-        t += f"💰 <b>Capital:</b> <code>₹{total_cap:,.0f}</code> │ ⚡ <b>Circuit:</b> <code>₹{circuit_val:,.0f}</code>\n"
-        mtd_sign = "+" if mtd_pnl >= 0 else ""
-        ytd_sign = "+" if ytd_pnl >= 0 else ""
-        t += f"📅 <b>MTD:</b> <code>{mtd_sign}₹{mtd_pnl:,.0f}</code> │ <b>YTD:</b> <code>{ytd_sign}₹{ytd_pnl:,.0f}</code>"
+        t += f"💰 <b>Capital:</b> <code>₹{total_cap:,.0f}</code>  ⚡ <b>Circuit:</b> <code>₹{circuit_val:,.0f}</code>\n"
+        t += f"📅 <b>MTD:</b> <code>{mtd_sign}₹{mtd_pnl:,.0f}</code>  <b>YTD:</b> <code>{ytd_sign}₹{ytd_pnl:,.0f}</code>"
 
-        is_refresh_cycle = (now_ts - _last_tg_dashboard_new_msg_ts) >= 60.0 or is_eod
+        # Refresh every 15 seconds (new msg) or edit in-place
+        is_refresh_cycle = (now_ts - _last_tg_dashboard_new_msg_ts) >= 15.0 or is_eod
 
         for cid in chat_ids:
             msg_id = _last_tg_dashboard_msg_ids.get(cid)
@@ -1134,10 +1162,16 @@ class ContinuousEMAEngine:
             self.confirmed_signal = 0
 
         hold_time = (now_ts - self.signal_start_ts) if self.signal_start_ts else 0.0
+        prev_confirmed = self.confirmed_signal
         if self.raw_signal != 0 and hold_time >= p_req:
             self.confirmed_signal = self.raw_signal
         else:
             self.confirmed_signal = 0
+
+        if self.confirmed_signal != prev_confirmed:
+            direction = {1: "BULLISH▲", -1: "BEARISH▼", 0: "FLAT━"}
+            print(f"[EMA SIGNAL NIFTY] Confirmed: {direction.get(prev_confirmed,'?')} → {direction.get(self.confirmed_signal,'?')}  "
+                  f"(EMA15={fast_val:.2f} EMA90={slow_val:.2f} slope={slow_slope:+.3f} VR={vr:.2f} hold={hold_time:.1f}s)", flush=True)
 
         self.latest_snapshot = {
             "ema_15": fast_val,
