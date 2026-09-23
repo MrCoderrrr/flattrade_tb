@@ -140,6 +140,13 @@ def get_flattrade_token_status() -> dict:
         "auth_url": auth_url
     }
 
+def check_process_running(pattern: str) -> bool:
+    try:
+        res = subprocess.run(["pgrep", "-f", pattern], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        return res.returncode == 0
+    except Exception:
+        return False
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DATA INGESTION
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2613,8 +2620,13 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         return
 
     def do_HEAD(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
         self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        if path.startswith("/api/"):
+            self.send_header("Content-Type", "application/json")
+        else:
+            self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
         self.end_headers()
 
@@ -2630,14 +2642,24 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             self.wfile.write(HTML_DASHBOARD.encode("utf-8"))
 
         elif path == "/api/status":
-            data = get_aggregated_dashboard_state()
-            payload = json.dumps(data).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
-            self.end_headers()
-            self.wfile.write(payload)
+            try:
+                data = get_aggregated_dashboard_state()
+                payload = json.dumps(data).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+                self.end_headers()
+                self.wfile.write(payload)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                err_payload = json.dumps({"status": "error", "message": str(e)}).encode("utf-8")
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(err_payload)
 
         elif path == "/api/stream":
             self.send_response(200)
