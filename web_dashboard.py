@@ -1385,6 +1385,12 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         # Silence access logs to keep terminal neat
         return
 
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.end_headers()
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
