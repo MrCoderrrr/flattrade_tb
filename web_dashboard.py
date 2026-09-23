@@ -192,13 +192,142 @@ def get_mcx_snapshot():
             return d
     return None
 
-def check_process_running(pattern: str) -> bool:
-    try:
-        out = subprocess.check_output(["pgrep", "-f", pattern], text=True).strip()
-        pids = [int(p) for p in out.splitlines() if int(p) != os.getpid()]
-        return len(pids) > 0
-    except Exception:
-        return False
+# ─────────────────────────────────────────────────────────────────────────────
+# INTRADAY PNL TIME-SERIES ENGINE (09:15 - SESSION CLOSE)
+# ─────────────────────────────────────────────────────────────────────────────
+INTRADAY_PNL_SERIES = []
+INTRADAY_SERIES_DATE = None
+
+def update_intraday_pnl_series(current_net_mtm: float, net_pct: float):
+    global INTRADAY_PNL_SERIES, INTRADAY_SERIES_DATE
+    now = get_ist_now()
+    today_str = str(now.date())
+
+    if INTRADAY_SERIES_DATE != today_str:
+        INTRADAY_SERIES_DATE = today_str
+        INTRADAY_PNL_SERIES = [{
+            "time": "09:15",
+            "pnl": 0.0,
+            "pct": 0.0,
+            "ts": now.replace(hour=9, minute=15, second=0).timestamp()
+        }]
+
+    now_ts = now.timestamp()
+    if not INTRADAY_PNL_SERIES or (now_ts - INTRADAY_PNL_SERIES[-1].get("ts", 0)) >= 4.0:
+        INTRADAY_PNL_SERIES.append({
+            "time": now.strftime("%H:%M:%S"),
+            "time_short": now.strftime("%H:%M"),
+            "pnl": round(current_net_mtm, 2),
+            "pct": round(net_pct, 2),
+            "ts": now_ts
+        })
+        if len(INTRADAY_PNL_SERIES) > 1500:
+            INTRADAY_PNL_SERIES.pop(0)
+
+    return INTRADAY_PNL_SERIES
+
+def get_history_analytics():
+    pnl_data = get_pnl_tracker_data()
+    daily_map = dict(pnl_data.get("daily_pnl", {}))
+
+    trade_csv = os.path.join(PROJECT_ROOT, "data", "logs", "trade_book", "trades_v2_paper.csv")
+    if os.path.exists(trade_csv):
+        try:
+            import csv
+            with open(trade_csv, "r", encoding="utf-8") as f:
+                r = csv.DictReader(f)
+                for row in r:
+                    ts = row.get("timestamp", "")
+                    pnl = row.get("pnl", "")
+                    if ts and pnl:
+                        dt_str = ts.split()[0]
+                        if dt_str not in daily_map:
+                            try:
+                                daily_map[dt_str] = round(daily_map.get(dt_str, 0.0) + float(pnl), 2)
+                            except Exception:
+                                pass
+        except Exception:
+            pass
+
+    all_dates = sorted(daily_map.keys())
+    last_30_dates = all_dates[-30:] if len(all_dates) > 30 else all_dates
+
+    last_30_days = []
+    day_of_week_map = {
+        "Monday": {"total_pnl": 0.0, "count": 0, "wins": 0},
+        "Tuesday": {"total_pnl": 0.0, "count": 0, "wins": 0},
+        "Wednesday": {"total_pnl": 0.0, "count": 0, "wins": 0},
+        "Thursday": {"total_pnl": 0.0, "count": 0, "wins": 0},
+        "Friday": {"total_pnl": 0.0, "count": 0, "wins": 0}
+    }
+    month_map = {}
+
+    for d_str in reversed(last_30_dates):
+        val = float(daily_map[d_str])
+        pct_2l = (val / 200000.0) * 100.0
+        try:
+            dt = datetime.strptime(d_str, "%Y-%m-%d")
+            weekday = dt.strftime("%A")
+            month_key = dt.strftime("%B %Y")
+        except Exception:
+            weekday = "Weekday"
+            month_key = "Recent"
+
+        last_30_days.append({
+            "date": d_str,
+            "day": weekday,
+            "pnl": val,
+            "pct": pct_2l,
+            "win": (val >= 0)
+        })
+
+        if weekday in day_of_week_map:
+            day_of_week_map[weekday]["total_pnl"] += val
+            day_of_week_map[weekday]["count"] += 1
+            if val >= 0:
+                day_of_week_map[weekday]["wins"] += 1
+
+        if month_key not in month_map:
+            month_map[month_key] = {"total_pnl": 0.0, "days": 0, "wins": 0}
+        month_map[month_key]["total_pnl"] += val
+        month_map[month_key]["days"] += 1
+        if val >= 0:
+            month_map[month_key]["wins"] += 1
+
+    dow_list = []
+    for day_name in ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]:
+        item = day_of_week_map[day_name]
+        cnt = item["count"]
+        pnl = item["total_pnl"]
+        pct = (pnl / 200000.0) * 100.0
+        win_rate = (item["wins"] / cnt * 100.0) if cnt > 0 else 0.0
+        dow_list.append({
+            "day": day_name,
+            "total_pnl": pnl,
+            "pct": pct,
+            "count": cnt,
+            "win_rate": win_rate
+        })
+
+    month_list = []
+    for m_name, m_data in month_map.items():
+        pnl = m_data["total_pnl"]
+        pct = (pnl / 200000.0) * 100.0
+        cnt = m_data["days"]
+        wr = (m_data["wins"] / cnt * 100.0) if cnt > 0 else 0.0
+        month_list.append({
+            "month": m_name,
+            "total_pnl": pnl,
+            "pct": pct,
+            "days": cnt,
+            "win_rate": wr
+        })
+
+    return {
+        "last_30_days": last_30_days,
+        "day_of_week": dow_list,
+        "monthwise": month_list
+    }
 
 def get_aggregated_dashboard_state() -> dict:
     now_ist = get_ist_now()
@@ -427,7 +556,9 @@ def get_aggregated_dashboard_state() -> dict:
             "trades": mcx_trades_list
         },
         "positions": nifty_positions + mcx_positions,
-        "recent_trades": all_trades[:35]
+        "recent_trades": all_trades[:35],
+        "intraday_series": update_intraday_pnl_series(combined_net, combined_net_pct),
+        "history_analytics": get_history_analytics()
     }
 
 
@@ -1001,6 +1132,97 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       .kpi-val { font-size: 1.55rem; }
       .seg-tab { padding: 8px 14px; font-size: 0.82rem; }
     }
+
+    /* ─── Ultra-Cool Animations & Chart Effects ─── */
+    @keyframes radarPulse {
+      0% { transform: scale(0.9); opacity: 0.9; box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }
+      70% { transform: scale(1.6); opacity: 0; box-shadow: 0 0 0 16px rgba(16, 185, 129, 0); }
+      100% { transform: scale(0.9); opacity: 0; box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+    }
+
+    @keyframes laserSweep {
+      0% { transform: translateX(-100%); opacity: 0.1; }
+      50% { opacity: 0.7; }
+      100% { transform: translateX(100%); opacity: 0.1; }
+    }
+
+    @keyframes neonBorderSweep {
+      0% { border-color: rgba(56, 189, 248, 0.2); }
+      50% { border-color: rgba(168, 85, 247, 0.5); }
+      100% { border-color: rgba(56, 189, 248, 0.2); }
+    }
+
+    .pulse-beacon {
+      animation: radarPulse 1.8s infinite ease-in-out;
+    }
+
+    .laser-line {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      width: 2px;
+      background: linear-gradient(to bottom, transparent, var(--primary), #fff, var(--primary), transparent);
+      box-shadow: 0 0 15px var(--primary);
+      pointer-events: none;
+    }
+
+    /* Day of Week Animated Bar */
+    .dow-bar-column {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      flex: 1;
+      min-width: 60px;
+    }
+
+    .dow-bar-track {
+      width: 100%;
+      height: 140px;
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      border-radius: 12px;
+      display: flex;
+      align-items: flex-end;
+      padding: 6px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .dow-bar-fill {
+      width: 100%;
+      border-radius: 8px;
+      transition: height 0.8s cubic-bezier(0.34, 1.56, 0.64, 1);
+      position: relative;
+      box-shadow: 0 0 16px rgba(56, 189, 248, 0.3);
+    }
+
+    /* Scrollable 30D Feed */
+    .scroll-feed-30d {
+      display: flex;
+      gap: 12px;
+      overflow-x: auto;
+      padding-bottom: 12px;
+      scrollbar-width: thin;
+      scrollbar-color: rgba(56, 189, 248, 0.35) rgba(255, 255, 255, 0.02);
+    }
+    .scroll-feed-30d::-webkit-scrollbar { height: 6px; }
+    .scroll-feed-30d::-webkit-scrollbar-thumb { background: rgba(56, 189, 248, 0.4); border-radius: 999px; }
+
+    .day-feed-card {
+      min-width: 165px;
+      background: rgba(255, 255, 255, 0.025);
+      border: 1px solid var(--card-border);
+      border-radius: 14px;
+      padding: 14px;
+      font-family: var(--mono);
+      transition: all 0.25s ease;
+      flex-shrink: 0;
+    }
+    .day-feed-card:hover {
+      border-color: rgba(56, 189, 248, 0.4);
+      transform: translateY(-3px);
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+    }
   </style>
 </head>
 <body>
@@ -1100,6 +1322,26 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         <div class="kpi-sub">
           <span>Year-to-Date: <b id="ytd-val" style="color:#fff;">₹0.00</b> <span id="ytd-pct" style="font-weight:700;">(+0.00%)</span></span>
         </div>
+      </div>
+    </div>
+
+    <!-- ─── Live Intraday P&L Tracking Chart (09:15 to Session Close) ─── -->
+    <div class="panel-box" style="padding:18px 20px; margin-bottom:22px; position:relative; overflow:hidden;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; flex-wrap:wrap; gap:8px;">
+        <div style="display:flex; align-items:center; gap:10px;">
+          <span style="font-size:1.2rem; color:var(--primary);">📈</span>
+          <span style="font-family:var(--display); font-weight:800; font-size:1.1rem; letter-spacing:-0.02em;">LIVE INTRADAY P&L TRAJECTORY</span>
+          <span class="status-chip chip-green" style="font-size:0.68rem; padding:3px 9px;" id="intraday-live-status">LIVE STREAM</span>
+        </div>
+        <div style="display:flex; align-items:center; gap:14px; font-family:var(--mono); font-size:0.78rem;">
+          <span style="color:var(--text-dim);">Timeline: <b style="color:#fff;">09:15 ➔ 15:35 IST</b></span>
+          <span style="color:var(--text-dim);">Live MTM: <b id="chart-cur-mtm" style="color:var(--green); font-size:0.92rem;">₹0.00 (+0.00%)</b></span>
+        </div>
+      </div>
+      
+      <!-- Interactive Live Canvas -->
+      <div style="position:relative; width:100%; height:230px; background:rgba(0,0,0,0.5); border:1px solid rgba(255,255,255,0.07); border-radius:16px; overflow:hidden;">
+        <canvas id="intraday-canvas" style="width:100%; height:100%; display:block;"></canvas>
       </div>
     </div>
 
@@ -1374,11 +1616,31 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- Past Trading Sessions Performance Grid -->
-      <div style="margin-bottom:12px;">
-        <h3 style="font-size:1.05rem; font-weight:800;">Historical Trading Sessions (Daily PnL)</h3>
+      <!-- Day-of-Week Cumulative Performance Analysis -->
+      <div style="margin-bottom:14px; display:flex; justify-content:space-between; align-items:center;">
+        <h3 style="font-size:1.05rem; font-weight:800;">Day-of-Week Cumulative Performance</h3>
+        <span style="font-size:0.75rem; color:var(--text-dim); font-family:var(--mono);">Monday – Friday Performance Heat</span>
       </div>
-      <div class="history-cards-flex" id="history-cards-box"></div>
+
+      <div class="panel-box" style="padding:20px; margin-bottom:24px;">
+        <div style="display:flex; gap:14px; justify-content:space-between; align-items:flex-end;" id="dow-bars-container">
+          <!-- Dynamically populated 5 weekday bars -->
+        </div>
+      </div>
+
+      <!-- Month-wise Performance Breakdown Cards -->
+      <div style="margin-bottom:14px; display:flex; justify-content:space-between; align-items:center;">
+        <h3 style="font-size:1.05rem; font-weight:800;">Monthly Performance Breakdown</h3>
+        <span style="font-size:0.75rem; color:var(--text-dim); font-family:var(--mono);">Month-over-Month Capital Gain</span>
+      </div>
+      <div class="history-cards-flex" id="monthwise-cards-box" style="margin-bottom:24px;"></div>
+
+      <!-- Scrollable Last 30 Days Performance Journal -->
+      <div style="margin-bottom:14px; display:flex; justify-content:space-between; align-items:center;">
+        <h3 style="font-size:1.05rem; font-weight:800;">Last 30 Days Performance Feed</h3>
+        <span style="font-size:0.75rem; color:var(--text-dim); font-family:var(--mono);">Scrollable Daily Session Journal</span>
+      </div>
+      <div class="scroll-feed-30d" id="history-30d-feed" style="margin-bottom:24px;"></div>
     </div>
   </div>
 
@@ -1523,6 +1785,490 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
               <div style="font-size:0.72rem; font-weight:700; opacity:0.85;">${fmtPct(tradePct2L)} on 2L</div>
             </td>
           </tr>
+        `;
+      }).join('');
+    }
+
+    // ── Live Intraday Canvas Chart State & Engine ──
+    let chartSeries = [];
+    let chartCurNet = 0.0;
+    let chartCurPct = 0.0;
+    let chartAnimFrame = null;
+    let chartMouseX = null;
+
+    function renderIntradayChart(series, curNet, curPct) {
+      if (Array.isArray(series)) {
+        chartSeries = series;
+      }
+      if (curNet !== undefined && !isNaN(curNet)) chartCurNet = parseFloat(curNet);
+      if (curPct !== undefined && !isNaN(curPct)) chartCurPct = parseFloat(curPct);
+
+      const curNetEl = document.getElementById('chart-cur-mtm');
+      if (curNetEl) {
+        curNetEl.innerText = `${fmtINR(chartCurNet, true)} (${fmtPct(chartCurPct)})`;
+        curNetEl.style.color = chartCurNet >= 0 ? 'var(--green)' : 'var(--red)';
+      }
+    }
+
+    function drawIntradayCanvas() {
+      const canvas = document.getElementById('intraday-canvas');
+      if (!canvas) return;
+
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      const w = rect.width;
+      const h = rect.height;
+      if (!w || !h) return;
+
+      if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+        canvas.width = Math.round(w * dpr);
+        canvas.height = Math.round(h * dpr);
+      }
+
+      const ctx = canvas.getContext('2d');
+      ctx.save();
+      ctx.scale(dpr, dpr);
+      ctx.clearRect(0, 0, w, h);
+
+      const padLeft = 68;
+      const padRight = 24;
+      const padTop = 22;
+      const padBottom = 26;
+      const plotW = Math.max(10, w - padLeft - padRight);
+      const plotH = Math.max(10, h - padTop - padBottom);
+
+      // Fixed grid: 09:15 (555m) to 15:35 (935m) = 380 min
+      const startMin = 555;
+      const endMin = 935;
+      const totalMinSpan = endMin - startMin; // 380
+
+      function timeStrToMin(timeStr) {
+        if (!timeStr) return startMin;
+        const parts = timeStr.split(':').map(Number);
+        const hh = parts[0] || 0;
+        const mm = parts[1] || 0;
+        const ss = parts[2] || 0;
+        return hh * 60 + mm + ss / 60.0;
+      }
+
+      function minToX(m) {
+        const ratio = Math.max(0.0, Math.min(1.0, (m - startMin) / totalMinSpan));
+        return padLeft + ratio * plotW;
+      }
+
+      // Determine Y range (PnL in INR)
+      let minPnl = 0.0;
+      let maxPnl = 0.0;
+      for (const pt of chartSeries) {
+        if (pt.pnl < minPnl) minPnl = pt.pnl;
+        if (pt.pnl > maxPnl) maxPnl = pt.pnl;
+      }
+      if (chartCurNet < minPnl) minPnl = chartCurNet;
+      if (chartCurNet > maxPnl) maxPnl = chartCurNet;
+
+      // Add headroom
+      const spread = Math.max(1000, maxPnl - minPnl);
+      const headRoom = spread * 0.18;
+      const yMin = minPnl - headRoom;
+      const yMax = maxPnl + headRoom;
+      const yRange = yMax - yMin || 1;
+
+      function pnlToY(pnl) {
+        const ratio = (pnl - yMin) / yRange;
+        return padTop + (1.0 - ratio) * plotH;
+      }
+
+      const zeroY = pnlToY(0.0);
+
+      // 1. Vertical time grid lines & labels (Fixed 09:15 to 15:35)
+      const timeTicks = [
+        { label: '09:15', m: 555 },
+        { label: '10:30', m: 630 },
+        { label: '11:30', m: 690 },
+        { label: '12:30', m: 750 },
+        { label: '13:30', m: 810 },
+        { label: '14:30', m: 870 },
+        { label: '15:35', m: 935 }
+      ];
+
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
+      ctx.lineWidth = 1;
+      ctx.fillStyle = 'rgba(148, 163, 184, 0.7)';
+      ctx.font = '10px "JetBrains Mono", monospace';
+      ctx.textAlign = 'center';
+
+      timeTicks.forEach(tick => {
+        const x = minToX(tick.m);
+        ctx.beginPath();
+        ctx.setLineDash([3, 4]);
+        ctx.moveTo(x, padTop);
+        ctx.lineTo(x, padTop + plotH);
+        ctx.stroke();
+
+        ctx.fillText(tick.label, x, h - 8);
+      });
+
+      // 2. Horizontal Zero Line (Dash + Glow)
+      ctx.beginPath();
+      ctx.setLineDash([4, 4]);
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+      ctx.lineWidth = 1.2;
+      ctx.moveTo(padLeft, zeroY);
+      ctx.lineTo(padLeft + plotW, zeroY);
+      ctx.stroke();
+
+      // Zero label on Y axis
+      ctx.setLineDash([]);
+      ctx.textAlign = 'right';
+      ctx.fillStyle = '#94a3b8';
+      ctx.fillText('₹0 (0%)', padLeft - 6, zeroY + 3.5);
+
+      // Upper guideline
+      const upperPnl = maxPnl > 0 ? maxPnl : 1000;
+      const upperY = pnlToY(upperPnl);
+      if (Math.abs(upperY - zeroY) > 22) {
+        ctx.strokeStyle = 'rgba(16, 185, 129, 0.15)';
+        ctx.beginPath();
+        ctx.moveTo(padLeft, upperY);
+        ctx.lineTo(padLeft + plotW, upperY);
+        ctx.stroke();
+
+        const upperPct = (upperPnl / 200000.0) * 100.0;
+        ctx.fillStyle = '#10b981';
+        ctx.fillText(`+₹${Math.round(upperPnl)} (${fmtPct(upperPct)})`, padLeft - 6, upperY + 3.5);
+      }
+
+      // Lower guideline
+      const lowerPnl = minPnl < 0 ? minPnl : -1000;
+      const lowerY = pnlToY(lowerPnl);
+      if (Math.abs(lowerY - zeroY) > 22) {
+        ctx.strokeStyle = 'rgba(244, 63, 94, 0.15)';
+        ctx.beginPath();
+        ctx.moveTo(padLeft, lowerY);
+        ctx.lineTo(padLeft + plotW, lowerY);
+        ctx.stroke();
+
+        const lowerPct = (lowerPnl / 200000.0) * 100.0;
+        ctx.fillStyle = '#f43f5e';
+        ctx.fillText(`-₹${Math.abs(Math.round(lowerPnl))} (${fmtPct(lowerPct)})`, padLeft - 6, lowerY + 3.5);
+      }
+
+      // 3. Build trajectory points
+      let points = [];
+      if (chartSeries.length > 0) {
+        for (const pt of chartSeries) {
+          const m = timeStrToMin(pt.time || pt.time_short);
+          const px = minToX(m);
+          const py = pnlToY(pt.pnl);
+          points.push({ x: px, y: py, pnl: pt.pnl, pct: pt.pct, time: pt.time });
+        }
+      }
+
+      if (points.length === 0) {
+        const startX = minToX(startMin);
+        const startY = pnlToY(0.0);
+        points.push({ x: startX, y: startY, pnl: 0, pct: 0, time: '09:15' });
+      }
+
+      points.sort((a, b) => a.x - b.x);
+
+      // 4. Fill gradient under the curve down to zeroY
+      if (points.length > 1) {
+        const lastPt = points[points.length - 1];
+        const isPos = chartCurNet >= 0;
+        const grad = ctx.createLinearGradient(0, padTop, 0, padTop + plotH);
+        if (isPos) {
+          grad.addColorStop(0, 'rgba(16, 185, 129, 0.28)');
+          grad.addColorStop(0.6, 'rgba(16, 185, 129, 0.06)');
+          grad.addColorStop(1, 'rgba(16, 185, 129, 0.0)');
+        } else {
+          grad.addColorStop(0, 'rgba(244, 63, 94, 0.0)');
+          grad.addColorStop(0.6, 'rgba(244, 63, 94, 0.06)');
+          grad.addColorStop(1, 'rgba(244, 63, 94, 0.28)');
+        }
+
+        ctx.beginPath();
+        ctx.moveTo(points[0].x, zeroY);
+        ctx.lineTo(points[0].x, points[0].y);
+        for (let i = 1; i < points.length; i++) {
+          ctx.lineTo(points[i].x, points[i].y);
+        }
+        ctx.lineTo(lastPt.x, zeroY);
+        ctx.closePath();
+        ctx.fillStyle = grad;
+        ctx.fill();
+
+        // 5. Stroke glowing curve
+        ctx.beginPath();
+        ctx.moveTo(points[0].x, points[0].y);
+        for (let i = 1; i < points.length; i++) {
+          ctx.lineTo(points[i].x, points[i].y);
+        }
+        ctx.lineWidth = 2.6;
+        ctx.strokeStyle = isPos ? '#10b981' : '#f43f5e';
+        ctx.shadowColor = isPos ? 'rgba(16, 185, 129, 0.65)' : 'rgba(244, 63, 94, 0.65)';
+        ctx.shadowBlur = 12;
+        ctx.stroke();
+        ctx.shadowBlur = 0;
+      }
+
+      // 6. Animated Cyberpunk Laser Sweep
+      const lastPt = points[points.length - 1];
+      const activeW = Math.max(10, lastPt.x - padLeft);
+      const nowMs = Date.now();
+      const scanX = padLeft + ((nowMs / 22) % activeW);
+
+      const laserGrad = ctx.createLinearGradient(0, padTop, 0, padTop + plotH);
+      laserGrad.addColorStop(0, 'rgba(56, 189, 248, 0)');
+      laserGrad.addColorStop(0.5, 'rgba(56, 189, 248, 0.55)');
+      laserGrad.addColorStop(1, 'rgba(56, 189, 248, 0)');
+      ctx.fillStyle = laserGrad;
+      ctx.fillRect(scanX - 1.5, padTop, 3, plotH);
+
+      // 7. Pulsing Beacon at Current Head Position
+      const pulsePhase = (Math.sin(nowMs / 180) + 1) / 2;
+      const outerR = 5 + pulsePhase * 9;
+      const isCurPos = chartCurNet >= 0;
+      const haloColor = isCurPos ? 'rgba(16, 185, 129, ' : 'rgba(244, 63, 94, ';
+
+      // Outer radar ring
+      ctx.beginPath();
+      ctx.arc(lastPt.x, lastPt.y, outerR, 0, Math.PI * 2);
+      ctx.strokeStyle = haloColor + (0.65 * (1 - pulsePhase)) + ')';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      // Inner glowing core
+      ctx.beginPath();
+      ctx.arc(lastPt.x, lastPt.y, 4.5, 0, Math.PI * 2);
+      ctx.fillStyle = '#ffffff';
+      ctx.shadowColor = isCurPos ? '#10b981' : '#f43f5e';
+      ctx.shadowBlur = 10;
+      ctx.fill();
+      ctx.shadowBlur = 0;
+
+      // Vertical tracer dashed line
+      ctx.beginPath();
+      ctx.setLineDash([2, 3]);
+      ctx.strokeStyle = haloColor + '0.45)';
+      ctx.lineWidth = 1;
+      ctx.moveTo(lastPt.x, padTop);
+      ctx.lineTo(lastPt.x, padTop + plotH);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Floating Live Tag above tip
+      const tagText = `${chartCurNet >= 0 ? '+' : ''}₹${Math.abs(chartCurNet).toFixed(2)} (${fmtPct(chartCurPct)})`;
+      ctx.font = 'bold 11px "JetBrains Mono", monospace';
+      const tagW = ctx.measureText(tagText).width + 16;
+      const tagH = 22;
+      let tagX = Math.max(padLeft + 8, Math.min(w - padRight - tagW, lastPt.x - tagW / 2));
+      let tagY = lastPt.y - 28;
+      if (tagY < padTop + 2) tagY = lastPt.y + 14;
+
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.9)';
+      ctx.strokeStyle = isCurPos ? 'rgba(16, 185, 129, 0.6)' : 'rgba(244, 63, 94, 0.6)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.roundRect ? ctx.roundRect(tagX, tagY, tagW, tagH, 6) : ctx.rect(tagX, tagY, tagW, tagH);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.fillStyle = isCurPos ? '#10b981' : '#f43f5e';
+      ctx.textAlign = 'center';
+      ctx.fillText(tagText, tagX + tagW / 2, tagY + 15);
+
+      // 8. Interactive crosshair on hover
+      if (chartMouseX !== null && chartMouseX >= padLeft && chartMouseX <= lastPt.x) {
+        let closest = points[0];
+        let minD = Math.abs(points[0].x - chartMouseX);
+        for (let i = 1; i < points.length; i++) {
+          const d = Math.abs(points[i].x - chartMouseX);
+          if (d < minD) { minD = d; closest = points[i]; }
+        }
+        if (closest) {
+          ctx.beginPath();
+          ctx.setLineDash([2, 2]);
+          ctx.strokeStyle = 'rgba(56, 189, 248, 0.65)';
+          ctx.moveTo(closest.x, padTop);
+          ctx.lineTo(closest.x, padTop + plotH);
+          ctx.moveTo(padLeft, closest.y);
+          ctx.lineTo(padLeft + plotW, closest.y);
+          ctx.stroke();
+          ctx.setLineDash([]);
+
+          ctx.beginPath();
+          ctx.arc(closest.x, closest.y, 4.5, 0, Math.PI * 2);
+          ctx.fillStyle = '#38bdf8';
+          ctx.fill();
+
+          const tStr = `${closest.time || ''} • ${fmtINR(closest.pnl, true)} (${fmtPct(closest.pct)})`;
+          ctx.font = '10px "JetBrains Mono", monospace';
+          const tw = ctx.measureText(tStr).width + 14;
+          let tx = Math.max(padLeft, Math.min(w - padRight - tw, closest.x - tw / 2));
+          let ty = closest.y - 20;
+          if (ty < padTop + 2) ty = closest.y + 14;
+
+          ctx.fillStyle = 'rgba(6, 9, 14, 0.95)';
+          ctx.strokeStyle = '#38bdf8';
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.roundRect ? ctx.roundRect(tx, ty, tw, 20, 5) : ctx.rect(tx, ty, tw, 20);
+          ctx.fill();
+          ctx.stroke();
+
+          ctx.fillStyle = '#ffffff';
+          ctx.textAlign = 'center';
+          ctx.fillText(tStr, tx + tw / 2, ty + 13);
+        }
+      }
+
+      ctx.restore();
+    }
+
+    function startCanvasAnimationLoop() {
+      function loop() {
+        drawIntradayCanvas();
+        chartAnimFrame = requestAnimationFrame(loop);
+      }
+      if (!chartAnimFrame) {
+        loop();
+      }
+    }
+
+    function setupCanvasInteractivity() {
+      const canvas = document.getElementById('intraday-canvas');
+      if (!canvas) return;
+      canvas.addEventListener('mousemove', (e) => {
+        const rect = canvas.getBoundingClientRect();
+        chartMouseX = e.clientX - rect.left;
+      });
+      canvas.addEventListener('mouseleave', () => {
+        chartMouseX = null;
+      });
+      window.addEventListener('resize', () => {
+        drawIntradayCanvas();
+      });
+    }
+
+    // ── Day-of-Week Cumulative Bar Chart Renderer ──
+    function renderDOWChart(dowList) {
+      const container = document.getElementById('dow-bars-container');
+      if (!container) return;
+
+      const defaultDOW = [
+        { day: 'Monday', total_pnl: 0, pct: 0, count: 0, win_rate: 0 },
+        { day: 'Tuesday', total_pnl: 0, pct: 0, count: 0, win_rate: 0 },
+        { day: 'Wednesday', total_pnl: 0, pct: 0, count: 0, win_rate: 0 },
+        { day: 'Thursday', total_pnl: 0, pct: 0, count: 0, win_rate: 0 },
+        { day: 'Friday', total_pnl: 0, pct: 0, count: 0, win_rate: 0 }
+      ];
+
+      const list = (Array.isArray(dowList) && dowList.length > 0) ? dowList : defaultDOW;
+
+      let maxAbs = 1000;
+      list.forEach(d => {
+        if (Math.abs(d.total_pnl) > maxAbs) maxAbs = Math.abs(d.total_pnl);
+      });
+
+      container.innerHTML = list.map(d => {
+        const isPos = d.total_pnl >= 0;
+        const heightPct = Math.max(12, Math.min(100, Math.round((Math.abs(d.total_pnl) / maxAbs) * 100)));
+        const colorClass = isPos ? 'positive' : 'negative';
+        const bgGradient = isPos
+          ? 'linear-gradient(to top, rgba(16, 185, 129, 0.25), #10b981)'
+          : 'linear-gradient(to top, rgba(244, 63, 94, 0.25), #f43f5e)';
+        const glow = isPos ? '0 0 16px rgba(16, 185, 129, 0.4)' : '0 0 16px rgba(244, 63, 94, 0.4)';
+        const shortDay = d.day.slice(0, 3).toUpperCase();
+
+        return `
+          <div class="dow-bar-column">
+            <div style="font-family:var(--mono); font-size:0.75rem; font-weight:800; margin-bottom:6px;" class="${colorClass}">
+              ${fmtINR(d.total_pnl, true)}
+              <div style="font-size:0.68rem; font-weight:700; opacity:0.85;">${fmtPct(d.pct)} on 2L</div>
+            </div>
+            <div class="dow-bar-track">
+              <div class="dow-bar-fill" style="height:${heightPct}%; background:${bgGradient}; box-shadow:${glow};"></div>
+            </div>
+            <div style="font-family:var(--mono); font-weight:800; font-size:0.85rem; margin-top:8px; color:#fff;">${shortDay}</div>
+            <div style="font-family:var(--mono); font-size:0.7rem; color:var(--text-dim); margin-top:2px;">
+              ${d.count}d • <span style="color:${d.win_rate >= 50 ? 'var(--green)' : 'var(--amber)'}; font-weight:700;">${Math.round(d.win_rate)}% Win</span>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    // ── Monthly Performance Breakdown Cards Renderer ──
+    function renderMonthwiseCards(monthList) {
+      const container = document.getElementById('monthwise-cards-box');
+      if (!container) return;
+
+      if (!Array.isArray(monthList) || monthList.length === 0) {
+        container.innerHTML = `<div style="grid-column:1/-1; text-align:center; color:var(--text-dim); padding:20px; font-family:var(--mono);">No monthly historical records available yet.</div>`;
+        return;
+      }
+
+      container.innerHTML = monthList.map(m => {
+        const isPos = m.total_pnl >= 0;
+        const cClass = isPos ? 'positive' : 'negative';
+        const tagClass = isPos ? 'pos' : 'neg';
+        const wr = Math.round(m.win_rate || 0);
+
+        return `
+          <div class="hist-box" style="padding:16px; border-radius:16px; position:relative; overflow:hidden;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+              <div class="hist-title" style="font-size:0.8rem; font-weight:700; color:var(--text-muted);">${m.month}</div>
+              <span class="tag-pct ${tagClass}" style="font-size:0.75rem;">${fmtPct(m.pct)} on 2L</span>
+            </div>
+            <div class="hist-num ${cClass}" style="font-size:1.35rem; margin-bottom:8px;">
+              ${fmtINR(m.total_pnl, true)}
+            </div>
+            <div style="font-size:0.74rem; color:var(--text-dim); display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+              <span>${m.days} Trading Days</span>
+              <span style="color:${wr >= 50 ? 'var(--green)' : 'var(--amber)'}; font-weight:700;">${wr}% Win Rate</span>
+            </div>
+            <div class="circuit-track" style="height:4px; margin-top:0;">
+              <div style="height:100%; width:${wr}%; background:${wr >= 50 ? 'var(--green)' : 'var(--amber)'}; border-radius:999px;"></div>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    // ── Last 30 Days Scrollable Daily Journal Renderer ──
+    function render30DayFeed(last30Days) {
+      const container = document.getElementById('history-30d-feed');
+      if (!container) return;
+
+      if (!Array.isArray(last30Days) || last30Days.length === 0) {
+        container.innerHTML = `<div style="color:var(--text-dim); padding:20px; font-family:var(--mono);">No 30-day session logs recorded yet.</div>`;
+        return;
+      }
+
+      container.innerHTML = last30Days.map(d => {
+        const isPos = d.pnl >= 0;
+        const cClass = isPos ? 'positive' : 'negative';
+        const tagClass = isPos ? 'pos' : 'neg';
+        const badgeText = d.pnl > 0 ? 'WIN' : (d.pnl < 0 ? 'LOSS' : 'FLAT');
+        const badgeBg = d.pnl > 0 ? 'rgba(16, 185, 129, 0.15)' : (d.pnl < 0 ? 'rgba(244, 63, 94, 0.15)' : 'rgba(148, 163, 184, 0.12)');
+        const badgeBorder = d.pnl > 0 ? 'rgba(16, 185, 129, 0.3)' : (d.pnl < 0 ? 'rgba(244, 63, 94, 0.3)' : 'rgba(148, 163, 184, 0.2)');
+        const badgeColor = d.pnl > 0 ? 'var(--green)' : (d.pnl < 0 ? 'var(--red)' : 'var(--text-dim)');
+
+        return `
+          <div class="day-feed-card">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+              <span style="font-size:0.75rem; color:var(--text-muted); font-weight:700;">${d.date}</span>
+              <span style="font-size:0.65rem; font-weight:800; padding:2px 6px; border-radius:6px; background:${badgeBg}; border:1px solid ${badgeBorder}; color:${badgeColor};">${badgeText}</span>
+            </div>
+            <div style="font-size:0.72rem; color:var(--text-dim); margin-bottom:6px;">${d.day}</div>
+            <div class="hist-num ${cClass}" style="font-size:1.05rem; margin-bottom:4px;">
+              ${fmtINR(d.pnl, true)}
+            </div>
+            <div style="font-size:0.72rem; font-weight:700;" class="${cClass}">
+              ${fmtPct(d.pct)} on 2L
+            </div>
+          </div>
         `;
       }).join('');
     }
@@ -1688,23 +2434,13 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       document.getElementById('all-pos-count').innerText = allPos.length;
       document.getElementById('all-pos-tbody').innerHTML = renderPositionsRows(allPos);
 
-      const histMap = p.daily_history || {};
-      const histBox = document.getElementById('history-cards-box');
-      const histKeys = Object.keys(histMap).sort().reverse();
-      if (histKeys.length > 0) {
-        histBox.innerHTML = histKeys.map(k => {
-          const v = histMap[k];
-          const c = v >= 0 ? 'positive' : 'negative';
-          const dayPct = (v / 200000.0) * 100.0;
-          return `
-            <div class="hist-box">
-              <div class="hist-title">${k}</div>
-              <div class="hist-num ${c}">${fmtINR(v, true)}</div>
-              <div style="font-size:0.73rem; font-weight:700; margin-top:3px;" class="${c}">${fmtPct(dayPct)} on 2L</div>
-            </div>
-          `;
-        }).join('');
-      }
+      // ── RENDER LIVE CHARTS & ADVANCED ANALYTICS ──
+      renderIntradayChart(data.intraday_series, netMtm, netPct);
+
+      const ha = data.history_analytics || {};
+      renderDOWChart(ha.day_of_week);
+      renderMonthwiseCards(ha.monthwise);
+      render30DayFeed(ha.last_30_days);
     }
 
     function initSSE() {
@@ -1855,6 +2591,8 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
     }
 
     window.addEventListener('DOMContentLoaded', () => {
+      setupCanvasInteractivity();
+      startCanvasAnimationLoop();
       fetch('/api/status')
         .then(res => res.json())
         .then(data => updateDashboard(data))
