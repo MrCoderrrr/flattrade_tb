@@ -930,6 +930,8 @@ def send_telegram_nifty_dashboard(spot: float, atm: int, mode: str, positions: d
             status_str = "🎯 SOLO TRAILING"
         elif has_ce or has_pe:
             status_str = "🎯 1-LEG ACTIVE"
+        elif mode == "SESSION_DONE":
+            status_str = "🏁 SESSION COMPLETE"
         else:
             status_str = f"⚙️ {mode}"
 
@@ -2170,8 +2172,10 @@ class ExecutionEngine:
             # If shutdown was caused by SIGTERM / pkill during code restart, save WAIT_DATA so reboot resumes trading
             self.mode = "WAIT_DATA" if reason.startswith("SIGNAL_") else "SESSION_DONE"
             self._save_state()
-            self._remove_pid()
-            print(f"\n{Fore.GREEN}✅ All positions successfully squared off. Strategy halted cleanly.{Style.RESET_ALL}\n", flush=True)
+            final_pct = (self.realized_pnl / 200_000.0) * 100.0
+            pnl_col = Fore.GREEN if self.realized_pnl >= 0 else Fore.RED
+            sign = "+" if self.realized_pnl >= 0 else ""
+            print(f"\n{pnl_col}✅ All positions successfully squared off. Final Realized PnL: {sign}₹{self.realized_pnl:,.2f} ({final_pct:+.2f}%). Strategy halted cleanly.{Style.RESET_ALL}\n", flush=True)
         except Exception as e:
             log_warn(f"Error during emergency shutdown: {e}")
         finally:
@@ -2432,7 +2436,7 @@ class ExecutionEngine:
         
         # Hedges are bought OTM and sold ONLY when session closes at 15:34 IST or emergency liquidation
         if leg.endswith("_HEDGE") and not (
-            reason in ("SESSION_CLOSE", "CIRCUIT_BREAKER", "STOP_FLAG", "EMERGENCY_ZXC") or
+            reason in ("SESSION_END", "SESSION_CLOSE", "CIRCUIT_BREAKER", "STOP_FLAG", "EMERGENCY_ZXC") or
             reason.startswith("SIGNAL_") or reason.startswith("GLOBAL_")
         ):
             log_warn(f"🛡️ BLOCKED EXIT for {leg} (Reason: {reason})! Protective hedges are held until 15:34 IST session close.")
@@ -3266,6 +3270,7 @@ class ExecutionEngine:
                 if now.hour > AUTO_SQUAREOFF_HOUR or (now.hour == AUTO_SQUAREOFF_HOUR and now.minute >= AUTO_SQUAREOFF_MINUTE):
                     log_alert(f"🕒 Auto Square-Off Time Reached ({AUTO_SQUAREOFF_HOUR}:{AUTO_SQUAREOFF_MINUTE:02d}). Liquidating all positions...")
                     self._exit_all_positions(reason="SESSION_END")
+                    self.positions.clear()
                     self.mode = "SESSION_DONE"
                     self._save_state()
                     try:
@@ -3274,7 +3279,10 @@ class ExecutionEngine:
                     except Exception as e:
                         log_warn(f"Failed to commit PnL: {e}")
                     self._render_dashboard(self.market_data.latest_spot, self.market_data.latest_atm)
-                    print(f"\n{Fore.GREEN}✅ Session Completed Successfully. Final Realized PnL: ₹{self.realized_pnl:,.2f}{Style.RESET_ALL}\n")
+                    final_pct = (self.realized_pnl / 200_000.0) * 100.0
+                    pnl_col = Fore.GREEN if self.realized_pnl >= 0 else Fore.RED
+                    sign = "+" if self.realized_pnl >= 0 else ""
+                    print(f"\n{pnl_col}✅ Session Completed Successfully. Final Realized PnL: {sign}₹{self.realized_pnl:,.2f} ({final_pct:+.2f}%){Style.RESET_ALL}\n")
                     self._remove_pid()
                     sys.exit(0)
 

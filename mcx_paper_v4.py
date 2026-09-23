@@ -1018,9 +1018,16 @@ class NaturalGasPaperBot:
                 if now.hour > MCX_EXIT_HOUR or (now.hour == MCX_EXIT_HOUR and now.minute >= MCX_EXIT_MINUTE):
                     print(f'[AUTO] {MCX_EXIT_HOUR}:{MCX_EXIT_MINUTE:02d} IST — squaring off all positions...', flush=True)
                     self._close_all('SESSION_END')
+                    self.positions.clear()
+                    self._render_dashboard(spot, atm)
+                    final_pct = (self.total_realized_pnl / 200_000.0) * 100.0
+                    pnl_col = GR if self.total_realized_pnl >= 0 else RD
+                    sign = '+' if self.total_realized_pnl >= 0 else ''
+                    print(f'\n{pnl_col}✅ Session Completed Successfully. Final Realized PnL: {sign}₹{self.total_realized_pnl:,.2f} ({final_pct:+.2f}%){RS}\n', flush=True)
                     send_telegram(
-                        f'<pre>MCX Session Complete\n'
-                        f'Final Realized PnL: ₹{self.total_realized_pnl:,.0f}</pre>')
+                        f'<pre>MCX Session Complete (v4.0)\n'
+                        f'Final Realized PnL: {sign}₹{self.total_realized_pnl:,.2f} ({final_pct:+.2f}%)\n'
+                        f'Trades Today:       {self.trades_today}</pre>')
                     break
 
                 if now.hour < MCX_ENTRY_HOUR:
