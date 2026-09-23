@@ -915,7 +915,7 @@ def send_telegram_nifty_dashboard(spot: float, atm: int, mode: str, positions: d
         kama_raw = ind.get("kama")
         kama_str = f"{kama_raw:.0f}" if kama_raw is not None else "WARMUP"
         total_pnl = realized_pnl + unrealized_pnl
-        pnl_pct = (total_pnl / total_cap * 100.0) if total_cap > 0 else 0.0
+        pnl_pct = (total_pnl / 200_000.0 * 100.0)
 
         pnl_badge = "🟢" if total_pnl >= 0 else "🔴"
         trend_val = ind.get("trend", 0)
@@ -2900,11 +2900,14 @@ class ExecutionEngine:
         sig_str = f"{c_green}▲ UP{res}" if sig_val > 0 else (f"{c_red}▼ DOWN{res}" if sig_val < 0 else f"{c_yellow}━ FLAT{res}")
         hold = ind.get("hold_time", 0.0)
 
+        trades_count = getattr(self, "trades_today", 0)
+
         ind_bar = (f"  {c_dim}SPOT:{res} {c_white}{spot:>9.2f}{res}  {c_dim}ATM:{res} {c_yellow}{atm:<5}{res}  "
                    f"{c_dim}FEED:{res} {feed_status}  "
                    f"{c_dim}ADX(5m):{res} {regime_col}{ind['adx']:>4.1f} ({ind['regime']}){res}  "
                    f"{c_dim}KAMA(1m):{res} {c_white}{kama_str:>8}{res} {trend_col}{trend_str}{res}  "
-                   f"{c_dim}ATR:{res} {c_white}{ind['atr']:>4.1f} pts{res}")
+                   f"{c_dim}ATR:{res} {c_white}{ind['atr']:>4.1f} pts{res}  "
+                   f"{c_dim}TRADES:{res} {c_white}{trades_count}{res}")
         pad_ind = max(0, W - ansi_len(ind_bar))
         print(MID)
         print(f"{V}{ind_bar}{' ' * pad_ind}{V}")
@@ -3002,7 +3005,7 @@ class ExecutionEngine:
 
         # Today's net MTM (realized + open unrealized PnL)
         today_net_mtm = self.realized_pnl + unrealized
-        ret_pct = (today_net_mtm / CAPITAL) * 100.0
+        ret_pct = (today_net_mtm / 200_000.0) * 100.0
         pnl_col = c_green if today_net_mtm >= 0 else c_red
         sign = "+" if today_net_mtm >= 0 else ""
 
@@ -3017,7 +3020,8 @@ class ExecutionEngine:
         ytd_col = c_green if live_ytd >= 0 else c_red
 
         pnl_str = (f"  {c_dim}TODAY REALIZED:{res} ₹{self.realized_pnl:,.2f}  {c_dim}UNREAL:{res} ₹{unrealized:,.2f}  "
-                   f"{c_dim}NET MTM:{res} {pnl_col}{sign}₹{today_net_mtm:,.2f} ({ret_pct:+.2f}%){res}  "
+                   f"{c_dim}NET MTM:{res} {pnl_col}{sign}₹{today_net_mtm:,.2f} ({ret_pct:+.2f}%){res}  {VS}  "
+                   f"{c_dim}TRADES:{res} {c_white}{trades_count}{res}  {VS}  "
                    f"{c_dim}CIRCUIT:{res} {c_red}-₹{abs(self.risk_manager.circuit_breaker_loss_limit):,.0f} (-1.8%){res}")
         print(f"{V}{pnl_str}{' ' * max(0, W - ansi_len(pnl_str))}{V}")
 

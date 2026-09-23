@@ -2102,7 +2102,7 @@ class ExecutionEngine:
 
         # Today's net MTM (realized + open unrealized PnL)
         today_net_mtm = self.realized_pnl + unrealized
-        ret_pct = (today_net_mtm / CAPITAL) * 100.0
+        ret_pct = (today_net_mtm / 200_000.0) * 100.0
         pnl_col = c_green if today_net_mtm >= 0 else c_red
         sign = "+" if today_net_mtm >= 0 else ""
 

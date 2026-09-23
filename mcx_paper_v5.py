@@ -917,7 +917,7 @@ class NaturalGasPaperBot:
         if now_ts - self._last_console_dash_ts >= 1.0:
             self._last_console_dash_ts = now_ts
 
-            W   = 110
+            W   = 118
             DIM = f'{Fore.WHITE}{Style.DIM}'
             CY  = f'{Fore.CYAN}{Style.BRIGHT}'
             WH  = f'{Fore.WHITE}{Style.BRIGHT}'
@@ -958,7 +958,7 @@ class NaturalGasPaperBot:
             print(f'{V}{title_l}{" " * pad_top}{title_r}{V}')
 
             print(MID)
-            exp_badge = f"{YL}{self.target_opt_expiry_str}{RS} ({CY}NEXT MONTH ROLLOVER{RS})" if self.is_rolled_over else f"{WH}{self.target_opt_expiry_str}{RS}"
+            exp_badge = f"{YL}{self.target_opt_expiry_str}{RS} ({CY}ROLLOVER{RS})" if self.is_rolled_over else f"{WH}{self.target_opt_expiry_str}{RS}"
             ind_row = (f'  {DIM}SPOT:{RS} {WH}{spot:>8.2f}{RS}  '
                        f'{DIM}ATM:{RS} {YL}{int(atm):<5}{RS}  '
                        f'{DIM}EXPIRY:{RS} {exp_badge}  '
@@ -1015,9 +1015,11 @@ class NaturalGasPaperBot:
             unreal_col = GR if total_unreal > 0 else (RD if total_unreal < 0 else YL)
             net_col    = GR if net > 0 else (RD if net < 0 else YL)
 
+            net_pct = (net / 200_000.0) * 100.0
             pnl_row = (f"  {DIM}REALIZED:{RS} {real_col}{real_fmt}{RS}  {VS}  "
                        f"{DIM}UNREALIZED:{RS} {unreal_col}{unreal_fmt}{RS}  {VS}  "
-                       f"{DIM}NET MTM:{RS} {net_col}{net_fmt}{RS}")
+                       f"{DIM}NET MTM:{RS} {net_col}{net_fmt} ({net_pct:+.2f}%){RS}  {VS}  "
+                       f"{DIM}TRADES:{RS} {WH}{self.trades_today}{RS}")
             print(f'{V}{_pad(pnl_row, W)}{V}')
             print(BOT)
             sys.stdout.flush()
@@ -1077,7 +1079,8 @@ class NaturalGasPaperBot:
             t += f"Realized PnL:               {r_sign}₹{self.total_realized_pnl:>10,.2f}\n"
             t += f"Unrealized MTM:             {u_sign}₹{total_unreal:>10,.2f}\n"
             t += "─────────────────────────────────────────\n"
-            t += f"NET MTM:                    {n_sign}₹{net:>10,.2f}\n"
+            net_pct = (net / 200_000.0) * 100.0
+            t += f"NET MTM:         {n_sign}₹{net:>10,.2f} ({net_pct:+.2f}%)\n"
             t += "</pre>\n"
             t += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             t += f"⚡ <b>MCX V5.0</b> │ <b>LOTS:</b> <code>1 ({LOT_SIZE}u)</code> │ <b>MODE:</b> <code>PAPER</code>"

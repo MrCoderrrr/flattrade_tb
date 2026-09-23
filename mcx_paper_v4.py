@@ -810,9 +810,11 @@ class NaturalGasPaperBot:
             u_txt = f"{unreal_col}{unreal_fmt}{RS}"
             n_txt = f"{net_col}{net_fmt}{RS}"
 
+            net_pct = (net / 200_000.0) * 100.0
             pnl_row = (f"  {DIM}REALIZED:{RS} {r_txt}  {VS}  "
                        f"{DIM}UNREALIZED:{RS} {u_txt}  {VS}  "
-                       f"{DIM}NET MTM:{RS} {n_txt}")
+                       f"{DIM}NET MTM:{RS} {n_txt} ({net_pct:+.2f}%){RS}  {VS}  "
+                       f"{DIM}TRADES:{RS} {WH}{self.trades_today}{RS}")
             print(f'{V}{_pad(pnl_row, W)}{V}')
             print(BOT)
             sys.stdout.flush()
@@ -852,10 +854,11 @@ class NaturalGasPaperBot:
             r_sign = '+' if self.total_realized_pnl >= 0 else ''
             u_sign = '+' if total_unreal >= 0 else ''
             n_sign = '+' if net >= 0 else ''
+            net_pct = (net / 200_000.0) * 100.0
             lines += [
                 f'Realized  {r_sign}₹{self.total_realized_pnl:>9,.2f}',
                 f'Unreal    {u_sign}₹{total_unreal:>9,.2f}',
-                f'Net MTM   {n_sign}₹{net:>9,.2f}',
+                f'Net MTM   {n_sign}₹{net:>9,.2f} ({net_pct:+.2f}%)',
                 f'Trades    {self.trades_today}',
                 '</pre>',
             ]
