@@ -3164,10 +3164,12 @@ class ExecutionEngine:
                 "ytd_return_pct": ytd_ret,
                 "total_capital": live_capital,
                 "positions": snap_positions,
-                "cooldown": self.cooldown_tracker
+                "cooldown": self.cooldown_tracker,
+                "trades_today": getattr(self, "trades_today", 0),
+                "trade_log": getattr(self, "trade_log", [])
             }
             with open(self.live_snap_file, "w") as sf:
-                json.dump(snap, sf)
+                json.dump(snap, sf, indent=2)
         except Exception as e:
             log_warn(f"Dashboard snap fail: {e}")
 

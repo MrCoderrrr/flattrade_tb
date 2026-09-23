@@ -1039,6 +1039,31 @@ class NaturalGasPaperBot:
             print(BOT)
             sys.stdout.flush()
 
+            # Save live snapshot for web dashboard
+            try:
+                mcx_snap = {
+                    "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+                    "spot": spot,
+                    "atm": int(atm),
+                    "expiry": self.target_opt_expiry_str,
+                    "is_rolled_over": self.is_rolled_over,
+                    "trades_today": self.trades_today,
+                    "reversal_latched": self._reversal_latched,
+                    "cooldown_remaining": max(0, int(POST_CLOSE_COOLDOWN - (now_ts - self.last_any_close_ts))),
+                    "ema": ema_snap,
+                    "positions": snap_rows,
+                    "realized_pnl": self.total_realized_pnl,
+                    "unrealized_pnl": total_unreal,
+                    "net_pnl": net,
+                    "net_pct": net_pct,
+                    "trade_log": getattr(self, "trade_log", [])
+                }
+                snap_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_snapshot_mcx_paper.json")
+                with open(snap_path, "w") as sf:
+                    json.dump(mcx_snap, sf, indent=2)
+            except Exception:
+                pass
+
         # ── Telegram live dashboard (every 3s) ─
         if now_ts - _last_tg_dash_edit_ts >= 3.0:
             if now_ts < _tg_rate_limited_until:
