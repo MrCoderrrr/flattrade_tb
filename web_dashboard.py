@@ -21,9 +21,11 @@ import socket
 import select
 import threading
 import subprocess
+import hashlib
+import requests
 from datetime import datetime, timezone, timedelta
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 IST = timezone(timedelta(hours=5, minutes=30))
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -34,6 +36,109 @@ def get_ist_now() -> datetime:
 
 PUBLIC_URL_FILE = os.path.join(PROJECT_ROOT, "public_url.txt")
 LIVE_PUBLIC_URL = ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FLATTRADE AUTHENTICATION & TOKEN SERVICES
+# ─────────────────────────────────────────────────────────────────────────────
+def get_flattrade_creds():
+    try:
+        import creds
+        return str(creds.API_KEY).strip(), str(creds.API_SECRET).strip(), getattr(creds, "USER_ID", "FZ04111")
+    except Exception:
+        return "fa5da7cfc3d7459298efeb11d87bab41", "2026.95f32fed8e9f4fa185d572667d1c256e799e1c26d797abcd", "FZ04111"
+
+def extract_request_code(raw_input: str) -> str:
+    raw = (raw_input or "").strip()
+    if not raw:
+        return ""
+    if "code=" in raw or "request_code=" in raw or "http://" in raw or "https://" in raw:
+        try:
+            parsed = urlparse(raw if "://" in raw else f"http://dummy/{raw.lstrip('?')}")
+            qs = parse_qs(parsed.query)
+            if "code" in qs and qs["code"]:
+                return qs["code"][0].strip()
+            if "request_code" in qs and qs["request_code"]:
+                return qs["request_code"][0].strip()
+        except Exception:
+            pass
+        m = re.search(r"[?&](?:code|request_code)=([a-zA-Z0-9_-]+)", raw)
+        if m:
+            return m.group(1).strip()
+    return raw
+
+def exchange_flattrade_token(url_or_code: str, multiplier: int = 1) -> dict:
+    code = extract_request_code(url_or_code)
+    if not code:
+        return {"status": "error", "message": "No valid request_code or URL detected. Please paste the full redirect URL or code."}
+
+    api_key, api_secret, user_id = get_flattrade_creds()
+    raw_token_str = f"{api_key}{code}{api_secret}"
+    token_hash = hashlib.sha256(raw_token_str.encode("utf-8")).hexdigest()
+
+    url = "https://authapi.flattrade.in/trade/apitoken"
+    payload = {
+        "api_key": api_key,
+        "request_code": code,
+        "api_secret": token_hash
+    }
+
+    try:
+        resp = requests.post(url, json=payload, timeout=12)
+        if resp.status_code == 200:
+            data = resp.json()
+            token = data.get("token")
+            if token:
+                token_file = os.path.join(PROJECT_ROOT, "token.txt")
+                with open(token_file, "w") as f:
+                    f.write(token.strip())
+                if multiplier > 0:
+                    mult_file = os.path.join(PROJECT_ROOT, "multiplier.txt")
+                    with open(mult_file, "w") as f:
+                        f.write(str(int(multiplier)))
+                return {
+                    "status": "success",
+                    "message": "Flattrade session token generated and saved to token.txt successfully!",
+                    "token_preview": token[:10] + "..." + token[-6:],
+                    "timestamp": get_ist_now().strftime("%Y-%m-%d %H:%M:%S IST")
+                }
+            else:
+                emsg = data.get("emsg", data.get("message", resp.text))
+                return {"status": "error", "message": f"Flattrade rejected code: {emsg}"}
+        else:
+            return {"status": "error", "message": f"HTTP {resp.status_code}: {resp.text}"}
+    except Exception as e:
+        return {"status": "error", "message": f"Network error: {str(e)}"}
+
+def get_flattrade_token_status() -> dict:
+    token_file = os.path.join(PROJECT_ROOT, "token.txt")
+    exists = os.path.exists(token_file) and os.path.getsize(token_file) > 10
+    preview = "Not Generated"
+    mtime_str = "Never"
+    is_today = False
+    api_key, _, user_id = get_flattrade_creds()
+
+    if exists:
+        try:
+            with open(token_file, "r") as f:
+                t = f.read().strip()
+                if len(t) >= 12:
+                    preview = t[:8] + "..." + t[-4:]
+            mtime = os.path.getmtime(token_file)
+            m_dt = datetime.fromtimestamp(mtime, tz=IST)
+            mtime_str = m_dt.strftime("%Y-%m-%d %H:%M IST")
+            is_today = (m_dt.date() == get_ist_now().date())
+        except Exception:
+            pass
+
+    auth_url = f"https://auth.flattrade.in/?app_key={api_key}"
+    return {
+        "token_exists": exists,
+        "token_preview": preview,
+        "last_updated": mtime_str,
+        "is_today": is_today,
+        "user_id": user_id,
+        "auth_url": auth_url
+    }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DATA INGESTION
@@ -919,6 +1024,9 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
           <span id="stream-status">LIVE STREAMING</span>
         </div>
         <div class="time-chip" id="live-clock">--:--:-- IST</div>
+        <button class="btn-action" id="btn-auth-header" onclick="openAuthModal()" style="border-color:rgba(168, 85, 247, 0.4); background:rgba(168, 85, 247, 0.12); color:#c084fc;">
+          <span>🔑</span> <span id="auth-header-text">Broker Auth</span>
+        </button>
         <button class="btn-action" onclick="copyPublicLink()">
           <span>🔗</span> <span id="copy-btn-text">Share Link</span>
         </button>
@@ -1274,6 +1382,56 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- ─── Broker Authentication Modal ─── -->
+  <div class="modal-overlay" id="auth-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.8); backdrop-filter:blur(10px); z-index:99999; align-items:center; justify-content:center; padding:16px;">
+    <div style="background:#0c1220; border:1px solid rgba(255,255,255,0.14); border-radius:24px; max-width:540px; width:100%; padding:24px; box-shadow:0 24px 60px rgba(0,0,0,0.85); position:relative;">
+      <button onclick="closeAuthModal()" style="position:absolute; top:18px; right:18px; background:rgba(255,255,255,0.06); border:none; color:var(--text-dim); width:32px; height:32px; border-radius:50%; font-size:1.1rem; cursor:pointer; display:flex; align-items:center; justify-content:center;">✕</button>
+      
+      <div style="display:flex; align-items:center; gap:12px; margin-bottom:16px;">
+        <div style="width:42px; height:42px; background:linear-gradient(135deg, #a855f7, #6366f1); border-radius:12px; display:flex; align-items:center; justify-content:center; font-size:1.3rem;">🔑</div>
+        <div>
+          <h3 style="font-family:var(--display); font-size:1.18rem; font-weight:800;">Flattrade Broker Authentication</h3>
+          <div style="font-size:0.75rem; color:var(--text-dim); font-family:var(--mono);">Client ID: <b style="color:var(--primary);" id="auth-client-id">FZ04111</b> • Daily Session Token</div>
+        </div>
+      </div>
+
+      <!-- Current Token Status Box -->
+      <div style="display:flex; align-items:center; justify-content:space-between; background:rgba(255,255,255,0.03); border:1px solid var(--card-border); border-radius:14px; padding:12px 16px; margin-bottom:18px; font-family:var(--mono); font-size:0.8rem;">
+        <div>
+          <div style="font-size:0.68rem; color:var(--text-dim); text-transform:uppercase;">Active Token Status</div>
+          <div style="font-weight:700; margin-top:2px;" id="modal-token-preview">Checking...</div>
+        </div>
+        <span class="status-chip chip-dim" id="modal-token-chip">CHECKING</span>
+      </div>
+
+      <!-- Step 1: Open Flattrade Login -->
+      <div style="margin-bottom:16px;">
+        <div style="font-size:0.8rem; font-weight:700; color:var(--text-muted); margin-bottom:6px;">STEP 1: Log In on Flattrade</div>
+        <a id="btn-flattrade-link" href="https://auth.flattrade.in/?app_key=fa5da7cfc3d7459298efeb11d87bab41" target="_blank" style="display:flex; align-items:center; justify-content:center; gap:8px; width:100%; background:linear-gradient(135deg, #0284c7, #4f46e5); color:#fff; text-decoration:none; padding:12px; border-radius:12px; font-weight:700; font-size:0.9rem; box-shadow:0 4px 18px rgba(2, 132, 199, 0.4);">
+          <span>🌐 Open Flattrade Login Page</span>
+        </a>
+        <div style="font-size:0.72rem; color:var(--text-dim); margin-top:5px; line-height:1.4;">Opens Flattrade's official login portal. Enter your password & TOTP. After login, it redirects to a blank page.</div>
+      </div>
+
+      <!-- Step 2: Paste Redirect URL or Code -->
+      <div style="margin-bottom:16px;">
+        <div style="font-size:0.8rem; font-weight:700; color:var(--text-muted); margin-bottom:6px;">STEP 2: Paste Redirect URL or Code</div>
+        <input type="text" id="auth-input-code" placeholder="Paste full redirect URL (e.g. https://127.0.0.1/?code=...) or request code" style="width:100%; background:rgba(0,0,0,0.5); border:1px solid rgba(255,255,255,0.16); border-radius:12px; padding:12px 14px; color:#fff; font-family:var(--mono); font-size:0.84rem; outline:none; transition:border-color 0.2s;" onfocus="this.style.borderColor='var(--primary)'" onblur="this.style.borderColor='rgba(255,255,255,0.16)'">
+        <div style="font-size:0.72rem; color:var(--text-dim); margin-top:5px;">Copy the entire URL from your browser address bar and paste it above. We will extract the code automatically!</div>
+      </div>
+
+      <!-- Submit Button -->
+      <div style="margin-bottom:12px;">
+        <button id="btn-submit-token" onclick="submitAuthToken()" style="width:100%; background:var(--green); color:#06090e; border:none; padding:12px; border-radius:12px; font-weight:800; font-size:0.92rem; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:8px; box-shadow:0 4px 18px rgba(16, 185, 129, 0.4); transition:all 0.2s;">
+          <span>⚡ Generate & Save Token to Server</span>
+        </button>
+      </div>
+
+      <!-- Output feedback message -->
+      <div id="auth-feedback-box" style="display:none; font-family:var(--mono); font-size:0.82rem; padding:12px 14px; border-radius:12px;"></div>
+    </div>
+  </div>
+
   <div class="toast-box" id="toast">Link copied to clipboard!</div>
 
   <script>
@@ -1596,11 +1754,112 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       });
     }
 
+    // ── Broker Auth Modal Handlers ──
+    function openAuthModal() {
+      const modal = document.getElementById('auth-modal');
+      modal.style.display = 'flex';
+      fetchAuthStatus();
+    }
+
+    function closeAuthModal() {
+      document.getElementById('auth-modal').style.display = 'none';
+      document.getElementById('auth-feedback-box').style.display = 'none';
+    }
+
+    function fetchAuthStatus() {
+      fetch('/api/auth/status')
+        .then(res => res.json())
+        .then(d => {
+          if (d.user_id) document.getElementById('auth-client-id').innerText = d.user_id;
+          if (d.auth_url) document.getElementById('btn-flattrade-link').href = d.auth_url;
+
+          const previewEl = document.getElementById('modal-token-preview');
+          const chipEl = document.getElementById('modal-token-chip');
+          const headerBtnText = document.getElementById('auth-header-text');
+
+          if (d.token_exists && d.is_today) {
+            previewEl.innerText = `${d.token_preview} (Updated ${d.last_updated})`;
+            chipEl.className = 'status-chip chip-green';
+            chipEl.innerText = 'VALID TODAY';
+            headerBtnText.innerText = 'Token Active';
+          } else if (d.token_exists) {
+            previewEl.innerText = `${d.token_preview} (Expired ${d.last_updated})`;
+            chipEl.className = 'status-chip chip-amber';
+            chipEl.innerText = 'EXPIRED / RENEW';
+            headerBtnText.innerText = 'Renew Token';
+          } else {
+            previewEl.innerText = 'No Token Found';
+            chipEl.className = 'status-chip chip-dim';
+            chipEl.innerText = 'LOGIN NEEDED';
+            headerBtnText.innerText = 'Login Needed';
+          }
+        })
+        .catch(() => {});
+    }
+
+    function submitAuthToken() {
+      const input = document.getElementById('auth-input-code');
+      const val = (input.value || '').trim();
+      const feedback = document.getElementById('auth-feedback-box');
+      const btn = document.getElementById('btn-submit-token');
+
+      if (!val) {
+        feedback.style.display = 'block';
+        feedback.style.background = 'rgba(244, 63, 94, 0.15)';
+        feedback.style.color = 'var(--red)';
+        feedback.style.border = '1px solid rgba(244, 63, 94, 0.3)';
+        feedback.innerText = 'Please paste the redirect URL or code first!';
+        return;
+      }
+
+      btn.disabled = true;
+      btn.style.opacity = '0.6';
+      btn.innerHTML = '<span>⏳ Exchanging Code for Token...</span>';
+
+      fetch('/api/auth/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url_or_code: val })
+      })
+      .then(res => res.json())
+      .then(data => {
+        btn.disabled = false;
+        btn.style.opacity = '1';
+        btn.innerHTML = '<span>⚡ Generate & Save Token to Server</span>';
+        feedback.style.display = 'block';
+
+        if (data.status === 'success') {
+          feedback.style.background = 'rgba(16, 185, 129, 0.15)';
+          feedback.style.color = 'var(--green)';
+          feedback.style.border = '1px solid rgba(16, 185, 129, 0.3)';
+          feedback.innerHTML = `✅ <b>Success!</b> ${data.message}<br><small>Token: ${data.token_preview}</small>`;
+          input.value = '';
+          fetchAuthStatus();
+        } else {
+          feedback.style.background = 'rgba(244, 63, 94, 0.15)';
+          feedback.style.color = 'var(--red)';
+          feedback.style.border = '1px solid rgba(244, 63, 94, 0.3)';
+          feedback.innerHTML = `❌ <b>Failed:</b> ${data.message}`;
+        }
+      })
+      .catch(err => {
+        btn.disabled = false;
+        btn.style.opacity = '1';
+        btn.innerHTML = '<span>⚡ Generate & Save Token to Server</span>';
+        feedback.style.display = 'block';
+        feedback.style.background = 'rgba(244, 63, 94, 0.15)';
+        feedback.style.color = 'var(--red)';
+        feedback.style.border = '1px solid rgba(244, 63, 94, 0.3)';
+        feedback.innerText = `Network error: ${err.message}`;
+      });
+    }
+
     window.addEventListener('DOMContentLoaded', () => {
       fetch('/api/status')
         .then(res => res.json())
         .then(data => updateDashboard(data))
         .catch(() => {});
+      fetchAuthStatus();
       initSSE();
     });
   </script>
@@ -1660,12 +1919,48 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
+        elif path == "/api/auth/status":
+            data = get_flattrade_token_status()
+            payload = json.dumps(data).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.end_headers()
+            self.wfile.write(payload)
+
         elif path == "/api/health":
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
             self.wfile.write(b"OK")
 
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path == "/api/auth/token":
+            try:
+                content_length = int(self.headers.get("Content-Length", 0))
+                post_body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else "{}"
+                data = json.loads(post_body)
+            except Exception:
+                data = {}
+
+            url_or_code = data.get("url_or_code", "")
+            multiplier = int(data.get("multiplier", 1) or 1)
+            result = exchange_flattrade_token(url_or_code, multiplier)
+
+            payload = json.dumps(result).encode("utf-8")
+            self.send_response(200 if result.get("status") == "success" else 400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(payload)
         else:
             self.send_response(404)
             self.end_headers()
