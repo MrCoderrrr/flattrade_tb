@@ -319,6 +319,7 @@ class NaturalGasPaperBot:
         self.last_any_close_ts     = 0.0         # Timestamp of last leg close
         self.total_realized_pnl    = 0.0
         self.trades_today          = 0
+        self.trade_log: List[Dict] = []   # Full record of every closed trade this session
         self.state_file            = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                    'mcx_state_paper_v5.json')
         self._mcx_master           = None
@@ -680,6 +681,14 @@ class NaturalGasPaperBot:
         self.total_realized_pnl += pnl
         sign     = '+' if pnl >= 0 else ''
         tot_sign = '+' if self.total_realized_pnl >= 0 else ''
+
+        # Record trade for EOD summary
+        self.trade_log.append({
+            'leg': leg, 'tsym': pos.get('tsym', leg), 'strike': int(pos['strike']),
+            'entry': pos['entry_price'], 'exit': ltp, 'qty': pos['qty'],
+            'pnl': pnl, 'reason': reason,
+            'time': get_ist_now().strftime('%H:%M:%S'),
+        })
 
         tg = '\n'.join([
             '<pre>',
@@ -1105,49 +1114,96 @@ class NaturalGasPaperBot:
             t += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             t += f"<b>MODE:</b> <code>PAPER</code>  <b>LOT:</b> <code>1×{LOT_SIZE}u</code>  <b>SL:</b> <code>{DEFAULT_SL_PCT*100:.0f}%</code>  <b>TSL:</b> <code>{DEFAULT_TSL_PCT*100:.0f}%</code>"
 
-            chat_ids   = _get_tg_chat_ids()
-            # Refresh every 15 seconds (new message) or edit in-place
-            is_refresh = (now_ts - _last_tg_dash_new_msg_ts) >= 15.0
-
+            chat_ids = _get_tg_chat_ids()
+            # Telegram rate-limit: edit same message in-place during session.
+            # Only send a NEW message if we have no msg_id (first render or after message deleted).
+            # This respects Telegram's limits and keeps chat clean across NIFTY+MCX sessions.
             for cid in chat_ids:
                 msg_id = _last_tg_dash_msg_ids.get(cid)
-                edited = False
-                if msg_id is not None and not is_refresh:
+                if msg_id is not None:
                     try:
                         r = requests.post(
                             f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText',
                             json={'chat_id': cid, 'message_id': msg_id, 'text': t, 'parse_mode': 'HTML'},
                             timeout=3)
-                        if r.status_code == 200 and r.json().get('ok'):
-                            edited = True
-                        elif r.status_code == 400 and 'message is not modified' in r.text:
-                            edited = True
+                        if r.status_code in (200, 400):  # 400 = "not modified" is fine
+                            if r.status_code == 400 and 'message to edit not found' in r.text:
+                                _last_tg_dash_msg_ids.pop(cid, None)  # message deleted, reset
+                            continue  # edited (or already same), done for this cid
                         elif r.status_code == 429:
                             _tg_rate_limited_until = time.time() + r.json().get('parameters', {}).get('retry_after', 30)
                             return
                     except Exception:
                         pass
+                # No valid msg_id — send ONE new message and save its ID
+                try:
+                    r = requests.post(
+                        f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage',
+                        data={'chat_id': cid, 'text': t, 'parse_mode': 'HTML'},
+                        timeout=4)
+                    if r.status_code == 200 and r.json().get('ok'):
+                        _last_tg_dash_msg_ids[cid] = r.json()['result']['message_id']
+                    elif r.status_code == 429:
+                        _tg_rate_limited_until = time.time() + r.json().get('parameters', {}).get('retry_after', 30)
+                        return
+                except Exception:
+                    pass
 
-                if not edited:
-                    try:
-                        r = requests.post(
-                            f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage',
-                            data={'chat_id': cid, 'text': t, 'parse_mode': 'HTML'},
-                            timeout=4)
-                        if r.status_code == 200 and r.json().get('ok'):
-                            _last_tg_dash_msg_ids[cid] = r.json().get('result', {}).get('message_id')
-                            _last_tg_dash_new_msg_ts   = now_ts
-                        elif r.status_code == 429:
-                            _tg_rate_limited_until = time.time() + r.json().get('parameters', {}).get('retry_after', 30)
-                            return
-                    except Exception:
-                        pass
 
-            if is_refresh:
-                _last_tg_dash_new_msg_ts = now_ts
+    # ── EOD Trade Summary ─────────────────────
+    def _send_eod_trade_summary(self):
+        """Send full session trade log split by leg as 4 separate Telegram messages."""
+        final_pct = (self.total_realized_pnl / 200_000.0) * 100.0
+        s_sign = '+' if self.total_realized_pnl >= 0 else ''
 
+        # Messages 1 & 2: per-leg breakdown
+        for leg_name in ('CE', 'PE'):
+            trades = [t for t in self.trade_log if t['leg'] == leg_name]
+            if not trades:
+                msg = f"<pre>━━━ MCX {leg_name} TRADES ━━━\n  No trades for this leg.\n</pre>"
+            else:
+                leg_tot = sum(t['pnl'] for t in trades)
+                lt_sign = '+' if leg_tot >= 0 else ''
+                msg  = f"<pre>━━━ MCX {leg_name} TRADES ({len(trades)} trades) ━━━\n"
+                msg += f"{'#':<3} {'TIME':<9} {'STRIKE':>7} {'ENTRY':>7} {'EXIT':>7} {'PnL':>10}\n"
+                msg += f"{'─'*3} {'─'*9} {'─'*7} {'─'*7} {'─'*7} {'─'*10}\n"
+                for i, t in enumerate(trades, 1):
+                    ps = '+' if t['pnl'] >= 0 else ''
+                    msg += f"{i:<3} {t['time']:<9} {t['strike']:>7} {t['entry']:>7.2f} {t['exit']:>7.2f} {ps}{t['pnl']:>9,.0f}\n"
+                msg += f"{'─'*51}\n"
+                msg += f"{'LEG TOTAL':>32}: {lt_sign}₹{leg_tot:>9,.0f}\n"
+                msg += "</pre>"
+            send_telegram(msg)
+            time.sleep(0.4)  # brief pause between messages to avoid rate limit
+
+        # Message 3: Intraday stats breakdown
+        ce_trades = [t for t in self.trade_log if t['leg'] == 'CE']
+        pe_trades = [t for t in self.trade_log if t['leg'] == 'PE']
+        ce_tot = sum(t['pnl'] for t in ce_trades)
+        pe_tot = sum(t['pnl'] for t in pe_trades)
+        ce_wins = sum(1 for t in ce_trades if t['pnl'] >= 0)
+        pe_wins = sum(1 for t in pe_trades if t['pnl'] >= 0)
+        msg  = "<pre>━━━ MCX SESSION STATS ━━━\n"
+        msg += f"  CE Trades : {len(ce_trades):>3}  Wins: {ce_wins}  PnL: {('+' if ce_tot>=0 else '')}₹{ce_tot:,.0f}\n"
+        msg += f"  PE Trades : {len(pe_trades):>3}  Wins: {pe_wins}  PnL: {('+' if pe_tot>=0 else '')}₹{pe_tot:,.0f}\n"
+        msg += f"  Total     : {self.trades_today:>3}\n"
+        msg += "</pre>"
+        send_telegram(msg)
+        time.sleep(0.4)
+
+        # Message 4: Final PnL summary
+        msg  = "<pre>━━━ MCX FINAL PNL ━━━\n"
+        msg += f"  Realized PnL : {s_sign}₹{self.total_realized_pnl:,.2f}\n"
+        msg += f"  Return on 2L : {final_pct:+.2f}%\n"
+        msg += f"  Base Capital : ₹2,00,000.00\n"
+        msg += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        badge = "✅ PROFIT" if self.total_realized_pnl >= 0 else "❌ LOSS"
+        msg += f"  {badge}\n"
+        msg += "</pre>"
+        send_telegram(msg)
 
     # ── Main run loop ─────────────────────────
+
     def run(self):
         self.authenticate()
         self._get_mcx_csv()
@@ -1191,11 +1247,8 @@ class NaturalGasPaperBot:
                     final_pct = (self.total_realized_pnl / 200_000.0) * 100.0
                     pnl_col = GR if self.total_realized_pnl >= 0 else RD
                     sign = '+' if self.total_realized_pnl >= 0 else ''
-                    print(f'\n{pnl_col}✅ Session Completed Successfully. Final Realized PnL: {sign}₹{self.total_realized_pnl:,.2f} ({final_pct:+.2f}%){RS}\n', flush=True)
-                    send_telegram(
-                        f'<pre>MCX Session Complete (v5.0)\n'
-                        f'Final Realized PnL: {sign}₹{self.total_realized_pnl:,.2f} ({final_pct:+.2f}%)\n'
-                        f'Trades Today:       {self.trades_today}</pre>')
+                    print(f'\n{pnl_col}✅ Session Complete. Final Realized PnL: {sign}₹{self.total_realized_pnl:,.2f} ({final_pct:+.2f}%){RS}\n', flush=True)
+                    self._send_eod_trade_summary()
                     break
 
                 if now.hour < MCX_ENTRY_HOUR or (now.hour == MCX_ENTRY_HOUR and now.minute < MCX_ENTRY_MINUTE):
@@ -1336,6 +1389,7 @@ class NaturalGasPaperBot:
                 sign = '+' if self.total_realized_pnl >= 0 else ''
                 pnl_col = GR if self.total_realized_pnl >= 0 else RD
                 print(f'\n{pnl_col}✅ All positions squared off. Final Realized PnL: {sign}₹{self.total_realized_pnl:,.2f} ({final_pct:+.2f}%){RS}\n', flush=True)
+                self._send_eod_trade_summary()
                 break
             except Exception as e:
                 print(f'[ERROR] Loop exception: {e}', flush=True)

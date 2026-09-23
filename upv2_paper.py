@@ -1013,24 +1013,23 @@ def send_telegram_nifty_dashboard(spot: float, atm: int, mode: str, positions: d
         t += f"💰 <b>Capital:</b> <code>₹{total_cap:,.0f}</code>  ⚡ <b>Circuit:</b> <code>₹{circuit_val:,.0f}</code>\n"
         t += f"📅 <b>MTD:</b> <code>{mtd_sign}₹{mtd_pnl:,.0f}</code>  <b>YTD:</b> <code>{ytd_sign}₹{ytd_pnl:,.0f}</code>"
 
-        # Refresh every 15 seconds (new msg) or edit in-place
-        is_refresh_cycle = (now_ts - _last_tg_dashboard_new_msg_ts) >= 15.0 or is_eod
-
+        # Telegram: edit same message in-place during session (respects rate limits, keeps chat clean).
+        # Only send a NEW message when no msg_id exists (first render or message deleted by user).
+        # EOD (is_eod) sends a new message so the final state is permanently visible in chat history.
         for cid in chat_ids:
             msg_id = _last_tg_dashboard_msg_ids.get(cid)
-            edited = False
-
-            if msg_id is not None and not is_refresh_cycle:
+            if msg_id is not None and not is_eod:
                 try:
                     edit_resp = requests.post(
                         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText",
                         json={"chat_id": cid, "message_id": msg_id, "text": t, "parse_mode": "HTML"},
                         timeout=3
                     )
-                    if edit_resp.status_code == 200 and edit_resp.json().get("ok"):
-                        edited = True
-                    elif edit_resp.status_code == 400 and "message is not modified" in edit_resp.text:
-                        edited = True  # Content identical, already up to date!
+                    if edit_resp.status_code in (200, 400):
+                        if edit_resp.status_code == 400 and 'message to edit not found' in edit_resp.text:
+                            _last_tg_dashboard_msg_ids.pop(cid, None)  # deleted, fall through to send
+                        else:
+                            continue  # edited (or identical), done for this cid
                     elif edit_resp.status_code == 429:
                         retry_after = edit_resp.json().get("parameters", {}).get("retry_after", 30)
                         _tg_rate_limited_until = time.time() + retry_after
@@ -1038,25 +1037,25 @@ def send_telegram_nifty_dashboard(spot: float, atm: int, mode: str, positions: d
                 except Exception:
                     pass
 
-            if not edited and (msg_id is None or is_refresh_cycle):
-                try:
-                    send_resp = requests.post(
-                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                        data={"chat_id": cid, "text": t, "parse_mode": "HTML"},
-                        timeout=4
-                    )
-                    if send_resp.status_code == 200 and send_resp.json().get("ok"):
-                        _last_tg_dashboard_msg_ids[cid] = send_resp.json().get("result", {}).get("message_id")
-                        _last_tg_dashboard_new_msg_ts = now_ts
-                    elif send_resp.status_code == 429:
-                        retry_after = send_resp.json().get("parameters", {}).get("retry_after", 30)
-                        _tg_rate_limited_until = time.time() + retry_after
-                        return
-                except Exception:
-                    pass
+            # No msg_id OR is_eod → send new message
+            try:
+                send_resp = requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                    data={"chat_id": cid, "text": t, "parse_mode": "HTML"},
+                    timeout=4
+                )
+                if send_resp.status_code == 200 and send_resp.json().get("ok"):
+                    _last_tg_dashboard_msg_ids[cid] = send_resp.json().get("result", {}).get("message_id")
+                    if is_eod:
+                        _last_tg_dashboard_msg_ids.pop(cid, None)  # don't edit EOD msg later
+                elif send_resp.status_code == 429:
+                    retry_after = send_resp.json().get("parameters", {}).get("retry_after", 30)
+                    _tg_rate_limited_until = time.time() + retry_after
+                    return
+            except Exception:
+                pass
 
-        if is_refresh_cycle:
-            _last_tg_dashboard_new_msg_ts = now_ts
+
     except Exception as e:
         log_warn(f"Telegram dashboard failed: {e}")
 
@@ -2081,6 +2080,7 @@ class ExecutionEngine:
         self.total_reentries_today = 0
         self.strangle_resets_today = 0
         self.trades_today = 0
+        self.trade_log: List[Dict] = []  # In-memory per-session trade record for EOD summary
         
         self.last_reconciliation = 0
         self.last_feed_tick = 0
@@ -2192,7 +2192,61 @@ class ExecutionEngine:
         t = threading.Thread(target=listener, daemon=True, name="ZXC_KillSwitch_Listener")
         t.start()
 
+    def _send_eod_trade_summary(self):
+        """Send full NIFTY session trade log as 4 Telegram messages (CE, PE, Hedges, Summary)."""
+        trade_log = getattr(self, 'trade_log', [])
+        final_pct = (self.realized_pnl / 200_000.0) * 100.0
+        s_sign = '+' if self.realized_pnl >= 0 else ''
+
+        # Messages 1 & 2: CE and PE leg trades
+        for leg_name in ('CE', 'PE'):
+            trades = [t for t in trade_log if t['leg'] == leg_name]
+            if not trades:
+                msg = f"<pre>━━━ NIFTY {leg_name} TRADES ━━━\n  No trades for this leg.\n</pre>"
+            else:
+                leg_tot = sum(t['pnl'] for t in trades)
+                lt_sign = '+' if leg_tot >= 0 else ''
+                msg  = f"<pre>━━━ NIFTY {leg_name} TRADES ({len(trades)} trades) ━━━\n"
+                msg += f"{'#':<3} {'TIME':<9} {'STRIKE':>7} {'ENTRY':>7} {'EXIT':>7} {'PnL':>10}\n"
+                msg += f"{'─'*3} {'─'*9} {'─'*7} {'─'*7} {'─'*7} {'─'*10}\n"
+                for i, t in enumerate(trades, 1):
+                    ps = '+' if t['pnl'] >= 0 else ''
+                    msg += f"{i:<3} {t['time']:<9} {t['strike']:>7} {t['entry']:>7.2f} {t['exit']:>7.2f} {ps}{t['pnl']:>9,.0f}\n"
+                msg += f"{'─'*51}\n{'LEG TOTAL':>32}: {lt_sign}₹{leg_tot:>9,.0f}\n"
+                msg += "</pre>"
+            _tg_send(msg)
+            time.sleep(0.4)
+
+        # Message 3: Hedge trades + win/loss stats
+        hedge_trades = [t for t in trade_log if 'HEDGE' in t['leg']]
+        ce_trades = [t for t in trade_log if t['leg'] == 'CE']
+        pe_trades = [t for t in trade_log if t['leg'] == 'PE']
+        ce_wins = sum(1 for t in ce_trades if t['pnl'] >= 0)
+        pe_wins = sum(1 for t in pe_trades if t['pnl'] >= 0)
+        msg  = "<pre>━━━ NIFTY SESSION STATS ━━━\n"
+        msg += f"  CE Trades : {len(ce_trades):>3}  Wins: {ce_wins}  PnL: {('+' if sum(t['pnl'] for t in ce_trades)>=0 else '')}₹{sum(t['pnl'] for t in ce_trades):,.0f}\n"
+        msg += f"  PE Trades : {len(pe_trades):>3}  Wins: {pe_wins}  PnL: {('+' if sum(t['pnl'] for t in pe_trades)>=0 else '')}₹{sum(t['pnl'] for t in pe_trades):,.0f}\n"
+        if hedge_trades:
+            h_tot = sum(t['pnl'] for t in hedge_trades)
+            msg += f"  Hedges    : {len(hedge_trades):>3}           PnL: {('+' if h_tot>=0 else '')}₹{h_tot:,.0f}\n"
+        msg += f"  Total Legs: {len(trade_log):>3}\n"
+        msg += "</pre>"
+        _tg_send(msg)
+        time.sleep(0.4)
+
+        # Message 4: Final PnL summary
+        msg  = "<pre>━━━ NIFTY FINAL PNL ━━━\n"
+        msg += f"  Realized PnL : {s_sign}₹{self.realized_pnl:,.2f}\n"
+        msg += f"  Return on 2L : {final_pct:+.2f}%\n"
+        msg += f"  Base Capital : ₹2,00,000.00\n"
+        msg += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        badge = "✅ PROFIT" if self.realized_pnl >= 0 else "❌ LOSS"
+        msg += f"  {badge}\n"
+        msg += "</pre>"
+        _tg_send(msg)
+
     def trigger_emergency_shutdown(self, reason: str = "EMERGENCY_ZXC"):
+
         global _EMERGENCY_STOP_TRIGGERED
         with _EMERGENCY_STOP_LOCK:
             if _EMERGENCY_STOP_TRIGGERED:
@@ -2373,6 +2427,15 @@ class ExecutionEngine:
                 f.write(f"{ts},{action},{leg},{strike},{side},{qty},{price:.2f},{pnl_str},{reason}\n")
             if action == "ENTRY" and leg in ("CE", "PE"):
                 self.trades_today = getattr(self, "trades_today", 0) + 1
+            if action == "EXIT":
+                if not hasattr(self, 'trade_log'):
+                    self.trade_log = []
+                self.trade_log.append({
+                    'leg': leg, 'strike': strike, 'side': side, 'qty': qty,
+                    'entry': float(self.positions.get(leg, {}).get('entry_price', price)) if leg in self.positions else price,
+                    'exit': price, 'pnl': pnl or 0.0, 'reason': reason,
+                    'time': get_ist_now().strftime('%H:%M:%S'),
+                })
         except: pass
 
     def _get_ltp(self, strike: int, option_type: str) -> float:
@@ -3317,6 +3380,7 @@ class ExecutionEngine:
                     pnl_col = Fore.GREEN if self.realized_pnl >= 0 else Fore.RED
                     sign = "+" if self.realized_pnl >= 0 else ""
                     print(f"\n{pnl_col}✅ Session Completed Successfully. Final Realized PnL: {sign}₹{self.realized_pnl:,.2f} ({final_pct:+.2f}%){Style.RESET_ALL}\n")
+                    self._send_eod_trade_summary()
                     self._remove_pid()
                     sys.exit(0)
 
