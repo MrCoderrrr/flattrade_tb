@@ -331,8 +331,29 @@ def get_aggregated_dashboard_state() -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 def run_tunnel_manager(port: int = 8000):
     global LIVE_PUBLIC_URL
+    # 1. First, check if a tunnel is already running and load its existing URL
+    if os.path.exists(PUBLIC_URL_FILE):
+        try:
+            with open(PUBLIC_URL_FILE, "r") as f:
+                saved = f.read().strip()
+                if saved.startswith("https://") and "trycloudflare.com" in saved:
+                    LIVE_PUBLIC_URL = saved
+        except Exception:
+            pass
+
     while True:
         try:
+            # If an existing cloudflared process is already alive and running, KEEP IT! Do not restart it!
+            if check_process_running("cloudflared tunnel"):
+                if not LIVE_PUBLIC_URL and os.path.exists(PUBLIC_URL_FILE):
+                    try:
+                        with open(PUBLIC_URL_FILE, "r") as f:
+                            LIVE_PUBLIC_URL = f.read().strip()
+                    except Exception:
+                        pass
+                time.sleep(3)
+                continue
+
             print(f"[TUNNEL] Launching Cloudflare Tunnel for 127.0.0.1:{port}...", flush=True)
             proc = subprocess.Popen(
                 ["cloudflared", "tunnel", "--url", f"http://127.0.0.1:{port}"],
@@ -937,11 +958,11 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       <div class="kpi-card">
         <div class="kpi-label">
           <span>Realized Booked</span>
-          <span id="realized-tag" style="font-family:var(--mono); font-size:0.75rem;">₹0.00</span>
+          <span class="tag-pct" id="realized-pct">+0.00%</span>
         </div>
         <div class="kpi-val" id="realized-val">₹0.00</div>
         <div class="kpi-sub">
-          <span>Floating MTM: <b id="unrealized-val" style="color:#fff;">₹0.00</b></span>
+          <span>Floating MTM: <b id="unrealized-val" style="color:#fff;">₹0.00</b> <span id="unrealized-pct" style="font-weight:700;">(+0.00%)</span></span>
         </div>
       </div>
 
@@ -949,7 +970,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       <div class="kpi-card">
         <div class="kpi-label">
           <span>Live Capital</span>
-          <span style="color:var(--text-dim); font-size:0.75rem; font-family:var(--mono);">Risk Distance</span>
+          <span id="capital-return-pct" class="tag-pct" style="font-size:0.75rem;">+0.00%</span>
         </div>
         <div class="kpi-val" id="capital-val">₹2,00,000.00</div>
         <div class="circuit-track">
@@ -965,11 +986,11 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       <div class="kpi-card">
         <div class="kpi-label">
           <span>MTD Performance</span>
-          <span id="trades-count-pill" style="font-family:var(--mono); color:var(--primary); font-size:0.75rem;">0 TRADES</span>
+          <span class="tag-pct" id="mtd-pct">+0.00%</span>
         </div>
         <div class="kpi-val" id="mtd-val">₹0.00</div>
         <div class="kpi-sub">
-          <span>Year-to-Date: <b id="ytd-val" style="color:#fff;">₹0.00</b></span>
+          <span>Year-to-Date: <b id="ytd-val" style="color:#fff;">₹0.00</b> <span id="ytd-pct" style="font-weight:700;">(+0.00%)</span></span>
         </div>
       </div>
     </div>
@@ -1147,9 +1168,11 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         <!-- MCX Details Bar -->
         <div style="font-family:var(--mono); font-size:0.8rem; display:flex; justify-content:space-between; flex-wrap:wrap; gap:10px; padding:10px 16px; background:rgba(255,255,255,0.025); border-radius:12px; border:1px solid rgba(255,255,255,0.05);">
           <span>MCX Day Net: <b id="m-net-pnl">₹0.00</b> (<span id="m-net-pct">+0.00%</span>)</span>
-          <span>Trades Executed: <b id="m-trades">0</b></span>
-          <span>Reversal State: <b id="m-reversal" style="color:var(--purple);">INACTIVE</b></span>
-          <span>Cooldown Timer: <b id="m-cooldown">0s</b></span>
+          <span>Trades: <b id="m-trades">0</b></span>
+          <span>Realized: <b id="m-realized">₹0.00</b></span>
+          <span>Floating: <b id="m-unrealized">₹0.00</b></span>
+          <span>Reversal: <b id="m-reversal" style="color:var(--purple);">INACTIVE</b></span>
+          <span>Cooldown: <b id="m-cooldown">0s</b></span>
         </div>
       </div>
 
@@ -1301,6 +1324,8 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         const isCall = pos.leg.startsWith('CE');
         const badgeClass = pos.leg.includes('HEDGE') ? 'leg-hd' : (isCall ? 'leg-ce' : 'leg-pe');
         const pnlClass = pos.pnl >= 0 ? 'positive' : 'negative';
+        const legPct2L = (pos.pnl / 200000.0) * 100.0;
+        const premPct = pos.entry > 0 ? (((pos.side === 'SELL' ? (pos.entry - pos.ltp) : (pos.ltp - pos.entry)) / pos.entry) * 100.0) : 0.0;
         return `
           <tr>
             <td><span class="leg-badge ${pos.market === 'NIFTY' ? 'leg-ce' : 'leg-pe'}">${pos.market}</span></td>
@@ -1311,7 +1336,10 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
             <td>₹${parseFloat(pos.entry).toFixed(2)}</td>
             <td><b style="color:#fff;">₹${parseFloat(pos.ltp).toFixed(2)}</b></td>
             <td style="color:var(--text-muted);">${pos.sl > 0 ? '₹' + parseFloat(pos.sl).toFixed(2) : '—'}</td>
-            <td style="text-align:right;" class="${pnlClass}"><b>${fmtINR(pos.pnl, true)}</b></td>
+            <td style="text-align:right;" class="${pnlClass}">
+              <div style="font-weight:800; font-size:0.95rem;">${fmtINR(pos.pnl, true)}</div>
+              <div style="font-size:0.73rem; font-weight:700; opacity:0.9; margin-top:2px;">${fmtPct(legPct2L)} on 2L <span style="opacity:0.75;">(${fmtPct(premPct)} prem)</span></div>
+            </td>
           </tr>
         `;
       }).join('');
@@ -1323,6 +1351,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       }
       return tradesList.map(t => {
         const pnlClass = t.pnl >= 0 ? 'positive' : 'negative';
+        const tradePct2L = (t.pnl / 200000.0) * 100.0;
         return `
           <tr>
             <td style="color:var(--text-dim);">${t.time || '--'}</td>
@@ -1331,7 +1360,10 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
             <td>₹${parseFloat(t.entry || 0).toFixed(2)}</td>
             <td>₹${parseFloat(t.exit || 0).toFixed(2)}</td>
             <td style="color:var(--text-muted); font-size:0.75rem;">${t.reason || 'SQUARE_OFF'}</td>
-            <td style="text-align:right;" class="${pnlClass}"><b>${fmtINR(t.pnl, true)}</b></td>
+            <td style="text-align:right;" class="${pnlClass}">
+              <div style="font-weight:800;">${fmtINR(t.pnl, true)}</div>
+              <div style="font-size:0.72rem; font-weight:700; opacity:0.85;">${fmtPct(tradePct2L)} on 2L</div>
+            </td>
           </tr>
         `;
       }).join('');
@@ -1358,29 +1390,63 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       netPctEl.innerText = fmtPct(netPct);
       netPctEl.className = 'tag-pct ' + (netPct >= 0 ? 'pos' : 'neg');
 
+      // Realized with % on 2L
+      const realPct = (p.combined_realized / 200000.0) * 100.0;
       const realEl = document.getElementById('realized-val');
       realEl.innerText = fmtINR(p.combined_realized, true);
       applyClass(realEl, p.combined_realized);
-      document.getElementById('realized-tag').innerText = fmtINR(p.combined_realized, true);
+      const realPctEl = document.getElementById('realized-pct');
+      if (realPctEl) {
+        realPctEl.innerText = fmtPct(realPct);
+        realPctEl.className = 'tag-pct ' + (realPct >= 0 ? 'pos' : 'neg');
+      }
 
+      // Unrealized with % on 2L
+      const unrealPct = (p.combined_unrealized / 200000.0) * 100.0;
       const unrealEl = document.getElementById('unrealized-val');
       unrealEl.innerText = fmtINR(p.combined_unrealized, true);
       applyClass(unrealEl, p.combined_unrealized);
+      const unrealPctEl = document.getElementById('unrealized-pct');
+      if (unrealPctEl) {
+        unrealPctEl.innerText = `(${fmtPct(unrealPct)})`;
+        unrealPctEl.style.color = unrealPct >= 0 ? 'var(--green)' : 'var(--red)';
+      }
 
+      // Capital return % on 2L
       document.getElementById('capital-val').innerText = fmtINR(p.current_capital);
       document.getElementById('circuit-val').innerText = fmtINR(p.circuit_limit);
+      const capRetPct = ((p.current_capital - 200000.0) / 200000.0) * 100.0;
+      const capRetEl = document.getElementById('capital-return-pct');
+      if (capRetEl) {
+        capRetEl.innerText = `${fmtPct(capRetPct)} Growth`;
+        capRetEl.className = 'tag-pct ' + (capRetPct >= 0 ? 'pos' : 'neg');
+      }
 
       const usedPct = p.circuit_used_pct || 0;
       document.getElementById('circuit-fill-bar').style.width = `${Math.min(100, usedPct)}%`;
       document.getElementById('circuit-used-text').innerText = `${usedPct.toFixed(1)}% Used`;
 
+      // MTD with % on 2L
+      const mtdPct = (p.mtd_pnl / 200000.0) * 100.0;
       const mtdEl = document.getElementById('mtd-val');
       mtdEl.innerText = fmtINR(p.mtd_pnl, true);
       applyClass(mtdEl, p.mtd_pnl);
+      const mtdPctEl = document.getElementById('mtd-pct');
+      if (mtdPctEl) {
+        mtdPctEl.innerText = fmtPct(mtdPct);
+        mtdPctEl.className = 'tag-pct ' + (mtdPct >= 0 ? 'pos' : 'neg');
+      }
 
+      // YTD with % on 2L
+      const ytdPct = (p.ytd_pnl / 200000.0) * 100.0;
       const ytdEl = document.getElementById('ytd-val');
       ytdEl.innerText = fmtINR(p.ytd_pnl, true);
       applyClass(ytdEl, p.ytd_pnl);
+      const ytdPctEl = document.getElementById('ytd-pct');
+      if (ytdPctEl) {
+        ytdPctEl.innerText = `(${fmtPct(ytdPct)})`;
+        ytdPctEl.style.color = ytdPct >= 0 ? 'var(--green)' : 'var(--red)';
+      }
 
       document.getElementById('trades-count-pill').innerText = `${p.total_trades || 0} TRADES`;
 
@@ -1400,8 +1466,11 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       applyClass(nNetEl, n.net_pnl);
       document.getElementById('n-net-pct').innerText = fmtPct(n.net_pct);
       document.getElementById('n-trades').innerText = n.trades_today || 0;
-      document.getElementById('n-realized').innerText = fmtINR(n.realized_pnl, true);
-      document.getElementById('n-unrealized').innerText = fmtINR(n.unrealized_pnl, true);
+
+      const nRealPct = (n.realized_pnl / 200000.0) * 100.0;
+      const nUnrealPct = (n.unrealized_pnl / 200000.0) * 100.0;
+      document.getElementById('n-realized').innerText = `${fmtINR(n.realized_pnl, true)} (${fmtPct(nRealPct)})`;
+      document.getElementById('n-unrealized').innerText = `${fmtINR(n.unrealized_pnl, true)} (${fmtPct(nUnrealPct)})`;
 
       const nChip = document.getElementById('nifty-status-chip');
       nChip.className = 'status-chip ' + (n.active ? 'chip-green' : 'chip-dim');
@@ -1432,6 +1501,14 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       applyClass(mNetEl, m.net_pnl);
       document.getElementById('m-net-pct').innerText = fmtPct(m.net_pct);
       document.getElementById('m-trades').innerText = m.trades_today || 0;
+
+      const mRealPct = (m.realized_pnl / 200000.0) * 100.0;
+      const mUnrealPct = (m.unrealized_pnl / 200000.0) * 100.0;
+      const mRealEl = document.getElementById('m-realized');
+      if (mRealEl) mRealEl.innerText = `${fmtINR(m.realized_pnl, true)} (${fmtPct(mRealPct)})`;
+      const mUnrealEl = document.getElementById('m-unrealized');
+      if (mUnrealEl) mUnrealEl.innerText = `${fmtINR(m.unrealized_pnl, true)} (${fmtPct(mUnrealPct)})`;
+
       document.getElementById('m-reversal').innerText = m.reversal_latched ? '⚡ LATCHED' : 'INACTIVE';
       document.getElementById('m-reversal').style.color = m.reversal_latched ? 'var(--amber)' : 'var(--text-dim)';
       document.getElementById('m-cooldown').innerText = `${m.cooldown_remaining || 0}s`;
@@ -1460,10 +1537,12 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         histBox.innerHTML = histKeys.map(k => {
           const v = histMap[k];
           const c = v >= 0 ? 'positive' : 'negative';
+          const dayPct = (v / 200000.0) * 100.0;
           return `
             <div class="hist-box">
               <div class="hist-title">${k}</div>
               <div class="hist-num ${c}">${fmtINR(v, true)}</div>
+              <div style="font-size:0.73rem; font-weight:700; margin-top:3px;" class="${c}">${fmtPct(dayPct)} on 2L</div>
             </div>
           `;
         }).join('');
