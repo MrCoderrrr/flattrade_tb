@@ -29,10 +29,34 @@ proc_mcx: subprocess.Popen | None = None
 _scheduler_lock_file = None
 
 
-def acquire_scheduler_lock() -> bool:
+def acquire_scheduler_lock(replace_existing: bool = True) -> bool:
     global _scheduler_lock_file
+    lock_path = "/tmp/trading_daily_scheduler.lock"
+
+    if replace_existing:
+        try:
+            # Cleanly terminate any duplicate or older daily_scheduler instances
+            out = subprocess.check_output(["pgrep", "-f", "daily_scheduler.py"], text=True).strip()
+            pids = [int(p) for p in out.splitlines() if int(p) != os.getpid()]
+            if pids:
+                now_str = get_ist_now().strftime("%Y-%m-%d %H:%M:%S IST")
+                print(f"[{now_str}] ⚠️ Terminating {len(pids)} duplicate/older scheduler instance(s): {pids}", flush=True)
+                for p in pids:
+                    try:
+                        os.kill(p, signal.SIGTERM)
+                    except Exception:
+                        pass
+                time.sleep(1)
+                for p in pids:
+                    try:
+                        os.kill(p, signal.SIGKILL)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
     try:
-        _scheduler_lock_file = open("/tmp/trading_daily_scheduler.lock", "a+")
+        _scheduler_lock_file = open(lock_path, "a+")
         fcntl.flock(_scheduler_lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         _scheduler_lock_file.seek(0)
         _scheduler_lock_file.truncate()
