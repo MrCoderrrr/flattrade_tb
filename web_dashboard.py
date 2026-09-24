@@ -572,16 +572,19 @@ def get_aggregated_dashboard_state() -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # CLOUDFLARE QUICK TUNNEL MANAGER
 # ─────────────────────────────────────────────────────────────────────────────
-def send_telegram_url_alert(url: str):
+def send_telegram_url_alert(tunnel_url: str = ""):
     bot_token = "8850507396:AAFwFm2_WxPdSM52JcCpJUj8V1rz9x3G-kE"
     chat_id = "6307066850"
+    perm_url = "http://54.162.151.193:8000"
     msg = (
         f"👑 *FLATTRADE ALGO PRO DASHBOARD IS LIVE*\n\n"
         f"॥ जय श्री कृष्ण ॥\n\n"
-        f"🌐 *Active Live Dashboard URL:*\n`{url}`\n\n"
-        f"👉 [Click Here To Open Dashboard]({url})\n\n"
-        f"📊 Track real-time NIFTY & MCX performance, live charts, and activate tokens."
+        f"🔒 *Permanent Fixed URL (Never Dies):*\n`{perm_url}`\n\n"
+        f"👉 [Click Here To Open Permanent Dashboard]({perm_url})\n\n"
     )
+    if tunnel_url:
+        msg += f"🌐 *Cloudflare Mirror:*\n`{tunnel_url}`\n\n"
+    msg += f"📊 Track real-time NIFTY & MCX performance, live charts, and activate tokens."
     try:
         requests.post(
             f"https://api.telegram.org/bot{bot_token}/sendMessage",
