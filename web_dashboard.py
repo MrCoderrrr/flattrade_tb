@@ -414,6 +414,8 @@ def update_intraday_pnl_series(current_net_mtm: float, net_pct: float):
     global INTRADAY_PNL_SERIES, INTRADAY_SERIES_DATE
     now = get_ist_now()
     today_str = str(now.date())
+    val_pnl = float(current_net_mtm) if current_net_mtm is not None else 0.0
+    val_pct = float(net_pct) if net_pct is not None else 0.0
 
     if INTRADAY_SERIES_DATE != today_str:
         INTRADAY_SERIES_DATE = today_str
@@ -429,8 +431,8 @@ def update_intraday_pnl_series(current_net_mtm: float, net_pct: float):
         INTRADAY_PNL_SERIES.append({
             "time": now.strftime("%H:%M:%S"),
             "time_short": now.strftime("%H:%M"),
-            "pnl": round(current_net_mtm, 2),
-            "pct": round(net_pct, 2),
+            "pnl": round(val_pnl, 2),
+            "pct": round(val_pct, 2),
             "ts": now_ts
         })
         if len(INTRADAY_PNL_SERIES) > 1500:
@@ -450,6 +452,9 @@ def update_market_intraday_series(market, current_net_mtm, net_pct, start_hour, 
     market_key = str(market).upper()
     if market_key not in MARKET_INTRADAY_SERIES:
         return []
+
+    val_pnl = float(current_net_mtm) if current_net_mtm is not None else 0.0
+    val_pct = float(net_pct) if net_pct is not None else 0.0
 
     if MARKET_INTRADAY_DATES[market_key] != today_str:
         saved = load_json_safe(MARKET_INTRADAY_FILE, {})
@@ -473,8 +478,8 @@ def update_market_intraday_series(market, current_net_mtm, net_pct, start_hour, 
             series.append({
                 "time": now.strftime("%H:%M:%S"),
                 "time_short": now.strftime("%H:%M"),
-                "pnl": round(float(current_net_mtm), 2),
-                "pct": round(float(net_pct), 4),
+                "pnl": round(val_pnl, 2),
+                "pct": round(val_pct, 4),
                 "ts": now_ts
             })
             MARKET_INTRADAY_SERIES[market_key] = series[-1500:]
@@ -687,6 +692,7 @@ def get_aggregated_dashboard_state() -> dict:
                 "side": side,
                 "qty": qty,
                 "entry": entry,
+                "best_price": (pos.get("best_price") if pos.get("best_price") is not None else sl_state.get("best_premium")),
                 "ltp": ltp,
                 "sl": current_sl,
                 "pnl": pnl,
@@ -707,6 +713,7 @@ def get_aggregated_dashboard_state() -> dict:
                 "side": pos.get("side", "SELL"),
                 "qty": pos.get("qty"),
                 "entry": float(pos.get("entry", 0.0) or 0.0),
+                "best_price": (pos.get("best_price") if pos.get("best_price") is not None else (pos.get("sl_state", {}) or {}).get("best_premium")),
                 "ltp": float(pos.get("ltp", 0.0) or 0.0),
                 "sl": float(pos.get("sl", 0.0) or 0.0),
                 "pnl": float(pos.get("pnl", 0.0) or 0.0),
@@ -726,6 +733,7 @@ def get_aggregated_dashboard_state() -> dict:
                 "side": pos.get("side", "SELL"),
                 "qty": pos.get("qty"),
                 "entry": entry,
+                "best_price": (pos.get("best_price") if pos.get("best_price") is not None else sl_state.get("best_premium")),
                 "ltp": ltp,
                 "sl": float(sl_state.get("current_sl", 0.0) or 0.0),
                 "pnl": (float(((entry - ltp) if pos.get("side") == "SELL" else (ltp - entry)) * pos.get("qty"))
@@ -2160,23 +2168,11 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
     .trade-stat-card span { display:block; color:var(--text-dim); font:700 .62rem var(--mono); letter-spacing:.1em; }
     .trade-stat-card strong { display:block; margin-top:7px; color:var(--text); font:800 1.2rem var(--mono); }
     .trade-stat-card small { display:block; margin-top:5px; color:var(--text-muted); font:500 .62rem var(--mono); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-    .market-chart-panel { margin:0 0 16px; padding:15px 17px 12px; border:1px solid rgba(133,174,221,.16); border-radius:18px; background:linear-gradient(145deg,rgba(10,23,44,.88),rgba(7,12,25,.82)); box-shadow:inset 0 1px 0 rgba(255,255,255,.08); }
-    .market-chart-heading { display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:7px; font-family:var(--mono); }
-    .market-chart-heading b { font:800 .76rem var(--display); letter-spacing:.05em; }
-    .market-chart-heading small { display:block; margin-top:3px; color:var(--text-dim); font-size:.62rem; }
-    .market-chart-heading strong { color:var(--green); font-size:.9rem; }
-    #nifty-market-canvas, #mcx-market-canvas { display:block; width:100%; height:148px; }
-    .mcx-chart-panel { border-color:rgba(255,200,87,.2); }
     @media (max-width:768px) {
       .trade-stats-grid { grid-template-columns:repeat(2,minmax(0,1fr)); gap:7px; margin-bottom:14px; }
       .trade-stat-card { padding:10px 11px; border-radius:12px; }
       .trade-stat-card strong { font-size:1rem; }
       .trade-stat-card small { font-size:.54rem; }
-      .market-chart-panel { padding:11px 11px 8px; border-radius:15px; }
-      .market-chart-heading b { font-size:.66rem; }
-      .market-chart-heading small { font-size:.54rem; }
-      .market-chart-heading strong { font-size:.75rem; }
-      #nifty-market-canvas, #mcx-market-canvas { height:128px; }
     }
   </style>
 </head>
@@ -2304,16 +2300,16 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- ─── Live Intraday P&L Tracking Chart (09:15 to Session Close) ─── -->
+    <!-- ─── Live Intraday P&L Tracking Chart ─── -->
     <div class="panel-box" style="padding:18px 20px; margin-bottom:22px; position:relative; overflow:hidden;">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; flex-wrap:wrap; gap:8px;">
         <div style="display:flex; align-items:center; gap:10px;">
-          <span style="font-size:1.2rem; color:var(--primary);">📈</span>
-          <span style="font-family:var(--display); font-weight:800; font-size:1.1rem; letter-spacing:-0.02em;">LIVE INTRADAY P&L TRAJECTORY</span>
+          <span style="font-size:1.2rem; color:var(--primary);" id="chart-market-icon">⚡</span>
+          <span style="font-family:var(--display); font-weight:800; font-size:1.1rem; letter-spacing:-0.02em;" id="chart-market-title">LIVE NIFTY P&L TRAJECTORY</span>
           <span class="status-chip chip-green" style="font-size:0.68rem; padding:3px 9px;" id="intraday-live-status">LIVE STREAM</span>
         </div>
         <div style="display:flex; align-items:center; gap:14px; font-family:var(--mono); font-size:0.78rem;">
-          <span style="color:var(--text-dim);">Timeline: <b style="color:#fff;">09:15 ➔ 15:35 IST</b></span>
+          <span style="color:var(--text-dim);">Timeline: <b style="color:#fff;" id="chart-timeline-label">09:15 ➔ 15:35 IST</b></span>
           <span style="color:var(--text-dim);">Live MTM: <b id="chart-cur-mtm" style="color:var(--green); font-size:0.92rem;">₹0.00 (+0.00%)</b></span>
         </div>
       </div>
@@ -2336,10 +2332,6 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
     <!-- TAB 1: NIFTY 50 DEDICATED COMMAND CENTER                               -->
     <!-- ═══════════════════════════════════════════════════════════════════════ -->
     <div id="view-nifty" class="view-section active">
-      <div class="market-chart-panel">
-        <div class="market-chart-heading"><div><b>⚡ NIFTY SESSION CURVE</b><small>09:15 — 15:35 IST • persisted intraday trail</small></div><strong id="nifty-chart-value">₹0.00</strong></div>
-        <canvas id="nifty-market-canvas" aria-label="NIFTY live P&L chart"></canvas>
-      </div>
       <div class="panel-box">
         <div class="panel-hdr">
           <div class="panel-title">
@@ -2414,13 +2406,14 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
                 <th>Side</th>
                 <th>Qty</th>
                 <th>Entry Price</th>
+                <th>Best Price</th>
                 <th>LTP</th>
                 <th>Current SL</th>
                 <th style="text-align:right;">Unrealized P&L</th>
               </tr>
             </thead>
             <tbody id="n-pos-tbody">
-              <tr><td colspan="9" style="text-align:center; color:var(--text-dim); padding:28px;">No active NIFTY positions open.</td></tr>
+              <tr><td colspan="10" style="text-align:center; color:var(--text-dim); padding:28px;">No active NIFTY positions open.</td></tr>
             </tbody>
           </table>
         </div>
@@ -2458,10 +2451,6 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
     <!-- TAB 2: MCX NATURAL GAS DEDICATED COMMAND CENTER                        -->
     <!-- ═══════════════════════════════════════════════════════════════════════ -->
     <div id="view-mcx" class="view-section">
-      <div class="market-chart-panel mcx-chart-panel">
-        <div class="market-chart-heading"><div><b>🛢️ MCX NATURAL GAS CURVE</b><small>16:00 — 23:24 IST • starts at the MCX session open</small></div><strong id="mcx-chart-value">₹0.00</strong></div>
-        <canvas id="mcx-market-canvas" aria-label="MCX live P&L chart"></canvas>
-      </div>
       <div class="panel-box">
         <div class="panel-hdr">
           <div class="panel-title">
@@ -2538,13 +2527,14 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
                 <th>Side</th>
                 <th>Qty</th>
                 <th>Entry Price</th>
+                <th>Best Price</th>
                 <th>LTP</th>
                 <th>Current SL</th>
                 <th style="text-align:right;">Unrealized P&L</th>
               </tr>
             </thead>
             <tbody id="m-pos-tbody">
-              <tr><td colspan="9" style="text-align:center; color:var(--text-dim); padding:28px;">No active MCX positions open.</td></tr>
+              <tr><td colspan="10" style="text-align:center; color:var(--text-dim); padding:28px;">No active MCX positions open.</td></tr>
             </tbody>
           </table>
         </div>
@@ -2599,13 +2589,14 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
                 <th>Side</th>
                 <th>Qty</th>
                 <th>Entry Price</th>
+                <th>Best Price</th>
                 <th>LTP</th>
                 <th>Current SL</th>
                 <th style="text-align:right;">Unrealized P&L</th>
               </tr>
             </thead>
             <tbody id="all-pos-tbody">
-              <tr><td colspan="9" style="text-align:center; color:var(--text-dim); padding:28px;">No market positions currently open.</td></tr>
+              <tr><td colspan="10" style="text-align:center; color:var(--text-dim); padding:28px;">No market positions currently open.</td></tr>
             </tbody>
           </table>
         </div>
@@ -2776,7 +2767,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
 
   <script>
     let activeTab = 'nifty';
-    let dashboardBaseCapital = null;
+    let dashboardBaseCapital = 200000.0;
 
     function toggleMobileDrawer() {
       const drawer = document.getElementById('mobile-drawer');
@@ -2829,6 +2820,9 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         if (dBtn) dBtn.classList.add('active-overview');
       }
       closeMobileDrawer();
+      if (typeof updateLiveChartFromState === 'function') {
+        updateLiveChartFromState();
+      }
     }
 
     function fmtINR(val, plus=false) {
@@ -2857,7 +2851,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
 
     function renderPositionsRows(posList) {
       if (!posList || posList.length === 0) {
-        return `<tr><td colspan="9" style="text-align:center; color:var(--text-dim); padding:28px;">No active market positions open.</td></tr>`;
+        return `<tr><td colspan="10" style="text-align:center; color:var(--text-dim); padding:28px;">No active market positions open.</td></tr>`;
       }
       return posList.map(pos => {
         const isCall = pos.leg.startsWith('CE');
@@ -2873,6 +2867,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
             <td><span class="${pos.side === 'SELL' ? 'side-sell' : 'side-buy'}">${pos.side}</span></td>
             <td>${pos.qty}</td>
             <td>₹${parseFloat(pos.entry).toFixed(2)}</td>
+            <td>${dataOrNA(pos.best_price, v => '₹' + Number(v).toFixed(2))}</td>
             <td><b style="color:#fff;">₹${parseFloat(pos.ltp).toFixed(2)}</b></td>
             <td style="color:var(--text-muted);">${pos.sl > 0 ? '₹' + parseFloat(pos.sl).toFixed(2) : '—'}</td>
             <td style="text-align:right;" class="${pnlClass}">
@@ -2914,6 +2909,109 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
     let chartCurPct = null;
     let chartAnimFrame = null;
     let chartMouseX = null;
+    let lastDashboardData = null;
+
+    let chartConfig = {
+      market: 'NIFTY',
+      title: 'LIVE NIFTY P&L TRAJECTORY',
+      icon: '⚡',
+      timeline: '09:15 ➔ 15:35 IST',
+      startMin: 555,
+      endMin: 935,
+      timeTicks: [
+        { label: '09:15', m: 555 },
+        { label: '10:30', m: 630 },
+        { label: '11:30', m: 690 },
+        { label: '12:30', m: 750 },
+        { label: '13:30', m: 810 },
+        { label: '14:30', m: 870 },
+        { label: '15:35', m: 935 }
+      ]
+    };
+
+    function updateLiveChartFromState() {
+      if (!lastDashboardData) return;
+      const data = lastDashboardData;
+      const n = data.nifty || {};
+      const m = data.mcx || {};
+      const p = data.performance || {};
+
+      if (activeTab === 'mcx') {
+        chartConfig = {
+          market: 'MCX',
+          title: 'LIVE MCX NATURAL GAS P&L TRAJECTORY',
+          icon: '🛢️',
+          timeline: '16:00 ➔ 23:24 IST',
+          startMin: 960,
+          endMin: 1404,
+          timeTicks: [
+            { label: '16:00', m: 960 },
+            { label: '17:30', m: 1050 },
+            { label: '19:00', m: 1140 },
+            { label: '20:30', m: 1230 },
+            { label: '22:00', m: 1320 },
+            { label: '23:24', m: 1404 }
+          ]
+        };
+        chartSeries = Array.isArray(m.intraday_series) ? m.intraday_series : [];
+        chartCurNet = Number.isFinite(Number(m.net_pnl)) ? Number(m.net_pnl) : 0.0;
+        chartCurPct = Number.isFinite(Number(m.net_pct)) ? Number(m.net_pct) : 0.0;
+      } else if (activeTab === 'overview') {
+        chartConfig = {
+          market: 'COMBINED',
+          title: 'LIVE COMBINED P&L TRAJECTORY',
+          icon: '📊',
+          timeline: '09:15 ➔ 23:24 IST',
+          startMin: 555,
+          endMin: 1404,
+          timeTicks: [
+            { label: '09:15', m: 555 },
+            { label: '12:00', m: 720 },
+            { label: '15:35', m: 935 },
+            { label: '18:00', m: 1080 },
+            { label: '21:00', m: 1260 },
+            { label: '23:24', m: 1404 }
+          ]
+        };
+        chartSeries = Array.isArray(data.intraday_series) ? data.intraday_series : [];
+        chartCurNet = Number.isFinite(Number(p.combined_net_mtm)) ? Number(p.combined_net_mtm) : 0.0;
+        chartCurPct = Number.isFinite(Number(p.combined_net_pct)) ? Number(p.combined_net_pct) : 0.0;
+      } else {
+        // NIFTY tab
+        chartConfig = {
+          market: 'NIFTY',
+          title: 'LIVE NIFTY P&L TRAJECTORY',
+          icon: '⚡',
+          timeline: '09:15 ➔ 15:35 IST',
+          startMin: 555,
+          endMin: 935,
+          timeTicks: [
+            { label: '09:15', m: 555 },
+            { label: '10:30', m: 630 },
+            { label: '11:30', m: 690 },
+            { label: '12:30', m: 750 },
+            { label: '13:30', m: 810 },
+            { label: '14:30', m: 870 },
+            { label: '15:35', m: 935 }
+          ]
+        };
+        chartSeries = Array.isArray(n.intraday_series) ? n.intraday_series : [];
+        chartCurNet = Number.isFinite(Number(n.net_pnl)) ? Number(n.net_pnl) : 0.0;
+        chartCurPct = Number.isFinite(Number(n.net_pct)) ? Number(n.net_pct) : 0.0;
+      }
+
+      const iconEl = document.getElementById('chart-market-icon');
+      if (iconEl) iconEl.innerText = chartConfig.icon;
+      const titleEl = document.getElementById('chart-market-title');
+      if (titleEl) titleEl.innerText = chartConfig.title;
+      const timelineEl = document.getElementById('chart-timeline-label');
+      if (timelineEl) timelineEl.innerText = chartConfig.timeline;
+      const curNetEl = document.getElementById('chart-cur-mtm');
+      if (curNetEl) {
+        curNetEl.innerText = `${fmtINR(chartCurNet, true)} (${fmtPct(chartCurPct)})`;
+        curNetEl.style.color = chartCurNet >= 0 ? 'var(--green)' : 'var(--red)';
+      }
+    }
 
     function renderIntradayChart(series, curNet, curPct) {
       if (Array.isArray(series)) {
@@ -2956,23 +3054,13 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       const plotW = Math.max(10, w - padLeft - padRight);
       const plotH = Math.max(10, h - padTop - padBottom);
 
-      if (!chartSeries.length && chartCurNet === null) {
-        ctx.fillStyle = 'rgba(148,163,184,.8)';
-        ctx.font = '11px "JetBrains Mono", monospace';
-        ctx.textAlign = 'center';
-        ctx.fillText('Not enough data', padLeft + plotW / 2, padTop + plotH / 2);
-        ctx.restore();
-        return;
-      }
-
-      // Fixed grid: 09:15 (555m) to 15:35 (935m) = 380 min
-      const startMin = 555;
-      const endMin = 935;
-      const totalMinSpan = endMin - startMin; // 380
+      const startMin = chartConfig.startMin;
+      const endMin = chartConfig.endMin;
+      const totalMinSpan = Math.max(1, endMin - startMin);
 
       function timeStrToMin(timeStr) {
         if (!timeStr) return startMin;
-        const parts = timeStr.split(':').map(Number);
+        const parts = String(timeStr).split(':').map(Number);
         const hh = parts[0] || 0;
         const mm = parts[1] || 0;
         const ss = parts[2] || 0;
@@ -2988,15 +3076,20 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       let minPnl = 0.0;
       let maxPnl = 0.0;
       for (const pt of chartSeries) {
-        if (pt.pnl < minPnl) minPnl = pt.pnl;
-        if (pt.pnl > maxPnl) maxPnl = pt.pnl;
+        const val = Number(pt.pnl);
+        if (Number.isFinite(val)) {
+          if (val < minPnl) minPnl = val;
+          if (val > maxPnl) maxPnl = val;
+        }
       }
-      if (chartCurNet < minPnl) minPnl = chartCurNet;
-      if (chartCurNet > maxPnl) maxPnl = chartCurNet;
+      if (chartCurNet !== null && Number.isFinite(chartCurNet)) {
+        if (chartCurNet < minPnl) minPnl = chartCurNet;
+        if (chartCurNet > maxPnl) maxPnl = chartCurNet;
+      }
 
       // Add headroom
-      const spread = Math.max(1000, maxPnl - minPnl);
-      const headRoom = spread * 0.18;
+      const spread = Math.max(500, maxPnl - minPnl);
+      const headRoom = spread * 0.20;
       const yMin = minPnl - headRoom;
       const yMax = maxPnl + headRoom;
       const yRange = yMax - yMin || 1;
@@ -3008,24 +3101,14 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
 
       const zeroY = pnlToY(0.0);
 
-      // 1. Vertical time grid lines & labels (Fixed 09:15 to 15:35)
-      const timeTicks = [
-        { label: '09:15', m: 555 },
-        { label: '10:30', m: 630 },
-        { label: '11:30', m: 690 },
-        { label: '12:30', m: 750 },
-        { label: '13:30', m: 810 },
-        { label: '14:30', m: 870 },
-        { label: '15:35', m: 935 }
-      ];
-
+      // 1. Vertical time grid lines & labels from active chartConfig
       ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
       ctx.lineWidth = 1;
       ctx.fillStyle = 'rgba(148, 163, 184, 0.7)';
       ctx.font = '10px "JetBrains Mono", monospace';
       ctx.textAlign = 'center';
 
-      timeTicks.forEach(tick => {
+      chartConfig.timeTicks.forEach(tick => {
         const x = minToX(tick.m);
         ctx.beginPath();
         ctx.setLineDash([3, 4]);
@@ -3051,17 +3134,19 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       ctx.fillStyle = '#94a3b8';
       ctx.fillText('₹0 (0%)', padLeft - 6, zeroY + 3.5);
 
+      const baseCap = (dashboardBaseCapital && dashboardBaseCapital > 0) ? dashboardBaseCapital : 200000.0;
+
       // Upper guideline
       const upperPnl = maxPnl > 0 ? maxPnl : 1000;
       const upperY = pnlToY(upperPnl);
-      if (Math.abs(upperY - zeroY) > 22) {
+      if (Math.abs(upperY - zeroY) > 20) {
         ctx.strokeStyle = 'rgba(16, 185, 129, 0.15)';
         ctx.beginPath();
         ctx.moveTo(padLeft, upperY);
         ctx.lineTo(padLeft + plotW, upperY);
         ctx.stroke();
 
-        const upperPct = (upperPnl / dashboardBaseCapital) * 100.0;
+        const upperPct = (upperPnl / baseCap) * 100.0;
         ctx.fillStyle = '#10b981';
         ctx.fillText(`+₹${Math.round(upperPnl)} (${fmtPct(upperPct)})`, padLeft - 6, upperY + 3.5);
       }
@@ -3069,14 +3154,14 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       // Lower guideline
       const lowerPnl = minPnl < 0 ? minPnl : -1000;
       const lowerY = pnlToY(lowerPnl);
-      if (Math.abs(lowerY - zeroY) > 22) {
+      if (Math.abs(lowerY - zeroY) > 20) {
         ctx.strokeStyle = 'rgba(244, 63, 94, 0.15)';
         ctx.beginPath();
         ctx.moveTo(padLeft, lowerY);
         ctx.lineTo(padLeft + plotW, lowerY);
         ctx.stroke();
 
-        const lowerPct = (lowerPnl / dashboardBaseCapital) * 100.0;
+        const lowerPct = (lowerPnl / baseCap) * 100.0;
         ctx.fillStyle = '#f43f5e';
         ctx.fillText(`-₹${Math.abs(Math.round(lowerPnl))} (${fmtPct(lowerPct)})`, padLeft - 6, lowerY + 3.5);
       }
@@ -3087,15 +3172,16 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         for (const pt of chartSeries) {
           const m = timeStrToMin(pt.time || pt.time_short);
           const px = minToX(m);
-          const py = pnlToY(pt.pnl);
-          points.push({ x: px, y: py, pnl: pt.pnl, pct: pt.pct, time: pt.time });
+          const py = pnlToY(Number(pt.pnl) || 0);
+          points.push({ x: px, y: py, pnl: Number(pt.pnl) || 0, pct: Number(pt.pct) || 0, time: pt.time || pt.time_short });
         }
       }
 
       if (points.length === 0) {
         const startX = minToX(startMin);
         const startY = pnlToY(0.0);
-        points.push({ x: startX, y: startY, pnl: 0, pct: 0, time: '09:15' });
+        const firstTickLabel = chartConfig.timeTicks[0]?.label || '09:15';
+        points.push({ x: startX, y: startY, pnl: 0, pct: 0, time: firstTickLabel });
       }
 
       points.sort((a, b) => a.x - b.x);
@@ -3103,7 +3189,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       // 4. Fill gradient under the curve down to zeroY
       if (points.length > 1) {
         const lastPt = points[points.length - 1];
-        const isPos = chartCurNet >= 0;
+        const isPos = (chartCurNet !== null ? chartCurNet : lastPt.pnl) >= 0;
         const grad = ctx.createLinearGradient(0, padTop, 0, padTop + plotH);
         if (isPos) {
           grad.addColorStop(0, 'rgba(16, 185, 129, 0.28)');
@@ -3126,8 +3212,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         ctx.fillStyle = grad;
         ctx.fill();
 
-        // 5. Thin segmented stroke: every section is green above zero and
-        // red below zero, including the exact crossing point.
+        // 5. Thin segmented stroke
         const drawThinSegment = (a, b, color) => {
           ctx.beginPath();
           ctx.moveTo(a.x, a.y);
@@ -3159,7 +3244,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       // 6. Refined Calm Market Dot & Organic Breathing Glow
       const lastPt = points[points.length - 1];
       const nowMs = Date.now();
-      const isCurPos = chartCurNet >= 0;
+      const isCurPos = (chartCurNet !== null ? chartCurNet : lastPt.pnl) >= 0;
 
       // Smooth slow organic breathing phase (3.4s cycle)
       const breath = (Math.sin(nowMs / 540) + 1) / 2;
@@ -3273,8 +3358,6 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
     function startCanvasAnimationLoop() {
       function loop() {
         drawIntradayCanvas();
-        drawMarketCanvas('NIFTY');
-        drawMarketCanvas('MCX');
         chartAnimFrame = requestAnimationFrame(loop);
       }
       if (!chartAnimFrame) {
@@ -3295,93 +3378,6 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       window.addEventListener('resize', () => {
         drawIntradayCanvas();
       });
-    }
-
-    const marketChartState = {
-      NIFTY: { series: [], value: 0, pct: 0, start: 555, end: 935 },
-      MCX: { series: [], value: 0, pct: 0, start: 960, end: 1404 }
-    };
-
-    function renderMarketChart(market, series, value, pct) {
-      const state = marketChartState[market];
-      if (!state) return;
-      state.series = Array.isArray(series) ? series : [];
-      state.value = Number.isFinite(Number(value)) ? Number(value) : null;
-      state.pct = Number.isFinite(Number(pct)) ? Number(pct) : null;
-      const valueEl = document.getElementById(`${market.toLowerCase()}-chart-value`);
-      if (valueEl) {
-        valueEl.innerText = fmtINR(state.value, true);
-        valueEl.style.color = state.value === null ? 'var(--text-dim)' : (state.value >= 0 ? 'var(--green)' : 'var(--red)');
-      }
-    }
-
-    function drawMarketCanvas(market) {
-      const canvas = document.getElementById(`${market.toLowerCase()}-market-canvas`);
-      const state = marketChartState[market];
-      if (!canvas || !state) return;
-      const rect = canvas.getBoundingClientRect();
-      const dpr = window.devicePixelRatio || 1;
-      const w = rect.width, h = rect.height;
-      if (!w || !h) return;
-      if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
-        canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr);
-      }
-      const ctx = canvas.getContext('2d');
-      ctx.save(); ctx.scale(dpr, dpr); ctx.clearRect(0, 0, w, h);
-      const left = 42, right = 12, top = 12, bottom = 22;
-      const plotW = Math.max(10, w - left - right), plotH = Math.max(10, h - top - bottom);
-      const toMin = (value) => {
-        const parts = String(value || '').split(':').map(Number);
-        return (parts[0] || 0) * 60 + (parts[1] || 0) + (parts[2] || 0) / 60;
-      };
-      const toX = (minute) => left + Math.max(0, Math.min(1, (minute - state.start) / (state.end - state.start))) * plotW;
-      const values = state.series.map(p => Number(p.pnl)).filter(Number.isFinite);
-      if (Number.isFinite(state.value)) values.push(state.value);
-      if (!values.length) {
-        ctx.fillStyle = 'rgba(148,163,184,.8)';
-        ctx.font = '11px "JetBrains Mono", monospace';
-        ctx.textAlign = 'center';
-        ctx.fillText('Not enough data', left + plotW / 2, top + plotH / 2);
-        ctx.restore();
-        return;
-      }
-      const minValue = Math.min(...values), maxValue = Math.max(...values);
-      values.push(0);
-      const min = Math.min(...values, minValue), max = Math.max(...values, maxValue);
-      const spread = Math.max(100, max - min), yMin = min - spread * .2, yMax = max + spread * .2;
-      const toY = (value) => top + (1 - ((value - yMin) / (yMax - yMin))) * plotH;
-      const zeroY = toY(0);
-
-      ctx.strokeStyle = 'rgba(148,163,184,.12)'; ctx.lineWidth = 1; ctx.setLineDash([3, 5]);
-      for (let i = 0; i < 5; i++) { const y = top + plotH * i / 4; ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(left + plotW, y); ctx.stroke(); }
-      ctx.setLineDash([]); ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.beginPath(); ctx.moveTo(left, zeroY); ctx.lineTo(left + plotW, zeroY); ctx.stroke();
-      ctx.font = '9px "JetBrains Mono", monospace'; ctx.fillStyle = 'rgba(148,163,184,.75)'; ctx.textAlign = 'left'; ctx.fillText(`₹${Math.round(max)}`, 4, top + 5); ctx.fillText(`₹0`, 10, zeroY + 3); ctx.fillText(`₹${Math.round(min)}`, 4, top + plotH);
-
-      let points = state.series.map(p => ({ x: toX(toMin(p.time || p.time_short)), y: toY(Number(p.pnl)), pnl: Number(p.pnl) })).filter(p => Number.isFinite(p.pnl)).sort((a,b) => a.x - b.x);
-      if (!points.length && Number.isFinite(state.value)) points = [{ x: toX(state.end), y: toY(state.value), pnl: state.value }];
-      if (!points.length) {
-        ctx.fillStyle = 'rgba(148,163,184,.8)';
-        ctx.font = '11px "JetBrains Mono", monospace';
-        ctx.textAlign = 'center';
-        ctx.fillText('Not enough data', left + plotW / 2, top + plotH / 2);
-        ctx.restore();
-        return;
-      }
-      if (points.length > 1) {
-        const fill = ctx.createLinearGradient(0, top, 0, top + plotH);
-        fill.addColorStop(0, 'rgba(53,224,161,.12)'); fill.addColorStop(.5, 'rgba(85,214,255,.025)'); fill.addColorStop(1, 'rgba(255,93,120,.12)');
-        ctx.beginPath(); ctx.moveTo(points[0].x, zeroY); ctx.lineTo(points[0].x, points[0].y); points.slice(1).forEach(p => ctx.lineTo(p.x,p.y)); ctx.lineTo(points[points.length-1].x, zeroY); ctx.closePath(); ctx.fillStyle = fill; ctx.fill();
-        for (let i = 1; i < points.length; i++) {
-          const a = points[i-1], b = points[i], same = (a.pnl >= 0) === (b.pnl >= 0);
-          const draw = (x,y,color) => { ctx.beginPath(); ctx.moveTo(x.x,x.y); ctx.lineTo(y.x,y.y); ctx.strokeStyle=color; ctx.lineWidth=1.15; ctx.lineCap='round'; ctx.stroke(); };
-          if (same || a.pnl === 0 || b.pnl === 0) draw(a,b,a.pnl >= 0 ? '#35e0a1' : '#ff5d78');
-          else { const t=Math.abs(a.pnl)/(Math.abs(a.pnl)+Math.abs(b.pnl)); const cross={x:a.x+(b.x-a.x)*t,y:zeroY}; draw(a,cross,a.pnl>=0?'#35e0a1':'#ff5d78'); draw(cross,b,b.pnl>=0?'#35e0a1':'#ff5d78'); }
-        }
-      }
-      const last = points[points.length - 1], positive = (state.value ?? last.pnl) >= 0;
-      ctx.beginPath(); ctx.arc(last.x,last.y,3.5,0,Math.PI*2); ctx.fillStyle='#fff'; ctx.shadowColor=positive?'#35e0a1':'#ff5d78'; ctx.shadowBlur=10; ctx.fill(); ctx.shadowBlur=0;
-      ctx.fillStyle='rgba(148,163,184,.72)'; ctx.textAlign='center'; ctx.fillText(market === 'MCX' ? '16:00' : '09:15', left, h - 4); ctx.fillText(market === 'MCX' ? '23:24' : '15:35', left + plotW, h - 4);
-      ctx.restore();
     }
 
     // ── Day-of-Week Cumulative Bar Chart Renderer ──
@@ -3518,9 +3514,9 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
 
       // KPI Performance
       const p = data.performance || {};
-      dashboardBaseCapital = parseFloat(p.base_capital) > 0 ? parseFloat(p.base_capital) : null;
+      dashboardBaseCapital = (p.base_capital && parseFloat(p.base_capital) > 0) ? parseFloat(p.base_capital) : 200000.0;
       const baseCapitalEl = document.getElementById('base-capital-label');
-      if (baseCapitalEl) baseCapitalEl.innerText = fmtINR(dashboardBaseCapital);
+      if (baseCapitalEl) baseCapitalEl.innerText = fmtINR(p.base_capital || dashboardBaseCapital);
       const netMtm = Number.isFinite(Number(p.combined_net_mtm)) ? Number(p.combined_net_mtm) : null;
       const netPct = Number.isFinite(Number(p.combined_net_pct)) ? Number(p.combined_net_pct) : null;
 
@@ -3613,7 +3609,6 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
 
       // ── NIFTY TAB DATA ──
       const n = data.nifty || {};
-      renderMarketChart('NIFTY', n.intraday_series, n.net_pnl, n.net_pct);
       document.getElementById('n-spot').innerText = dataOrNA(n.spot, v => Number(v).toFixed(2));
       document.getElementById('n-atm').innerText = dataOrNA(n.atm);
       document.getElementById('n-adx').innerText = dataOrNA(n.adx, v => Number(v).toFixed(1));
@@ -3649,7 +3644,6 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
 
       // ── MCX TAB DATA ──
       const m = data.mcx || {};
-      renderMarketChart('MCX', m.intraday_series, m.net_pnl, m.net_pct);
       document.getElementById('m-spot').innerText = dataOrNA(m.spot, v => Number(v).toFixed(2));
       document.getElementById('m-atm').innerText = dataOrNA(m.atm);
       document.getElementById('m-expiry').innerText = dataOrNA(m.expiry, v => v + (m.is_rolled_over ? ' (ROLL)' : ''));
@@ -3694,7 +3688,8 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       document.getElementById('all-pos-tbody').innerHTML = renderPositionsRows(allPos);
 
       // ── RENDER LIVE CHARTS & ADVANCED ANALYTICS ──
-      renderIntradayChart(data.intraday_series, netMtm, netPct);
+      lastDashboardData = data;
+      updateLiveChartFromState();
 
       const ha = data.history_analytics || {};
       renderDOWChart(ha.day_of_week);
