@@ -371,6 +371,10 @@ def get_trade_analytics(nifty_snapshot=None, mcx_snapshot=None, base_capital=Non
         except Exception:
             pass
 
+    all_by_market = {
+        market: [t for t in all_trades if t.get("market") == market]
+        for market in ("NIFTY", "MCX")
+    }
     today_trades = [t for t in all_trades if t.get("date") == today.isoformat()]
     by_market = {
         market: [t for t in today_trades if t.get("market") == market]
@@ -379,8 +383,10 @@ def get_trade_analytics(nifty_snapshot=None, mcx_snapshot=None, base_capital=Non
     return {
         "all": _trade_metrics(all_trades, base_capital),
         "today": _trade_metrics(today_trades, base_capital),
-        "nifty": _trade_metrics(by_market["NIFTY"], base_capital),
-        "mcx": _trade_metrics(by_market["MCX"], base_capital),
+        "nifty": _trade_metrics(all_by_market["NIFTY"], base_capital),
+        "nifty_today": _trade_metrics(by_market["NIFTY"], base_capital),
+        "mcx": _trade_metrics(all_by_market["MCX"], base_capital),
+        "mcx_today": _trade_metrics(by_market["MCX"], base_capital),
         "today_trades": today_trades,
     }
 
@@ -2827,7 +2833,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       }
       closeMobileDrawer();
       if (lastDashboardData) {
-        updateTabKPIs(lastDashboardData);
+        updateDashboard(lastDashboardData);
         updateLiveChartFromState();
       }
     }
@@ -3721,16 +3727,19 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       updateTabKPIs(data);
 
       const analytics = data.trade_analytics || {};
-      const allStats = analytics.all || {};
+      const isNifty = activeTab === 'nifty';
+      const isMcx = activeTab === 'mcx';
+      const curStats = isNifty ? (analytics.nifty || {}) : (isMcx ? (analytics.mcx || {}) : (analytics.all || {}));
+      const curToday = isNifty ? (analytics.nifty_today || {}) : (isMcx ? (analytics.mcx_today || {}) : (analytics.today || {}));
+
       const setStat = (id, value) => { const el = document.getElementById(id); if (el) el.innerText = value; };
-      setStat('stat-win-rate', allStats.win_pct == null ? 'Not enough data' : `${allStats.win_pct.toFixed(1)}%`);
-      const todayStats = analytics.today || {};
-      setStat('stat-win-detail', allStats.count ? `${allStats.wins} wins / ${allStats.losses} losses • today ${todayStats.win_pct == null ? 'Not enough data' : `${todayStats.win_pct.toFixed(1)}%`}` : 'Not enough data');
-      setStat('stat-risk-reward', allStats.risk_reward == null || !allStats.wins || !allStats.losses ? 'Not enough data' : `${allStats.risk_reward.toFixed(2)} : 1`);
-      setStat('stat-max-dd', allStats.count ? fmtINR(allStats.max_drawdown, true) : 'Not enough data');
-      setStat('stat-max-dd-pct', allStats.max_drawdown_pct == null ? 'Not enough data' : `${allStats.max_drawdown_pct.toFixed(2)}% of initial capital`);
-      setStat('stat-trade-count', `${todayStats.count || 0}`);
-      setStat('stat-profit-factor', `${allStats.count || 0} in ledger • Profit factor ${allStats.profit_factor == null ? '∞' : (allStats.profit_factor || 0).toFixed(2)}`);
+      setStat('stat-win-rate', curStats.win_pct == null ? 'Not enough data' : `${curStats.win_pct.toFixed(1)}%`);
+      setStat('stat-win-detail', curStats.count ? `${curStats.wins} wins / ${curStats.losses} losses • today ${curToday.win_pct == null ? 'Not enough data' : `${curToday.win_pct.toFixed(1)}%`}` : 'Not enough data');
+      setStat('stat-risk-reward', curStats.risk_reward == null || !curStats.wins || !curStats.losses ? 'Not enough data' : `${curStats.risk_reward.toFixed(2)} : 1`);
+      setStat('stat-max-dd', curStats.count ? fmtINR(curStats.max_drawdown, true) : 'Not enough data');
+      setStat('stat-max-dd-pct', curStats.max_drawdown_pct == null ? 'Not enough data' : `${curStats.max_drawdown_pct.toFixed(2)}% of initial capital`);
+      setStat('stat-trade-count', `${curToday.count || 0}`);
+      setStat('stat-profit-factor', `${curStats.count || 0} in ledger • Profit factor ${curStats.profit_factor == null ? '∞' : (curStats.profit_factor || 0).toFixed(2)}`);
 
       // ── NIFTY TAB DATA ──
       const n = data.nifty || {};

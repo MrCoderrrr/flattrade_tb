@@ -21,8 +21,10 @@ Key Architecture & Rules:
        proactively exits before full SL is reached.
   4. Momentum Reversal Re-Entry:
      - Surviving leg re-enters missing side when momentum flips/halts.
-  5. Strict 7% Trailing Stop-Loss (TSL):
-     - All legs protected by a strict 7% initial SL, ratcheting down at 7% TSL from lowest price.
+  5. Dual-Phase Dynamic Stop-Loss & Solo TSL:
+     - Strangle active (both legs open): 12% SL per leg, ratcheting with best LTP stored.
+     - One leg squared off -> Surviving leg immediately switches to strict 7% TSL.
+     - All SL and TSL tracked against best (lowest) LTP stored.
   6. Box-Drawing ANSI Dashboard + 3-second live Telegram broadcast.
 ================================================================================
 """
@@ -100,15 +102,12 @@ MCX_ENTRY_MINUTE    = 30
 MCX_EXIT_HOUR       = 23
 MCX_EXIT_MINUTE     = 24           # 23:24 IST auto square-off (11:24 PM)
 LOT_SIZE            = 1250         # 1 lot = 1250 units
-DEFAULT_SL_PCT      = 0.07         # 7% initial stop-loss
-REENTRY_SL_PCT      = 0.07         # 7% initial stop-loss for reversal re-entry
-DEFAULT_TSL_PCT     = 0.07         # 7% trailing stop-loss
-POST_CLOSE_COOLDOWN = 120.0        # 120s cooldown after any close — allows market to stabilise (was 60s, too fast for NatGas whipsaws)
-REENTRY_COOLDOWN_S  = 90.0         # Min 90s between single-leg re-entries (was 30s — too aggressive)
-SWING_REVERSAL_PTS  = 2.0          # Fallback swing reversal pullback threshold — 2.0 pts is ~0.7% for NatGas (was 0.80, too sensitive)
-SOLO_TSL_MIN_PROFIT_PCT = 0.0      # Solo TSL active immediately from entry (trails strictly at 7% from lowest)
-PROACTIVE_EXIT_PCT  = 0.07         # Proactive early exit threshold aligned with 7%
-SESSION_MAX_LOSS    = -4000.0      # Session-level loss guard: stop new entries if realized PnL < -₹4000
+DEFAULT_SL_PCT      = 0.12         # 12% initial stop-loss per leg (Strangle active)
+REENTRY_SL_PCT      = 0.12         # 12% initial stop-loss for reversal re-entry
+DEFAULT_TSL_PCT     = 0.07         # 7% trailing stop-loss (Solo surviving leg)
+POST_CLOSE_COOLDOWN = 60.0         # 60s cooldown after close (reverted to yesterday)
+REENTRY_COOLDOWN_S  = 30.0         # 30s min between single-leg re-entries (reverted to yesterday)
+SWING_REVERSAL_PTS  = 0.80         # 0.80 pts pullback threshold (reverted to yesterday)
 
 TELEGRAM_TOKEN = '8850507396:AAFwFm2_WxPdSM52JcCpJUj8V1rz9x3G-kE'
 CHAT_ID        = '6307066850'
@@ -370,7 +369,8 @@ class NaturalGasPaperBot:
                 self.trades_today       = int(state.get('trades_today', 0))
                 self.last_reentry_ts    = float(state.get('last_reentry_ts', 0.0))
                 self.last_any_close_ts  = float(state.get('last_any_close_ts', 0.0))
-                # Ensure all active positions adhere to updated DEFAULT_TSL_PCT / DEFAULT_SL_PCT
+                # Ensure all active positions adhere to updated DEFAULT_SL_PCT (12%) / DEFAULT_TSL_PCT (7%)
+                is_strangle_restored = ('CE' in self.positions and 'PE' in self.positions)
                 for leg, pos in self.positions.items():
                     pos['loss_stop_pct'] = DEFAULT_SL_PCT
                     pos['tsl_pct'] = DEFAULT_TSL_PCT
@@ -378,12 +378,14 @@ class NaturalGasPaperBot:
                     sl_st['loss_stop_pct'] = DEFAULT_SL_PCT
                     sl_st['tsl_pct'] = DEFAULT_TSL_PCT
                     lowest = float(sl_st.get('lowest_ltp', pos.get('entry_price', 0.0)))
-                    new_sl = round_to_tick(lowest * (1.0 + DEFAULT_TSL_PCT))
+                    pct = DEFAULT_SL_PCT if is_strangle_restored else DEFAULT_TSL_PCT
+                    new_sl = round_to_tick(lowest * (1.0 + pct))
                     curr_sl = float(sl_st.get('current_sl', new_sl))
                     sl_st['current_sl'] = min(curr_sl, new_sl)
+                    sl_st['solo_mode'] = not is_strangle_restored
                 print(f'[STATE] Restored: {len(self.positions)} open legs | '
                       f'Realized PnL: ₹{self.total_realized_pnl:,.2f} | '
-                      f'Trades: {self.trades_today} | TSL: {DEFAULT_TSL_PCT*100:.0f}%', flush=True)
+                      f'Trades: {self.trades_today} | Strangle SL: {DEFAULT_SL_PCT*100:.0f}% | Solo TSL: {DEFAULT_TSL_PCT*100:.0f}%', flush=True)
         except Exception as e:
             print(f'[WARN] Error loading MCX state: {e}', flush=True)
 
@@ -818,49 +820,38 @@ class NaturalGasPaperBot:
 
         if is_strangle:
             # ── STRANGLE IS ON (both legs open) ──
+            # Each leg has a 12% stop loss tracked with best LTP stored
             state['solo_mode'] = False
-            if lowest >= entry_prem:
-                target_sl = initial_sl
-            else:
-                trail_sl  = round_to_tick(lowest * (1.0 + pos['tsl_pct']))
-                target_sl = min(trail_sl, initial_sl)
-
-            current_sl = min(target_sl, state.get('current_sl', initial_sl))
+            initial_sl  = round_to_tick(entry_prem * (1.0 + DEFAULT_SL_PCT))
+            strangle_sl = round_to_tick(lowest * (1.0 + DEFAULT_SL_PCT))
+            target_sl   = min(strangle_sl, initial_sl)
+            current_sl  = min(target_sl, state.get('current_sl', initial_sl))
             state['current_sl'] = current_sl
 
             if live_ltp >= current_sl:
-                label = 'TSL Hit' if current_sl < initial_sl else 'SL Hit'
+                label = 'Strangle 12% SL Hit' if current_sl >= initial_sl else 'Strangle 12% Trailed SL Hit'
                 return True, f'{label} on {leg} ({live_ltp:.2f} >= {current_sl:.2f})'
         else:
-            # ── STRANGLE IS OFF (Solo surviving leg) ──
+            # ── STRANGLE IS OFF (One leg squared off -> Solo surviving leg gets 7% TSL) ──
             state['solo_mode'] = True
-            solo_tsl = round_to_tick(lowest * (1.0 + pos['tsl_pct']))
-
-            # Only activate TSL once the leg has at least SOLO_TSL_MIN_PROFIT_PCT in profit
-            # This prevents premature trailing stop exits when the leg hasn't moved enough yet
-            profit_pct = (entry_prem - lowest) / entry_prem if entry_prem > 0 else 0.0
-            tsl_active = profit_pct >= SOLO_TSL_MIN_PROFIT_PCT
-
-            if tsl_active:
-                if 'current_sl' in state:
-                    current_sl = min(solo_tsl, state['current_sl'])
-                else:
-                    current_sl = solo_tsl
-                state['current_sl'] = current_sl
-
-                if live_ltp >= current_sl:
-                    return True, f'Solo TSL Hit on {leg} ({live_ltp:.2f} >= {current_sl:.2f})'
+            pos['tsl_pct'] = DEFAULT_TSL_PCT
+            # 7% TSL tracked with best LTP stored
+            solo_tsl = round_to_tick(lowest * (1.0 + DEFAULT_TSL_PCT))
+            if 'current_sl' in state:
+                current_sl = min(solo_tsl, state['current_sl'])
             else:
-                # Not enough profit yet — use hard initial SL only (no trailing)
-                hard_sl = round_to_tick(entry_prem * (1.0 + pos['loss_stop_pct']))
-                state['current_sl'] = hard_sl
-                if live_ltp >= hard_sl:
-                    return True, f'Solo Hard SL Hit on {leg} ({live_ltp:.2f} >= {hard_sl:.2f})'
+                current_sl = solo_tsl
+            state['current_sl'] = current_sl
+
+            if live_ltp >= current_sl:
+                return True, f'Solo 7% TSL Hit on {leg} ({live_ltp:.2f} >= {current_sl:.2f})'
 
         return False, ''
 
-    # ── Proactive Early Exit (NIFTY 50 logic ported) ───
+    # ── Proactive Early Exit ──
     def _check_proactive_exit(self, confirmed_signal: int) -> Optional[Tuple[str, str]]:
+        # Disabled so legs are strictly governed by 12% Strangle SL and 7% Solo TSL
+        return None
         """
         When both legs are open, if continuous streaming EMA locks strongly against an open leg,
         proactively exit it early before full SL is hit.
@@ -1326,54 +1317,26 @@ class NaturalGasPaperBot:
                 # ── STEP 1: NO POSITIONS → MOMENTUM ENTRY ───
                 if not self.positions:
                     time_since_close = now_ts - self.last_any_close_ts
-
-                    # Session max-loss guard: if already lost too much, stop new entries
-                    if self.total_realized_pnl <= SESSION_MAX_LOSS:
-                        print(f'[SESSION GUARD] Realized PnL ₹{self.total_realized_pnl:,.2f} <= session max loss ₹{SESSION_MAX_LOSS:,.2f}. '
-                              f'No new entries for rest of session.', flush=True)
-                        self._render_dashboard(spot, atm, ema_snap)
-                        time.sleep(1.0)
-                        continue
-
                     if time_since_close < POST_CLOSE_COOLDOWN:
                         pass  # Cooldown after previous close
                     else:
-                        # Compute minutes since session start for neutral-entry gate
-                        session_start_ts = None
-                        if now.hour == MCX_ENTRY_HOUR and now.minute >= MCX_ENTRY_MINUTE:
-                            session_start_ts = now.replace(minute=MCX_ENTRY_MINUTE, second=0, microsecond=0)
-                        elif now.hour > MCX_ENTRY_HOUR:
-                            session_start_ts = now.replace(hour=MCX_ENTRY_HOUR, minute=MCX_ENTRY_MINUTE, second=0, microsecond=0)
-                        mins_open = ((now - session_start_ts).total_seconds() / 60.0) if session_start_ts else 99.0
-
                         if confirmed_sig == 1:
                             print(f'[MOMENTUM ENTRY] Bullish trend confirmed (+1). Writing PE at ATM {int(atm)} (CE deferred)...', flush=True)
                             self._enter_leg('PE', atm, 'SELL')
                         elif confirmed_sig == -1:
                             print(f'[MOMENTUM ENTRY] Bearish trend confirmed (-1). Writing CE at ATM {int(atm)} (PE deferred)...', flush=True)
                             self._enter_leg('CE', atm, 'SELL')
-                        elif mins_open >= 15.0:
-                            # Only enter balanced straddle after 15 min of session — avoids early directional traps
-                            print(f'[INIT ENTRY] Neutral / Flat market (signal 0, {mins_open:.0f}m open). Writing balanced ATM Straddle at {int(atm)}...', flush=True)
+                        else:
+                            print(f'[INIT ENTRY] Neutral / Flat market (signal 0). Writing balanced ATM Straddle at {int(atm)}...', flush=True)
                             self._enter_leg('CE', atm, 'SELL')
                             self._enter_leg('PE', atm, 'SELL')
-                        else:
-                            print(f'[WAIT] Signal flat, only {mins_open:.0f}m into session — waiting 15m before straddle entry to avoid early trend traps.', flush=True)
                         self._consume_reversal()
 
                     self._render_dashboard(spot, atm, ema_snap)
                     time.sleep(1.0)
                     continue
 
-                # ── STEP 2: PROACTIVE EARLY EXIT (RUNAWAY TREND) ──
-                # If market locks in runaway trend against an open leg, exit early before full SL
-                proactive = self._check_proactive_exit(confirmed_sig)
-                if proactive:
-                    p_leg, p_reason = proactive
-                    print(f'[PROACTIVE ALERT] {p_reason}. Exiting {p_leg} early to cut loss.', flush=True)
-                    self._close_leg(p_leg, p_reason)
-
-                # ── STEP 3: 1 LEG OPEN → MOMENTUM RE-ENTRY ───
+                # ── STEP 2: 1 LEG OPEN → MOMENTUM RE-ENTRY ───
                 short_legs = [leg for leg, p in self.positions.items() if p['side'] == 'SELL']
 
                 if len(short_legs) == 1 and self._reversal_latched:
