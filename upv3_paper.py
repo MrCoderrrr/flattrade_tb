@@ -742,6 +742,17 @@ PREM_MAX_PROFIT_GIVEBACK  = 0.20   # Maximum 20% giveback of peak profit (locks 
 BREAKEVEN_PROFIT_PCT      = 0.04   # 4% profit triggers instant Break-Even Lock (SL capped at entry price)
 BREAKEVEN_PROFIT_POINTS   = 5.0    # 5.0 points profit triggers instant Break-Even Lock
 
+# Adaptive premium/expiry compression. Higher premiums and lower DTE receive
+# smaller percentage and absolute-point allowances.
+PREM_RISK_REFERENCE        = 250.0
+PREM_RISK_INITIAL_PCT_HIGH = 0.08
+PREM_RISK_INITIAL_PCT_LOW  = 0.12
+PREM_RISK_INITIAL_MIN_PTS  = 7.0
+PREM_RISK_INITIAL_MAX_PTS  = 18.0
+PREM_RISK_TRAIL_MIN_PTS    = 5.0
+PREM_RISK_TRAIL_MAX_PTS    = 14.0
+PREM_RISK_EXPIRY_FLOOR     = 0.65
+
 # Weekly expiry safety. Weekly options have much higher gamma near expiry, so
 # theta decay is not a reason to hold short legs into the final move.
 EXPIRY_ENTRY_CUTOFF_DTE   = 1.0    # do not open/re-enter short legs on expiry day or day before
@@ -1883,7 +1894,33 @@ class RiskManager:
             return True, f"Global Circuit Breaker Hit! PnL {total_pnl:.2f} <= Limit {self.circuit_breaker_loss_limit:.2f}"
         return False, ""
 
-    def get_active_tsl_pct(self, now_ist: datetime, dte_days: float = 2.0, is_solo: bool = False) -> float:
+    def _premium_risk_profile(self, premium: float, dte_days: float = 2.0) -> dict:
+        """Calculate stop allowances from premium size and time to expiry."""
+        premium_ratio = min(1.0, max(0.0, float(premium or 0.0)) / PREM_RISK_REFERENCE)
+        dte_ratio = min(1.0, max(0.0, float(dte_days)) / 3.0)
+        expiry_factor = PREM_RISK_EXPIRY_FLOOR + (1.0 - PREM_RISK_EXPIRY_FLOOR) * dte_ratio
+        initial_pct = PREM_RISK_INITIAL_PCT_LOW - (
+            PREM_RISK_INITIAL_PCT_LOW - PREM_RISK_INITIAL_PCT_HIGH
+        ) * premium_ratio
+        initial_points = (
+            PREM_RISK_INITIAL_MIN_PTS
+            + (PREM_RISK_INITIAL_MAX_PTS - PREM_RISK_INITIAL_MIN_PTS) * premium_ratio
+        ) * expiry_factor
+        trail_points = (
+            PREM_RISK_TRAIL_MIN_PTS
+            + (PREM_RISK_TRAIL_MAX_PTS - PREM_RISK_TRAIL_MIN_PTS) * premium_ratio
+        ) * expiry_factor
+        return {
+            "initial_pct": initial_pct,
+            "initial_points": initial_points,
+            "trail_points": trail_points,
+            "expiry_factor": expiry_factor,
+        }
+
+    def get_active_tsl_pct(
+        self, now_ist: datetime, dte_days: float = 2.0,
+        is_solo: bool = False, premium: float = 0.0
+    ) -> float:
         """
         Determines the active trailing stop loss percentage:
         - Afternoon theta acceleration window (after 1:00 PM IST): 6% (0.06)
@@ -1891,20 +1928,31 @@ class RiskManager:
         - Standard dual leg deep profit floor: 8.5% (0.085)
         """
         is_after_1pm = (now_ist.hour > AFTERNOON_TSL_HOUR or (now_ist.hour == AFTERNOON_TSL_HOUR and now_ist.minute >= AFTERNOON_TSL_MINUTE))
+        profile = self._premium_risk_profile(premium, dte_days)
+        premium_floor = max(
+            PREM_SL_MIN_PCT * profile["expiry_factor"],
+            PREM_SL_MIN_PCT - 0.02 * min(
+                1.0, max(0.0, float(premium or 0.0)) / PREM_RISK_REFERENCE
+            ),
+        )
         if is_after_1pm:
-            return AFTERNOON_TSL_PCT   # 0.06 (6%)
+            return min(AFTERNOON_TSL_PCT, premium_floor)
         if is_solo:
-            return SOLO_LEG_TSL_PCT    # 0.09 (9%)
-        return PREM_SL_MIN_PCT         # 0.085 (8.5%)
+            return min(SOLO_LEG_TSL_PCT, premium_floor)
+        return premium_floor
 
     def init_dual_sl(self, leg: str, entry_spot: float, strike: float, entry_premium: float, atr: float, iv: float, dte_days: float = 2.0) -> dict:
         now_ist = get_ist_now()
         is_after_1pm = (now_ist.hour > AFTERNOON_TSL_HOUR or (now_ist.hour == AFTERNOON_TSL_HOUR and now_ist.minute >= AFTERNOON_TSL_MINUTE))
         is_expiry = (dte_days <= EXPIRY_0DTE_THRESHOLD)
-        initial_pct = PREM_SL_INITIAL_PCT_EXPIRY if (is_expiry and is_after_1pm) else PREM_SL_INITIAL_PCT
+        profile = self._premium_risk_profile(entry_premium, dte_days)
+        initial_pct = min(
+            PREM_SL_INITIAL_PCT_EXPIRY if (is_expiry and is_after_1pm) else PREM_SL_INITIAL_PCT,
+            profile["initial_pct"],
+        )
         initial_sl = round(min(
             entry_premium * (1.0 + initial_pct),
-            entry_premium + PREM_INITIAL_MAX_POINTS,
+            entry_premium + profile["initial_points"],
         ), 2)
         return {
             "entry_spot": entry_spot,
@@ -1923,7 +1971,13 @@ class RiskManager:
 
         now_ist = get_ist_now()
         is_solo = bool(sl_state.get("solo_mode", False))
-        active_tsl_pct = self.get_active_tsl_pct(now_ist, dte_days, is_solo=is_solo)
+        anchor_premium = float(
+            sl_state.get("best_premium", sl_state.get("entry_premium", current_premium))
+            or current_premium
+        )
+        active_tsl_pct = self.get_active_tsl_pct(
+            now_ist, dte_days, is_solo=is_solo, premium=anchor_premium
+        )
 
         if is_solo:
             # ─────────────────────────────────────────────────────────────
@@ -1937,7 +1991,7 @@ class RiskManager:
             best_prem = sl_state.get("best_premium", anchor_prem)
             new_trail_sl = round(min(
                 best_prem * (1.0 + active_tsl_pct),
-                best_prem + PREM_TRAIL_MAX_POINTS,
+                best_prem + self._premium_risk_profile(best_prem, dte_days)["trail_points"],
             ), 2)
 
             # High Premium & Trend-Capture Profit Protection for Solo Mode:
@@ -1986,10 +2040,14 @@ class RiskManager:
 
         is_after_1pm = (now_ist.hour > AFTERNOON_TSL_HOUR or (now_ist.hour == AFTERNOON_TSL_HOUR and now_ist.minute >= AFTERNOON_TSL_MINUTE))
         is_expiry = (dte_days <= EXPIRY_0DTE_THRESHOLD)
-        initial_pct = PREM_SL_INITIAL_PCT_EXPIRY if (is_expiry and is_after_1pm) else PREM_SL_INITIAL_PCT
+        profile = self._premium_risk_profile(entry_prem, dte_days)
+        initial_pct = min(
+            PREM_SL_INITIAL_PCT_EXPIRY if (is_expiry and is_after_1pm) else PREM_SL_INITIAL_PCT,
+            profile["initial_pct"],
+        )
         initial_sl = round(min(
             entry_prem * (1.0 + initial_pct),
-            entry_prem + PREM_INITIAL_MAX_POINTS,
+            entry_prem + profile["initial_points"],
         ), 2)
 
         if best_prem >= entry_prem:
@@ -2001,14 +2059,14 @@ class RiskManager:
             profit = entry_prem - best_prem
             profit_pct = profit / entry_prem  # 0.0 → 1.0
 
-            trail_ceiling = PREM_SL_MAX_PCT
+            trail_ceiling = min(PREM_SL_MAX_PCT, profile["initial_pct"])
             trail_floor = active_tsl_pct
             trail_pct = trail_ceiling - (trail_ceiling - trail_floor) * min(profit_pct / 0.50, 1.0)
             trail_pct = max(trail_pct, trail_floor)
 
             trail_sl = round(min(
                 best_prem * (1.0 + trail_pct),
-                best_prem + PREM_TRAIL_MAX_POINTS,
+                best_prem + self._premium_risk_profile(best_prem, dte_days)["trail_points"],
             ), 2)
 
             # ─────────────────────────────────────────────────────────
@@ -2785,7 +2843,9 @@ class ExecutionEngine:
 
         now_ist = get_ist_now()
         _, dte_days = self.market_data.streamer.get_near_expiry_dte()
-        trail_pct = self.risk_manager.get_active_tsl_pct(now_ist, dte_days, is_solo=True)
+        trail_pct = self.risk_manager.get_active_tsl_pct(
+            now_ist, dte_days, is_solo=True, premium=ltp
+        )
 
         sl_state = pos.get("dual_sl_state")
         if not sl_state:
@@ -2798,7 +2858,8 @@ class ExecutionEngine:
         # This is a new solo/strangle anchor. Do not carry forward the
         # breached stop, otherwise the open leg would trigger again
         # immediately instead of getting fresh room from the current LTP.
-        new_sl = round(ltp * (1.0 + trail_pct), 2)
+        trail_points = self.risk_manager._premium_risk_profile(ltp, dte_days)["trail_points"]
+        new_sl = round(min(ltp * (1.0 + trail_pct), ltp + trail_points), 2)
         sl_state["entry_premium"] = ltp        # Baseline anchor price when other leg exited
         sl_state["best_premium"] = ltp         # Start trailing from this exact LTP
         sl_state["current_premium_sl"] = new_sl
