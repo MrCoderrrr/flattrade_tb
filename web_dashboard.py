@@ -303,6 +303,13 @@ def update_intraday_pnl_series(current_net_mtm: float, net_pct: float):
 
 def get_history_analytics():
     pnl_data = get_pnl_tracker_data()
+    stored_ytd = float(pnl_data.get("ytd_pnl", 0.0) or 0.0)
+    stored_capital = float(pnl_data.get("current_capital", 0.0) or 0.0)
+    base_capital = float(pnl_data.get("base_capital", 0.0) or 0.0)
+    if base_capital <= 0.0 and stored_capital > 0.0:
+        base_capital = stored_capital - stored_ytd
+    if base_capital <= 0.0:
+        base_capital = 200000.0
     daily_map = dict(pnl_data.get("daily_pnl", {}))
 
     trade_csv = os.path.join(PROJECT_ROOT, "data", "logs", "trade_book", "trades_v2_paper.csv")
@@ -339,7 +346,7 @@ def get_history_analytics():
 
     for d_str in reversed(last_30_dates):
         val = float(daily_map[d_str])
-        pct_2l = (val / 200000.0) * 100.0
+        pct_2l = (val / base_capital) * 100.0
         try:
             dt = datetime.strptime(d_str, "%Y-%m-%d")
             weekday = dt.strftime("%A")
@@ -374,7 +381,7 @@ def get_history_analytics():
         item = day_of_week_map[day_name]
         cnt = item["count"]
         pnl = item["total_pnl"]
-        pct = (pnl / 200000.0) * 100.0
+        pct = (pnl / base_capital) * 100.0
         win_rate = (item["wins"] / cnt * 100.0) if cnt > 0 else 0.0
         dow_list.append({
             "day": day_name,
@@ -387,7 +394,7 @@ def get_history_analytics():
     month_list = []
     for m_name, m_data in month_map.items():
         pnl = m_data["total_pnl"]
-        pct = (pnl / 200000.0) * 100.0
+        pct = (pnl / base_capital) * 100.0
         cnt = m_data["days"]
         wr = (m_data["wins"] / cnt * 100.0) if cnt > 0 else 0.0
         month_list.append({
@@ -430,12 +437,29 @@ def get_aggregated_dashboard_state() -> dict:
     combined_realized = nifty_realized + mcx_realized
     combined_unrealized = nifty_unrealized + mcx_unrealized
     combined_net = combined_realized + combined_unrealized
-    combined_net_pct = (combined_net / 200000.0) * 100.0
 
-    base_capital = 200000.0
-    live_capital = float(pnl_data.get("current_capital", 200000.0) or 200000.0) + combined_unrealized
-    mtd_pnl = float(pnl_data.get("mtd_pnl", 0.0) or 0.0)
-    ytd_pnl = float(pnl_data.get("ytd_pnl", 0.0) or 0.0)
+    # Use the same initial capital for every return calculation. Older tracker
+    # files do not store it explicitly, so derive it from current capital less
+    # the stored YTD result (195,784 in the live strategy configuration).
+    stored_ytd = float(pnl_data.get("ytd_pnl", 0.0) or 0.0)
+    stored_capital = float(pnl_data.get("current_capital", 0.0) or 0.0)
+    base_capital = float(pnl_data.get("base_capital", 0.0) or 0.0)
+    if base_capital <= 0.0 and stored_capital > 0.0:
+        base_capital = stored_capital - stored_ytd
+    if base_capital <= 0.0:
+        base_capital = 200000.0
+
+    # The tracker commits completed sessions. Add today's live result exactly
+    # once so Live Capital, MTD and YTD all share one consistent basis.
+    today_str = str(now_ist.date())
+    tracker_includes_today = str(pnl_data.get("last_date", ""))[:10] == today_str
+    today_realized_delta = 0.0 if tracker_includes_today else combined_realized
+    stored_mtd = float(pnl_data.get("mtd_pnl", 0.0) or 0.0)
+    mtd_pnl = stored_mtd + today_realized_delta + combined_unrealized
+    ytd_pnl = stored_ytd + today_realized_delta + combined_unrealized
+    live_capital = base_capital + ytd_pnl
+    combined_net_pct = (combined_net / base_capital) * 100.0
+    capital_growth_pct = ((live_capital - base_capital) / base_capital) * 100.0
     circuit_limit = round(-live_capital * 0.018, 2)
 
     nifty_trades = int(nifty_snap.get("trades_today", 0) or 0)
@@ -575,6 +599,7 @@ def get_aggregated_dashboard_state() -> dict:
             "combined_unrealized": combined_unrealized,
             "current_capital": live_capital,
             "base_capital": base_capital,
+            "capital_growth_pct": capital_growth_pct,
             "circuit_limit": circuit_limit,
             "circuit_used_pct": min(100.0, max(0.0, (abs(combined_net) / abs(circuit_limit)) * 100.0)) if combined_net < 0 and circuit_limit != 0 else 0.0,
             "mtd_pnl": mtd_pnl,
@@ -590,7 +615,7 @@ def get_aggregated_dashboard_state() -> dict:
             "realized_pnl": nifty_realized,
             "unrealized_pnl": nifty_unrealized,
             "net_pnl": nifty_net,
-            "net_pct": (nifty_net / 200000.0) * 100.0,
+            "net_pct": (nifty_net / base_capital) * 100.0,
             "trades_today": nifty_trades,
             "regime": regime,
             "adx": adx_val,
@@ -616,7 +641,7 @@ def get_aggregated_dashboard_state() -> dict:
             "realized_pnl": mcx_realized,
             "unrealized_pnl": mcx_unrealized,
             "net_pnl": mcx_net,
-            "net_pct": (mcx_net / 200000.0) * 100.0,
+            "net_pct": (mcx_net / base_capital) * 100.0,
             "trades_today": mcx_trades,
             "reversal_latched": bool(mcx_snap.get("reversal_latched", False)),
             "cooldown_remaining": mcx_snap.get("cooldown_remaining", 0),
@@ -1995,7 +2020,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         </div>
         <div class="kpi-val" id="net-mtm-val">₹0.00</div>
         <div class="kpi-sub">
-          <span>Calculated on: <b style="color:#fff;">₹2,00,000.00 Fixed</b></span>
+          <span>Initial capital: <b id="base-capital-label" style="color:#fff;">₹2,00,000.00</b></span>
         </div>
       </div>
 
@@ -2496,6 +2521,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
 
   <script>
     let activeTab = 'nifty';
+    let dashboardBaseCapital = 200000.0;
 
     function toggleMobileDrawer() {
       const drawer = document.getElementById('mobile-drawer');
@@ -2578,7 +2604,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         const isCall = pos.leg.startsWith('CE');
         const badgeClass = pos.leg.includes('HEDGE') ? 'leg-hd' : (isCall ? 'leg-ce' : 'leg-pe');
         const pnlClass = pos.pnl >= 0 ? 'positive' : 'negative';
-        const legPct2L = (pos.pnl / 200000.0) * 100.0;
+        const legPct2L = (pos.pnl / dashboardBaseCapital) * 100.0;
         const premPct = pos.entry > 0 ? (((pos.side === 'SELL' ? (pos.entry - pos.ltp) : (pos.ltp - pos.entry)) / pos.entry) * 100.0) : 0.0;
         return `
           <tr>
@@ -2605,7 +2631,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       }
       return tradesList.map(t => {
         const pnlClass = t.pnl >= 0 ? 'positive' : 'negative';
-        const tradePct2L = (t.pnl / 200000.0) * 100.0;
+        const tradePct2L = (t.pnl / dashboardBaseCapital) * 100.0;
         return `
           <tr>
             <td style="color:var(--text-dim);">${t.time || '--'}</td>
@@ -2767,7 +2793,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         ctx.lineTo(padLeft + plotW, upperY);
         ctx.stroke();
 
-        const upperPct = (upperPnl / 200000.0) * 100.0;
+        const upperPct = (upperPnl / dashboardBaseCapital) * 100.0;
         ctx.fillStyle = '#10b981';
         ctx.fillText(`+₹${Math.round(upperPnl)} (${fmtPct(upperPct)})`, padLeft - 6, upperY + 3.5);
       }
@@ -2782,7 +2808,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         ctx.lineTo(padLeft + plotW, lowerY);
         ctx.stroke();
 
-        const lowerPct = (lowerPnl / 200000.0) * 100.0;
+        const lowerPct = (lowerPnl / dashboardBaseCapital) * 100.0;
         ctx.fillStyle = '#f43f5e';
         ctx.fillText(`-₹${Math.abs(Math.round(lowerPnl))} (${fmtPct(lowerPct)})`, padLeft - 6, lowerY + 3.5);
       }
@@ -3144,6 +3170,9 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
 
       // KPI Performance
       const p = data.performance || {};
+      dashboardBaseCapital = parseFloat(p.base_capital) > 0 ? parseFloat(p.base_capital) : 200000.0;
+      const baseCapitalEl = document.getElementById('base-capital-label');
+      if (baseCapitalEl) baseCapitalEl.innerText = fmtINR(dashboardBaseCapital);
       const netMtm = p.combined_net_mtm || 0.0;
       const netPct = p.combined_net_pct || 0.0;
 
@@ -3155,8 +3184,8 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       netPctEl.innerText = fmtPct(netPct);
       netPctEl.className = 'tag-pct ' + (netPct >= 0 ? 'pos' : 'neg');
 
-      // Realized with % on 2L
-      const realPct = (p.combined_realized / 200000.0) * 100.0;
+      // Realized with % on initial capital
+      const realPct = (p.combined_realized / dashboardBaseCapital) * 100.0;
       const realEl = document.getElementById('realized-val');
       realEl.innerText = fmtINR(p.combined_realized, true);
       applyClass(realEl, p.combined_realized);
@@ -3166,8 +3195,8 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         realPctEl.className = 'tag-pct ' + (realPct >= 0 ? 'pos' : 'neg');
       }
 
-      // Unrealized with % on 2L
-      const unrealPct = (p.combined_unrealized / 200000.0) * 100.0;
+      // Unrealized with % on initial capital
+      const unrealPct = (p.combined_unrealized / dashboardBaseCapital) * 100.0;
       const unrealEl = document.getElementById('unrealized-val');
       unrealEl.innerText = fmtINR(p.combined_unrealized, true);
       applyClass(unrealEl, p.combined_unrealized);
@@ -3177,10 +3206,12 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         unrealPctEl.style.color = unrealPct >= 0 ? 'var(--green)' : 'var(--red)';
       }
 
-      // Capital return % on 2L
+      // Capital return uses exactly the same initial-capital denominator as MTD.
       document.getElementById('capital-val').innerText = fmtINR(p.current_capital);
       document.getElementById('circuit-val').innerText = fmtINR(p.circuit_limit);
-      const capRetPct = ((p.current_capital - 200000.0) / 200000.0) * 100.0;
+      const capRetPct = (p.capital_growth_pct !== undefined)
+        ? parseFloat(p.capital_growth_pct)
+        : ((p.current_capital - dashboardBaseCapital) / dashboardBaseCapital) * 100.0;
       const capRetEl = document.getElementById('capital-return-pct');
       if (capRetEl) {
         capRetEl.innerText = `${fmtPct(capRetPct)} Growth`;
@@ -3191,8 +3222,8 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       document.getElementById('circuit-fill-bar').style.width = `${Math.min(100, usedPct)}%`;
       document.getElementById('circuit-used-text').innerText = `${usedPct.toFixed(1)}% Used`;
 
-      // MTD with % on 2L
-      const mtdPct = (p.mtd_pnl / 200000.0) * 100.0;
+      // MTD with the same initial-capital denominator as Live Capital Growth.
+      const mtdPct = (p.mtd_pnl / dashboardBaseCapital) * 100.0;
       const mtdEl = document.getElementById('mtd-val');
       mtdEl.innerText = fmtINR(p.mtd_pnl, true);
       applyClass(mtdEl, p.mtd_pnl);
@@ -3202,8 +3233,8 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         mtdPctEl.className = 'tag-pct ' + (mtdPct >= 0 ? 'pos' : 'neg');
       }
 
-      // YTD with % on 2L
-      const ytdPct = (p.ytd_pnl / 200000.0) * 100.0;
+      // YTD with the same initial-capital denominator.
+      const ytdPct = (p.ytd_pnl / dashboardBaseCapital) * 100.0;
       const ytdEl = document.getElementById('ytd-val');
       ytdEl.innerText = fmtINR(p.ytd_pnl, true);
       applyClass(ytdEl, p.ytd_pnl);
@@ -3237,8 +3268,8 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       document.getElementById('n-net-pct').innerText = fmtPct(n.net_pct);
       document.getElementById('n-trades').innerText = n.trades_today || 0;
 
-      const nRealPct = (n.realized_pnl / 200000.0) * 100.0;
-      const nUnrealPct = (n.unrealized_pnl / 200000.0) * 100.0;
+      const nRealPct = (n.realized_pnl / dashboardBaseCapital) * 100.0;
+      const nUnrealPct = (n.unrealized_pnl / dashboardBaseCapital) * 100.0;
       document.getElementById('n-realized').innerText = `${fmtINR(n.realized_pnl, true)} (${fmtPct(nRealPct)})`;
       document.getElementById('n-unrealized').innerText = `${fmtINR(n.unrealized_pnl, true)} (${fmtPct(nUnrealPct)})`;
 
@@ -3272,8 +3303,8 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       document.getElementById('m-net-pct').innerText = fmtPct(m.net_pct);
       document.getElementById('m-trades').innerText = m.trades_today || 0;
 
-      const mRealPct = (m.realized_pnl / 200000.0) * 100.0;
-      const mUnrealPct = (m.unrealized_pnl / 200000.0) * 100.0;
+      const mRealPct = (m.realized_pnl / dashboardBaseCapital) * 100.0;
+      const mUnrealPct = (m.unrealized_pnl / dashboardBaseCapital) * 100.0;
       const mRealEl = document.getElementById('m-realized');
       if (mRealEl) mRealEl.innerText = `${fmtINR(m.realized_pnl, true)} (${fmtPct(mRealPct)})`;
       const mUnrealEl = document.getElementById('m-unrealized');
