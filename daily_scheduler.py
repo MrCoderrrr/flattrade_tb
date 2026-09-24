@@ -3,7 +3,7 @@
 📅 DAILY PAPER TRADING SESSION SCHEDULER (NIFTY & MCX)
 ================================================================================
 Automatically manages the lifecycle of paper trading engines in IST:
-- NIFTY Engine (nifty_paper_v3.py): Mon-Fri 09:15 - 15:35 IST
+- NIFTY Engine (upv3_paper.py): Mon-Fri 09:15 - 15:35 IST
 - MCX Engine (mcx_paper_v5.py): Mon-Fri 15:30 - 23:25 IST
 Includes:
 - Single-instance process lock (/tmp/trading_daily_scheduler.lock)
@@ -178,7 +178,7 @@ def main() -> None:
             nifty_active = is_nifty_session(now)
             mcx_active = is_mcx_session(now)
 
-            proc_nifty = manage_engine("NIFTY", "nifty_paper_v3.py", "nifty.log", nifty_active, proc_nifty)
+            proc_nifty = manage_engine("NIFTY", "upv3_paper.py", "nifty.log", nifty_active, proc_nifty)
             proc_mcx = manage_engine("MCX Natural Gas", "mcx_paper_v5.py", "mcx.log", mcx_active, proc_mcx)
 
             time.sleep(15)

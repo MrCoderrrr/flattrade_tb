@@ -615,7 +615,7 @@ def get_aggregated_dashboard_state() -> dict:
     trade_analytics = None
 
     scheduler_running = check_process_running("daily_scheduler.py")
-    nifty_running = check_process_running("nifty_paper_v3.py") or check_process_running("upv2_paper.py")
+    nifty_running = check_process_running("upv3_paper.py") or check_process_running("nifty_paper_v3.py") or check_process_running("upv2_paper.py")
     mcx_running = check_process_running("mcx_paper_v5.py")
 
     hhmm = now_ist.strftime("%H:%M")
