@@ -742,6 +742,7 @@ def get_aggregated_dashboard_state() -> dict:
     # 3. Single Shared Capital Account
     # Both NIFTY and MCX reuse the exact same initial account capital (not separate funds)
     account_initial_capital = 195784.0
+    combined_net_pct = (combined_net / account_initial_capital) * 100.0 if account_initial_capital else 0.0
     combined_mtd_pnl = round(nifty_mtd_pnl + mcx_mtd_pnl, 2)
     combined_ytd_pnl = round(nifty_ytd_pnl + mcx_ytd_pnl, 2)
 
