@@ -462,7 +462,7 @@ MARKET_INTRADAY_SERIES = {"NIFTY": [], "MCX": []}
 MARKET_INTRADAY_DATES = {"NIFTY": None, "MCX": None}
 MARKET_INTRADAY_FILE = os.path.join(PROJECT_ROOT, "market_intraday_series.json")
 
-def update_market_intraday_series(market, current_net_mtm, net_pct, start_hour, start_minute, end_hour, end_minute):
+def update_market_intraday_series(market, current_net_mtm, net_pct, start_hour, start_minute, end_hour, end_minute, seed_series=None):
     """Maintain a persisted per-market intraday curve for the UI."""
     now = get_ist_now()
     today_str = str(now.date())
@@ -477,7 +477,10 @@ def update_market_intraday_series(market, current_net_mtm, net_pct, start_hour, 
         saved = load_json_safe(MARKET_INTRADAY_FILE, {})
         saved_series = saved.get(today_str, {}).get(market_key, []) if isinstance(saved, dict) else []
         MARKET_INTRADAY_DATES[market_key] = today_str
-        MARKET_INTRADAY_SERIES[market_key] = [p for p in saved_series[-5000:] if isinstance(p, dict)]
+        seed_points = seed_series if isinstance(seed_series, list) else []
+        source_series = [p for p in (saved_series + seed_points) if isinstance(p, dict)]
+        source_series.sort(key=lambda p: float(p.get("ts", 0.0) or 0.0))
+        MARKET_INTRADAY_SERIES[market_key] = source_series[-5000:]
     session_start = start_hour * 60 + start_minute
     session_end = end_hour * 60 + end_minute
     now_minutes = now.hour * 60 + now.minute + now.second / 60.0
@@ -830,6 +833,9 @@ def get_aggregated_dashboard_state() -> dict:
             sl_state = pos.get("dual_sl_state", {})
             current_sl = float(sl_state.get("current_premium_sl", 0.0) or 0.0)
             is_solo = bool(sl_state.get("solo_mode", False))
+            best_price = pos.get("best_price")
+            if best_price is None:
+                best_price = sl_state.get("best_premium", sl_state.get("entry_premium"))
 
             nifty_positions.append({
                 "market": "NIFTY",
@@ -839,7 +845,10 @@ def get_aggregated_dashboard_state() -> dict:
                 "side": side,
                 "qty": qty,
                 "entry": entry,
-                "best_price": (pos.get("best_price") if pos.get("best_price") is not None else sl_state.get("best_premium")),
+                "best_price": best_price,
+                "reconstruction_count": int(pos.get("reconstruction_count", 0) or 0),
+                "pnl_realization_status": pos.get("pnl_realization_status", "PENDING_UNTIL_SQUARE_OFF") if side == "SELL" else None,
+                "last_reconstructed_at": pos.get("last_reconstructed_at"),
                 "ltp": ltp,
                 "sl": current_sl,
                 "pnl": pnl,
@@ -852,6 +861,10 @@ def get_aggregated_dashboard_state() -> dict:
     raw_mcx_pos = mcx_snap.get("positions", [])
     if isinstance(raw_mcx_pos, list):
         for pos in raw_mcx_pos:
+            mcx_sl_state = pos.get("sl_state", {}) or {}
+            mcx_best_price = pos.get("best_price")
+            if mcx_best_price is None:
+                mcx_best_price = mcx_sl_state.get("best_premium", mcx_sl_state.get("entry_premium"))
             mcx_positions.append({
                 "market": "MCX",
                 "leg": pos.get("leg", "CE"),
@@ -860,7 +873,10 @@ def get_aggregated_dashboard_state() -> dict:
                 "side": pos.get("side", "SELL"),
                 "qty": pos.get("qty"),
                 "entry": float(pos.get("entry", 0.0) or 0.0),
-                "best_price": (pos.get("best_price") if pos.get("best_price") is not None else (pos.get("sl_state", {}) or {}).get("best_premium")),
+                "best_price": mcx_best_price,
+                "reconstruction_count": int(pos.get("reconstruction_count", 0) or 0),
+                "pnl_realization_status": pos.get("pnl_realization_status", "PENDING_UNTIL_SQUARE_OFF") if pos.get("side", "SELL") == "SELL" else None,
+                "last_reconstructed_at": pos.get("last_reconstructed_at"),
                 "ltp": float(pos.get("ltp", 0.0) or 0.0),
                 "sl": float(pos.get("sl", 0.0) or 0.0),
                 "pnl": float(pos.get("pnl", 0.0) or 0.0),
@@ -872,6 +888,9 @@ def get_aggregated_dashboard_state() -> dict:
             entry = float(pos.get("entry_price", 0.0) or 0.0)
             ltp = float(pos.get("_last_ltp", entry) or entry)
             sl_state = pos.get("sl_state", {})
+            best_price = pos.get("best_price")
+            if best_price is None:
+                best_price = sl_state.get("best_premium", sl_state.get("entry_premium"))
             mcx_positions.append({
                 "market": "MCX",
                 "leg": leg,
@@ -880,7 +899,10 @@ def get_aggregated_dashboard_state() -> dict:
                 "side": pos.get("side", "SELL"),
                 "qty": pos.get("qty"),
                 "entry": entry,
-                "best_price": (pos.get("best_price") if pos.get("best_price") is not None else sl_state.get("best_premium")),
+                "best_price": best_price,
+                "reconstruction_count": int(pos.get("reconstruction_count", 0) or 0),
+                "pnl_realization_status": pos.get("pnl_realization_status", "PENDING_UNTIL_SQUARE_OFF") if pos.get("side", "SELL") == "SELL" else None,
+                "last_reconstructed_at": pos.get("last_reconstructed_at"),
                 "ltp": ltp,
                 "sl": float(sl_state.get("current_sl", 0.0) or 0.0),
                 "pnl": (float(((entry - ltp) if pos.get("side") == "SELL" else (ltp - entry)) * pos.get("qty"))
@@ -939,7 +961,8 @@ def get_aggregated_dashboard_state() -> dict:
     mcx_sig_str = ("BULLISH ▲" if mcx_sig > 0 else ("BEARISH ▼" if mcx_sig < 0 else "FLAT ━")) if mcx_sig is not None else None
 
     nifty_intraday_series = update_market_intraday_series(
-        "NIFTY", nifty_net, (nifty_net / base_capital) * 100.0 if base_capital else None, 9, 15, 15, 35
+        "NIFTY", nifty_net, (nifty_net / base_capital) * 100.0 if base_capital else None, 9, 15, 15, 35,
+        seed_series=nifty_snap.get("intraday_series")
     )
     mcx_intraday_series = update_market_intraday_series(
         "MCX", mcx_net, (mcx_net / base_capital) * 100.0 if base_capital else None, 16, 0, 23, 24
@@ -3169,12 +3192,16 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
             <td><span class="${pos.side === 'SELL' ? 'side-sell' : 'side-buy'}">${pos.side}</span></td>
             <td>${pos.qty}</td>
             <td>₹${parseFloat(pos.entry).toFixed(2)}</td>
-            <td>${dataOrNA(pos.best_price, v => '₹' + Number(v).toFixed(2))}</td>
+            <td title="${pos.last_reconstructed_at ? `Reset at ${pos.last_reconstructed_at}` : 'Current lowest premium used by TSL'}">
+              <b style="color:var(--amber);">${dataOrNA(pos.best_price, v => '₹' + Number(v).toFixed(2))}</b>
+              ${pos.reconstruction_count > 0 ? `<div style="font-size:0.62rem; color:var(--cyan);">RESET #${pos.reconstruction_count}</div>` : ''}
+            </td>
             <td><b style="color:#fff;">₹${parseFloat(pos.ltp).toFixed(2)}</b></td>
             <td style="color:var(--text-muted);">${pos.sl > 0 ? '₹' + parseFloat(pos.sl).toFixed(2) : '—'}</td>
             <td style="text-align:right;" class="${pnlClass}">
               <div style="font-weight:800; font-size:0.95rem;">${fmtINR(pos.pnl, true)}</div>
               <div style="font-size:0.73rem; font-weight:700; opacity:0.9; margin-top:2px;">${fmtPct(legPct2L)} on 2L <span style="opacity:0.75;">(${fmtPct(premPct)} prem)</span></div>
+              ${pos.pnl_realization_status === 'PENDING_UNTIL_SQUARE_OFF' && pos.reconstruction_count > 0 ? '<div style="font-size:0.62rem; color:var(--amber); margin-top:2px;">PENDING UNTIL SQUARE-OFF</div>' : ''}
             </td>
           </tr>
         `;

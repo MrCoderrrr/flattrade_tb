@@ -2155,6 +2155,8 @@ class ExecutionEngine:
         self.strangle_resets_today = 0
         self.trades_today = 0
         self.trade_log: List[Dict] = []  # In-memory per-session trade record for EOD summary
+        self.intraday_series_date = None
+        self.intraday_pnl_series: List[Dict[str, Any]] = []
         
         self.last_reconciliation = 0
         self.last_feed_tick = 0
@@ -2609,6 +2611,9 @@ class ExecutionEngine:
             if getattr(self, 'session_em_1sd', 0) > 0:
                 current_iv = (self.session_em_1sd / spot) * 19.1 * 100.0
             pos_info["dual_sl_state"] = self.risk_manager.init_dual_sl(leg, spot, strike, ltp, atr, current_iv, dte_days)
+            # Best premium is a live trailing anchor, not realized P&L.
+            pos_info["best_price"] = ltp
+            pos_info["reconstruction_count"] = 0
             
         self.positions[leg] = pos_info
         log_trade(f"ENTERED {leg:10s} Strike: {strike} {side} @ ₹{ltp:.2f} (Qty: {qty}) [{tsym}]")
@@ -2802,6 +2807,7 @@ class ExecutionEngine:
         sl_state["solo_anchor_time"] = time.time()
         sl_state["solo_trail_pct"] = trail_pct
         sl_state["breach_count"] = 0
+        pos["best_price"] = ltp
 
         log_alert(
             f"🎯 [SOLO LEG TSL ANCHORED] {surviving_leg} anchored at LTP ₹{ltp:.2f} (Other leg removed). "
@@ -2983,7 +2989,8 @@ class ExecutionEngine:
             log_warn(f"⚠️ Entry of missing {other_leg} failed, falling back to standard leg exit.")
             return False
 
-        # 3. Log recalibration for solo_leg (PnL stays in the leg, not locked into realized)
+        # 3. Log recalibration only. The short leg remains open, so this P&L
+        # stays unrealized/pending and is realized only by _exit_leg.
         old_entry = float(pos.get("entry_price", ltp_premium))
         close_qty = int(pos.get("qty", self.qty))
         unreal_pnl = (old_entry - ltp_premium) * close_qty
@@ -2994,10 +3001,18 @@ class ExecutionEngine:
             f"RECALIBRATE ROLL {solo_leg:10s} Strike: {pos['strike']} @ ₹{ltp_premium:.2f} | "
             f"Unrealized P&L in leg: {col}{sign}₹{unreal_pnl:,.2f}{Style.RESET_ALL} (Saved Exit+Entry Slippage)"
         )
-        self._log_trade("RECALIBRATE_ROLL", solo_leg, pos["strike"], "HOLD", close_qty, ltp_premium, pnl=unreal_pnl, reason="IN_PLACE_STRANGLE_REBALANCE")
+        # Do not write this mark-to-market amount into the realized-P&L column
+        # of the trade book. It is still attached to the open leg and will be
+        # calculated once, at the eventual square-off.
+        self._log_trade("RECALIBRATE_ROLL", solo_leg, pos["strike"], "HOLD", close_qty, ltp_premium, pnl=None, reason="IN_PLACE_STRANGLE_REBALANCE_PENDING")
 
-        # 4. Refresh solo_leg SL/TSL to fresh strangle state (preserve original entry_price & leg PnL)
+        # 4. Refresh the SL/TSL while preserving the original entry price for
+        # eventual square-off P&L. Restart the best-premium trail at this LTP.
         pos["peak_premium"] = ltp_premium
+        pos["best_price"] = ltp_premium
+        pos["reconstruction_count"] = int(pos.get("reconstruction_count", 0) or 0) + 1
+        pos["last_reconstructed_at"] = get_ist_now().strftime("%Y-%m-%d %H:%M:%S")
+        pos["pnl_realization_status"] = "PENDING_UNTIL_SQUARE_OFF"
         current_iv = 15.0
         if getattr(self, 'session_em_1sd', 0) > 0:
             current_iv = (self.session_em_1sd / spot) * 19.1 * 100.0
@@ -3153,6 +3168,12 @@ class ExecutionEngine:
                 pnl = ((pos["entry_price"] - ltp) if is_short else (ltp - pos["entry_price"])) * pos["qty"]
                 unrealized += pnl
 
+                sl_state = pos.get("dual_sl_state")
+                if sl_state and is_short:
+                    # Publish the exact risk-engine anchor used for the TSL.
+                    pos["best_price"] = float(sl_state.get("best_premium", sl_state.get("entry_premium", ltp)) or ltp)
+                    pos["pnl_realization_status"] = pos.get("pnl_realization_status", "PENDING_UNTIL_SQUARE_OFF")
+
                 pos_copy = pos.copy()
                 pos_copy["ltp"] = ltp
                 pos_copy["pnl"] = pnl
@@ -3162,7 +3183,6 @@ class ExecutionEngine:
                 pnl_col = c_green if pnl >= 0 else c_red
                 sign = "+" if pnl >= 0 else ""
                 
-                sl_state = pos.get("dual_sl_state")
                 if sl_state and is_short:
                     entry_spot_str = f"{sl_state.get('best_premium', sl_state.get('entry_premium', 0.0)):.2f}"
                     spot_sl_str = f"{sl_state.get('current_premium_sl', 0.0):.2f}"
@@ -3242,6 +3262,26 @@ class ExecutionEngine:
         print(BOT)
         sys.stdout.flush()
 
+        # Persist the NIFTY curve in the strategy snapshot as well as in the
+        # web sampler. This preserves the line across a dashboard restart.
+        series_now = get_ist_now()
+        series_date = str(series_now.date())
+        if self.intraday_series_date != series_date:
+            self.intraday_series_date = series_date
+            self.intraday_pnl_series = []
+        series_minutes = series_now.hour * 60 + series_now.minute + series_now.second / 60.0
+        if 555 <= series_minutes <= 935 and (
+                not self.intraday_pnl_series or
+                time.time() - float(self.intraday_pnl_series[-1].get("ts", 0.0)) >= 4.0):
+            self.intraday_pnl_series.append({
+                "time": series_now.strftime("%H:%M:%S"),
+                "time_short": series_now.strftime("%H:%M"),
+                "pnl": round(today_net_mtm, 2),
+                "pct": round(ret_pct, 4),
+                "ts": time.time(),
+            })
+            self.intraday_pnl_series = self.intraday_pnl_series[-5000:]
+
         try:
             snap = {
                 "timestamp": get_ist_now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -3274,7 +3314,8 @@ class ExecutionEngine:
                 "positions": snap_positions,
                 "cooldown": self.cooldown_tracker,
                 "trades_today": getattr(self, "trades_today", 0),
-                "trade_log": getattr(self, "trade_log", [])
+                "trade_log": getattr(self, "trade_log", []),
+                "intraday_series": self.intraday_pnl_series
             }
             with open(self.live_snap_file, "w") as sf:
                 json.dump(snap, sf, indent=2)
