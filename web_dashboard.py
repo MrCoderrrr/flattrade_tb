@@ -2327,10 +2327,10 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
 
     <!-- Persisted trade intelligence -->
     <div class="trade-stats-grid" aria-label="Trade performance statistics">
-      <div class="trade-stat-card"><span>WIN RATE</span><strong id="stat-win-rate">0.0%</strong><small id="stat-win-detail">0 wins / 0 losses</small></div>
+      <div class="trade-stat-card"><span>WIN RATE • LEDGER</span><strong id="stat-win-rate">0.0%</strong><small id="stat-win-detail">0 wins / 0 losses</small></div>
       <div class="trade-stat-card"><span>RISK : REWARD</span><strong id="stat-risk-reward">0.00 : 1</strong><small>Average win ÷ average loss</small></div>
       <div class="trade-stat-card"><span>MAX DRAWDOWN</span><strong id="stat-max-dd">₹0.00</strong><small id="stat-max-dd-pct">0.00% of initial capital</small></div>
-      <div class="trade-stat-card"><span>LEDGER TRADES</span><strong id="stat-trade-count">0</strong><small id="stat-profit-factor">0 completed today • Profit factor 0.00</small></div>
+      <div class="trade-stat-card"><span>TODAY COMPLETED</span><strong id="stat-trade-count">0</strong><small id="stat-profit-factor">0 in ledger • Profit factor 0.00</small></div>
     </div>
 
     <!-- ═══════════════════════════════════════════════════════════════════════ -->
@@ -3597,12 +3597,13 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       const allStats = analytics.all || {};
       const setStat = (id, value) => { const el = document.getElementById(id); if (el) el.innerText = value; };
       setStat('stat-win-rate', `${(allStats.win_pct || 0).toFixed(1)}%`);
-      setStat('stat-win-detail', `${allStats.wins || 0} wins / ${allStats.losses || 0} losses`);
+      const todayStats = analytics.today || {};
+      setStat('stat-win-detail', `${allStats.wins || 0} wins / ${allStats.losses || 0} losses • today ${(todayStats.win_pct || 0).toFixed(1)}%`);
       setStat('stat-risk-reward', `${(allStats.risk_reward || 0).toFixed(2)} : 1`);
       setStat('stat-max-dd', fmtINR(allStats.max_drawdown || 0, true));
       setStat('stat-max-dd-pct', `${(allStats.max_drawdown_pct || 0).toFixed(2)}% of initial capital`);
-      setStat('stat-trade-count', `${allStats.count || 0}`);
-      setStat('stat-profit-factor', `${(analytics.today?.count || 0)} today • Profit factor ${allStats.profit_factor == null ? '∞' : (allStats.profit_factor || 0).toFixed(2)}`);
+      setStat('stat-trade-count', `${todayStats.count || 0}`);
+      setStat('stat-profit-factor', `${allStats.count || 0} in ledger • Profit factor ${allStats.profit_factor == null ? '∞' : (allStats.profit_factor || 0).toFixed(2)}`);
 
       // ── NIFTY TAB DATA ──
       const n = data.nifty || {};
