@@ -1387,7 +1387,7 @@ class NaturalGasPaperBot:
                     row = (f"  {WH}{leg_label:<6}{RS} {VS} {CY}{r['tsym']:<22}{RS} {VS} {WH}{int(r['strike']):>7}{RS} {VS} "
                            f"{side_col}{r['side']:<5}{RS} {VS} "
                            f"{WH}{r['entry']:>8.2f}{RS} {VS} "
-                           f"{DIM}{r['best']:>10.2f}{RS} {VS} "
+                           f"{DIM}{r['best_price']:>10.2f}{RS} {VS} "
                            f"{YL}{r['ltp']:>8.2f}{RS} {VS} "
                            f"{MG}{r['sl']:>9.2f}{RS} {VS} "
                            f"  {pnl_col}{pnl_fmt}{RS}  ")
