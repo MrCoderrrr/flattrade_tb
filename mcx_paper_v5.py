@@ -1294,7 +1294,7 @@ class NaturalGasPaperBot:
                 'strike': pos['strike'],
                 'side': pos['side'],
                 'entry': pos['entry_price'],
-                'best': best,
+                'best_price': best,
                 'ltp': ltp,
                 'sl': sl,
                 'pnl': pnl,
