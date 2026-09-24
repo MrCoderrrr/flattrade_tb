@@ -621,14 +621,19 @@ def get_aggregated_dashboard_state() -> dict:
     hhmm = now_ist.strftime("%H:%M")
     is_weekday = now_ist.weekday() < 5
     nifty_session_active = is_weekday and "09:15" <= hhmm < "15:35"
-    mcx_session_active = is_weekday and "16:00" <= hhmm <= "23:24"
+    mcx_session_active = is_weekday and "15:30" <= hhmm <= "23:24"
 
     nifty_realized = float(nifty_snap.get("realized_pnl", 0.0) or 0.0)
     nifty_unrealized = float(nifty_snap.get("unrealized_pnl", 0.0) or 0.0)
+    if not nifty_session_active and not nifty_running:
+        # Session ended: all positions exited at 15:34, unrealized strictly 0
+        nifty_unrealized = 0.0
     nifty_net = nifty_realized + nifty_unrealized
 
     mcx_realized = float(mcx_snap.get("realized_pnl", mcx_snap.get("total_realized_pnl", 0.0)) or 0.0)
     mcx_unrealized = float(mcx_snap.get("unrealized_pnl", 0.0) or 0.0)
+    if not mcx_session_active and not mcx_running:
+        mcx_unrealized = 0.0
     mcx_net = float(mcx_snap.get("net_pnl", mcx_realized + mcx_unrealized) or 0.0)
 
     combined_realized = nifty_realized + mcx_realized
@@ -647,11 +652,12 @@ def get_aggregated_dashboard_state() -> dict:
         base_capital = None
     trade_analytics = get_trade_analytics(nifty_snap, mcx_snap, base_capital)
 
-    # The tracker commits completed sessions. Add today's live result exactly
-    # once so Live Capital, MTD and YTD all share one consistent basis.
+    # The tracker commits completed sessions. Add today's live uncommitted result
+    # so Live Capital, MTD and YTD all share one consistent basis across NIFTY + MCX.
     today_str = str(now_ist.date())
     tracker_includes_today = str(pnl_data.get("last_date", ""))[:10] == today_str
-    today_realized_delta = 0.0 if tracker_includes_today else combined_realized
+    stored_today_realized = float(pnl_data.get("daily_pnl", {}).get(today_str, 0.0) or 0.0)
+    today_realized_delta = (combined_realized - stored_today_realized) if tracker_includes_today else combined_realized
     stored_mtd = float(pnl_data.get("mtd_pnl", 0.0) or 0.0)
     mtd_pnl = stored_mtd + today_realized_delta + combined_unrealized
     ytd_pnl = stored_ytd + today_realized_delta + combined_unrealized
@@ -795,7 +801,7 @@ def get_aggregated_dashboard_state() -> dict:
         "NIFTY", nifty_net, (nifty_net / base_capital) * 100.0 if base_capital else None, 9, 15, 15, 35
     )
     mcx_intraday_series = update_market_intraday_series(
-        "MCX", mcx_net, (mcx_net / base_capital) * 100.0 if base_capital else None, 16, 0, 23, 24
+        "MCX", mcx_net, (mcx_net / base_capital) * 100.0 if base_capital else None, 15, 30, 23, 24
     )
 
     return {
@@ -2250,24 +2256,24 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       <!-- Net MTM PnL -->
       <div class="kpi-card">
         <div class="kpi-label">
-          <span>Net MTM P&L</span>
+          <span id="kpi-net-title">Net MTM P&L</span>
           <span class="tag-pct" id="net-mtm-pct">+0.00%</span>
         </div>
         <div class="kpi-val" id="net-mtm-val">₹0.00</div>
         <div class="kpi-sub">
-          <span>Initial capital: <b id="base-capital-label" style="color:#fff;">₹2,00,000.00</b></span>
+          <span><span id="kpi-capital-sub-label">Initial capital</span>: <b id="base-capital-label" style="color:#fff;">₹2,00,000.00</b></span>
         </div>
       </div>
 
       <!-- Realized vs Unrealized -->
       <div class="kpi-card">
         <div class="kpi-label">
-          <span>Realized Booked</span>
+          <span id="kpi-realized-title">Realized Booked</span>
           <span class="tag-pct" id="realized-pct">+0.00%</span>
         </div>
         <div class="kpi-val" id="realized-val">₹0.00</div>
         <div class="kpi-sub">
-          <span>Floating MTM: <b id="unrealized-val" style="color:#fff;">₹0.00</b> <span id="unrealized-pct" style="font-weight:700;">(+0.00%)</span></span>
+          <span><span id="kpi-unrealized-label">Floating MTM</span>: <b id="unrealized-val" style="color:#fff;">₹0.00</b> <span id="unrealized-pct" style="font-weight:700;">(+0.00%)</span></span>
         </div>
       </div>
 
@@ -2820,8 +2826,163 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         if (dBtn) dBtn.classList.add('active-overview');
       }
       closeMobileDrawer();
-      if (typeof updateLiveChartFromState === 'function') {
+      if (lastDashboardData) {
+        updateTabKPIs(lastDashboardData);
         updateLiveChartFromState();
+      }
+    }
+
+    function updateTabKPIs(data) {
+      if (!data) return;
+      const p = data.performance || {};
+      const n = data.nifty || {};
+      const m = data.mcx || {};
+      const sys = data.system || {};
+
+      dashboardBaseCapital = (p.base_capital && parseFloat(p.base_capital) > 0) ? parseFloat(p.base_capital) : 200000.0;
+      const baseCap = dashboardBaseCapital;
+
+      let netMtm = 0.0;
+      let netPct = 0.0;
+      let realPnl = 0.0;
+      let unrealPnl = 0.0;
+      let netTitle = 'Net MTM P&L';
+      let realTitle = 'Realized Booked';
+      let unrealLabel = 'Floating MTM';
+      let capSubLabel = 'Initial capital';
+      let capSubValue = fmtINR(baseCap);
+      let tradeCount = 0;
+
+      if (activeTab === 'nifty') {
+        netMtm = Number.isFinite(Number(n.net_pnl)) ? Number(n.net_pnl) : 0.0;
+        netPct = Number.isFinite(Number(n.net_pct)) ? Number(n.net_pct) : (netMtm / baseCap) * 100.0;
+        realPnl = Number.isFinite(Number(n.realized_pnl)) ? Number(n.realized_pnl) : 0.0;
+        unrealPnl = Number.isFinite(Number(n.unrealized_pnl)) ? Number(n.unrealized_pnl) : 0.0;
+        netTitle = sys.nifty_session_active ? 'NIFTY Net MTM' : 'NIFTY Net MTM (Session Locked)';
+        realTitle = 'NIFTY Realized';
+        unrealLabel = 'NIFTY Floating';
+        capSubLabel = 'NIFTY Session';
+        capSubValue = sys.nifty_session_active ? '09:15 - 15:35 Active' : '09:15 - 15:35 Final Exit Locked';
+        tradeCount = n.trades_today || (n.trades || []).length || 0;
+      } else if (activeTab === 'mcx') {
+        netMtm = Number.isFinite(Number(m.net_pnl)) ? Number(m.net_pnl) : 0.0;
+        netPct = Number.isFinite(Number(m.net_pct)) ? Number(m.net_pct) : (netMtm / baseCap) * 100.0;
+        realPnl = Number.isFinite(Number(m.realized_pnl)) ? Number(m.realized_pnl) : 0.0;
+        unrealPnl = Number.isFinite(Number(m.unrealized_pnl)) ? Number(m.unrealized_pnl) : 0.0;
+        netTitle = sys.mcx_session_active ? 'MCX Net MTM (Live)' : 'MCX Net MTM';
+        realTitle = 'MCX Realized';
+        unrealLabel = 'MCX Floating';
+        capSubLabel = 'MCX Session';
+        capSubValue = sys.mcx_session_active ? '15:30 - 23:24 Live Momentum' : '15:30 - 23:24 Standby';
+        tradeCount = m.trades_today || (m.trades || []).length || 0;
+      } else {
+        // Unified overview
+        netMtm = Number.isFinite(Number(p.combined_net_mtm)) ? Number(p.combined_net_mtm) : 0.0;
+        netPct = Number.isFinite(Number(p.combined_net_pct)) ? Number(p.combined_net_pct) : (netMtm / baseCap) * 100.0;
+        realPnl = Number.isFinite(Number(p.combined_realized)) ? Number(p.combined_realized) : 0.0;
+        unrealPnl = Number.isFinite(Number(p.combined_unrealized)) ? Number(p.combined_unrealized) : 0.0;
+        netTitle = 'Unified Net MTM (NIFTY + MCX)';
+        realTitle = 'Unified Realized';
+        unrealLabel = 'Unified Floating';
+        capSubLabel = 'Initial capital';
+        capSubValue = fmtINR(baseCap);
+        tradeCount = p.total_trades || 0;
+      }
+
+      const netTitleEl = document.getElementById('kpi-net-title');
+      if (netTitleEl) netTitleEl.innerText = netTitle;
+      const netEl = document.getElementById('net-mtm-val');
+      if (netEl) {
+        netEl.innerText = fmtINR(netMtm, true);
+        applyClass(netEl, netMtm);
+      }
+      const netPctEl = document.getElementById('net-mtm-pct');
+      if (netPctEl) {
+        netPctEl.innerText = fmtPct(netPct);
+        netPctEl.className = 'tag-pct ' + (netPct >= 0 ? 'pos' : 'neg');
+      }
+
+      const realTitleEl = document.getElementById('kpi-realized-title');
+      if (realTitleEl) realTitleEl.innerText = realTitle;
+      const realEl = document.getElementById('realized-val');
+      if (realEl) {
+        realEl.innerText = fmtINR(realPnl, true);
+        applyClass(realEl, realPnl);
+      }
+      const realPct = (realPnl / baseCap) * 100.0;
+      const realPctEl = document.getElementById('realized-pct');
+      if (realPctEl) {
+        realPctEl.innerText = fmtPct(realPct);
+        realPctEl.className = 'tag-pct ' + (realPct >= 0 ? 'pos' : 'neg');
+      }
+
+      const unrealLabelEl = document.getElementById('kpi-unrealized-label');
+      if (unrealLabelEl) unrealLabelEl.innerText = unrealLabel;
+      const unrealEl = document.getElementById('unrealized-val');
+      if (unrealEl) {
+        unrealEl.innerText = fmtINR(unrealPnl, true);
+        applyClass(unrealEl, unrealPnl);
+      }
+      const unrealPct = (unrealPnl / baseCap) * 100.0;
+      const unrealPctEl = document.getElementById('unrealized-pct');
+      if (unrealPctEl) {
+        unrealPctEl.innerText = `(${fmtPct(unrealPct)})`;
+        unrealPctEl.style.color = unrealPnl >= 0 ? 'var(--green)' : 'var(--red)';
+      }
+
+      const capSubLabelEl = document.getElementById('kpi-capital-sub-label');
+      if (capSubLabelEl) capSubLabelEl.innerText = capSubLabel;
+      const baseCapitalEl = document.getElementById('base-capital-label');
+      if (baseCapitalEl) baseCapitalEl.innerText = capSubValue;
+
+      // Account-level totals
+      const capVal = document.getElementById('capital-val');
+      if (capVal) capVal.innerText = fmtINR(p.current_capital);
+      const circVal = document.getElementById('circuit-val');
+      if (circVal) circVal.innerText = fmtINR(p.circuit_limit);
+      const capRetPct = (p.capital_growth_pct !== undefined)
+        ? parseFloat(p.capital_growth_pct)
+        : ((p.current_capital - baseCap) / baseCap) * 100.0;
+      const capRetEl = document.getElementById('capital-return-pct');
+      if (capRetEl) {
+        capRetEl.innerText = `${fmtPct(capRetPct)} Growth`;
+        capRetEl.className = 'tag-pct ' + (capRetPct >= 0 ? 'pos' : 'neg');
+      }
+
+      const usedPct = Number.isFinite(Number(p.circuit_used_pct)) ? Number(p.circuit_used_pct) : null;
+      const cFill = document.getElementById('circuit-fill-bar');
+      if (cFill) cFill.style.width = usedPct === null ? '0%' : `${Math.min(100, usedPct)}%`;
+      const cText = document.getElementById('circuit-used-text');
+      if (cText) cText.innerText = usedPct === null ? 'Not enough data' : `${usedPct.toFixed(1)}% Used`;
+
+      const mtdPct = (p.mtd_pnl / baseCap) * 100.0;
+      const mtdEl = document.getElementById('mtd-val');
+      if (mtdEl) {
+        mtdEl.innerText = fmtINR(p.mtd_pnl, true);
+        applyClass(mtdEl, p.mtd_pnl);
+      }
+      const mtdPctEl = document.getElementById('mtd-pct');
+      if (mtdPctEl) {
+        mtdPctEl.innerText = fmtPct(mtdPct);
+        mtdPctEl.className = 'tag-pct ' + (mtdPct >= 0 ? 'pos' : 'neg');
+      }
+
+      const ytdPct = (p.ytd_pnl / baseCap) * 100.0;
+      const ytdEl = document.getElementById('ytd-val');
+      if (ytdEl) {
+        ytdEl.innerText = fmtINR(p.ytd_pnl, true);
+        applyClass(ytdEl, p.ytd_pnl);
+      }
+      const ytdPctEl = document.getElementById('ytd-pct');
+      if (ytdPctEl) {
+        ytdPctEl.innerText = `(${fmtPct(ytdPct)})`;
+        ytdPctEl.style.color = ytdPct >= 0 ? 'var(--green)' : 'var(--red)';
+      }
+
+      const tradesCountPill = document.getElementById('trades-count-pill');
+      if (tradesCountPill) {
+        const badgeLabel = activeTab === 'nifty' ? 'NIFTY TRADES' : (activeTab === 'mcx' ? 'MCX TRADES' : 'TRADES');
+        tradesCountPill.innerText = `${tradeCount} ${badgeLabel}`;
       }
     }
 
@@ -2849,8 +3010,12 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       else el.classList.add('neutral');
     }
 
-    function renderPositionsRows(posList) {
+    function renderPositionsRows(posList, isSessionClosed = false, sessionLabel = 'NIFTY') {
       if (!posList || posList.length === 0) {
+        if (isSessionClosed) {
+          const exitTime = sessionLabel === 'MCX' ? '23:24' : '15:34';
+          return `<tr><td colspan="10" style="text-align:center; color:var(--text-dim); padding:28px;">All ${sessionLabel} positions squared off at session close (${exitTime} IST). Final PnL locked.</td></tr>`;
+        }
         return `<tr><td colspan="10" style="text-align:center; color:var(--text-dim); padding:28px;">No active market positions open.</td></tr>`;
       }
       return posList.map(pos => {
@@ -2935,31 +3100,42 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       const n = data.nifty || {};
       const m = data.mcx || {};
       const p = data.performance || {};
+      const sys = data.system || {};
+
+      let isLiveActive = false;
+      let liveChipText = 'LIVE STREAM';
+      let liveChipClass = 'chip-green';
 
       if (activeTab === 'mcx') {
+        isLiveActive = Boolean(sys.mcx_session_active && m.active);
         chartConfig = {
           market: 'MCX',
-          title: 'LIVE MCX NATURAL GAS P&L TRAJECTORY',
+          isLive: isLiveActive,
+          title: isLiveActive ? 'LIVE MCX NATURAL GAS P&L TRAJECTORY' : 'MCX NATURAL GAS P&L TRAJECTORY',
           icon: '🛢️',
-          timeline: '16:00 ➔ 23:24 IST',
-          startMin: 960,
+          timeline: '15:30 ➔ 23:24 IST',
+          startMin: 930,
           endMin: 1404,
           timeTicks: [
-            { label: '16:00', m: 960 },
-            { label: '17:30', m: 1050 },
-            { label: '19:00', m: 1140 },
-            { label: '20:30', m: 1230 },
-            { label: '22:00', m: 1320 },
+            { label: '15:30', m: 930 },
+            { label: '17:00', m: 1020 },
+            { label: '18:30', m: 1110 },
+            { label: '20:00', m: 1200 },
+            { label: '21:30', m: 1290 },
             { label: '23:24', m: 1404 }
           ]
         };
         chartSeries = Array.isArray(m.intraday_series) ? m.intraday_series : [];
         chartCurNet = Number.isFinite(Number(m.net_pnl)) ? Number(m.net_pnl) : 0.0;
         chartCurPct = Number.isFinite(Number(m.net_pct)) ? Number(m.net_pct) : 0.0;
+        liveChipText = isLiveActive ? 'LIVE STREAM' : 'STANDBY';
+        liveChipClass = isLiveActive ? 'chip-green' : 'chip-dim';
       } else if (activeTab === 'overview') {
+        isLiveActive = Boolean(sys.nifty_session_active || sys.mcx_session_active);
         chartConfig = {
           market: 'COMBINED',
-          title: 'LIVE COMBINED P&L TRAJECTORY',
+          isLive: isLiveActive,
+          title: 'UNIFIED PORTFOLIO P&L TRAJECTORY (NIFTY + MCX)',
           icon: '📊',
           timeline: '09:15 ➔ 23:24 IST',
           startMin: 555,
@@ -2976,11 +3152,15 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         chartSeries = Array.isArray(data.intraday_series) ? data.intraday_series : [];
         chartCurNet = Number.isFinite(Number(p.combined_net_mtm)) ? Number(p.combined_net_mtm) : 0.0;
         chartCurPct = Number.isFinite(Number(p.combined_net_pct)) ? Number(p.combined_net_pct) : 0.0;
+        liveChipText = isLiveActive ? 'UNIFIED STREAM' : 'MARKET CLOSED';
+        liveChipClass = isLiveActive ? 'chip-green' : 'chip-dim';
       } else {
         // NIFTY tab
+        isLiveActive = Boolean(sys.nifty_session_active && n.active);
         chartConfig = {
           market: 'NIFTY',
-          title: 'LIVE NIFTY P&L TRAJECTORY',
+          isLive: isLiveActive,
+          title: isLiveActive ? 'LIVE NIFTY P&L TRAJECTORY' : 'NIFTY P&L TRAJECTORY (SESSION CLOSED)',
           icon: '⚡',
           timeline: '09:15 ➔ 15:35 IST',
           startMin: 555,
@@ -2998,6 +3178,8 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         chartSeries = Array.isArray(n.intraday_series) ? n.intraday_series : [];
         chartCurNet = Number.isFinite(Number(n.net_pnl)) ? Number(n.net_pnl) : 0.0;
         chartCurPct = Number.isFinite(Number(n.net_pct)) ? Number(n.net_pct) : 0.0;
+        liveChipText = isLiveActive ? 'LIVE STREAM' : 'SESSION CLOSED (15:35)';
+        liveChipClass = isLiveActive ? 'chip-green' : 'chip-dim';
       }
 
       const iconEl = document.getElementById('chart-market-icon');
@@ -3006,6 +3188,11 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       if (titleEl) titleEl.innerText = chartConfig.title;
       const timelineEl = document.getElementById('chart-timeline-label');
       if (timelineEl) timelineEl.innerText = chartConfig.timeline;
+      const liveChipEl = document.getElementById('intraday-live-status');
+      if (liveChipEl) {
+        liveChipEl.className = 'status-chip ' + liveChipClass;
+        liveChipEl.innerText = liveChipText;
+      }
       const curNetEl = document.getElementById('chart-cur-mtm');
       if (curNetEl) {
         curNetEl.innerText = `${fmtINR(chartCurNet, true)} (${fmtPct(chartCurPct)})`;
@@ -3260,42 +3447,60 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       ctx.arc(lastPt.x, lastPt.y, glowR, 0, Math.PI * 2);
       ctx.fill();
 
-      // Smooth Concentric Expanding Ripple Waves (Slow water-drop effect)
-      // Wave 1 (2.8s period)
-      const wave1 = (nowMs % 2800) / 2800;
-      const r1 = 6 + wave1 * 26;
-      const a1 = (1 - wave1) * 0.45;
-      ctx.beginPath();
-      ctx.arc(lastPt.x, lastPt.y, r1, 0, Math.PI * 2);
-      ctx.strokeStyle = isCurPos ? `rgba(16, 185, 129, ${a1})` : `rgba(244, 63, 94, ${a1})`;
-      ctx.lineWidth = 1.6 * (1 - wave1 * 0.6);
-      ctx.stroke();
+      if (chartConfig.isLive) {
+        // Smooth Concentric Expanding Ripple Waves (Slow water-drop effect)
+        // Wave 1 (2.8s period)
+        const wave1 = (nowMs % 2800) / 2800;
+        const r1 = 6 + wave1 * 26;
+        const a1 = (1 - wave1) * 0.45;
+        ctx.beginPath();
+        ctx.arc(lastPt.x, lastPt.y, r1, 0, Math.PI * 2);
+        ctx.strokeStyle = isCurPos ? `rgba(16, 185, 129, ${a1})` : `rgba(244, 63, 94, ${a1})`;
+        ctx.lineWidth = 1.6 * (1 - wave1 * 0.6);
+        ctx.stroke();
 
-      // Wave 2 (staggered by 1.4s)
-      const wave2 = ((nowMs + 1400) % 2800) / 2800;
-      const r2 = 6 + wave2 * 26;
-      const a2 = (1 - wave2) * 0.45;
-      ctx.beginPath();
-      ctx.arc(lastPt.x, lastPt.y, r2, 0, Math.PI * 2);
-      ctx.strokeStyle = isCurPos ? `rgba(16, 185, 129, ${a2})` : `rgba(244, 63, 94, ${a2})`;
-      ctx.lineWidth = 1.6 * (1 - wave2 * 0.6);
-      ctx.stroke();
+        // Wave 2 (staggered by 1.4s)
+        const wave2 = ((nowMs + 1400) % 2800) / 2800;
+        const r2 = 6 + wave2 * 26;
+        const a2 = (1 - wave2) * 0.45;
+        ctx.beginPath();
+        ctx.arc(lastPt.x, lastPt.y, r2, 0, Math.PI * 2);
+        ctx.strokeStyle = isCurPos ? `rgba(16, 185, 129, ${a2})` : `rgba(244, 63, 94, ${a2})`;
+        ctx.lineWidth = 1.6 * (1 - wave2 * 0.6);
+        ctx.stroke();
 
-      // Inner Breathing Halo Ring
-      ctx.beginPath();
-      ctx.arc(lastPt.x, lastPt.y, 6.5 + breath * 2.2, 0, Math.PI * 2);
-      ctx.strokeStyle = isCurPos ? `rgba(52, 211, 153, ${0.65 + 0.35 * breath})` : `rgba(251, 113, 133, ${0.65 + 0.35 * breath})`;
-      ctx.lineWidth = 1.8;
-      ctx.stroke();
+        // Inner Breathing Halo Ring
+        ctx.beginPath();
+        ctx.arc(lastPt.x, lastPt.y, 6.5 + breath * 2.2, 0, Math.PI * 2);
+        ctx.strokeStyle = isCurPos ? `rgba(52, 211, 153, ${0.65 + 0.35 * breath})` : `rgba(251, 113, 133, ${0.65 + 0.35 * breath})`;
+        ctx.lineWidth = 1.8;
+        ctx.stroke();
 
-      // Radiant Core Jewel Dot
-      ctx.beginPath();
-      ctx.arc(lastPt.x, lastPt.y, 4.2, 0, Math.PI * 2);
-      ctx.fillStyle = '#ffffff';
-      ctx.shadowColor = isCurPos ? '#10b981' : '#f43f5e';
-      ctx.shadowBlur = 12 + breath * 6;
-      ctx.fill();
-      ctx.shadowBlur = 0;
+        // Radiant Core Jewel Dot
+        ctx.beginPath();
+        ctx.arc(lastPt.x, lastPt.y, 4.2, 0, Math.PI * 2);
+        ctx.fillStyle = '#ffffff';
+        ctx.shadowColor = isCurPos ? '#10b981' : '#f43f5e';
+        ctx.shadowBlur = 12 + breath * 6;
+        ctx.fill();
+        ctx.shadowBlur = 0;
+      } else {
+        // Settled static pin dot for finalized session
+        ctx.beginPath();
+        ctx.arc(lastPt.x, lastPt.y, 5.0, 0, Math.PI * 2);
+        ctx.fillStyle = isCurPos ? '#10b981' : '#f43f5e';
+        ctx.fill();
+
+        ctx.beginPath();
+        ctx.arc(lastPt.x, lastPt.y, 2.0, 0, Math.PI * 2);
+        ctx.fillStyle = '#ffffff';
+        ctx.fill();
+
+        ctx.font = '10px "JetBrains Mono", monospace';
+        ctx.fillStyle = isCurPos ? '#10b981' : '#f43f5e';
+        ctx.textAlign = 'right';
+        ctx.fillText(`EXIT LOCKED • ${fmtINR(lastPt.pnl, true)}`, Math.min(w - padRight, lastPt.x), padTop + 14);
+      }
 
       // Subtle Vertical Tracking Guide
       ctx.beginPath();
@@ -3512,88 +3717,8 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         if (dataAge) dataAge.innerText = `UPDATED ${timeStr}`;
       }
 
-      // KPI Performance
-      const p = data.performance || {};
-      dashboardBaseCapital = (p.base_capital && parseFloat(p.base_capital) > 0) ? parseFloat(p.base_capital) : 200000.0;
-      const baseCapitalEl = document.getElementById('base-capital-label');
-      if (baseCapitalEl) baseCapitalEl.innerText = fmtINR(p.base_capital || dashboardBaseCapital);
-      const netMtm = Number.isFinite(Number(p.combined_net_mtm)) ? Number(p.combined_net_mtm) : null;
-      const netPct = Number.isFinite(Number(p.combined_net_pct)) ? Number(p.combined_net_pct) : null;
-
-      const netEl = document.getElementById('net-mtm-val');
-      netEl.innerText = fmtINR(netMtm, true);
-      applyClass(netEl, netMtm);
-
-      const netPctEl = document.getElementById('net-mtm-pct');
-      netPctEl.innerText = fmtPct(netPct);
-      netPctEl.className = 'tag-pct ' + (netPct >= 0 ? 'pos' : 'neg');
-
-      // Realized with % on initial capital
-      const realPct = (p.combined_realized / dashboardBaseCapital) * 100.0;
-      const realEl = document.getElementById('realized-val');
-      realEl.innerText = fmtINR(p.combined_realized, true);
-      applyClass(realEl, p.combined_realized);
-      const realPctEl = document.getElementById('realized-pct');
-      if (realPctEl) {
-        realPctEl.innerText = fmtPct(realPct);
-        realPctEl.className = 'tag-pct ' + (realPct >= 0 ? 'pos' : 'neg');
-      }
-
-      // Unrealized with % on initial capital
-      const unrealPct = (p.combined_unrealized / dashboardBaseCapital) * 100.0;
-      const unrealEl = document.getElementById('unrealized-val');
-      unrealEl.innerText = fmtINR(p.combined_unrealized, true);
-      applyClass(unrealEl, p.combined_unrealized);
-      const unrealPctEl = document.getElementById('unrealized-pct');
-      if (unrealPctEl) {
-        unrealPctEl.innerText = `(${fmtPct(unrealPct)})`;
-        unrealPctEl.style.color = unrealPct >= 0 ? 'var(--green)' : 'var(--red)';
-      }
-
-      // Capital return uses exactly the same initial-capital denominator as MTD.
-      document.getElementById('capital-val').innerText = fmtINR(p.current_capital);
-      document.getElementById('circuit-val').innerText = fmtINR(p.circuit_limit);
-      const capRetPct = (p.capital_growth_pct !== undefined)
-        ? parseFloat(p.capital_growth_pct)
-        : ((p.current_capital - dashboardBaseCapital) / dashboardBaseCapital) * 100.0;
-      const capRetEl = document.getElementById('capital-return-pct');
-      if (capRetEl) {
-        capRetEl.innerText = `${fmtPct(capRetPct)} Growth`;
-        capRetEl.className = 'tag-pct ' + (capRetPct >= 0 ? 'pos' : 'neg');
-      }
-
-      const usedPct = Number.isFinite(Number(p.circuit_used_pct)) ? Number(p.circuit_used_pct) : null;
-      document.getElementById('circuit-fill-bar').style.width = usedPct === null ? '0%' : `${Math.min(100, usedPct)}%`;
-      document.getElementById('circuit-used-text').innerText = usedPct === null ? 'Not enough data' : `${usedPct.toFixed(1)}% Used`;
-
-      // MTD with the same initial-capital denominator as Live Capital Growth.
-      const mtdPct = (p.mtd_pnl / dashboardBaseCapital) * 100.0;
-      const mtdEl = document.getElementById('mtd-val');
-      mtdEl.innerText = fmtINR(p.mtd_pnl, true);
-      applyClass(mtdEl, p.mtd_pnl);
-      const mtdPctEl = document.getElementById('mtd-pct');
-      if (mtdPctEl) {
-        mtdPctEl.innerText = fmtPct(mtdPct);
-        mtdPctEl.className = 'tag-pct ' + (mtdPct >= 0 ? 'pos' : 'neg');
-      }
-
-      // YTD with the same initial-capital denominator.
-      const ytdPct = (p.ytd_pnl / dashboardBaseCapital) * 100.0;
-      const ytdEl = document.getElementById('ytd-val');
-      ytdEl.innerText = fmtINR(p.ytd_pnl, true);
-      applyClass(ytdEl, p.ytd_pnl);
-      const ytdPctEl = document.getElementById('ytd-pct');
-      if (ytdPctEl) {
-        ytdPctEl.innerText = `(${fmtPct(ytdPct)})`;
-        ytdPctEl.style.color = ytdPct >= 0 ? 'var(--green)' : 'var(--red)';
-      }
-
-      // This legacy badge was removed from the current header markup. Keep the
-      // refresh loop alive when an optional element is not present.
-      const tradesCountPill = document.getElementById('trades-count-pill');
-      if (tradesCountPill) {
-        tradesCountPill.innerText = `${p.total_trades || 0} TRADES`;
-      }
+      // Dynamic KPI cards based on active tab (NIFTY / MCX / Unified Overview)
+      updateTabKPIs(data);
 
       const analytics = data.trade_analytics || {};
       const allStats = analytics.all || {};
@@ -3639,7 +3764,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       nSess.innerText = sys.nifty_session_active ? 'MARKET OPEN' : 'SESSION: 09:15 - 15:35';
 
       document.getElementById('n-pos-count').innerText = (n.positions || []).length;
-      document.getElementById('n-pos-tbody').innerHTML = renderPositionsRows(n.positions);
+      document.getElementById('n-pos-tbody').innerHTML = renderPositionsRows(n.positions, !sys.nifty_session_active, 'NIFTY');
       document.getElementById('n-trades-tbody').innerHTML = renderTradesRows(n.trades);
 
       // ── MCX TAB DATA ──
@@ -3676,10 +3801,10 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
 
       const mSess = document.getElementById('mcx-session-chip');
       mSess.className = 'status-chip ' + (sys.mcx_session_active ? 'chip-amber' : 'chip-dim');
-      mSess.innerText = sys.mcx_session_active ? 'MARKET OPEN' : 'SESSION: 16:00 - 23:24';
+      mSess.innerText = sys.mcx_session_active ? 'MARKET OPEN' : 'SESSION: 15:30 - 23:24';
 
       document.getElementById('m-pos-count').innerText = (m.positions || []).length;
-      document.getElementById('m-pos-tbody').innerHTML = renderPositionsRows(m.positions);
+      document.getElementById('m-pos-tbody').innerHTML = renderPositionsRows(m.positions, !sys.mcx_session_active, 'MCX');
       document.getElementById('m-trades-tbody').innerHTML = renderTradesRows(m.trades);
 
       // ── OVERVIEW TAB DATA ──
