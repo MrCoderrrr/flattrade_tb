@@ -115,16 +115,16 @@ CAPITAL             = 200000.0
 # --- GENERALIZED PREMIUM SL & PROFIT PROTECTION (NIFTY ALIGNED) ---
 PREM_RISK_REFERENCE        = 30.0   # Reference high premium (pts) for interpolation
 PREM_RISK_EXPIRY_FLOOR     = 0.6    # Compress points-based stops by up to 40% on expiry day
-PREM_RISK_INITIAL_PCT_HIGH = 0.15   # 15% initial SL for high premiums
-PREM_RISK_INITIAL_PCT_LOW  = 0.25   # 25% initial SL for low premiums (need more % breathing room)
+PREM_RISK_INITIAL_PCT_HIGH = 0.12   # 15% initial SL for high premiums
+PREM_RISK_INITIAL_PCT_LOW  = 0.12   # 25% initial SL for low premiums (need more % breathing room)
 PREM_RISK_INITIAL_MIN_PTS  = 1.50   # Min initial SL in points
 PREM_RISK_INITIAL_MAX_PTS  = 4.50   # Max initial SL in points
 PREM_RISK_TRAIL_MIN_PTS    = 1.00   # Min trailing SL in points
 PREM_RISK_TRAIL_MAX_PTS    = 2.50   # Max trailing SL in points
 
 PREM_SL_MIN_PCT            = 0.085  # 8.5% trail floor when deep in profit
-PREM_SL_MAX_PCT            = 0.15   # 15% trail ceiling at breakeven
-SOLO_LEG_TSL_PCT           = 0.09   # 9% trailing stop for solo surviving leg (re-anchored at LTP)
+PREM_SL_MAX_PCT            = 0.12   # 15% trail ceiling at breakeven
+SOLO_LEG_TSL_PCT           = 0.07   # 9% trailing stop for solo surviving leg (re-anchored at LTP)
 
 # KEY FIX FOR 4k -> 1.5k: Strict Profit Protection Ratchet & Max Giveback Cap
 PREM_MAX_PROFIT_GIVEBACK   = 0.20   # Maximum 20% giveback of peak profit (guarantees keeping >= 80% of peak PnL!)
