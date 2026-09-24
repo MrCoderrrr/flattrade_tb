@@ -111,7 +111,7 @@ SWING_REVERSAL_PTS  = 0.80         # 0.80 pts pullback threshold (reverted to ye
 
 TELEGRAM_TOKEN = '8850507396:AAFwFm2_WxPdSM52JcCpJUj8V1rz9x3G-kE'
 CHAT_ID        = '6307066850'
-CAPITAL        = 200000.0
+CAPITAL        = 195784.0
 PROJECT_ROOT   = os.path.dirname(os.path.abspath(__file__))
 
 # ─────────────────────────────────────────────
@@ -126,7 +126,7 @@ class MCXDBManager:
         return get_ist_now().strftime("%Y-%m-%d")
 
     def _load(self) -> dict:
-        base_cap = globals().get("CAPITAL", 200000.0)
+        base_cap = globals().get("CAPITAL", 195784.0)
         target_file = self.filename
         if not os.path.isabs(target_file):
             cand = os.path.join(PROJECT_ROOT, self.filename)
