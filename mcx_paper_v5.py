@@ -1604,6 +1604,8 @@ class NaturalGasPaperBot:
 
         DIM = f'{Fore.WHITE}{Style.DIM}'
         CY  = f'{Fore.CYAN}{Style.BRIGHT}'
+        GR  = f'{Fore.GREEN}{Style.BRIGHT}'
+        RD  = f'{Fore.RED}{Style.BRIGHT}'
         RS  = Style.RESET_ALL
         print()
         print(f'{DIM}{"="*98}{RS}')
