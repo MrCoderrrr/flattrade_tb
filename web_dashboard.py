@@ -160,6 +160,52 @@ def load_json_safe(filepath: str, default=None):
     except Exception:
         return default
 
+def _snapshot_date(snapshot: dict):
+    """Return the trading date encoded in a snapshot, when available."""
+    for key in ("date", "trading_date", "session_date"):
+        value = snapshot.get(key)
+        if value:
+            try:
+                return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+            except ValueError:
+                pass
+
+    for key in ("timestamp", "updated_at"):
+        value = snapshot.get(key)
+        if value:
+            try:
+                return datetime.fromisoformat(str(value).replace("Z", "+00:00")).date()
+            except ValueError:
+                try:
+                    return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+                except ValueError:
+                    pass
+    return None
+
+def load_current_snapshot(relative_paths):
+    """Load the first snapshot belonging to today's IST trading session."""
+    today = get_ist_now().date()
+    for relative_path in relative_paths:
+        filepath = os.path.join(PROJECT_ROOT, relative_path)
+        snapshot = load_json_safe(filepath)
+        if not isinstance(snapshot, dict):
+            continue
+
+        snapshot_date = _snapshot_date(snapshot)
+        if snapshot_date is None:
+            # Older snapshot formats only expose a clock. Use file mtime as a
+            # safe fallback so an old session cannot leak into today's view.
+            try:
+                snapshot_date = datetime.fromtimestamp(
+                    os.path.getmtime(filepath), tz=IST
+                ).date()
+            except OSError:
+                continue
+
+        if snapshot_date == today:
+            return snapshot
+    return None
+
 def get_pnl_tracker_data():
     candidates = [
         os.path.join(PROJECT_ROOT, "pnl_tracker.json"),
@@ -179,26 +225,26 @@ def get_pnl_tracker_data():
     }
 
 def get_nifty_snapshot():
-    candidates = [
-        os.path.join(PROJECT_ROOT, "data", "state", "live_snapshot_v2_paper.json"),
-        os.path.join(PROJECT_ROOT, "data", "state", "algo_state_v2_paper.json")
-    ]
-    for p in candidates:
-        d = load_json_safe(p)
-        if d:
-            return d
-    return None
+    return load_current_snapshot([
+        "tradingbot/data/state/live_snapshot_v2_paper.json",
+        "tradingbot/data/state/algo_state_v2_paper.json",
+        "data/state/live_snapshot_v2_paper.json",
+        "data/state/algo_state_v2_paper.json",
+        "tradingbot/data/state/live_snapshot_v2.json",
+        "tradingbot/data/state/algo_state_v2.json",
+        "data/state/live_snapshot_v2.json",
+        "data/state/algo_state_v2.json",
+    ])
 
 def get_mcx_snapshot():
-    candidates = [
-        os.path.join(PROJECT_ROOT, "live_snapshot_mcx_paper.json"),
-        os.path.join(PROJECT_ROOT, "mcx_state_paper_v5.json")
-    ]
-    for p in candidates:
-        d = load_json_safe(p)
-        if d:
-            return d
-    return None
+    return load_current_snapshot([
+        "tradingbot/live_snapshot_mcx_paper.json",
+        "tradingbot/mcx_state_paper_v5.json",
+        "live_snapshot_mcx_paper.json",
+        "mcx_state_paper_v5.json",
+        "tradingbot/mcx_state_paper.json",
+        "mcx_state_paper.json",
+    ])
 
 # ─────────────────────────────────────────────────────────────────────────────
 # INTRADAY PNL TIME-SERIES ENGINE (09:15 - SESSION CLOSE)
