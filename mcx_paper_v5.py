@@ -21,9 +21,8 @@ Key Architecture & Rules:
        proactively exits before full SL is reached.
   4. Momentum Reversal Re-Entry:
      - Surviving leg re-enters missing side when momentum flips/halts.
-  5. Dual-State SL & Solo TSL:
-     - Strangle active: 15% initial SL, ratcheting into 8% TSL when in profit.
-     - Solo active: Initial SL disabled, trailing strictly at 8% TSL.
+  5. Strict 7% Trailing Stop-Loss (TSL):
+     - All legs protected by a strict 7% initial SL, ratcheting down at 7% TSL from lowest price.
   6. Box-Drawing ANSI Dashboard + 3-second live Telegram broadcast.
 ================================================================================
 """
@@ -101,14 +100,14 @@ MCX_ENTRY_MINUTE    = 30
 MCX_EXIT_HOUR       = 23
 MCX_EXIT_MINUTE     = 24           # 23:24 IST auto square-off (11:24 PM)
 LOT_SIZE            = 1250         # 1 lot = 1250 units
-DEFAULT_SL_PCT      = 0.15         # 15% initial stop-loss (fresh straddles)
-REENTRY_SL_PCT      = 0.15         # 15% initial stop-loss for reversal re-entry
-DEFAULT_TSL_PCT     = 0.08         # 8% trailing stop-loss
+DEFAULT_SL_PCT      = 0.07         # 7% initial stop-loss
+REENTRY_SL_PCT      = 0.07         # 7% initial stop-loss for reversal re-entry
+DEFAULT_TSL_PCT     = 0.07         # 7% trailing stop-loss
 POST_CLOSE_COOLDOWN = 120.0        # 120s cooldown after any close — allows market to stabilise (was 60s, too fast for NatGas whipsaws)
 REENTRY_COOLDOWN_S  = 90.0         # Min 90s between single-leg re-entries (was 30s — too aggressive)
 SWING_REVERSAL_PTS  = 2.0          # Fallback swing reversal pullback threshold — 2.0 pts is ~0.7% for NatGas (was 0.80, too sensitive)
-SOLO_TSL_MIN_PROFIT_PCT = 0.05     # Solo TSL only activates when leg is at least 5% in profit (prevents premature trailing stop)
-PROACTIVE_EXIT_PCT  = 0.08         # Proactive early exit when leg is 8% against (was 5% — too tight, normal noise)
+SOLO_TSL_MIN_PROFIT_PCT = 0.0      # Solo TSL active immediately from entry (trails strictly at 7% from lowest)
+PROACTIVE_EXIT_PCT  = 0.07         # Proactive early exit threshold aligned with 7%
 SESSION_MAX_LOSS    = -4000.0      # Session-level loss guard: stop new entries if realized PnL < -₹4000
 
 TELEGRAM_TOKEN = '8850507396:AAFwFm2_WxPdSM52JcCpJUj8V1rz9x3G-kE'
@@ -371,9 +370,20 @@ class NaturalGasPaperBot:
                 self.trades_today       = int(state.get('trades_today', 0))
                 self.last_reentry_ts    = float(state.get('last_reentry_ts', 0.0))
                 self.last_any_close_ts  = float(state.get('last_any_close_ts', 0.0))
+                # Ensure all active positions adhere to updated DEFAULT_TSL_PCT / DEFAULT_SL_PCT
+                for leg, pos in self.positions.items():
+                    pos['loss_stop_pct'] = DEFAULT_SL_PCT
+                    pos['tsl_pct'] = DEFAULT_TSL_PCT
+                    sl_st = pos.get('sl_state', {})
+                    sl_st['loss_stop_pct'] = DEFAULT_SL_PCT
+                    sl_st['tsl_pct'] = DEFAULT_TSL_PCT
+                    lowest = float(sl_st.get('lowest_ltp', pos.get('entry_price', 0.0)))
+                    new_sl = round_to_tick(lowest * (1.0 + DEFAULT_TSL_PCT))
+                    curr_sl = float(sl_st.get('current_sl', new_sl))
+                    sl_st['current_sl'] = min(curr_sl, new_sl)
                 print(f'[STATE] Restored: {len(self.positions)} open legs | '
                       f'Realized PnL: ₹{self.total_realized_pnl:,.2f} | '
-                      f'Trades: {self.trades_today}', flush=True)
+                      f'Trades: {self.trades_today} | TSL: {DEFAULT_TSL_PCT*100:.0f}%', flush=True)
         except Exception as e:
             print(f'[WARN] Error loading MCX state: {e}', flush=True)
 
@@ -780,7 +790,7 @@ class NaturalGasPaperBot:
             f'  Preserved Open: {solo_leg} {int(pos["strike"])} (Entry: {old_entry:.2f} -> {live_ltp:.2f})',
             f'  Locked Profit: {sign}₹{run_pnl:,.2f}',
             f'  Entered: {other_leg} {int(other_strike)} SELL',
-            f'  SL Reset: 15% (₹{fresh_sl:.2f})',
+            f'  SL Reset: {DEFAULT_SL_PCT*100:.0f}% (₹{fresh_sl:.2f})',
             f'  Total Realized: {tot_sign}₹{self.total_realized_pnl:,.2f}',
             '',
             '  *Entry price updated • Zero exit/entry slippage*',

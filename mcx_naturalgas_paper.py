@@ -82,9 +82,9 @@ MCX_ENTRY_HOUR      = 18           # 18:00 IST open
 MCX_EXIT_HOUR       = 23
 MCX_EXIT_MINUTE     = 24           # 23:24 IST auto square-off
 LOT_SIZE            = 1250         # 1 lot = 1250 units
-DEFAULT_SL_PCT      = 0.15         # 15% initial stop-loss (fresh straddles)
-REENTRY_SL_PCT      = 0.05         # 5% initial stop-loss for reversal re-entry (instant cutoff)
-DEFAULT_TSL_PCT     = 0.08         # 8% trailing stop-loss
+DEFAULT_SL_PCT      = 0.07         # 7% initial stop-loss
+REENTRY_SL_PCT      = 0.07         # 7% initial stop-loss for reversal re-entry
+DEFAULT_TSL_PCT     = 0.07         # 7% trailing stop-loss
 POST_CLOSE_COOLDOWN = 5.0          # Seconds to wait after any close before re-entry
 REVERSAL_MIN_PTS    = 0.80         # Swing reversal threshold (0.80 pts pullback from peak/trough)
 MICRO_REVERSAL_PTS  = 0.50         # Fast micro-momentum threshold (0.50 pts with velocity)
