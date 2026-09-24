@@ -507,6 +507,31 @@ def update_market_intraday_series(market, current_net_mtm, net_pct, start_hour, 
         except (AttributeError, TypeError, ValueError, IndexError):
             return None
 
+    # Reconcile the in-memory curve with the persisted curve on every request.
+    # This prevents a dashboard restart from serving an older truncated prefix
+    # when the on-disk NIFTY tracker already contains the full session.
+    persisted = load_json_safe(MARKET_INTRADAY_FILE, {})
+    persisted_points = []
+    if isinstance(persisted, dict):
+        persisted_points = persisted.get(today_str, {}).get(market_key, []) or []
+    if isinstance(persisted_points, list) and persisted_points:
+        merged = {}
+        for point in MARKET_INTRADAY_SERIES[market_key] + persisted_points:
+            if not isinstance(point, dict):
+                continue
+            key = str(point.get("ts", point.get("time", "")))
+            merged[key] = point
+        MARKET_INTRADAY_SERIES[market_key] = sorted(
+            merged.values(), key=lambda p: float(p.get("ts", 0.0) or 0.0)
+        )[-5000:]
+        if market_key == "NIFTY" and not seed_points:
+            try:
+                merged_pnls = [float(p.get("pnl")) for p in MARKET_INTRADAY_SERIES[market_key] if p.get("pnl") is not None]
+                if merged_pnls and all(abs(value) < 1e-9 for value in merged_pnls):
+                    MARKET_INTRADAY_SERIES[market_key] = []
+            except (TypeError, ValueError):
+                pass
+
     MARKET_INTRADAY_SERIES[market_key] = [
         point for point in MARKET_INTRADAY_SERIES[market_key]
         if session_start <= (point_minutes(point) if point_minutes(point) is not None else -1) <= session_end
