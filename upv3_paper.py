@@ -706,7 +706,7 @@ LOT_SIZE                = 65          # 1 lot per user request
 TRADE_LOG_FILE          = os.path.join(PROJECT_ROOT, "data", "logs", "trade_book", "trades_v2_paper.csv")
 CAPITAL_BUFFER          = 0.95
 MARGIN_IRON_CONDOR      = 95_000
-PORTFOLIO_CIRCUIT_PCT   = 1.8
+PORTFOLIO_CIRCUIT_PCT   = 2.5        # -2.5% circuit breaker (was -1.8% — was triggering too early, no room to recover)
 
 # --- REAL-MONEY SAFETY & GOVERNANCE ---
 TELEGRAM_BOT_TOKEN        = "8850507396:AAFwFm2_WxPdSM52JcCpJUj8V1rz9x3G-kE"
@@ -760,11 +760,11 @@ OPENING_NOISE_SHIELD_HOUR   = 9
 OPENING_NOISE_SHIELD_MINUTE = 25   # 09:25 AM IST — 10m clean warmup to absorb opening volatility
 
 # --- REENTRY CAPS ---
-KAMA_REVERSAL_ATR_RATIO   = 0.15
+KAMA_REVERSAL_ATR_RATIO   = 0.30   # Stronger reversal required before re-entry (was 0.15 — too easy to trigger)
 KAMA_CONSECUTIVE_BARS     = 2
-MAX_REENTRIES_PER_LEG     = 999
-MAX_REENTRIES_TOTAL       = 999
-MAX_STRANGLE_RESETS       = 999
+MAX_REENTRIES_PER_LEG     = 2      # Max 2 re-entries per leg per session (was 999 = unlimited SL cascade)
+MAX_REENTRIES_TOTAL       = 3      # Max 3 total re-entries per session (was 999)
+MAX_STRANGLE_RESETS       = 3      # Max strangle resets per session (was 999)
 KAMA_PERIOD             = 10          # KAMA Efficiency Ratio lookback (10 bars)
 KAMA_FAST_EMA           = 3           # KAMA Fast EMA constant (3)
 KAMA_SLOW_EMA           = 30          # KAMA Slow EMA constant (30)
@@ -2662,10 +2662,22 @@ class ExecutionEngine:
             log_alert(f"⚠️ The position {leg} is STILL OPEN in the market! Manual intervention required.")
             return 0.0
 
-        # Only reach here if placed_successfully == True
-        ltp = self._get_ltp(pos["strike"], base)
-        if ltp <= 0:
-            ltp = float(pos.get("entry_price", 0.0))
+        # Fresh LTP fetch for PnL: bypass the cleared main cache, query broker directly
+        # (The main loop clears _ltp_cache every 1s, so _get_ltp returns 0 immediately after clear)
+        exit_ltp = 0.0
+        if self.market_data.streamer.api and not getattr(self.broker, "paper_trading", True):
+            # Live mode: use fresh broker quote
+            q = self.market_data.streamer.get_live_quote(pos["strike"], base)
+            exit_ltp = float(q.get("lp", 0.0)) if q else 0.0
+        if exit_ltp <= 0:
+            # Paper mode or API fail: use last-known real LTP from streamer cache, then fall back to entry_price
+            cache_key = f"{pos['strike']}_{base}"
+            exit_ltp = self.market_data.streamer._last_real_lp.get(cache_key, 0.0)
+        if exit_ltp <= 0:
+            exit_ltp = float(pos.get("entry_price", 0.0))
+            log_warn(f"Exit LTP unavailable for {leg} — using entry price {exit_ltp:.2f} as exit. PnL will show 0.")
+
+        ltp = exit_ltp
         if pos["side"] == "SELL":
             pnl = (pos["entry_price"] - ltp) * close_qty
         else:
@@ -2806,6 +2818,13 @@ class ExecutionEngine:
 
         indicators = self.current_indicators
 
+        # ADX strong-trend guard: when ADX > 30, market is trending — skip all re-entries
+        # This is the primary cause of SL cascades: re-entering a short into a continuing trend
+        adx_now = indicators.get("adx", 18.0)
+        if adx_now > 30.0:
+            log_info(f"[REENTRY BLOCKED] ADX={adx_now:.1f} > 30 — strong trend active. No re-entry until market chops.")
+            return
+
         for leg in ("PE", "CE"):
             cd = self.cooldown_tracker.get(leg)
             if not cd or not cd.get("active", False):
@@ -2852,7 +2871,7 @@ class ExecutionEngine:
                 cd["active"] = False
                 cd["reentries_today"] = cd.get("reentries_today", 0) + 1
                 self.total_reentries_today += 1
-                cd["next_eligible_time"] = time.time() + 15  # 15s cooldown between re-entries
+                cd["next_eligible_time"] = time.time() + 120  # 120s cooldown between re-entries (was 15s — too fast, re-entered into same trend)
                 self.mode = "RUNNING"
                 log_info(f"✅ {leg} re-entered at ATM {strike}. Mode → RUNNING. Total re-entries today: {self.total_reentries_today}")
                 self._save_state()
