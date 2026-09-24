@@ -22,6 +22,7 @@ import select
 import threading
 import subprocess
 import hashlib
+import shutil
 import requests
 from datetime import datetime, timezone, timedelta
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -610,6 +611,12 @@ def extract_url_from_tunnel_log():
 def run_tunnel_manager(port: int = 8000):
     global LIVE_PUBLIC_URL
     last_notified_url = ""
+
+    # The tunnel is optional. Do not wake up every few seconds with a failed
+    # subprocess attempt when cloudflared is not installed on the host.
+    if shutil.which("cloudflared") is None:
+        print("[TUNNEL] cloudflared is not installed; using the direct dashboard URL.", flush=True)
+        return
 
     # Load initial URL from public_url.txt if present
     if os.path.exists(PUBLIC_URL_FILE):
@@ -3025,38 +3032,72 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
     function initSSE() {
       const streamStatus = document.getElementById('stream-status');
       let es = null;
+      let reconnectTimer = null;
+      let reconnectDelay = 1000;
+      let lastStreamMessageAt = 0;
+      let pollInFlight = false;
+
+      function setStreamStatus(label, color) {
+        if (!streamStatus) return;
+        streamStatus.innerText = label;
+        streamStatus.style.color = color;
+      }
+
+      function scheduleReconnect() {
+        if (reconnectTimer) return;
+        reconnectTimer = setTimeout(() => {
+          reconnectTimer = null;
+          connect();
+        }, reconnectDelay);
+        reconnectDelay = Math.min(reconnectDelay * 2, 10000);
+      }
 
       function connect() {
+        if (es) es.close();
         es = new EventSource('/api/stream');
         es.onopen = () => {
-          streamStatus.innerText = 'LIVE STREAMING';
-          streamStatus.style.color = 'var(--green)';
+          reconnectDelay = 1000;
+          lastStreamMessageAt = Date.now();
+          setStreamStatus('LIVE STREAMING', 'var(--green)');
         };
         es.onmessage = (e) => {
           try {
             const data = JSON.parse(e.data);
             updateDashboard(data);
+            lastStreamMessageAt = Date.now();
           } catch(err) {
             console.error('SSE Error', err);
+            // Let the watchdog polling path recover even if a malformed or
+            // partially rendered update reaches the browser.
+            lastStreamMessageAt = 0;
           }
         };
         es.onerror = () => {
-          streamStatus.innerText = 'RECONNECTING...';
-          streamStatus.style.color = 'var(--amber)';
+          setStreamStatus('RECONNECTING...', 'var(--amber)');
           es.close();
-          setTimeout(connect, 2000);
+          scheduleReconnect();
         };
       }
       connect();
 
-      // Reliable fallback polling
+      // Watchdog polling also handles a half-open/stalled SSE connection.
       setInterval(() => {
-        if (!es || es.readyState !== EventSource.OPEN) {
-          fetch('/api/status')
-            .then(res => res.json())
-            .then(data => updateDashboard(data))
-            .catch(() => {});
-        }
+        const streamHealthy = es && es.readyState === EventSource.OPEN &&
+          lastStreamMessageAt > 0 && (Date.now() - lastStreamMessageAt) < 5000;
+        if (streamHealthy || pollInFlight) return;
+
+        pollInFlight = true;
+        fetch('/api/status', { cache: 'no-store' })
+          .then(res => {
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            return res.json();
+          })
+          .then(data => {
+            updateDashboard(data);
+            setStreamStatus('POLLING FALLBACK', 'var(--amber)');
+          })
+          .catch(() => {})
+          .finally(() => { pollInFlight = false; });
       }, 2000);
     }
 
