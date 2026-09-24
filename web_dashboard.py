@@ -1254,12 +1254,108 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       z-index: 9999;
     }
 
-    @media (max-width: 640px) {
-      .container { padding: 10px; }
-      header { padding: 12px 14px; }
-      .brand-title { font-size: 1.05rem; }
+    /* ─── Comprehensive High-End Responsive Mobile Architecture ─── */
+    @media (max-width: 768px) {
+      .container { padding: 10px 8px 30px; }
+      header {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 12px;
+        padding: 14px;
+      }
+      .brand-wrap {
+        justify-content: flex-start;
+      }
+      .brand-title { font-size: 1.1rem; }
+      .brand-subtitle { font-size: 0.68rem; flex-wrap: wrap; }
+      .header-ctrls {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        flex-wrap: wrap;
+        width: 100%;
+      }
+      .live-badge { padding: 5px 10px; font-size: 0.7rem; }
+      .time-chip { padding: 5px 10px; font-size: 0.75rem; }
+      .btn-action { padding: 6px 11px; font-size: 0.75rem; }
+
+      .royal-banner-wrap { margin-bottom: 12px; }
+      .royal-auspicious-bar { padding: 6px 14px; }
+      .royal-krishna-badge { font-size: 0.82rem; letter-spacing: 0.05em; }
+
+      .segmented-tabs-bar {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        padding-bottom: 6px;
+        justify-content: flex-start;
+      }
+      .segmented-tabs {
+        width: 100%;
+        display: flex;
+        justify-content: space-between;
+        padding: 4px;
+        gap: 4px;
+      }
+      .seg-tab {
+        flex: 1;
+        padding: 8px 10px;
+        font-size: 0.78rem;
+        white-space: nowrap;
+        text-align: center;
+        justify-content: center;
+      }
+
+      .kpi-row {
+        grid-template-columns: repeat(2, 1fr);
+        gap: 10px;
+        margin-bottom: 16px;
+      }
+      .kpi-card { padding: 14px; }
+      .kpi-val { font-size: 1.45rem; }
+      .kpi-sub { font-size: 0.72rem; }
+
+      .panel-box { padding: 14px; border-radius: 16px; margin-bottom: 16px; }
+      .panel-hdr { padding-bottom: 12px; margin-bottom: 14px; }
+      .panel-title { font-size: 0.98rem; }
+
+      .telemetry-grid {
+        grid-template-columns: repeat(2, 1fr);
+        gap: 8px;
+      }
+      .tel-item { padding: 10px 12px; }
+      .tel-val { font-size: 1rem; }
+
+      .history-cards-flex {
+        grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+        gap: 8px;
+      }
+
+      .dow-bar-track { height: 110px; }
+      .dow-bar-column { min-width: 48px; }
+    }
+
+    @media (max-width: 480px) {
+      .container { padding: 8px 6px 24px; }
+      .brand-title { font-size: 0.98rem; }
+      .royal-krishna-badge { font-size: 0.74rem; }
+      .kpi-row {
+        grid-template-columns: 1fr;
+        gap: 10px;
+      }
       .kpi-val { font-size: 1.55rem; }
-      .seg-tab { padding: 8px 14px; font-size: 0.82rem; }
+      .telemetry-grid {
+        grid-template-columns: repeat(2, 1fr);
+      }
+      .segmented-tabs {
+        display: flex;
+        width: max-content;
+      }
+      .history-cards-flex {
+        grid-template-columns: 1fr;
+      }
+      .dow-bar-track { height: 95px; }
+      .dow-bar-column { min-width: 40px; }
     }
 
     /* ─── Ultra-Cool Animations & Chart Effects ─── */
@@ -1759,34 +1855,40 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
             </tbody>
           </table>
         </div>
-      </div>
-
-      <!-- Day-of-Week Cumulative Performance Analysis -->
-      <div style="margin-bottom:14px; display:flex; justify-content:space-between; align-items:center;">
-        <h3 style="font-size:1.05rem; font-weight:800;">Day-of-Week Cumulative Performance</h3>
-        <span style="font-size:0.75rem; color:var(--text-dim); font-family:var(--mono);">Monday – Friday Performance Heat</span>
-      </div>
-
-      <div class="panel-box" style="padding:20px; margin-bottom:24px;">
-        <div style="display:flex; gap:14px; justify-content:space-between; align-items:flex-end;" id="dow-bars-container">
-          <!-- Dynamically populated 5 weekday bars -->
-        </div>
-      </div>
-
-      <!-- Month-wise Performance Breakdown Cards -->
-      <div style="margin-bottom:14px; display:flex; justify-content:space-between; align-items:center;">
-        <h3 style="font-size:1.05rem; font-weight:800;">Monthly Performance Breakdown</h3>
-        <span style="font-size:0.75rem; color:var(--text-dim); font-family:var(--mono);">Month-over-Month Capital Gain</span>
-      </div>
-      <div class="history-cards-flex" id="monthwise-cards-box" style="margin-bottom:24px;"></div>
-
-      <!-- Scrollable Last 30 Days Performance Journal -->
-      <div style="margin-bottom:14px; display:flex; justify-content:space-between; align-items:center;">
-        <h3 style="font-size:1.05rem; font-weight:800;">Last 30 Days Performance Feed</h3>
-        <span style="font-size:0.75rem; color:var(--text-dim); font-family:var(--mono);">Scrollable Daily Session Journal</span>
-      </div>
-      <div class="scroll-feed-30d" id="history-30d-feed" style="margin-bottom:24px;"></div>
     </div>
+
+    <!-- ─── Universal Historical Performance & Analytics (Visible on all tabs) ─── -->
+    <!-- Day-of-Week Cumulative Performance Analysis -->
+    <div style="margin-top:28px; margin-bottom:14px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+      <h3 style="font-size:1.05rem; font-weight:800; display:flex; align-items:center; gap:8px;">
+        <span>📊</span> <span>Day-of-Week Cumulative Performance</span>
+      </h3>
+      <span style="font-size:0.75rem; color:var(--text-dim); font-family:var(--mono);">Monday – Friday Performance Heat</span>
+    </div>
+
+    <div class="panel-box" style="padding:20px; margin-bottom:24px;">
+      <div style="display:flex; gap:14px; justify-content:space-between; align-items:flex-end;" id="dow-bars-container">
+        <!-- Dynamically populated 5 weekday bars -->
+      </div>
+    </div>
+
+    <!-- Month-wise Performance Breakdown Cards -->
+    <div style="margin-bottom:14px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+      <h3 style="font-size:1.05rem; font-weight:800; display:flex; align-items:center; gap:8px;">
+        <span>📅</span> <span>Monthly Performance Breakdown</span>
+      </h3>
+      <span style="font-size:0.75rem; color:var(--text-dim); font-family:var(--mono);">Month-over-Month Capital Gain (Base: ₹2,00,000)</span>
+    </div>
+    <div class="history-cards-flex" id="monthwise-cards-box" style="margin-bottom:24px;"></div>
+
+    <!-- Scrollable Last 30 Days Performance Journal -->
+    <div style="margin-bottom:14px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+      <h3 style="font-size:1.05rem; font-weight:800; display:flex; align-items:center; gap:8px;">
+        <span>🗓️</span> <span>Last 30 Days Performance Feed</span>
+      </h3>
+      <span style="font-size:0.75rem; color:var(--text-dim); font-family:var(--mono);">Scrollable Daily Session Journal</span>
+    </div>
+    <div class="scroll-feed-30d" id="history-30d-feed" style="margin-bottom:28px;"></div>
   </div>
 
   <!-- ─── Broker Authentication Modal (Apple macOS Glass Styling) ─── -->
