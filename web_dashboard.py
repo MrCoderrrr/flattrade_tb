@@ -2926,7 +2926,12 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         ytdPctEl.style.color = ytdPct >= 0 ? 'var(--green)' : 'var(--red)';
       }
 
-      document.getElementById('trades-count-pill').innerText = `${p.total_trades || 0} TRADES`;
+      // This legacy badge was removed from the current header markup. Keep the
+      // refresh loop alive when an optional element is not present.
+      const tradesCountPill = document.getElementById('trades-count-pill');
+      if (tradesCountPill) {
+        tradesCountPill.innerText = `${p.total_trades || 0} TRADES`;
+      }
 
       // ── NIFTY TAB DATA ──
       const n = data.nifty || {};
