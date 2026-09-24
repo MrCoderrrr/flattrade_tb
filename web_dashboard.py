@@ -108,72 +108,6 @@ def exchange_flattrade_token(url_or_code: str, multiplier: int = 1) -> dict:
             return {"status": "error", "message": f"HTTP {resp.status_code}: {resp.text}"}
     except Exception as e:
         return {"status": "error", "message": f"Network error: {str(e)}"}
-
-FLATTRADE_PASSWORD = os.environ.get("FLATTRADE_PASSWORD", "Trade@1234")
-
-def login_flattrade_with_totp(totp_code: str, multiplier: int = 1) -> dict:
-    totp = (totp_code or "").strip()
-    if not totp:
-        return {"status": "error", "message": "Please enter your 6-digit TOTP code from your authenticator app."}
-
-    api_key, api_secret, user_id = get_flattrade_creds()
-    pwd_sha256 = hashlib.sha256(FLATTRADE_PASSWORD.encode("utf-8")).hexdigest()
-
-    session_headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Content-Type": "application/json",
-        "Origin": "https://auth.flattrade.in",
-        "Referer": f"https://auth.flattrade.in/?app_key={api_key}"
-    }
-
-    try:
-        # Step 1: Initialize session on Flattrade Auth API
-        s_resp = requests.post("https://authapi.flattrade.in/auth/session", headers=session_headers, timeout=10)
-        sid = s_resp.text.strip()
-        if not sid or len(sid) < 16:
-            return {"status": "error", "message": f"Failed to initialize Flattrade session. Response: {s_resp.text}"}
-
-        # Step 2: Validate session
-        try:
-            requests.post("https://authapi.flattrade.in/sessionValid", headers={**session_headers, "Sid": sid}, json={}, timeout=10)
-        except Exception:
-            pass
-
-        # Step 3: Authenticate with User ID, hashed password (Trade@1234), and TOTP
-        auth_payload = {
-            "UserName": user_id,
-            "Password": pwd_sha256,
-            "PAN_DOB": totp.upper(),
-            "App": "",
-            "ClientID": "",
-            "Key": "",
-            "APIKey": api_key,
-            "Sid": sid,
-            "Override": "Y",
-            "Source": "AUTHPAGE",
-            "Rd": ""
-        }
-
-        auth_resp = requests.post("https://authapi.flattrade.in/ftauth", headers=session_headers, json=auth_payload, timeout=14)
-        if auth_resp.status_code != 200:
-            return {"status": "error", "message": f"Flattrade server returned HTTP {auth_resp.status_code}: {auth_resp.text}"}
-
-        res_data = auth_resp.json()
-        redirect_url = res_data.get("RedirectURL", "")
-        emsg = res_data.get("emsg", "")
-
-        if redirect_url and ("code=" in redirect_url or "request_code=" in redirect_url):
-            # Step 4: Extract request_code and exchange for access token
-            return exchange_flattrade_token(redirect_url, multiplier)
-        elif emsg:
-            return {"status": "error", "message": f"Flattrade rejected login: {emsg}"}
-        else:
-            return {"status": "error", "message": f"Unexpected Flattrade response: {auth_resp.text}"}
-
-    except Exception as e:
-        return {"status": "error", "message": f"Login automation error: {str(e)}"}
-
 def get_flattrade_token_status() -> dict:
     token_file = os.path.join(PROJECT_ROOT, "token.txt")
     exists = os.path.exists(token_file) and os.path.getsize(token_file) > 10
@@ -1840,8 +1774,8 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       <div style="display:flex; align-items:center; gap:14px; margin-bottom:16px;">
         <div style="width:44px; height:44px; background:linear-gradient(135deg, #f59e0b, #d97706); border-radius:14px; display:flex; align-items:center; justify-content:center; font-size:1.4rem; box-shadow:0 4px 18px rgba(245, 158, 11, 0.35);">🔑</div>
         <div>
-          <h3 style="font-family:var(--display); font-size:1.22rem; font-weight:800; background:linear-gradient(to right, #fff, #fde047); -webkit-background-clip:text; -webkit-text-fill-color:transparent;">Flattrade One-Click Login</h3>
-          <div style="font-size:0.74rem; color:var(--text-dim); font-family:var(--mono);">Client ID: <b style="color:var(--primary);" id="auth-client-id">FZ04111</b> &bull; Password: <b style="color:#fde047;">Trade@1234 (Auto)</b></div>
+          <h3 style="font-family:var(--display); font-size:1.22rem; font-weight:800; background:linear-gradient(to right, #fff, #fde047); -webkit-background-clip:text; -webkit-text-fill-color:transparent;">Flattrade Daily Token Activation</h3>
+          <div style="font-size:0.74rem; color:var(--text-dim); font-family:var(--mono);">Client ID: <b style="color:var(--primary);" id="auth-client-id">FZ04111</b> &bull; Official Web Auth</div>
         </div>
       </div>
 
@@ -1854,49 +1788,27 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         <span class="status-chip chip-dim" id="modal-token-chip">CHECKING</span>
       </div>
 
-      <!-- Primary 1-Click TOTP Box (Instant) -->
-      <div style="background:rgba(255,255,255,0.025); border:1px solid rgba(255,255,255,0.08); border-radius:16px; padding:18px; margin-bottom:14px; box-shadow:inset 0 1px 0 rgba(255,255,255,0.06);">
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-          <span style="font-size:0.84rem; font-weight:800; color:#fff; display:flex; align-items:center; gap:6px;">
-            <span>⚡</span> <span>Enter 6-Digit TOTP</span>
-          </span>
-          <span style="font-size:0.7rem; color:var(--gold); font-family:var(--mono); font-weight:700;">Password: Trade@1234</span>
+      <!-- STEP 1: Open Flattrade Login Page -->
+      <div style="background:rgba(255,255,255,0.025); border:1px solid rgba(255,255,255,0.08); border-radius:16px; padding:16px; margin-bottom:14px;">
+        <div style="font-size:0.75rem; font-weight:800; color:var(--primary); text-transform:uppercase; letter-spacing:0.06em; margin-bottom:6px;">STEP 1: Log in on Flattrade</div>
+        <div style="font-size:0.74rem; color:var(--text-dim); margin-bottom:12px; line-height:1.4;">
+          Click below to open Flattrade in a new tab. Log in securely with your User ID, Password, and TOTP:
         </div>
-        
-        <div style="font-size:0.73rem; color:var(--text-dim); margin-bottom:12px; line-height:1.4;">
-          Open your authenticator app on your phone, enter your 6-digit TOTP below, and click Authenticate. All login steps and token saving are executed in seconds!
-        </div>
-
-        <input type="text" id="auth-input-totp" maxlength="6" placeholder="0 0 0 0 0 0" style="width:100%; background:rgba(0,0,0,0.6); border:1px solid rgba(255,255,255,0.18); border-radius:14px; padding:14px; color:#fff; font-family:var(--mono); font-size:1.6rem; font-weight:800; letter-spacing:0.35em; text-align:center; outline:none; transition:border-color 0.2s, box-shadow 0.2s; box-shadow:inset 0 2px 6px rgba(0,0,0,0.5);" onfocus="this.style.borderColor='var(--gold)'; this.style.boxShadow='0 0 16px rgba(251, 191, 36, 0.3)';" onblur="this.style.borderColor='rgba(255,255,255,0.18)'; this.style.boxShadow='inset 0 2px 6px rgba(0,0,0,0.5)';" onkeypress="if(event.key === 'Enter') submitAuthTOTP();">
-
-        <button id="btn-submit-totp" onclick="submitAuthTOTP()" style="width:100%; margin-top:14px; background:linear-gradient(135deg, #10b981, #059669); color:#fff; border:none; padding:13px; border-radius:13px; font-weight:800; font-size:0.95rem; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:8px; box-shadow:0 4px 20px rgba(16, 185, 129, 0.4), inset 0 1px 0 rgba(255,255,255,0.25); transition:all 0.2s;">
-          <span>⚡ Authenticate & Generate Token</span>
-        </button>
+        <a id="btn-flattrade-link" href="https://auth.flattrade.in/?app_key=fa5da7cfc3d7459298efeb11d87bab41" target="_blank" style="display:flex; align-items:center; justify-content:center; gap:8px; width:100%; background:linear-gradient(135deg, rgba(56, 189, 248, 0.18), rgba(99, 102, 241, 0.22)); border:1px solid rgba(56, 189, 248, 0.45); color:#fff; text-decoration:none; padding:12px 16px; border-radius:12px; font-weight:800; font-size:0.92rem; box-shadow:0 4px 18px rgba(56, 189, 248, 0.25); transition:all 0.2s;">
+          <span>🌐</span> <span>Open Flattrade Official Login Page ↗</span>
+        </a>
       </div>
 
-      <!-- Toggle for Manual Fallback -->
-      <div style="text-align:center; margin-bottom:12px;">
-        <button type="button" onclick="toggleManualAuth()" style="background:none; border:none; color:var(--text-dim); font-size:0.74rem; font-family:var(--mono); text-decoration:underline; cursor:pointer;">
-          🔗 Need to paste redirect URL manually? Click here
-        </button>
-      </div>
-
-      <!-- Manual Browser Fallback Section (Hidden by Default) -->
-      <div id="auth-manual-fallback" style="display:none; background:rgba(0,0,0,0.35); border:1px solid rgba(255,255,255,0.08); border-radius:14px; padding:14px; margin-bottom:14px;">
-        <div style="margin-bottom:10px;">
-          <div style="font-size:0.75rem; font-weight:700; color:var(--text-muted); margin-bottom:5px;">STEP 1: Open Flattrade Login Page</div>
-          <a id="btn-flattrade-link" href="https://auth.flattrade.in/?app_key=fa5da7cfc3d7459298efeb11d87bab41" target="_blank" style="display:flex; align-items:center; justify-content:center; gap:6px; width:100%; background:rgba(56, 189, 248, 0.14); border:1px solid rgba(56, 189, 248, 0.35); color:var(--primary); text-decoration:none; padding:9px; border-radius:10px; font-weight:700; font-size:0.82rem;">
-            <span>🌐 Open Flattrade Login Page</span>
-          </a>
+      <!-- STEP 2: Paste Redirect URL or Code -->
+      <div style="background:rgba(255,255,255,0.025); border:1px solid rgba(255,255,255,0.08); border-radius:16px; padding:16px; margin-bottom:14px;">
+        <div style="font-size:0.75rem; font-weight:800; color:var(--gold); text-transform:uppercase; letter-spacing:0.06em; margin-bottom:6px;">STEP 2: Paste Redirect URL or Code</div>
+        <div style="font-size:0.74rem; color:var(--text-dim); margin-bottom:12px; line-height:1.4;">
+          After logging in, copy the URL from your browser address bar (or just the code) and paste it below:
         </div>
+        <input type="text" id="auth-input-code" placeholder="Paste redirected URL (e.g. https://127.0.0.1/?code=...) or code" style="width:100%; background:rgba(0,0,0,0.6); border:1px solid rgba(255,255,255,0.18); border-radius:12px; padding:12px 14px; color:#fff; font-family:var(--mono); font-size:0.85rem; outline:none; transition:border-color 0.2s;" onfocus="this.style.borderColor='var(--gold)';" onblur="this.style.borderColor='rgba(255,255,255,0.18)';" onkeypress="if(event.key === 'Enter') submitAuthToken();">
 
-        <div style="margin-bottom:10px;">
-          <div style="font-size:0.75rem; font-weight:700; color:var(--text-muted); margin-bottom:5px;">STEP 2: Paste Redirect URL or Code</div>
-          <input type="text" id="auth-input-code" placeholder="Paste full redirect URL (e.g. https://127.0.0.1/?code=...)" style="width:100%; background:rgba(0,0,0,0.5); border:1px solid rgba(255,255,255,0.14); border-radius:10px; padding:10px 12px; color:#fff; font-family:var(--mono); font-size:0.8rem; outline:none;">
-        </div>
-
-        <button id="btn-submit-token" onclick="submitAuthToken()" style="width:100%; background:rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.2); color:#fff; padding:10px; border-radius:10px; font-weight:700; font-size:0.84rem; cursor:pointer;">
-          <span>Exchange Code For Token</span>
+        <button id="btn-submit-token" onclick="submitAuthToken()" style="width:100%; margin-top:14px; background:linear-gradient(135deg, #10b981, #059669); color:#fff; border:none; padding:13px; border-radius:12px; font-weight:800; font-size:0.95rem; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:8px; box-shadow:0 4px 20px rgba(16, 185, 129, 0.4), inset 0 1px 0 rgba(255,255,255,0.25); transition:all 0.2s;">
+          <span>⚡ Extract & Activate Token</span>
         </button>
       </div>
 
@@ -2728,7 +2640,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       modal.style.display = 'flex';
       fetchAuthStatus();
       setTimeout(() => {
-        const inp = document.getElementById('auth-input-totp');
+        const inp = document.getElementById('auth-input-code');
         if (inp) inp.focus();
       }, 100);
     }
@@ -2736,70 +2648,6 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
     function closeAuthModal() {
       document.getElementById('auth-modal').style.display = 'none';
       document.getElementById('auth-feedback-box').style.display = 'none';
-    }
-
-    function toggleManualAuth() {
-      const el = document.getElementById('auth-manual-fallback');
-      if (el) {
-        el.style.display = (el.style.display === 'none' || !el.style.display) ? 'block' : 'none';
-      }
-    }
-
-    function submitAuthTOTP() {
-      const input = document.getElementById('auth-input-totp');
-      const totp = (input.value || '').trim();
-      const feedback = document.getElementById('auth-feedback-box');
-      const btn = document.getElementById('btn-submit-totp');
-
-      if (!totp || totp.length < 6) {
-        feedback.style.display = 'block';
-        feedback.style.background = 'rgba(244, 63, 94, 0.15)';
-        feedback.style.color = 'var(--red)';
-        feedback.style.border = '1px solid rgba(244, 63, 94, 0.3)';
-        feedback.innerText = 'Please enter your 6-digit TOTP code from your authenticator app!';
-        return;
-      }
-
-      btn.disabled = true;
-      btn.style.opacity = '0.6';
-      btn.innerHTML = '<span>⏳ Logging in & Generating Token...</span>';
-
-      fetch('/api/auth/login_totp', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ totp: totp })
-      })
-      .then(res => res.json())
-      .then(data => {
-        btn.disabled = false;
-        btn.style.opacity = '1';
-        btn.innerHTML = '<span>⚡ Authenticate & Generate Token</span>';
-        feedback.style.display = 'block';
-
-        if (data.status === 'success') {
-          feedback.style.background = 'rgba(16, 185, 129, 0.15)';
-          feedback.style.color = 'var(--green)';
-          feedback.style.border = '1px solid rgba(16, 185, 129, 0.3)';
-          feedback.innerHTML = `✅ <b>Success!</b> ${data.message}<br><small>Token: ${data.token_preview}</small>`;
-          input.value = '';
-          fetchAuthStatus();
-        } else {
-          feedback.style.background = 'rgba(244, 63, 94, 0.15)';
-          feedback.style.color = 'var(--red)';
-          feedback.style.border = '1px solid rgba(244, 63, 94, 0.3)';
-          feedback.innerHTML = `❌ <b>Failed:</b> ${data.message}`;
-        }
-      })
-      .catch(err => {
-        btn.disabled = false;
-        btn.style.opacity = '1';
-        btn.innerHTML = '<span>⚡ Authenticate & Generate Token</span>';
-        feedback.style.display = 'block';
-        feedback.style.background = 'rgba(244, 63, 94, 0.15)';
-        feedback.style.color = 'var(--red)';
-        feedback.style.border = '1px solid rgba(244, 63, 94, 0.3)';
-        feedback.innerText = `Network error: ${err.message}`;
-      });
     }
 
     function fetchAuthStatus() {
@@ -2844,13 +2692,13 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         feedback.style.background = 'rgba(244, 63, 94, 0.15)';
         feedback.style.color = 'var(--red)';
         feedback.style.border = '1px solid rgba(244, 63, 94, 0.3)';
-        feedback.innerText = 'Please paste the redirect URL or code first!';
+        feedback.innerText = 'Please paste the redirected URL or code from Flattrade first!';
         return;
       }
 
       btn.disabled = true;
       btn.style.opacity = '0.6';
-      btn.innerHTML = '<span>⏳ Exchanging Code for Token...</span>';
+      btn.innerHTML = '<span>⏳ Extracting Token & Activating...</span>';
 
       fetch('/api/auth/token', {
         method: 'POST',
@@ -2861,7 +2709,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       .then(data => {
         btn.disabled = false;
         btn.style.opacity = '1';
-        btn.innerHTML = '<span>⚡ Generate & Save Token to Server</span>';
+        btn.innerHTML = '<span>⚡ Extract & Activate Token</span>';
         feedback.style.display = 'block';
 
         if (data.status === 'success') {
@@ -2881,7 +2729,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       .catch(err => {
         btn.disabled = false;
         btn.style.opacity = '1';
-        btn.innerHTML = '<span>⚡ Generate & Save Token to Server</span>';
+        btn.innerHTML = '<span>⚡ Extract & Activate Token</span>';
         feedback.style.display = 'block';
         feedback.style.background = 'rgba(244, 63, 94, 0.15)';
         feedback.style.color = 'var(--red)';
@@ -3013,26 +2861,6 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            self.wfile.write(payload)
-
-        elif path == "/api/auth/login_totp":
-            try:
-                content_length = int(self.headers.get("Content-Length", 0))
-                post_body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else "{}"
-                data = json.loads(post_body)
-            except Exception:
-                data = {}
-
-            totp = data.get("totp", "")
-            multiplier = int(data.get("multiplier", 1) or 1)
-            result = login_flattrade_with_totp(totp, multiplier)
-
-            payload = json.dumps(result).encode("utf-8")
-            self.send_response(200 if result.get("status") == "success" else 400)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(payload)
         else:
             self.send_response(404)
             self.end_headers()
