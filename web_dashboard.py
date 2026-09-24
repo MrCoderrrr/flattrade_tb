@@ -346,6 +346,42 @@ def _trade_metrics(trades, base_capital=None):
         "net_pnl": round(sum(t["pnl"] for t in ordered), 2),
     }
 
+def _load_nifty_csv_trades(filepath: str, fallback_date=None):
+    """Load NIFTY exits and pair them with their preceding entry prices."""
+    trades = []
+    open_entries = {}
+    try:
+        with open(filepath, "r", encoding="utf-8", newline="") as f:
+            for row in csv.DictReader(f):
+                action = str(row.get("action", "")).upper()
+                leg = str(row.get("leg", ""))
+                strike = str(row.get("strike", ""))
+                try:
+                    qty = int(float(row.get("qty", 0) or 0))
+                    price = float(row.get("price", 0) or 0)
+                except (TypeError, ValueError):
+                    qty, price = 0, 0.0
+                key = (leg, strike, qty)
+
+                if action == "ENTRY":
+                    open_entries.setdefault(key, []).append(price)
+                    continue
+                if action not in {"EXIT", "CLOSE", "SQUARE_OFF", "SQUAREOFF"}:
+                    continue
+
+                trade = _normalise_trade(row, "NIFTY", fallback_date)
+                if not trade:
+                    continue
+                entries = open_entries.get(key)
+                if entries:
+                    trade["entry"] = entries.pop(0)
+                    if not entries:
+                        open_entries.pop(key, None)
+                trades.append(trade)
+    except (OSError, csv.Error):
+        pass
+    return trades
+
 def get_trade_analytics(nifty_snapshot=None, mcx_snapshot=None, base_capital=None):
     observed = []
     today = get_ist_now().date()
@@ -363,14 +399,7 @@ def get_trade_analytics(nifty_snapshot=None, mcx_snapshot=None, base_capital=Non
         filepath = os.path.join(PROJECT_ROOT, relative_path)
         if not os.path.exists(filepath):
             continue
-        try:
-            with open(filepath, "r", encoding="utf-8", newline="") as f:
-                for row in csv.DictReader(f):
-                    trade = _normalise_trade(row, "NIFTY")
-                    if trade:
-                        observed.append(trade)
-        except (OSError, csv.Error):
-            pass
+        observed.extend(_load_nifty_csv_trades(filepath))
 
     stored = load_json_safe(TRADE_STORE_FILE, [])
     if not isinstance(stored, list):
