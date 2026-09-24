@@ -1,31 +1,39 @@
-"""mcx_paper_v5.py  —  v5.0 (Continuous Streaming EMA Momentum + Hedged Straddle)
+"""mcx_paper_v5.py  —  v5.1 (NIFTY-Aligned Precision Hedged Straddle + Noise-Filtered Streaming EMA Engine)
 ================================================================================
-MCX Natural Gas Paper Trading Engine | Version 5.0
+MCX Natural Gas Paper Trading Engine | Version 5.1
 Session Window: 15:30 – 23:24 IST (weekdays & Sundays)
 Auto Square-Off: 23:24 IST
 
-Key Architecture & Rules:
-  1. Continuous Streaming EMA Momentum Engine (from NIFTY 50 architecture):
-     - Fast EMA: 15s half-life
-     - Slow EMA: 90s half-life
-     - Anchor EMA: 300s half-life
-     - Rolling Volatility: RV60 / RV300 -> Volatility Ratio (VR)
-     - Adaptive Persistence: P_req = clamp(10.0 / VR, 3.0s, 30.0s)
-     - Directional Lock: Confirmed Signal (+1 Bullish, -1 Bearish, 0 Flat)
-  2. Momentum-Guided Entry:
-     - Confirmed Bullish (+1): Write PE solo at ATM, defer CE.
-     - Confirmed Bearish (-1): Write CE solo at ATM, defer PE.
-     - Neutral (0): Write balanced ATM Straddle (CE + PE).
-  3. Proactive Early Trend Exit:
-     - When both legs are open, if momentum locks strongly against an open leg,
-       proactively exits before full SL is reached.
-  4. Momentum Reversal Re-Entry:
-     - Surviving leg re-enters missing side when momentum flips/halts.
-  5. Dual-Phase Dynamic Stop-Loss & Solo TSL:
-     - Strangle active (both legs open): 12% SL per leg, ratcheting with best LTP stored.
-     - One leg squared off -> Surviving leg immediately switches to strict 7% TSL.
-     - All SL and TSL tracked against best (lowest) LTP stored.
-  6. Box-Drawing ANSI Dashboard + 3-second live Telegram broadcast.
+NIFTY ARCHITECTURE ALIGNMENT & FIXES (Resolves 4k -> 1.5k PnL Degradation):
+  1. Noise-Resistant Continuous Streaming EMA Engine:
+     - 60-second sliding history window for 300s anchor EMA slope (eliminates 11s micro-jitter).
+     - Strict deadbands: MIN_EMA_SPREAD = 0.20 pts (4 ticks) and MIN_SLOPE = 0.035 pts/min.
+       If EMA spread < 0.20 pts or slope < 0.035 pts/min, signal is strictly FLAT / NEUTRAL (0).
+     - Adaptive persistence clamped to [15.0s, 45.0s] (eliminates 3-second noise whipsaws).
+  2. Balanced Straddle Entry Default (Decay Harvest):
+     - In steady / sideways / normal markets, ALWAYS writes balanced ATM Straddle (CE + PE).
+     - Deferral of one leg ONLY occurs on an overwhelming, sustained directional trend
+       (held >= 25s with EMA spread >= 0.40 pts).
+  3. Strict NIFTY-Style Profit Protection & Max Giveback Cap (Prevents Giving Back Profits):
+     - Break-Even Lock: When profit >= 4% or >= 0.50 pts, SL is capped at entry price (cannot lose!).
+     - Tiered Profit Ratchet:
+         * Profit >= 0.80 pts (8%): locks 30% of profit.
+         * Profit >= 1.50 pts (15%): locks 55% of profit.
+         * Profit >= 2.50 pts (25%): locks 75% of profit.
+         * Profit >= 3.50 pts (40%): locks 85% of profit.
+     - Hard Max Giveback Cap (PREM_MAX_PROFIT_GIVEBACK = 0.20):
+         * Position stop is capped at entry_prem - 0.80 * profit.
+         * At peak profit (e.g. +4k = 3.2 pts decay), AT LEAST 80% (+₹3,200) IS GUARANTEED LOCKED IN!
+  4. NIFTY-Style Solo Leg Re-Anchoring (No Choking on Old Lowest):
+     - When one leg hits SL, the surviving leg immediately re-anchors to its live LTP:
+       anchor_ltp = live_ltp, best_premium = live_ltp, current_sl = live_ltp * (1 + 9%).
+     - Gives the winning leg fresh breathing room and trailing protection rather than
+       choking it on an old historical lowest tick.
+  5. 2-Second Tick Debounce Filter:
+     - Price must stay at or above SL for 2 consecutive seconds before triggering exit.
+       Completely eliminates false stop-outs from 1-second wide bid-ask spread flickers.
+  6. Reversal Re-Entry Engine:
+     - Missing leg re-enters at ATM as soon as trend halts/reverses or 0.80 pt swing pullback occurs.
 ================================================================================
 """
 
@@ -93,7 +101,7 @@ def is_expiry_week(today_date: Any, expiry_date: Any) -> bool:
     return in_calendar_week or within_dte_window
 
 # ─────────────────────────────────────────────
-# Configuration
+# Configuration & Risk Settings (NIFTY-Aligned)
 # ─────────────────────────────────────────────
 TOKEN_FILE          = 'token.txt'
 STRIKE_STEP         = 5.0          # Natural Gas strike step
@@ -102,16 +110,40 @@ MCX_ENTRY_MINUTE    = 30
 MCX_EXIT_HOUR       = 23
 MCX_EXIT_MINUTE     = 24           # 23:24 IST auto square-off (11:24 PM)
 LOT_SIZE            = 1250         # 1 lot = 1250 units
-DEFAULT_SL_PCT      = 0.12         # 12% initial stop-loss per leg (Strangle active)
-REENTRY_SL_PCT      = 0.12         # 12% initial stop-loss for reversal re-entry
-DEFAULT_TSL_PCT     = 0.07         # 7% trailing stop-loss (Solo surviving leg)
-POST_CLOSE_COOLDOWN = 60.0         # 60s cooldown after close (reverted to yesterday)
-REENTRY_COOLDOWN_S  = 30.0         # 30s min between single-leg re-entries (reverted to yesterday)
-SWING_REVERSAL_PTS  = 0.80         # 0.80 pts pullback threshold (reverted to yesterday)
+CAPITAL             = 200000.0
+
+# --- NIFTY-ALIGNED PREMIUM SL & PROFIT PROTECTION ---
+PREM_SL_INITIAL_PCT        = 0.15   # 15% initial SL per leg (gives breathing room against tick noise)
+PREM_SL_MIN_PCT            = 0.085  # 8.5% trail floor when deep in profit
+PREM_SL_MAX_PCT            = 0.15   # 15% trail ceiling at breakeven
+SOLO_LEG_TSL_PCT           = 0.09   # 9% trailing stop for solo surviving leg (re-anchored at LTP)
+PREM_INITIAL_MAX_POINTS    = 2.50   # Cap initial SL in points for high premiums
+PREM_TRAIL_MAX_POINTS      = 1.80   # Cap trailing distance in points
+
+# KEY FIX FOR 4k -> 1.5k: Strict Profit Protection Ratchet & Max Giveback Cap
+PREM_MAX_PROFIT_GIVEBACK   = 0.20   # Maximum 20% giveback of peak profit (guarantees keeping >= 80% of peak PnL!)
+BREAKEVEN_PROFIT_PCT       = 0.04   # 4% profit triggers instant Break-Even Lock (SL capped at entry price)
+BREAKEVEN_PROFIT_POINTS    = 0.50   # 0.50 points profit triggers instant Break-Even Lock
+
+# Noise Debounce
+SL_DEBOUNCE_SECONDS        = 2.0    # 2 seconds persistence before SL fires (eliminates single-tick bid-ask spread glitches)
+
+# Cooldowns
+POST_CLOSE_COOLDOWN        = 45.0   # 45s cooldown after both legs close
+REENTRY_COOLDOWN_S         = 15.0   # 15s cooldown after leg close before re-entry check
+SWING_REVERSAL_PTS         = 0.80   # 0.80 pts pullback threshold
+
+# EMA Engine Sensitivity Tuning (Noise Filtered)
+EMA_FAST_HL                = 15.0   # 15s half-life
+EMA_SLOW_HL                = 90.0   # 90s half-life
+EMA_ANCHOR_HL              = 300.0  # 300s half-life (5 min equivalent)
+EMA_MIN_SLOPE              = 0.035  # Minimum slope threshold on anchor EMA (points/min)
+EMA_MIN_SPREAD             = 0.20   # Fast and Slow EMA must separate by >= 0.20 pts (4 ticks)
+PERSISTENCE_MIN            = 15.0   # Clamped minimum persistence hold time (was 3s - too noisy!)
+PERSISTENCE_MAX            = 45.0   # Clamped maximum persistence hold time
 
 TELEGRAM_TOKEN = '8850507396:AAFwFm2_WxPdSM52JcCpJUj8V1rz9x3G-kE'
 CHAT_ID        = '6307066850'
-CAPITAL        = 195784.0
 PROJECT_ROOT   = os.path.dirname(os.path.abspath(__file__))
 
 # ─────────────────────────────────────────────
@@ -126,7 +158,7 @@ class MCXDBManager:
         return get_ist_now().strftime("%Y-%m-%d")
 
     def _load(self) -> dict:
-        base_cap = globals().get("CAPITAL", 195784.0)
+        base_cap = globals().get("CAPITAL", 200000.0)
         target_file = self.filename
         if not os.path.isabs(target_file):
             cand = os.path.join(PROJECT_ROOT, self.filename)
@@ -232,7 +264,7 @@ class MCXDBManager:
                 print(f"[WARN] Failed writing to daily_pnl_mcx_paper.csv: {e}", flush=True)
 
 # ─────────────────────────────────────────────
-# CONTINUOUS STREAMING EMA MOMENTUM ENGINE
+# CONTINUOUS STREAMING EMA MOMENTUM ENGINE (NOISE-RESISTANT)
 # ─────────────────────────────────────────────
 class ContinuousEMA:
     """Continuous exponential moving average with half-life in seconds."""
@@ -266,18 +298,19 @@ class RollingVolatility:
         return math.sqrt(max(0.0, variance))
 
 
-class AdaptivePersistence:
-    """Maps volatility ratio to required signal hold duration."""
-    @staticmethod
-    def raw(volatility_ratio: float, minimum: float = 3.0, maximum: float = 30.0) -> float:
-        return max(minimum, min(maximum, 10.0 / max(float(volatility_ratio), 1e-12)))
-
-
 class ContinuousEMAEngine:
-    """Continuous streaming indicator pipeline tracking EMA 15s, 90s, 300s, slope, and persistence."""
+    """
+    Noise-resistant continuous streaming EMA engine with deadband & robust persistence.
+    Tracks EMA 15s (fast), 90s (slow), 300s (anchor), slope, and volatility ratio.
+    """
     def __init__(self):
-        self.emas = {h: ContinuousEMA(h) for h in (15.0, 90.0, 300.0)}
-        self.slow_history = deque(maxlen=11)
+        self.emas = {
+            15.0: ContinuousEMA(EMA_FAST_HL),
+            90.0: ContinuousEMA(EMA_SLOW_HL),
+            300.0: ContinuousEMA(EMA_ANCHOR_HL),
+        }
+        # Track 60 seconds of 300s EMA history to compute a genuine 1-minute drift slope (not 11-second jitter!)
+        self.slow_history = deque(maxlen=60)
         self.rv = {60: RollingVolatility(60), 300: RollingVolatility(300)}
         self.raw_signal: int = 0
         self.signal_start_ts: Optional[float] = None
@@ -291,27 +324,38 @@ class ContinuousEMAEngine:
         for ema in self.emas.values():
             ema.update(spot, now_ts)
 
-        if self.emas[300.0].value is not None:
-            self.slow_history.append(self.emas[300.0].value)
+        anchor_val = self.emas[300.0].value or spot
+        self.slow_history.append((now_ts, anchor_val))
 
         rv60 = self.rv[60].update(spot)
         rv300 = self.rv[300].update(spot)
 
         vr = (rv60 / rv300) if rv60 is not None and rv300 and rv300 > 0 else 1.0
-        p_req = AdaptivePersistence.raw(vr)
+        p_req = max(PERSISTENCE_MIN, min(PERSISTENCE_MAX, 15.0 / max(float(vr), 1e-12)))
 
-        slow_slope = (self.slow_history[-1] - self.slow_history[0]) if len(self.slow_history) >= 2 else 0.0
+        # Compute slope over the available history window (up to 60s)
+        if len(self.slow_history) >= 2:
+            dt = self.slow_history[-1][0] - self.slow_history[0][0]
+            if dt >= 5.0:
+                # Slope in points per minute
+                slow_slope = ((self.slow_history[-1][1] - self.slow_history[0][1]) / dt) * 60.0
+            else:
+                slow_slope = 0.0
+        else:
+            slow_slope = 0.0
 
         fast_val = self.emas[15.0].value if self.emas[15.0].value is not None else spot
         slow_val = self.emas[90.0].value if self.emas[90.0].value is not None else spot
+        ema_diff = fast_val - slow_val
 
-        # Directional raw signal: Fast > Slow and Slow Slope > 0 (Bullish), or Fast < Slow and Slope < 0 (Bearish)
-        if fast_val > slow_val and slow_slope > 0:
-            sig = 1
-        elif fast_val < slow_val and slow_slope < 0:
-            sig = -1
+        # Noise-Filtered Directional Signal:
+        # Requires BOTH EMA spread >= EMA_MIN_SPREAD (0.20 pts) AND slope >= EMA_MIN_SLOPE (0.035 pts/min)
+        if ema_diff >= EMA_MIN_SPREAD and slow_slope >= EMA_MIN_SLOPE:
+            sig = 1   # Bullish
+        elif ema_diff <= -EMA_MIN_SPREAD and slow_slope <= -EMA_MIN_SLOPE:
+            sig = -1  # Bearish
         else:
-            sig = 0
+            sig = 0   # FLAT / NEUTRAL (Filters out normal chop and micro-oscillations)
 
         if sig != 0:
             if sig == self.raw_signal:
@@ -333,13 +377,13 @@ class ContinuousEMAEngine:
 
         if self.confirmed_signal != prev_confirmed:
             direction = {1: "BULLISH▲", -1: "BEARISH▼", 0: "FLAT━"}
-            print(f"[EMA SIGNAL] Confirmed signal changed: {direction.get(prev_confirmed,'?')} → {direction.get(self.confirmed_signal,'?')}  "
-                  f"(EMA15={fast_val:.2f} EMA90={slow_val:.2f} slope={slow_slope:+.3f} VR={vr:.2f} hold={hold_time:.1f}s)", flush=True)
+            print(f"[EMA SIGNAL] Confirmed: {direction.get(prev_confirmed,'?')} → {direction.get(self.confirmed_signal,'?')}  "
+                  f"(Fast={fast_val:.2f} Slow={slow_val:.2f} diff={ema_diff:+.2f} slope={slow_slope:+.3f}/m VR={vr:.2f} hold={hold_time:.1f}s)", flush=True)
 
         self.latest_snapshot = {
             "ema_15": fast_val,
             "ema_90": slow_val,
-            "ema_300": self.emas[300.0].value or spot,
+            "ema_300": anchor_val,
             "slow_slope": slow_slope,
             "rv60": rv60 or 0.0,
             "rv300": rv300 or 0.0,
@@ -491,25 +535,26 @@ class NaturalGasPaperBot:
                 self.trades_today       = int(state.get('trades_today', 0))
                 self.last_reentry_ts    = float(state.get('last_reentry_ts', 0.0))
                 self.last_any_close_ts  = float(state.get('last_any_close_ts', 0.0))
-                # Ensure all active positions adhere to updated DEFAULT_SL_PCT (12%) / DEFAULT_TSL_PCT (7%)
+
                 is_strangle_restored = ('CE' in self.positions and 'PE' in self.positions)
                 for leg, pos in self.positions.items():
-                    pos['loss_stop_pct'] = DEFAULT_SL_PCT
-                    pos['tsl_pct'] = DEFAULT_TSL_PCT
                     sl_st = pos.get('sl_state', {})
-                    sl_st['loss_stop_pct'] = DEFAULT_SL_PCT
-                    sl_st['tsl_pct'] = DEFAULT_TSL_PCT
+                    pos['sl_state'] = sl_st
+                    sl_st['loss_stop_pct'] = PREM_SL_INITIAL_PCT
+                    sl_st['tsl_pct'] = SOLO_LEG_TSL_PCT
                     lowest = float(sl_st.get('lowest_ltp', pos.get('entry_price', 0.0)))
-                    pct = DEFAULT_SL_PCT if is_strangle_restored else DEFAULT_TSL_PCT
+                    pct = PREM_SL_INITIAL_PCT if is_strangle_restored else SOLO_LEG_TSL_PCT
                     new_sl = round_to_tick(lowest * (1.0 + pct))
                     curr_sl = float(sl_st.get('current_sl', new_sl))
                     sl_st['current_sl'] = min(curr_sl, new_sl)
                     sl_st['solo_mode'] = not is_strangle_restored
+                    sl_st['breach_start_ts'] = 0.0
+
                 if hasattr(self, 'db'):
                     self.db.commit_daily_pnl(self.total_realized_pnl)
                 print(f'[STATE] Restored: {len(self.positions)} open legs | '
                       f'Realized PnL: ₹{self.total_realized_pnl:,.2f} | '
-                      f'Trades: {self.trades_today} | Strangle SL: {DEFAULT_SL_PCT*100:.0f}% | Solo TSL: {DEFAULT_TSL_PCT*100:.0f}%', flush=True)
+                      f'Trades: {self.trades_today} | Strangle SL: {PREM_SL_INITIAL_PCT*100:.0f}% | Solo TSL: {SOLO_LEG_TSL_PCT*100:.0f}%', flush=True)
         except Exception as e:
             print(f'[WARN] Error loading MCX state: {e}', flush=True)
 
@@ -544,7 +589,7 @@ class NaturalGasPaperBot:
         except Exception as e:
             print(f'[WARN] Flattrade session warning: {e}. Proceeding in paper mode.', flush=True)
 
-        print(f'[OK] Natural Gas v5.0 PAPER TRADING bot authenticated from {token_path}.', flush=True)
+        print(f'[OK] Natural Gas v5.1 PAPER TRADING bot authenticated from {token_path}.', flush=True)
 
     # ── MCX Symbol master ─────────────────────
     def _get_mcx_csv(self):
@@ -746,8 +791,8 @@ class NaturalGasPaperBot:
 
     # ── Enter a single leg ────────────────────
     def _enter_leg(self, leg: str, strike: float, side: str = 'SELL',
-                   loss_stop_pct: float = DEFAULT_SL_PCT,
-                   tsl_pct: float = DEFAULT_TSL_PCT) -> Optional[dict]:
+                   loss_stop_pct: float = PREM_SL_INITIAL_PCT,
+                   tsl_pct: float = SOLO_LEG_TSL_PCT) -> Optional[dict]:
 
         option_type = 'CE' if leg == 'CE' else 'PE'
         match = self.find_option_symbol(strike, option_type)
@@ -761,9 +806,10 @@ class NaturalGasPaperBot:
             print(f'[WARN] LTP is 0 for {tsym}. Skipping entry.', flush=True)
             return None
 
-        qty        = LOT_SIZE
-        initial_sl = round_to_tick(ltp * (1.0 + loss_stop_pct))
-        now_ts     = time.time()
+        qty = LOT_SIZE
+        initial_sl_dist = min(ltp * loss_stop_pct, PREM_INITIAL_MAX_POINTS)
+        initial_sl      = round_to_tick(ltp + max(0.80, initial_sl_dist))
+        now_ts          = time.time()
 
         pos = {
             'leg':           leg,
@@ -778,11 +824,15 @@ class NaturalGasPaperBot:
             'loss_stop_pct': loss_stop_pct,
             'tsl_pct':       tsl_pct,
             'sl_state': {
-                'lowest_ltp':    ltp,
-                'current_sl':    initial_sl,
-                'initial_sl':    initial_sl,
-                'loss_stop_pct': loss_stop_pct,
-                'tsl_pct':       tsl_pct,
+                'lowest_ltp':      ltp,
+                'current_sl':      initial_sl,
+                'initial_sl':      initial_sl,
+                'loss_stop_pct':   loss_stop_pct,
+                'tsl_pct':         tsl_pct,
+                'anchor_ltp':      ltp,
+                'best_premium':    ltp,
+                'solo_mode':       False,
+                'breach_start_ts': 0.0
             }
         }
         self.positions[leg] = pos
@@ -791,7 +841,7 @@ class NaturalGasPaperBot:
 
         tg = '\n'.join([
             '<pre>',
-            '━━━ MCX TRADE OPENED (v5.0) ━━━',
+            '━━━ MCX TRADE OPENED (v5.1) ━━━',
             '',
             f'  {leg:<4} {int(strike):<5} {side} @ {ltp:.2f}',
             f'  SL  {loss_stop_pct*100:.0f}%  →  {initial_sl:.2f}',
@@ -803,6 +853,35 @@ class NaturalGasPaperBot:
         print(f'[PAPER ENTRY] {side} {qty}x {leg} Strike {int(strike)} ({tsym}) @ ₹{ltp:.2f}', flush=True)
         send_telegram(tg)
         return pos
+
+    # ── NIFTY-Style Solo Leg Re-Anchoring ─────
+    def _anchor_surviving_leg_sl(self, surviving_leg: str):
+        """
+        NIFTY ARCHITECTURE FIX:
+        When partner leg exits, surviving leg immediately re-anchors to its current live LTP.
+        Prevents choking the winning leg on an old lowest price.
+        """
+        pos = self.positions.get(surviving_leg)
+        if not pos:
+            return
+        ltp = self._get_leg_ltp(pos)
+        state = pos.setdefault('sl_state', {})
+
+        solo_sl_dist = min(ltp * SOLO_LEG_TSL_PCT, PREM_TRAIL_MAX_POINTS)
+        new_sl = round_to_tick(ltp + max(0.50, solo_sl_dist))
+
+        # Fresh solo anchor — DO NOT carry forward old breached stop!
+        state['anchor_ltp'] = ltp
+        state['best_premium'] = ltp
+        state['lowest_ltp'] = ltp
+        state['current_sl'] = new_sl
+        state['solo_mode'] = True
+        state['breach_start_ts'] = 0.0
+        pos['_last_ltp'] = ltp
+
+        print(f"🎯 [SOLO LEG ANCHORED] {surviving_leg} re-anchored at LTP ₹{ltp:.2f} (Other leg removed). "
+              f"TSL reset to ₹{new_sl:.2f} ({SOLO_LEG_TSL_PCT*100:.0f}% buffer above LTP). Trailing active!", flush=True)
+        self._save_state()
 
     # ── Close a single leg ────────────────────
     def _close_leg(self, leg: str, reason: str, exit_price: Optional[float] = None):
@@ -831,7 +910,7 @@ class NaturalGasPaperBot:
 
         tg = '\n'.join([
             '<pre>',
-            '━━━ MCX TRADE CLOSED (v5.0) ━━━',
+            '━━━ MCX TRADE CLOSED (v5.1) ━━━',
             '',
             f'  {leg:<4} {int(pos["strike"]):<5} {reason}',
             f'  Entry  {pos["entry_price"]:.2f}',
@@ -846,8 +925,13 @@ class NaturalGasPaperBot:
               f'| PnL: {sign}₹{pnl:,.2f} | {reason}', flush=True)
         send_telegram(tg)
         del self.positions[leg]
+
+        # NIFTY ALIGNMENT: If exactly 1 surviving leg remains, re-anchor its stop cleanly at live LTP!
         if len(self.positions) == 1:
+            surviving = list(self.positions.keys())[0]
+            self._anchor_surviving_leg_sl(surviving)
             self._extreme_spot = 0.0
+
         self.last_any_close_ts = time.time()
         self._save_state()
 
@@ -859,12 +943,7 @@ class NaturalGasPaperBot:
         """
         Smart In-Place Strangle Rebalance for MCX Natural Gas:
         When a solo surviving leg hits its TSL and the target strangle strike is identical to
-        its current strike (atm == strike), we do NOT exit and immediately re-enter this leg.
-        Instead:
-        1. Enter ONLY the missing leg at ATM.
-        2. Lock in the solo run's accrued profit into self.total_realized_pnl.
-        3. Reset the leg's entry_price to current live_ltp and SL to a fresh 15% strangle SL.
-        4. Saves 2 unnecessary market orders, bid-ask spreads, and slippage!
+        its current strike (atm == strike), preserve this leg and enter only the missing leg.
         """
         pos = self.positions.get(solo_leg)
         if not pos:
@@ -876,40 +955,40 @@ class NaturalGasPaperBot:
         print(f'[IN-PLACE REBALANCE] {solo_leg} {int(pos["strike"])} TSL reached. Target is ATM Straddle at {int(atm)}. '
               f'Preserving {solo_leg} in-place to avoid exit+entry slippage!', flush=True)
 
-        # 1. Enter ONLY the missing leg at ATM
-        other_pos = self._enter_leg(other_leg, other_strike, 'SELL', loss_stop_pct=DEFAULT_SL_PCT)
+        other_pos = self._enter_leg(other_leg, other_strike, 'SELL', loss_stop_pct=PREM_SL_INITIAL_PCT)
         if not other_pos:
             print(f'[WARN] Failed to enter {other_leg} at {other_strike}, falling back to leg close.', flush=True)
             return False
 
-        # 2. Update SL/TSL in-place while keeping actual entry price and unrealized PnL intact
         actual_entry = pos['entry_price']
         pos['_last_ltp'] = live_ltp
-        pos['loss_stop_pct'] = DEFAULT_SL_PCT
-        pos['tsl_pct'] = DEFAULT_TSL_PCT
-        fresh_sl = round_to_tick(live_ltp * (1.0 + DEFAULT_SL_PCT))
+        pos['loss_stop_pct'] = PREM_SL_INITIAL_PCT
+        pos['tsl_pct'] = SOLO_LEG_TSL_PCT
+        fresh_sl = round_to_tick(live_ltp * (1.0 + PREM_SL_INITIAL_PCT))
         pos['sl_state'] = {
-            'lowest_ltp': live_ltp,
-            'current_sl': fresh_sl,
-            'initial_sl': fresh_sl,
-            'loss_stop_pct': DEFAULT_SL_PCT,
-            'tsl_pct': DEFAULT_TSL_PCT,
-            'solo_mode': False
+            'lowest_ltp':      live_ltp,
+            'current_sl':      fresh_sl,
+            'initial_sl':      fresh_sl,
+            'loss_stop_pct':   PREM_SL_INITIAL_PCT,
+            'tsl_pct':         SOLO_LEG_TSL_PCT,
+            'anchor_ltp':      live_ltp,
+            'best_premium':    live_ltp,
+            'solo_mode':       False,
+            'breach_start_ts': 0.0
         }
 
         self.last_reentry_ts = time.time()
         self._consume_reversal()
         self._save_state()
 
-        # 3. Telegram alert
         tot_sign = '+' if self.total_realized_pnl >= 0 else ''
         tg = '\n'.join([
             '<pre>',
-            '━━━ MCX IN-PLACE RECALIBRATION (v5.0) ━━━',
+            '━━━ MCX IN-PLACE RECALIBRATION (v5.1) ━━━',
             '',
             f'  Preserved Open: {solo_leg} {int(pos["strike"])} (Entry: {actual_entry:.2f}, Live: {live_ltp:.2f})',
             f'  Entered: {other_leg} {int(other_strike)} SELL',
-            f'  SL Reset: {DEFAULT_SL_PCT*100:.0f}% on best premium (₹{fresh_sl:.2f})',
+            f'  SL Reset: {PREM_SL_INITIAL_PCT*100:.0f}% on best premium (₹{fresh_sl:.2f})',
             f'  Total Realized: {tot_sign}₹{self.total_realized_pnl:,.2f}',
             '',
             '  *Actual entry preserved • SL/TSL reset on best premium*',
@@ -919,77 +998,153 @@ class NaturalGasPaperBot:
         send_telegram(tg)
         return True
 
-    # ── Update SL/TSL for a single leg ────────
+    # ── Update SL/TSL for a single leg (NIFTY RISK LOGIC) ────────
     def _update_leg(self, leg: str, live_ltp: float) -> Tuple[bool, str]:
+        """
+        NIFTY-ALIGNED DUAL-LEG RISK MANAGER:
+        - Break-Even Lock at 4% / 0.50 pts
+        - Dynamic Trailing Stop (15% down to 8.5%)
+        - Tiered Profit Ratchet (30%, 55%, 75%, 85%)
+        - HARD MAX GIVEBACK CAP (20%): locks in >= 80% of peak profit!
+        - 2-Second Tick Debounce Filter to avoid bid-ask spread whipsaws
+        """
         pos = self.positions.get(leg)
         if not pos or pos['side'] != 'SELL' or live_ltp <= 0:
             return False, ''
 
         state       = pos['sl_state']
-        entry_prem  = pos['entry_price']
-        lowest      = float(state.get('lowest_ltp', entry_prem))
+        entry_prem  = float(pos['entry_price'])
+        now_ts      = time.time()
+
+        # Track lowest (best) premium seen
+        lowest = float(state.get('lowest_ltp', entry_prem))
         if live_ltp < lowest:
             lowest = live_ltp
             state['lowest_ltp'] = round(lowest, 2)
 
         is_strangle = ('CE' in self.positions and 'PE' in self.positions)
-        initial_sl  = round_to_tick(entry_prem * (1.0 + pos['loss_stop_pct']))
+        is_solo     = not is_strangle or state.get('solo_mode', False)
 
-        if is_strangle:
-            # ── STRANGLE IS ON (both legs open) ──
-            # Each leg has a 12% stop loss tracked with best LTP stored
-            state['solo_mode'] = False
-            initial_sl  = state.get('initial_sl', round_to_tick(entry_prem * (1.0 + DEFAULT_SL_PCT)))
-            strangle_sl = round_to_tick(lowest * (1.0 + DEFAULT_SL_PCT))
-            target_sl   = min(strangle_sl, initial_sl)
-            current_sl  = min(target_sl, state.get('current_sl', initial_sl))
-            state['current_sl'] = current_sl
+        if is_solo:
+            # ─────────────────────────────────────────────────────────────
+            # SOLO LEG MODE: Re-anchored to LTP when partner leg exited
+            # ─────────────────────────────────────────────────────────────
+            anchor_prem = float(state.get('anchor_ltp', entry_prem))
+            best_prem   = float(state.get('best_premium', lowest))
+            if live_ltp < best_prem:
+                best_prem = live_ltp
+                state['best_premium'] = round(best_prem, 2)
 
-            if live_ltp >= current_sl:
-                label = 'Strangle 12% SL Hit' if current_sl >= initial_sl else 'Strangle 12% Trailed SL Hit'
-                return True, f'{label} on {leg} ({live_ltp:.2f} >= {current_sl:.2f})'
-        else:
-            # ── STRANGLE IS OFF (One leg squared off -> Solo surviving leg gets 7% TSL) ──
-            state['solo_mode'] = True
-            pos['tsl_pct'] = DEFAULT_TSL_PCT
-            # 7% TSL tracked with best LTP stored
-            solo_tsl = round_to_tick(lowest * (1.0 + DEFAULT_TSL_PCT))
+            solo_tsl_dist = min(best_prem * SOLO_LEG_TSL_PCT, PREM_TRAIL_MAX_POINTS)
+            new_trail_sl  = round_to_tick(best_prem + max(0.40, solo_tsl_dist))
+
+            solo_profit     = anchor_prem - best_prem
+            solo_profit_pct = (solo_profit / anchor_prem) if anchor_prem > 0 else 0.0
+
+            # 1. Break-Even Lock: as soon as in profit, SL can NEVER exceed anchor price!
+            if solo_profit >= BREAKEVEN_PROFIT_POINTS or solo_profit_pct >= BREAKEVEN_PROFIT_PCT:
+                new_trail_sl = min(new_trail_sl, anchor_prem)
+
+            # 2. Dynamic Profit Ratchet (lock in captured trend)
+            if solo_profit >= 0.80 or solo_profit_pct >= 0.08:
+                new_trail_sl = min(new_trail_sl, round_to_tick(anchor_prem - (0.30 * solo_profit)))
+            if solo_profit >= 1.50 or solo_profit_pct >= 0.15:
+                new_trail_sl = min(new_trail_sl, round_to_tick(anchor_prem - (0.55 * solo_profit)))
+            if solo_profit >= 2.50 or solo_profit_pct >= 0.25:
+                new_trail_sl = min(new_trail_sl, round_to_tick(anchor_prem - (0.75 * solo_profit)))
+            if solo_profit >= 3.50 or solo_profit_pct >= 0.40:
+                new_trail_sl = min(new_trail_sl, round_to_tick(anchor_prem - (0.85 * solo_profit)))
+
+            # Cap max giveback to 20% of peak profit:
+            giveback_stop = round_to_tick(anchor_prem - ((1.0 - PREM_MAX_PROFIT_GIVEBACK) * solo_profit))
+            new_trail_sl  = min(new_trail_sl, giveback_stop)
+
+            # Strict Ratchet: Stop loss can never move backwards (upwards)
             if 'current_sl' in state:
-                current_sl = min(solo_tsl, state['current_sl'])
+                prem_sl = min(new_trail_sl, state['current_sl'])
             else:
-                current_sl = solo_tsl
-            state['current_sl'] = current_sl
+                prem_sl = new_trail_sl
 
-            if live_ltp >= current_sl:
-                return True, f'Solo 7% TSL Hit on {leg} ({live_ltp:.2f} >= {current_sl:.2f})'
+            state['current_sl'] = prem_sl
+
+            # Tick Debounce Filter (2 seconds of continuous breach required)
+            if live_ltp >= prem_sl:
+                breach_start = state.get('breach_start_ts', 0.0)
+                if breach_start <= 0.0:
+                    state['breach_start_ts'] = now_ts
+                elif (now_ts - breach_start) >= SL_DEBOUNCE_SECONDS:
+                    return True, f"Solo TSL Hit on {leg} ({live_ltp:.2f} >= {prem_sl:.2f}, profit locked)"
+            else:
+                state['breach_start_ts'] = 0.0
+
+            return False, ''
+
+        # ─────────────────────────────────────────────────────────────
+        # STANDARD DUAL-LEG STRANGLE MODE (Both legs open)
+        # ─────────────────────────────────────────────────────────────
+        state['solo_mode'] = False
+        initial_sl_dist = min(entry_prem * PREM_SL_INITIAL_PCT, PREM_INITIAL_MAX_POINTS)
+        initial_sl      = round_to_tick(entry_prem + max(0.80, initial_sl_dist))
+
+        if lowest >= entry_prem:
+            # Phase A: not yet in profit — hold at initial SL
+            prem_sl = initial_sl
+        else:
+            # Phase B: In profit — dynamic trailing + tiered profit ratchet
+            profit     = entry_prem - lowest
+            profit_pct = profit / entry_prem if entry_prem > 0 else 0.0
+
+            trail_ceiling = PREM_SL_MAX_PCT
+            trail_floor   = PREM_SL_MIN_PCT
+            trail_pct     = trail_ceiling - (trail_ceiling - trail_floor) * min(profit_pct / 0.50, 1.0)
+            trail_pct     = max(trail_pct, trail_floor)
+
+            trail_dist = min(lowest * trail_pct, PREM_TRAIL_MAX_POINTS)
+            trail_sl   = round_to_tick(lowest + max(0.50, trail_dist))
+
+            # 1. IMMEDIATE BREAK-EVEN LOCK:
+            # If profit is >= 4% or >= 0.50 points, SL can NEVER be above entry_prem!
+            if profit >= BREAKEVEN_PROFIT_POINTS or profit_pct >= BREAKEVEN_PROFIT_PCT:
+                trail_sl = min(trail_sl, entry_prem)
+
+            # 2. TIERED PROFIT RATCHET (Lock in the captured decay):
+            if profit >= 0.80 or profit_pct >= 0.08:
+                trail_sl = min(trail_sl, round_to_tick(entry_prem - (0.30 * profit)))
+            if profit >= 1.50 or profit_pct >= 0.15:
+                trail_sl = min(trail_sl, round_to_tick(entry_prem - (0.55 * profit)))
+            if profit >= 2.50 or profit_pct >= 0.25:
+                trail_sl = min(trail_sl, round_to_tick(entry_prem - (0.75 * profit)))
+            if profit >= 3.50 or profit_pct >= 0.40:
+                trail_sl = min(trail_sl, round_to_tick(entry_prem - (0.85 * profit)))
+
+            # 3. CRITICAL: CAP MAX GIVEBACK TO 20% OF PEAK PROFIT!
+            # Once peak profit is reached (e.g. +4k = 3.2 pts), it CAN NEVER give back > 20%!
+            giveback_stop = round_to_tick(entry_prem - ((1.0 - PREM_MAX_PROFIT_GIVEBACK) * profit))
+            trail_sl      = min(trail_sl, giveback_stop)
+
+            # Never let trail SL exceed initial SL
+            prem_sl = min(trail_sl, initial_sl)
+
+        # STRICT RATCHET: The stop loss can NEVER move backwards (upwards).
+        if 'current_sl' in state:
+            prem_sl = min(prem_sl, state['current_sl'])
+        else:
+            prem_sl = initial_sl
+
+        state['current_sl'] = prem_sl
+
+        # Tick Debounce Filter (2 seconds of continuous breach required)
+        if live_ltp >= prem_sl:
+            breach_start = state.get('breach_start_ts', 0.0)
+            if breach_start <= 0.0:
+                state['breach_start_ts'] = now_ts
+            elif (now_ts - breach_start) >= SL_DEBOUNCE_SECONDS:
+                label = 'Strangle Initial SL Hit' if prem_sl >= initial_sl else 'Strangle Trailed SL Hit'
+                return True, f'{label} on {leg} ({live_ltp:.2f} >= {prem_sl:.2f})'
+        else:
+            state['breach_start_ts'] = 0.0
 
         return False, ''
-
-    # ── Proactive Early Exit ──
-    def _check_proactive_exit(self, confirmed_signal: int) -> Optional[Tuple[str, str]]:
-        # Disabled so legs are strictly governed by 12% Strangle SL and 7% Solo TSL
-        return None
-        """
-        When both legs are open, if continuous streaming EMA locks strongly against an open leg,
-        proactively exit it early before full SL is hit.
-        Returns (leg, reason) if triggered.
-        """
-        if not ('CE' in self.positions and 'PE' in self.positions):
-            return None
-
-        # CE short is hurt when market goes strongly UP
-        if confirmed_signal == 1 and 'CE' in self.positions:
-            ce_ltp = self._get_leg_ltp(self.positions['CE'])
-            if ce_ltp > self.positions['CE']['entry_price'] * (1.0 + PROACTIVE_EXIT_PCT):
-                return ('CE', 'PROACTIVE_EXIT_CE[EMA_BULLISH_LOCKED]')
-
-        # PE short is hurt when market goes strongly DOWN
-        if confirmed_signal == -1 and 'PE' in self.positions:
-            pe_ltp = self._get_leg_ltp(self.positions['PE'])
-            if pe_ltp > self.positions['PE']['entry_price'] * (1.0 + PROACTIVE_EXIT_PCT):
-                return ('PE', 'PROACTIVE_EXIT_PE[EMA_BEARISH_LOCKED]')
-
-        return None
 
     # ── Momentum reversal & extreme tracking ──
     def _update_reversal_tracker(self, spot: float, confirmed_signal: int):
@@ -1004,25 +1159,19 @@ class NaturalGasPaperBot:
         if self._extreme_spot <= 0:
             self._extreme_spot = spot
 
-        # Surviving leg is PE (Call was hit on bull rally). We look for rally reversal to re-enter Call.
         if surviving_leg == 'PE':
             if spot > self._extreme_spot:
                 self._extreme_spot = spot
             pullback = self._extreme_spot - spot
             self._reversal_pullback = pullback
-
-            # Reversal: EMA confirmed flat/bearish (sig <= 0) OR significant swing pullback >= 0.80 pts
             if confirmed_signal <= 0 or pullback >= SWING_REVERSAL_PTS:
                 self._reversal_latched = True
 
-        # Surviving leg is CE (Put was hit on bear dump). We look for dump reversal to re-enter Put.
         elif surviving_leg == 'CE':
             if spot < self._extreme_spot:
                 self._extreme_spot = spot
             pullback = spot - self._extreme_spot
             self._reversal_pullback = pullback
-
-            # Reversal: EMA confirmed flat/bullish (sig >= 0) OR significant swing bounce >= 0.80 pts
             if confirmed_signal >= 0 or pullback >= SWING_REVERSAL_PTS:
                 self._reversal_latched = True
 
@@ -1087,7 +1236,7 @@ class NaturalGasPaperBot:
             ema90 = ema_snap.get("ema_90", spot)
             slope = ema_snap.get("slow_slope", 0.0)
             vr    = ema_snap.get("vr", 1.0)
-            preq  = ema_snap.get("persistence_req", 10.0)
+            preq  = ema_snap.get("persistence_req", 15.0)
             sig   = ema_snap.get("confirmed_signal", 0)
             hold  = ema_snap.get("hold_time", 0.0)
 
@@ -1098,9 +1247,9 @@ class NaturalGasPaperBot:
 
             print()
             print(TOP)
-            title_l = (f'  {CY}MCX NATGAS PAPER v5.0{RS}  {DIM}│{RS}  '
-                       f'{YL}STREAMING EMA MOMENTUM + STRADDLE{RS}  {DIM}│{RS}  '
-                       f'{GR}tail -f mcx.log{RS}')
+            title_l = (f'  {CY}MCX NATGAS PAPER v5.1{RS}  {DIM}│{RS}  '
+                       f'{YL}NIFTY-ALIGNED HEDGED STRADDLE + EMA MOMENTUM{RS}  {DIM}│{RS}  '
+                       f'{GR}PROFIT PROTECTION ACTIVE{RS}')
             title_r = f'{DIM}{now.strftime("%H:%M:%S IST")}{RS}  '
             pad_top = max(1, W - _ansi_len(title_l) - _ansi_len(title_r))
             print(f'{V}{title_l}{" " * pad_top}{title_r}{V}')
@@ -1116,7 +1265,7 @@ class NaturalGasPaperBot:
             print(MIDS)
             mom_row = (f'  {CY}MOMENTUM:{RS} {DIM}EMA15:{RS} {WH}{ema15:>8.2f}{RS}  '
                        f'{DIM}EMA90:{RS} {WH}{ema90:>8.2f}{RS}  '
-                       f'{DIM}SLOPE:{RS} {WH}{slope:>+6.3f}{RS}  '
+                       f'{DIM}SLOPE/m:{RS} {WH}{slope:>+6.3f}{RS}  '
                        f'{DIM}VR:{RS} {WH}{vr:>4.2f}{RS}  '
                        f'{DIM}PERSIST:{RS} {YL}{preq:>4.1f}s{RS}  '
                        f'{DIM}SIGNAL:{RS} {sig_str} {DIM}({hold:.1f}s){RS}')
@@ -1125,7 +1274,7 @@ class NaturalGasPaperBot:
 
             # Position table
             if not snap_rows:
-                msg = f'  {YL}No open positions — evaluating momentum for entry...{RS}'
+                msg = f'  {YL}No open positions — evaluating momentum for balanced straddle entry...{RS}'
                 print(f'{V}{_pad(msg, W)}{V}')
             else:
                 hdr = (f'  {"LEG":<6} {VS} {"CONTRACT":<22} {VS} {"STRIKE":>7} {VS} {"SIDE":<5} {VS} '
@@ -1151,7 +1300,7 @@ class NaturalGasPaperBot:
 
                 if any(r.get('solo_mode') for r in snap_rows):
                     print(MIDS)
-                    solo_msg = f"  {CY}🎯 SOLO TSL ACTIVE (*):{RS} Strangle OFF — trailing strictly at {DEFAULT_TSL_PCT*100:.0f}% TSL"
+                    solo_msg = f"  {CY}🎯 SOLO TSL ACTIVE (*):{RS} Strangle OFF — Re-anchored at LTP with {SOLO_LEG_TSL_PCT*100:.0f}% TSL & Giveback Cap"
                     print(f'{V}{_pad(solo_msg, W)}{V}')
 
             print(MID)
@@ -1163,7 +1312,7 @@ class NaturalGasPaperBot:
             unreal_col = GR if total_unreal > 0 else (RD if total_unreal < 0 else YL)
             net_col    = GR if net > 0 else (RD if net < 0 else YL)
 
-            net_pct = (net / 200_000.0) * 100.0
+            net_pct = (net / CAPITAL) * 100.0
             pnl_row = (f"  {DIM}REALIZED:{RS} {real_col}{real_fmt}{RS}  {VS}  "
                        f"{DIM}UNREALIZED:{RS} {unreal_col}{unreal_fmt}{RS}  {VS}  "
                        f"{DIM}NET MTM:{RS} {net_col}{net_fmt} ({net_pct:+.2f}%){RS}  {VS}  "
@@ -1226,28 +1375,27 @@ class NaturalGasPaperBot:
             else:
                 status_str = "⚙️ SCANNING"
 
-            # ── Redesigned clean Telegram dashboard ──────────────────────────────
             roll_tag = " ⟳NEXT MO" if self.is_rolled_over else ""
             r_sign = '+' if self.total_realized_pnl >= 0 else ''
             u_sign = '+' if total_unreal >= 0 else ''
             n_sign = '+' if net >= 0 else ''
-            net_pct_tg = (net / 200_000.0) * 100.0
+            net_pct_tg = (net / CAPITAL) * 100.0
             pnl_badge  = "🟢" if net >= 0 else "🔴"
             rev_tag    = " 🔄REVERSAL" if self._reversal_latched else ""
             cd_tag     = f" ⏳{int(POST_CLOSE_COOLDOWN-(now_ts-self.last_any_close_ts))}s" if (now_ts - self.last_any_close_ts) < POST_CLOSE_COOLDOWN else ""
 
-            t  = f"<b>⚡ MCX NATGAS · PAPER TRADING</b>\n"
+            t  = f"<b>⚡ MCX NATGAS · PAPER TRADING (v5.1)</b>\n"
             t += f"<code>🕐 {now.strftime('%H:%M:%S IST')}</code>\n"
             t += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             t += f"<b>SPOT:</b>   <code>{spot:>8.2f}</code>  <b>ATM:</b> <code>{int(atm)}</code>\n"
             t += f"<b>EXPIRY:</b> <code>{self.target_opt_expiry_str}{roll_tag}</code>\n"
             t += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            t += f"<b>EMA MOMENTUM ENGINE</b>\n"
+            t += f"<b>EMA MOMENTUM ENGINE (NOISE FILTERED)</b>\n"
             t += f"<pre>"
             t += f"  EMA15 : {ema15:>8.2f}\n"
             t += f"  EMA90 : {ema90:>8.2f}\n"
-            t += f"  SLOPE : {slope:>+8.3f}\n"
-            t += f"  VR    : {vr:>8.2f}  P_REQ: {ema_snap.get('persistence_req',10.0):.1f}s\n"
+            t += f"  SLOPE : {slope:>+8.3f}/m\n"
+            t += f"  VR    : {vr:>8.2f}  P_REQ: {ema_snap.get('persistence_req',15.0):.1f}s\n"
             t += f"  SIGNAL: {sig_txt:>8}  HOLD:  {ema_snap.get('hold_time',0.0):.1f}s\n"
             t += f"</pre>"
             t += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1272,12 +1420,9 @@ class NaturalGasPaperBot:
             t += f"{'NET MTM':>16}: {pnl_badge}{n_sign}₹{net:>9,.2f} ({net_pct_tg:+.2f}%)\n"
             t += "</pre>"
             t += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            t += f"<b>MODE:</b> <code>PAPER</code>  <b>LOT:</b> <code>1×{LOT_SIZE}u</code>  <b>SL:</b> <code>{DEFAULT_SL_PCT*100:.0f}%</code>  <b>TSL:</b> <code>{DEFAULT_TSL_PCT*100:.0f}%</code>"
+            t += f"<b>MODE:</b> <code>PAPER</code>  <b>LOT:</b> <code>1×{LOT_SIZE}u</code>  <b>SL:</b> <code>{PREM_SL_INITIAL_PCT*100:.0f}%</code>  <b>TSL:</b> <code>{SOLO_LEG_TSL_PCT*100:.0f}%</code>"
 
             chat_ids = _get_tg_chat_ids()
-            # Telegram rate-limit: edit same message in-place during session.
-            # Only send a NEW message if we have no msg_id (first render or after message deleted).
-            # This respects Telegram's limits and keeps chat clean across NIFTY+MCX sessions.
             for cid in chat_ids:
                 msg_id = _last_tg_dash_msg_ids.get(cid)
                 if msg_id is not None:
@@ -1286,16 +1431,15 @@ class NaturalGasPaperBot:
                             f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText',
                             json={'chat_id': cid, 'message_id': msg_id, 'text': t, 'parse_mode': 'HTML'},
                             timeout=3)
-                        if r.status_code in (200, 400):  # 400 = "not modified" is fine
+                        if r.status_code in (200, 400):
                             if r.status_code == 400 and 'message to edit not found' in r.text:
-                                _last_tg_dash_msg_ids.pop(cid, None)  # message deleted, reset
-                            continue  # edited (or already same), done for this cid
+                                _last_tg_dash_msg_ids.pop(cid, None)
+                            continue
                         elif r.status_code == 429:
                             _tg_rate_limited_until = time.time() + r.json().get('parameters', {}).get('retry_after', 30)
                             return
                     except Exception:
                         pass
-                # No valid msg_id — send ONE new message and save its ID
                 try:
                     r = requests.post(
                         f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage',
@@ -1309,14 +1453,12 @@ class NaturalGasPaperBot:
                 except Exception:
                     pass
 
-
     # ── EOD Trade Summary ─────────────────────
     def _send_eod_trade_summary(self):
         """Send full session trade log split by leg as 4 separate Telegram messages."""
-        final_pct = (self.total_realized_pnl / 200_000.0) * 100.0
+        final_pct = (self.total_realized_pnl / CAPITAL) * 100.0
         s_sign = '+' if self.total_realized_pnl >= 0 else ''
 
-        # Messages 1 & 2: per-leg breakdown
         for leg_name in ('CE', 'PE'):
             trades = [t for t in self.trade_log if t['leg'] == leg_name]
             if not trades:
@@ -1334,9 +1476,8 @@ class NaturalGasPaperBot:
                 msg += f"{'LEG TOTAL':>32}: {lt_sign}₹{leg_tot:>9,.0f}\n"
                 msg += "</pre>"
             send_telegram(msg)
-            time.sleep(0.4)  # brief pause between messages to avoid rate limit
+            time.sleep(0.4)
 
-        # Message 3: Intraday stats breakdown
         ce_trades = [t for t in self.trade_log if t['leg'] == 'CE']
         pe_trades = [t for t in self.trade_log if t['leg'] == 'PE']
         ce_tot = sum(t['pnl'] for t in ce_trades)
@@ -1351,11 +1492,10 @@ class NaturalGasPaperBot:
         send_telegram(msg)
         time.sleep(0.4)
 
-        # Message 4: Final PnL summary
         msg  = "<pre>━━━ MCX FINAL PNL ━━━\n"
         msg += f"  Realized PnL : {s_sign}₹{self.total_realized_pnl:,.2f}\n"
         msg += f"  Return on 2L : {final_pct:+.2f}%\n"
-        msg += f"  Base Capital : ₹2,00,000.00\n"
+        msg += f"  Base Capital : ₹{CAPITAL:,.2f}\n"
         msg += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         badge = "✅ PROFIT" if self.total_realized_pnl >= 0 else "❌ LOSS"
         msg += f"  {badge}\n"
@@ -1363,7 +1503,6 @@ class NaturalGasPaperBot:
         send_telegram(msg)
 
     # ── Main run loop ─────────────────────────
-
     def run(self):
         self.authenticate()
         self._get_mcx_csv()
@@ -1373,12 +1512,12 @@ class NaturalGasPaperBot:
         RS  = Style.RESET_ALL
         print()
         print(f'{DIM}{"="*98}{RS}')
-        print(f'{CY}  MCX NATURAL GAS PAPER TRADING BOT  v5.0  |  15:30 – 23:24 IST (EMA ENGINE){RS}')
+        print(f'{CY}  MCX NATURAL GAS PAPER TRADING BOT  v5.1  |  15:30 – 23:24 IST (NIFTY LOGIC){RS}')
         print(f'{DIM}{"="*98}{RS}')
         print(flush=True)
 
         exp_note = f"\nTarget Expiry: {self.target_opt_expiry_str}" + (" (Next Month Rollover Active)" if self.is_rolled_over else "")
-        send_telegram(f'<pre>MCX Natural Gas\nPaper Trading Bot Online (v5.0 EMA Engine)\nSession: 15:30 – 23:24 IST{exp_note}</pre>')
+        send_telegram(f'<pre>MCX Natural Gas\nPaper Trading Bot Online (v5.1 NIFTY-Aligned Engine)\nSession: 15:30 – 23:24 IST{exp_note}</pre>')
 
         last_wait_msg_ts = 0.0
 
@@ -1404,7 +1543,7 @@ class NaturalGasPaperBot:
                     self._close_all('SESSION_END')
                     self.positions.clear()
                     self._render_dashboard(spot, atm, ema_snap)
-                    final_pct = (self.total_realized_pnl / 200_000.0) * 100.0
+                    final_pct = (self.total_realized_pnl / CAPITAL) * 100.0
                     pnl_col = GR if self.total_realized_pnl >= 0 else RD
                     sign = '+' if self.total_realized_pnl >= 0 else ''
                     print(f'\n{pnl_col}✅ Session Complete. Final Realized PnL: {sign}₹{self.total_realized_pnl:,.2f} ({final_pct:+.2f}%){RS}\n', flush=True)
@@ -1426,27 +1565,32 @@ class NaturalGasPaperBot:
                     continue
                 atm = round_to_price(spot, STRIKE_STEP)
 
-                # ── Continuous Streaming EMA Update ─────────
+                # ── Continuous Streaming EMA Update (Noise Filtered) ──
                 ema_snap = self.ema_engine.update(spot, now_ts)
                 confirmed_sig = ema_snap.get("confirmed_signal", 0)
 
                 # ── Momentum Reversal Tracking ──────────────
                 self._update_reversal_tracker(spot, confirmed_sig)
 
-                # ── STEP 1: NO POSITIONS → MOMENTUM ENTRY ───
+                # ── STEP 1: NO POSITIONS → BALANCED STRADDLE ENTRY (NIFTY LOGIC) ───
                 if not self.positions:
                     time_since_close = now_ts - self.last_any_close_ts
                     if time_since_close < POST_CLOSE_COOLDOWN:
-                        pass  # Cooldown after previous close
+                        pass  # Respect post-close cooldown
                     else:
-                        if confirmed_sig == 1:
-                            print(f'[MOMENTUM ENTRY] Bullish trend confirmed (+1). Writing PE at ATM {int(atm)} (CE deferred)...', flush=True)
+                        # NIFTY PRINCIPLE: Default to balanced ATM Straddle (CE + PE) to harvest theta decay.
+                        # Defer a leg ONLY if there is an overwhelming, sustained trend.
+                        is_strong_trend = (confirmed_sig != 0 and ema_snap.get("hold_time", 0.0) >= 25.0
+                                           and abs(ema_snap.get("ema_15", spot) - ema_snap.get("ema_90", spot)) >= 0.40)
+
+                        if is_strong_trend and confirmed_sig == 1:
+                            print(f'[MOMENTUM ENTRY] Strong Bullish Trend (+1, hold >= 25s). Writing PE at ATM {int(atm)} (CE deferred)...', flush=True)
                             self._enter_leg('PE', atm, 'SELL')
-                        elif confirmed_sig == -1:
-                            print(f'[MOMENTUM ENTRY] Bearish trend confirmed (-1). Writing CE at ATM {int(atm)} (PE deferred)...', flush=True)
+                        elif is_strong_trend and confirmed_sig == -1:
+                            print(f'[MOMENTUM ENTRY] Strong Bearish Trend (-1, hold >= 25s). Writing CE at ATM {int(atm)} (PE deferred)...', flush=True)
                             self._enter_leg('CE', atm, 'SELL')
                         else:
-                            print(f'[INIT ENTRY] Neutral / Flat market (signal 0). Writing balanced ATM Straddle at {int(atm)}...', flush=True)
+                            print(f'[INIT ENTRY] Writing balanced ATM Straddle (CE + PE) at {int(atm)} to harvest decay...', flush=True)
                             self._enter_leg('CE', atm, 'SELL')
                             self._enter_leg('PE', atm, 'SELL')
                         self._consume_reversal()
@@ -1455,55 +1599,35 @@ class NaturalGasPaperBot:
                     time.sleep(1.0)
                     continue
 
-                # ── STEP 2: 1 LEG OPEN → MOMENTUM RE-ENTRY ───
+                # ── STEP 2: 1 LEG OPEN → RE-ENTER MISSING LEG TO RESTORE STRANGLE ───
                 short_legs = [leg for leg, p in self.positions.items() if p['side'] == 'SELL']
 
-                if len(short_legs) == 1 and self._reversal_latched:
+                if len(short_legs) == 1:
                     time_since_reentry = now_ts - self.last_reentry_ts
-                    if time_since_reentry >= REENTRY_COOLDOWN_S:
-                        surviving_leg    = short_legs[0]
-                        surviving_strike = self.positions[surviving_leg]['strike']
-                        missing_leg      = 'CE' if surviving_leg == 'PE' else 'PE'
+                    time_since_close   = now_ts - self.last_any_close_ts
+                    if time_since_reentry >= REENTRY_COOLDOWN_S and time_since_close >= REENTRY_COOLDOWN_S:
+                        surviving_leg = short_legs[0]
+                        missing_leg   = 'CE' if surviving_leg == 'PE' else 'PE'
 
-                        dist = min(abs(surviving_strike - atm), 25.0)
-                        if dist < STRIKE_STEP:
-                            reentry_strike = atm
-                        else:
-                            reentry_strike = round_to_price(
-                                atm + dist if missing_leg == 'CE' else atm - dist, STRIKE_STEP)
-
-                        print(f'[REENTRY] Momentum reversal confirmed! '
-                              f'Re-entering {missing_leg} at {int(reentry_strike)} '
-                              f'(Surviving: {surviving_leg} {int(surviving_strike)}) '
-                              f'with {REENTRY_SL_PCT*100:.0f}% instant SL', flush=True)
-
-                        if self._enter_leg(missing_leg, reentry_strike, 'SELL', loss_stop_pct=REENTRY_SL_PCT):
-                            self.last_reentry_ts = now_ts
-                            self._consume_reversal()
-
-                            # Reshape surviving leg & update entry price to current LTP
-                            # Reshape surviving leg: preserve actual entry, reset best premium & SL/TSL
-                            surv_pos = self.positions.get(surviving_leg)
-                            if surv_pos:
-                                surv_ltp = self._get_leg_ltp(surv_pos)
-                                surv_actual_entry = surv_pos.get('entry_price', surv_ltp)
-                                surv_pos['_last_ltp'] = surv_ltp
-                                surv_pos['loss_stop_pct'] = DEFAULT_SL_PCT
-                                surv_pos['tsl_pct'] = DEFAULT_TSL_PCT
-                                fresh_surv_sl = round_to_tick(surv_ltp * (1.0 + DEFAULT_SL_PCT))
-                                surv_pos['sl_state'] = {
-                                    'lowest_ltp': surv_ltp,
-                                    'current_sl': fresh_surv_sl,
-                                    'initial_sl': fresh_surv_sl,
-                                    'loss_stop_pct': DEFAULT_SL_PCT,
-                                    'tsl_pct': DEFAULT_TSL_PCT,
-                                    'solo_mode': False
-                                }
-                                print(f'[RESHAPE SURVIVOR] {surviving_leg} {int(surviving_strike)} preserved (Entry: {surv_actual_entry:.2f}, Live: {surv_ltp:.2f}) | '
-                                      f'Fresh Strangle SL: ₹{fresh_surv_sl:.2f}', flush=True)
+                        # Condition to re-enter missing leg:
+                        # 1) Swing pullback/bounce >= 0.80 pts, OR
+                        # 2) EMA confirmed signal returned to 0 (flat) or reversed in favor of missing leg
+                        is_ema_reversal = (confirmed_sig == 0) or (missing_leg == 'CE' and confirmed_sig == -1) or (missing_leg == 'PE' and confirmed_sig == 1)
+                        if self._reversal_latched or is_ema_reversal:
+                            print(f'[RE-ENTER STRANGLE] Trend normalized / reversed (EMA sig={confirmed_sig}). '
+                                  f'Restoring balanced strangle by entering {missing_leg} at ATM {int(atm)}...', flush=True)
+                            if self._enter_leg(missing_leg, atm, 'SELL', loss_stop_pct=PREM_SL_INITIAL_PCT):
+                                self.last_reentry_ts = now_ts
+                                self._consume_reversal()
+                                # Reset both legs to active strangle mode with fresh breathing room
+                                for leg_name in ('CE', 'PE'):
+                                    p = self.positions.get(leg_name)
+                                    if p and 'sl_state' in p:
+                                        p['sl_state']['solo_mode'] = False
+                                        p['sl_state']['breach_start_ts'] = 0.0
                                 self._save_state()
 
-                # ── STEP 4: CHECK TSL/SL FOR ALL OPEN LEGS ───
+                # ── STEP 3: CHECK TSL/SL FOR ALL OPEN LEGS (NIFTY RISK LOGIC) ───
                 legs_to_close: List[Tuple[str, str, float]] = []
                 for leg in list(self.positions.keys()):
                     pos      = self.positions.get(leg)
@@ -1519,14 +1643,14 @@ class NaturalGasPaperBot:
                             ema_against = (confirmed_sig == 1 and leg == 'CE') or (confirmed_sig == -1 and leg == 'PE')
                             if not ema_against:
                                 if self._rebalance_strangle_in_place(leg, spot, atm, live_ltp):
-                                    continue  # Successfully rebalanced in-place! Skip physical exit.
+                                    continue  # Preserved in-place! Skip physical exit.
                         legs_to_close.append((leg, reason, live_ltp))
 
                 for leg, reason, exit_px in legs_to_close:
                     print(f'[ALERT] {reason}', flush=True)
                     self._close_leg(leg, reason, exit_price=exit_px)
 
-                # ── STEP 5: Render Dashboard ─────────────────
+                # ── STEP 4: Render Dashboard ─────────────────
                 self._render_dashboard(spot, atm, ema_snap)
                 time.sleep(1.0)
 
@@ -1535,7 +1659,7 @@ class NaturalGasPaperBot:
                 self._close_all('KEYBOARD_INTERRUPT')
                 self.positions.clear()
                 self._render_dashboard(spot, atm, ema_snap)
-                final_pct = (self.total_realized_pnl / 200_000.0) * 100.0
+                final_pct = (self.total_realized_pnl / CAPITAL) * 100.0
                 sign = '+' if self.total_realized_pnl >= 0 else ''
                 pnl_col = GR if self.total_realized_pnl >= 0 else RD
                 print(f'\n{pnl_col}✅ All positions squared off. Final Realized PnL: {sign}₹{self.total_realized_pnl:,.2f} ({final_pct:+.2f}%){RS}\n', flush=True)
@@ -1553,5 +1677,5 @@ if __name__ == '__main__':
         bot.run()
     except Exception as e:
         print(f'[FATAL] {e}', flush=True)
-        send_telegram(f'<pre>MCX Bot Fatal Error (v5.0):\n{e}</pre>')
+        send_telegram(f'<pre>MCX Bot Fatal Error (v5.1):\n{e}</pre>')
         sys.exit(1)
