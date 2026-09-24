@@ -109,6 +109,71 @@ def exchange_flattrade_token(url_or_code: str, multiplier: int = 1) -> dict:
     except Exception as e:
         return {"status": "error", "message": f"Network error: {str(e)}"}
 
+FLATTRADE_PASSWORD = os.environ.get("FLATTRADE_PASSWORD", "Trade@1234")
+
+def login_flattrade_with_totp(totp_code: str, multiplier: int = 1) -> dict:
+    totp = (totp_code or "").strip()
+    if not totp:
+        return {"status": "error", "message": "Please enter your 6-digit TOTP code from your authenticator app."}
+
+    api_key, api_secret, user_id = get_flattrade_creds()
+    pwd_sha256 = hashlib.sha256(FLATTRADE_PASSWORD.encode("utf-8")).hexdigest()
+
+    session_headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "Origin": "https://auth.flattrade.in",
+        "Referer": f"https://auth.flattrade.in/?app_key={api_key}"
+    }
+
+    try:
+        # Step 1: Initialize session on Flattrade Auth API
+        s_resp = requests.post("https://authapi.flattrade.in/auth/session", headers=session_headers, timeout=10)
+        sid = s_resp.text.strip()
+        if not sid or len(sid) < 16:
+            return {"status": "error", "message": f"Failed to initialize Flattrade session. Response: {s_resp.text}"}
+
+        # Step 2: Validate session
+        try:
+            requests.post("https://authapi.flattrade.in/sessionValid", headers={**session_headers, "Sid": sid}, json={}, timeout=10)
+        except Exception:
+            pass
+
+        # Step 3: Authenticate with User ID, hashed password (Trade@1234), and TOTP
+        auth_payload = {
+            "UserName": user_id,
+            "Password": pwd_sha256,
+            "PAN_DOB": totp.upper(),
+            "App": "",
+            "ClientID": "",
+            "Key": "",
+            "APIKey": api_key,
+            "Sid": sid,
+            "Override": "Y",
+            "Source": "AUTHPAGE",
+            "Rd": ""
+        }
+
+        auth_resp = requests.post("https://authapi.flattrade.in/ftauth", headers=session_headers, json=auth_payload, timeout=14)
+        if auth_resp.status_code != 200:
+            return {"status": "error", "message": f"Flattrade server returned HTTP {auth_resp.status_code}: {auth_resp.text}"}
+
+        res_data = auth_resp.json()
+        redirect_url = res_data.get("RedirectURL", "")
+        emsg = res_data.get("emsg", "")
+
+        if redirect_url and ("code=" in redirect_url or "request_code=" in redirect_url):
+            # Step 4: Extract request_code and exchange for access token
+            return exchange_flattrade_token(redirect_url, multiplier)
+        elif emsg:
+            return {"status": "error", "message": f"Flattrade rejected login: {emsg}"}
+        else:
+            return {"status": "error", "message": f"Unexpected Flattrade response: {auth_resp.text}"}
+
+    except Exception as e:
+        return {"status": "error", "message": f"Login automation error: {str(e)}"}
+
 def get_flattrade_token_status() -> dict:
     token_file = os.path.join(PROJECT_ROOT, "token.txt")
     exists = os.path.exists(token_file) and os.path.getsize(token_file) > 10
@@ -640,20 +705,24 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
   <style>
     :root {
-      --bg: #06090e;
-      --card-bg: rgba(13, 19, 33, 0.78);
-      --card-border: rgba(255, 255, 255, 0.08);
-      --card-hover: rgba(56, 189, 248, 0.2);
+      --bg: #060911;
+      --card-bg: rgba(14, 21, 37, 0.76);
+      --card-border: rgba(255, 255, 255, 0.12);
+      --card-hover: rgba(56, 189, 248, 0.3);
       --primary: #38bdf8;
-      --primary-glow: rgba(56, 189, 248, 0.25);
+      --primary-glow: rgba(56, 189, 248, 0.35);
       --green: #10b981;
-      --green-glow: rgba(16, 185, 129, 0.35);
+      --green-glow: rgba(16, 185, 129, 0.4);
       --red: #f43f5e;
-      --red-glow: rgba(244, 63, 94, 0.35);
+      --red-glow: rgba(244, 63, 94, 0.4);
       --amber: #f59e0b;
-      --amber-glow: rgba(245, 158, 11, 0.3);
-      --purple: #a855f7;
-      --indigo: #6366f1;
+      --amber-glow: rgba(245, 158, 11, 0.35);
+      --gold: #fbbf24;
+      --gold-bright: #fde047;
+      --gold-glow: rgba(251, 191, 36, 0.45);
+      --purple: #c084fc;
+      --purple-glow: rgba(192, 132, 252, 0.35);
+      --indigo: #818cf8;
       --text: #f8fafc;
       --text-muted: #94a3b8;
       --text-dim: #64748b;
@@ -667,9 +736,9 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
     body {
       background-color: var(--bg);
       background-image: 
-        radial-gradient(at 0% 0%, rgba(56, 189, 248, 0.09) 0px, transparent 45%),
-        radial-gradient(at 100% 0%, rgba(245, 158, 11, 0.07) 0px, transparent 40%),
-        radial-gradient(at 50% 100%, rgba(168, 85, 247, 0.06) 0px, transparent 55%);
+        radial-gradient(at 15% 0%, rgba(30, 58, 138, 0.22) 0px, transparent 50%),
+        radial-gradient(at 85% 0%, rgba(217, 119, 6, 0.14) 0px, transparent 45%),
+        radial-gradient(at 50% 100%, rgba(88, 28, 135, 0.16) 0px, transparent 60%);
       background-attachment: fixed;
       color: var(--text);
       font-family: var(--sans);
@@ -684,19 +753,92 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       padding: 16px;
     }
 
-    /* Top Navigation Header */
+    /* ─── Royal Auspicious Bar (Jay Shri Krishna) ─── */
+    .royal-banner-wrap {
+      display: flex;
+      justify-content: center;
+      margin-bottom: 14px;
+    }
+
+    .royal-auspicious-bar {
+      display: inline-flex;
+      align-items: center;
+      gap: 12px;
+      padding: 7px 24px;
+      background: linear-gradient(135deg, rgba(251, 191, 36, 0.14), rgba(15, 23, 42, 0.85), rgba(245, 158, 11, 0.14));
+      border: 1px solid rgba(251, 191, 36, 0.38);
+      border-radius: 999px;
+      backdrop-filter: blur(28px) saturate(190%);
+      -webkit-backdrop-filter: blur(28px) saturate(190%);
+      box-shadow: 0 8px 28px -4px rgba(245, 158, 11, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.25);
+      animation: royalGlowPulse 4s infinite ease-in-out;
+    }
+
+    @keyframes royalGlowPulse {
+      0%, 100% { box-shadow: 0 8px 28px -4px rgba(245, 158, 11, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.2); }
+      50% { box-shadow: 0 10px 36px 0px rgba(251, 191, 36, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.35); border-color: rgba(251, 191, 36, 0.55); }
+    }
+
+    .royal-krishna-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-family: var(--display);
+      font-weight: 800;
+      font-size: 0.96rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      background: linear-gradient(135deg, #fffbeb 0%, #fef08a 35%, #f59e0b 70%, #d97706 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      filter: drop-shadow(0 2px 10px rgba(245, 158, 11, 0.45));
+    }
+
+    .krishna-symbol {
+      font-size: 1.15rem;
+      -webkit-text-fill-color: initial;
+      filter: drop-shadow(0 0 10px rgba(251, 191, 36, 0.6));
+    }
+
+    .royal-star {
+      color: #fbbf24;
+      font-size: 0.72rem;
+      opacity: 0.85;
+      animation: royalStarTwinkle 2.4s infinite ease-in-out;
+    }
+
+    @keyframes royalStarTwinkle {
+      0%, 100% { opacity: 0.35; transform: scale(0.85); }
+      50% { opacity: 1; transform: scale(1.2); filter: drop-shadow(0 0 8px #fbbf24); }
+    }
+
+    .royal-pill {
+      font-family: var(--display);
+      font-size: 0.74rem;
+      font-weight: 800;
+      padding: 3px 10px;
+      border-radius: 999px;
+      background: linear-gradient(135deg, rgba(251, 191, 36, 0.16), rgba(245, 158, 11, 0.22));
+      border: 1px solid rgba(251, 191, 36, 0.45);
+      color: #fde047;
+      letter-spacing: 0.04em;
+      box-shadow: 0 0 14px rgba(245, 158, 11, 0.3);
+    }
+
+    /* ─── Apple MacBook Glass Solid Header ─── */
     header {
       display: flex;
       justify-content: space-between;
       align-items: center;
       gap: 16px;
-      padding: 14px 20px;
+      padding: 14px 22px;
       background: var(--card-bg);
       border: 1px solid var(--card-border);
       border-radius: 20px;
-      backdrop-filter: blur(24px);
+      backdrop-filter: blur(28px) saturate(190%);
+      -webkit-backdrop-filter: blur(28px) saturate(190%);
       margin-bottom: 18px;
-      box-shadow: 0 12px 36px -10px rgba(0,0,0,0.6);
+      box-shadow: 0 16px 40px -12px rgba(0,0,0,0.65), inset 0 1px 0 rgba(255, 255, 255, 0.12);
       flex-wrap: wrap;
     }
 
@@ -715,7 +857,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       align-items: center;
       justify-content: center;
       font-size: 22px;
-      box-shadow: 0 4px 20px rgba(2, 132, 199, 0.4);
+      box-shadow: 0 4px 20px rgba(2, 132, 199, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.2);
     }
 
     .brand-title {
@@ -749,14 +891,15 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       align-items: center;
       gap: 8px;
       padding: 6px 14px;
-      background: rgba(16, 185, 129, 0.12);
-      border: 1px solid rgba(16, 185, 129, 0.35);
+      background: rgba(16, 185, 129, 0.14);
+      border: 1px solid rgba(16, 185, 129, 0.4);
       border-radius: 999px;
       color: var(--green);
       font-family: var(--mono);
       font-size: 0.75rem;
       font-weight: 700;
       letter-spacing: 0.04em;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.1);
     }
 
     .dot-pulse {
@@ -779,17 +922,19 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       font-size: 0.85rem;
       font-weight: 700;
       padding: 6px 14px;
-      background: rgba(255, 255, 255, 0.04);
-      border: 1px solid var(--card-border);
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.12);
       border-radius: 12px;
       color: #e2e8f0;
+      backdrop-filter: blur(16px);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
     }
 
     .btn-action {
-      background: rgba(56, 189, 248, 0.12);
-      color: var(--primary);
-      border: 1px solid rgba(56, 189, 248, 0.3);
-      padding: 7px 14px;
+      background: rgba(255, 255, 255, 0.06);
+      color: var(--text);
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      padding: 7px 15px;
       border-radius: 12px;
       font-size: 0.8rem;
       font-weight: 700;
@@ -797,15 +942,19 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       display: flex;
       align-items: center;
       gap: 6px;
-      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+      backdrop-filter: blur(16px);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.1);
+      transition: all 0.22s cubic-bezier(0.16, 1, 0.3, 1);
     }
 
     .btn-action:hover {
-      background: rgba(56, 189, 248, 0.25);
+      background: rgba(255, 255, 255, 0.12);
+      border-color: rgba(255, 255, 255, 0.28);
       transform: translateY(-1px);
+      box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.2);
     }
 
-    /* ─── Hero Segmented Navigation Tabs ─── */
+    /* ─── Apple MacBook Glass Solid Segmented Tabs ─── */
     .segmented-tabs-bar {
       display: flex;
       justify-content: center;
@@ -814,27 +963,28 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
 
     .segmented-tabs {
       display: inline-flex;
-      background: rgba(15, 23, 42, 0.85);
-      border: 1px solid rgba(255, 255, 255, 0.1);
+      background: rgba(16, 24, 40, 0.85);
+      border: 1px solid rgba(255, 255, 255, 0.12);
       padding: 5px;
       border-radius: 16px;
       gap: 6px;
-      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
-      backdrop-filter: blur(20px);
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55), inset 0 1px 1px rgba(255, 255, 255, 0.1);
+      backdrop-filter: blur(28px) saturate(190%);
+      -webkit-backdrop-filter: blur(28px) saturate(190%);
       max-width: 100%;
       overflow-x: auto;
     }
 
     .seg-tab {
       background: transparent;
-      border: none;
+      border: 1px solid transparent;
       color: var(--text-muted);
       padding: 10px 22px;
       border-radius: 12px;
       font-weight: 700;
       font-size: 0.92rem;
       cursor: pointer;
-      transition: all 0.25s ease;
+      transition: all 0.22s cubic-bezier(0.16, 1, 0.3, 1);
       display: flex;
       align-items: center;
       gap: 8px;
@@ -843,31 +993,31 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
 
     .seg-tab:hover {
       color: #fff;
-      background: rgba(255, 255, 255, 0.05);
+      background: rgba(255, 255, 255, 0.06);
     }
 
     .seg-tab.active-nifty {
-      background: linear-gradient(135deg, rgba(56, 189, 248, 0.25), rgba(99, 102, 241, 0.25));
+      background: rgba(56, 189, 248, 0.18);
       color: #fff;
-      border: 1px solid rgba(56, 189, 248, 0.5);
-      box-shadow: 0 0 16px rgba(56, 189, 248, 0.2);
+      border: 1px solid rgba(56, 189, 248, 0.45);
+      box-shadow: 0 4px 18px rgba(56, 189, 248, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.25);
     }
 
     .seg-tab.active-mcx {
-      background: linear-gradient(135deg, rgba(245, 158, 11, 0.25), rgba(234, 88, 12, 0.25));
+      background: rgba(245, 158, 11, 0.18);
       color: #fff;
-      border: 1px solid rgba(245, 158, 11, 0.5);
-      box-shadow: 0 0 16px rgba(245, 158, 11, 0.2);
+      border: 1px solid rgba(245, 158, 11, 0.45);
+      box-shadow: 0 4px 18px rgba(245, 158, 11, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.25);
     }
 
     .seg-tab.active-overview {
-      background: linear-gradient(135deg, rgba(168, 85, 247, 0.25), rgba(56, 189, 248, 0.25));
+      background: rgba(168, 85, 247, 0.18);
       color: #fff;
-      border: 1px solid rgba(168, 85, 247, 0.5);
-      box-shadow: 0 0 16px rgba(168, 85, 247, 0.2);
+      border: 1px solid rgba(168, 85, 247, 0.45);
+      box-shadow: 0 4px 18px rgba(168, 85, 247, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.25);
     }
 
-    /* ─── Hero KPI Cards ─── */
+    /* ─── Apple MacBook Glass Solid KPI Cards ─── */
     .kpi-row {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
@@ -880,15 +1030,18 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       border: 1px solid var(--card-border);
       border-radius: 18px;
       padding: 18px 20px;
-      backdrop-filter: blur(18px);
+      backdrop-filter: blur(28px) saturate(190%);
+      -webkit-backdrop-filter: blur(28px) saturate(190%);
       position: relative;
       overflow: hidden;
-      transition: transform 0.2s ease, border-color 0.2s ease;
+      box-shadow: 0 14px 34px -10px rgba(0, 0, 0, 0.65), inset 0 1px 0 rgba(255, 255, 255, 0.11);
+      transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
     }
 
     .kpi-card:hover {
-      border-color: var(--card-hover);
+      border-color: rgba(255, 255, 255, 0.24);
       transform: translateY(-2px);
+      box-shadow: 0 20px 42px -10px rgba(0, 0, 0, 0.75), inset 0 1px 0 rgba(255, 255, 255, 0.2);
     }
 
     .kpi-label {
@@ -970,9 +1123,11 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       border: 1px solid var(--card-border);
       border-radius: 20px;
       padding: 22px;
-      backdrop-filter: blur(20px);
-      box-shadow: 0 12px 36px -12px rgba(0,0,0,0.6);
+      backdrop-filter: blur(28px) saturate(190%);
+      -webkit-backdrop-filter: blur(28px) saturate(190%);
+      box-shadow: 0 16px 40px -12px rgba(0,0,0,0.65), inset 0 1px 0 rgba(255, 255, 255, 0.11);
       margin-bottom: 22px;
+      transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
     }
 
     .panel-hdr {
@@ -1234,14 +1389,30 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
 </head>
 <body>
   <div class="container">
+    <!-- Royal Auspicious Banner: Jay Shri Krishna -->
+    <div class="royal-banner-wrap">
+      <div class="royal-auspicious-bar">
+        <span class="royal-star">✦</span>
+        <div class="royal-krishna-badge">
+          <span class="krishna-symbol">🪷</span>
+          <span class="krishna-title">॥ जय श्री कृष्ण ॥ &bull; JAY SHRI KRISHNA</span>
+          <span class="krishna-symbol">🪷</span>
+        </div>
+        <span class="royal-star">✦</span>
+      </div>
+    </div>
+
     <!-- Top Header -->
     <header>
       <div class="brand-wrap">
         <div class="brand-logo">⚡</div>
         <div>
-          <div class="brand-title">FLATTRADE QUANT TERMINAL</div>
+          <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+            <div class="brand-title">FLATTRADE QUANT TERMINAL</div>
+            <span class="royal-pill">॥ जय श्री कृष्ण ॥</span>
+          </div>
           <div class="brand-subtitle">
-            <span>HIGH-PRECISION EXECUTION</span>
+            <span>HIGH-PRECISION ALGORITHMIC ARCHITECTURE</span>
             <span>•</span>
             <span id="market-mode-badge" style="color:var(--primary); font-weight:700;">PAPER MODE</span>
           </div>
@@ -1651,48 +1822,81 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- ─── Broker Authentication Modal ─── -->
-  <div class="modal-overlay" id="auth-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.8); backdrop-filter:blur(10px); z-index:99999; align-items:center; justify-content:center; padding:16px;">
-    <div style="background:#0c1220; border:1px solid rgba(255,255,255,0.14); border-radius:24px; max-width:540px; width:100%; padding:24px; box-shadow:0 24px 60px rgba(0,0,0,0.85); position:relative;">
-      <button onclick="closeAuthModal()" style="position:absolute; top:18px; right:18px; background:rgba(255,255,255,0.06); border:none; color:var(--text-dim); width:32px; height:32px; border-radius:50%; font-size:1.1rem; cursor:pointer; display:flex; align-items:center; justify-content:center;">✕</button>
+  <!-- ─── Broker Authentication Modal (Apple macOS Glass Styling) ─── -->
+  <div class="modal-overlay" id="auth-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.82); backdrop-filter:blur(16px); -webkit-backdrop-filter:blur(16px); z-index:99999; align-items:center; justify-content:center; padding:16px;">
+    <div style="background:rgba(14, 21, 37, 0.94); border:1px solid rgba(255,255,255,0.16); border-radius:24px; max-width:540px; width:100%; padding:26px; box-shadow:0 30px 80px rgba(0,0,0,0.85), inset 0 1px 0 rgba(255,255,255,0.18); position:relative; backdrop-filter:blur(32px) saturate(190%); -webkit-backdrop-filter:blur(32px) saturate(190%);">
       
-      <div style="display:flex; align-items:center; gap:12px; margin-bottom:16px;">
-        <div style="width:42px; height:42px; background:linear-gradient(135deg, #a855f7, #6366f1); border-radius:12px; display:flex; align-items:center; justify-content:center; font-size:1.3rem;">🔑</div>
+      <!-- Apple Window Traffic Light Controls -->
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:18px;">
+        <div style="display:flex; align-items:center; gap:8px;">
+          <span onclick="closeAuthModal()" style="width:12px; height:12px; border-radius:50%; background:#ef4444; display:inline-block; cursor:pointer;" title="Close"></span>
+          <span style="width:12px; height:12px; border-radius:50%; background:#f59e0b; display:inline-block; opacity:0.8;"></span>
+          <span style="width:12px; height:12px; border-radius:50%; background:#10b981; display:inline-block; opacity:0.8;"></span>
+          <span style="font-size:0.75rem; font-family:var(--mono); color:var(--text-dim); margin-left:8px;">Flattrade Direct Terminal Auth</span>
+        </div>
+        <button onclick="closeAuthModal()" style="background:rgba(255,255,255,0.06); border:none; color:var(--text-dim); width:28px; height:28px; border-radius:50%; font-size:1rem; cursor:pointer; display:flex; align-items:center; justify-content:center;">✕</button>
+      </div>
+      
+      <div style="display:flex; align-items:center; gap:14px; margin-bottom:16px;">
+        <div style="width:44px; height:44px; background:linear-gradient(135deg, #f59e0b, #d97706); border-radius:14px; display:flex; align-items:center; justify-content:center; font-size:1.4rem; box-shadow:0 4px 18px rgba(245, 158, 11, 0.35);">🔑</div>
         <div>
-          <h3 style="font-family:var(--display); font-size:1.18rem; font-weight:800;">Flattrade Broker Authentication</h3>
-          <div style="font-size:0.75rem; color:var(--text-dim); font-family:var(--mono);">Client ID: <b style="color:var(--primary);" id="auth-client-id">FZ04111</b> • Daily Session Token</div>
+          <h3 style="font-family:var(--display); font-size:1.22rem; font-weight:800; background:linear-gradient(to right, #fff, #fde047); -webkit-background-clip:text; -webkit-text-fill-color:transparent;">Flattrade One-Click Login</h3>
+          <div style="font-size:0.74rem; color:var(--text-dim); font-family:var(--mono);">Client ID: <b style="color:var(--primary);" id="auth-client-id">FZ04111</b> &bull; Password: <b style="color:#fde047;">Trade@1234 (Auto)</b></div>
         </div>
       </div>
 
       <!-- Current Token Status Box -->
-      <div style="display:flex; align-items:center; justify-content:space-between; background:rgba(255,255,255,0.03); border:1px solid var(--card-border); border-radius:14px; padding:12px 16px; margin-bottom:18px; font-family:var(--mono); font-size:0.8rem;">
+      <div style="display:flex; align-items:center; justify-content:space-between; background:rgba(255,255,255,0.035); border:1px solid var(--card-border); border-radius:14px; padding:12px 16px; margin-bottom:18px; font-family:var(--mono); font-size:0.8rem; box-shadow:inset 0 1px 0 rgba(255,255,255,0.05);">
         <div>
-          <div style="font-size:0.68rem; color:var(--text-dim); text-transform:uppercase;">Active Token Status</div>
+          <div style="font-size:0.68rem; color:var(--text-dim); text-transform:uppercase;">Daily Token State</div>
           <div style="font-weight:700; margin-top:2px;" id="modal-token-preview">Checking...</div>
         </div>
         <span class="status-chip chip-dim" id="modal-token-chip">CHECKING</span>
       </div>
 
-      <!-- Step 1: Open Flattrade Login -->
-      <div style="margin-bottom:16px;">
-        <div style="font-size:0.8rem; font-weight:700; color:var(--text-muted); margin-bottom:6px;">STEP 1: Log In on Flattrade</div>
-        <a id="btn-flattrade-link" href="https://auth.flattrade.in/?app_key=fa5da7cfc3d7459298efeb11d87bab41" target="_blank" style="display:flex; align-items:center; justify-content:center; gap:8px; width:100%; background:linear-gradient(135deg, #0284c7, #4f46e5); color:#fff; text-decoration:none; padding:12px; border-radius:12px; font-weight:700; font-size:0.9rem; box-shadow:0 4px 18px rgba(2, 132, 199, 0.4);">
-          <span>🌐 Open Flattrade Login Page</span>
-        </a>
-        <div style="font-size:0.72rem; color:var(--text-dim); margin-top:5px; line-height:1.4;">Opens Flattrade's official login portal. Enter your password & TOTP. After login, it redirects to a blank page.</div>
+      <!-- Primary 1-Click TOTP Box (Instant) -->
+      <div style="background:rgba(255,255,255,0.025); border:1px solid rgba(255,255,255,0.08); border-radius:16px; padding:18px; margin-bottom:14px; box-shadow:inset 0 1px 0 rgba(255,255,255,0.06);">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+          <span style="font-size:0.84rem; font-weight:800; color:#fff; display:flex; align-items:center; gap:6px;">
+            <span>⚡</span> <span>Enter 6-Digit TOTP</span>
+          </span>
+          <span style="font-size:0.7rem; color:var(--gold); font-family:var(--mono); font-weight:700;">Password: Trade@1234</span>
+        </div>
+        
+        <div style="font-size:0.73rem; color:var(--text-dim); margin-bottom:12px; line-height:1.4;">
+          Open your authenticator app on your phone, enter your 6-digit TOTP below, and click Authenticate. All login steps and token saving are executed in seconds!
+        </div>
+
+        <input type="text" id="auth-input-totp" maxlength="6" placeholder="0 0 0 0 0 0" style="width:100%; background:rgba(0,0,0,0.6); border:1px solid rgba(255,255,255,0.18); border-radius:14px; padding:14px; color:#fff; font-family:var(--mono); font-size:1.6rem; font-weight:800; letter-spacing:0.35em; text-align:center; outline:none; transition:border-color 0.2s, box-shadow 0.2s; box-shadow:inset 0 2px 6px rgba(0,0,0,0.5);" onfocus="this.style.borderColor='var(--gold)'; this.style.boxShadow='0 0 16px rgba(251, 191, 36, 0.3)';" onblur="this.style.borderColor='rgba(255,255,255,0.18)'; this.style.boxShadow='inset 0 2px 6px rgba(0,0,0,0.5)';" onkeypress="if(event.key === 'Enter') submitAuthTOTP();">
+
+        <button id="btn-submit-totp" onclick="submitAuthTOTP()" style="width:100%; margin-top:14px; background:linear-gradient(135deg, #10b981, #059669); color:#fff; border:none; padding:13px; border-radius:13px; font-weight:800; font-size:0.95rem; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:8px; box-shadow:0 4px 20px rgba(16, 185, 129, 0.4), inset 0 1px 0 rgba(255,255,255,0.25); transition:all 0.2s;">
+          <span>⚡ Authenticate & Generate Token</span>
+        </button>
       </div>
 
-      <!-- Step 2: Paste Redirect URL or Code -->
-      <div style="margin-bottom:16px;">
-        <div style="font-size:0.8rem; font-weight:700; color:var(--text-muted); margin-bottom:6px;">STEP 2: Paste Redirect URL or Code</div>
-        <input type="text" id="auth-input-code" placeholder="Paste full redirect URL (e.g. https://127.0.0.1/?code=...) or request code" style="width:100%; background:rgba(0,0,0,0.5); border:1px solid rgba(255,255,255,0.16); border-radius:12px; padding:12px 14px; color:#fff; font-family:var(--mono); font-size:0.84rem; outline:none; transition:border-color 0.2s;" onfocus="this.style.borderColor='var(--primary)'" onblur="this.style.borderColor='rgba(255,255,255,0.16)'">
-        <div style="font-size:0.72rem; color:var(--text-dim); margin-top:5px;">Copy the entire URL from your browser address bar and paste it above. We will extract the code automatically!</div>
+      <!-- Toggle for Manual Fallback -->
+      <div style="text-align:center; margin-bottom:12px;">
+        <button type="button" onclick="toggleManualAuth()" style="background:none; border:none; color:var(--text-dim); font-size:0.74rem; font-family:var(--mono); text-decoration:underline; cursor:pointer;">
+          🔗 Need to paste redirect URL manually? Click here
+        </button>
       </div>
 
-      <!-- Submit Button -->
-      <div style="margin-bottom:12px;">
-        <button id="btn-submit-token" onclick="submitAuthToken()" style="width:100%; background:var(--green); color:#06090e; border:none; padding:12px; border-radius:12px; font-weight:800; font-size:0.92rem; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:8px; box-shadow:0 4px 18px rgba(16, 185, 129, 0.4); transition:all 0.2s;">
-          <span>⚡ Generate & Save Token to Server</span>
+      <!-- Manual Browser Fallback Section (Hidden by Default) -->
+      <div id="auth-manual-fallback" style="display:none; background:rgba(0,0,0,0.35); border:1px solid rgba(255,255,255,0.08); border-radius:14px; padding:14px; margin-bottom:14px;">
+        <div style="margin-bottom:10px;">
+          <div style="font-size:0.75rem; font-weight:700; color:var(--text-muted); margin-bottom:5px;">STEP 1: Open Flattrade Login Page</div>
+          <a id="btn-flattrade-link" href="https://auth.flattrade.in/?app_key=fa5da7cfc3d7459298efeb11d87bab41" target="_blank" style="display:flex; align-items:center; justify-content:center; gap:6px; width:100%; background:rgba(56, 189, 248, 0.14); border:1px solid rgba(56, 189, 248, 0.35); color:var(--primary); text-decoration:none; padding:9px; border-radius:10px; font-weight:700; font-size:0.82rem;">
+            <span>🌐 Open Flattrade Login Page</span>
+          </a>
+        </div>
+
+        <div style="margin-bottom:10px;">
+          <div style="font-size:0.75rem; font-weight:700; color:var(--text-muted); margin-bottom:5px;">STEP 2: Paste Redirect URL or Code</div>
+          <input type="text" id="auth-input-code" placeholder="Paste full redirect URL (e.g. https://127.0.0.1/?code=...)" style="width:100%; background:rgba(0,0,0,0.5); border:1px solid rgba(255,255,255,0.14); border-radius:10px; padding:10px 12px; color:#fff; font-family:var(--mono); font-size:0.8rem; outline:none;">
+        </div>
+
+        <button id="btn-submit-token" onclick="submitAuthToken()" style="width:100%; background:rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.2); color:#fff; padding:10px; border-radius:10px; font-weight:700; font-size:0.84rem; cursor:pointer;">
+          <span>Exchange Code For Token</span>
         </button>
       </div>
 
@@ -2502,11 +2706,79 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       const modal = document.getElementById('auth-modal');
       modal.style.display = 'flex';
       fetchAuthStatus();
+      setTimeout(() => {
+        const inp = document.getElementById('auth-input-totp');
+        if (inp) inp.focus();
+      }, 100);
     }
 
     function closeAuthModal() {
       document.getElementById('auth-modal').style.display = 'none';
       document.getElementById('auth-feedback-box').style.display = 'none';
+    }
+
+    function toggleManualAuth() {
+      const el = document.getElementById('auth-manual-fallback');
+      if (el) {
+        el.style.display = (el.style.display === 'none' || !el.style.display) ? 'block' : 'none';
+      }
+    }
+
+    function submitAuthTOTP() {
+      const input = document.getElementById('auth-input-totp');
+      const totp = (input.value || '').trim();
+      const feedback = document.getElementById('auth-feedback-box');
+      const btn = document.getElementById('btn-submit-totp');
+
+      if (!totp || totp.length < 6) {
+        feedback.style.display = 'block';
+        feedback.style.background = 'rgba(244, 63, 94, 0.15)';
+        feedback.style.color = 'var(--red)';
+        feedback.style.border = '1px solid rgba(244, 63, 94, 0.3)';
+        feedback.innerText = 'Please enter your 6-digit TOTP code from your authenticator app!';
+        return;
+      }
+
+      btn.disabled = true;
+      btn.style.opacity = '0.6';
+      btn.innerHTML = '<span>⏳ Logging in & Generating Token...</span>';
+
+      fetch('/api/auth/login_totp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ totp: totp })
+      })
+      .then(res => res.json())
+      .then(data => {
+        btn.disabled = false;
+        btn.style.opacity = '1';
+        btn.innerHTML = '<span>⚡ Authenticate & Generate Token</span>';
+        feedback.style.display = 'block';
+
+        if (data.status === 'success') {
+          feedback.style.background = 'rgba(16, 185, 129, 0.15)';
+          feedback.style.color = 'var(--green)';
+          feedback.style.border = '1px solid rgba(16, 185, 129, 0.3)';
+          feedback.innerHTML = `✅ <b>Success!</b> ${data.message}<br><small>Token: ${data.token_preview}</small>`;
+          input.value = '';
+          fetchAuthStatus();
+        } else {
+          feedback.style.background = 'rgba(244, 63, 94, 0.15)';
+          feedback.style.color = 'var(--red)';
+          feedback.style.border = '1px solid rgba(244, 63, 94, 0.3)';
+          feedback.innerHTML = `❌ <b>Failed:</b> ${data.message}`;
+        }
+      })
+      .catch(err => {
+        btn.disabled = false;
+        btn.style.opacity = '1';
+        btn.innerHTML = '<span>⚡ Authenticate & Generate Token</span>';
+        feedback.style.display = 'block';
+        feedback.style.background = 'rgba(244, 63, 94, 0.15)';
+        feedback.style.color = 'var(--red)';
+        feedback.style.border = '1px solid rgba(244, 63, 94, 0.3)';
+        feedback.innerText = `Network error: ${err.message}`;
+      });
     }
 
     function fetchAuthStatus() {
@@ -2714,6 +2986,25 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             url_or_code = data.get("url_or_code", "")
             multiplier = int(data.get("multiplier", 1) or 1)
             result = exchange_flattrade_token(url_or_code, multiplier)
+
+            payload = json.dumps(result).encode("utf-8")
+            self.send_response(200 if result.get("status") == "success" else 400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(payload)
+
+        elif path == "/api/auth/login_totp":
+            try:
+                content_length = int(self.headers.get("Content-Length", 0))
+                post_body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else "{}"
+                data = json.loads(post_body)
+            except Exception:
+                data = {}
+
+            totp = data.get("totp", "")
+            multiplier = int(data.get("multiplier", 1) or 1)
+            result = login_flattrade_with_totp(totp, multiplier)
 
             payload = json.dumps(result).encode("utf-8")
             self.send_response(200 if result.get("status") == "success" else 400)
