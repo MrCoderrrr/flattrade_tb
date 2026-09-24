@@ -3210,27 +3210,6 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       ctx.stroke();
       ctx.setLineDash([]);
 
-      // Floating Live Tag above tip
-      const tagText = `${chartCurNet >= 0 ? '+' : ''}₹${Math.abs(chartCurNet).toFixed(2)} (${fmtPct(chartCurPct)})`;
-      ctx.font = 'bold 11px "JetBrains Mono", monospace';
-      const tagW = ctx.measureText(tagText).width + 16;
-      const tagH = 22;
-      let tagX = Math.max(padLeft + 8, Math.min(w - padRight - tagW, lastPt.x - tagW / 2));
-      let tagY = lastPt.y - 28;
-      if (tagY < padTop + 2) tagY = lastPt.y + 14;
-
-      ctx.fillStyle = 'rgba(15, 23, 42, 0.9)';
-      ctx.strokeStyle = isCurPos ? 'rgba(16, 185, 129, 0.6)' : 'rgba(244, 63, 94, 0.6)';
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.roundRect ? ctx.roundRect(tagX, tagY, tagW, tagH, 6) : ctx.rect(tagX, tagY, tagW, tagH);
-      ctx.fill();
-      ctx.stroke();
-
-      ctx.fillStyle = isCurPos ? '#10b981' : '#f43f5e';
-      ctx.textAlign = 'center';
-      ctx.fillText(tagText, tagX + tagW / 2, tagY + 15);
-
       // 8. Interactive crosshair on hover
       if (chartMouseX !== null && chartMouseX >= padLeft && chartMouseX <= lastPt.x) {
         let closest = points[0];
