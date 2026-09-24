@@ -1929,10 +1929,13 @@ class RiskManager:
         """
         is_after_1pm = (now_ist.hour > AFTERNOON_TSL_HOUR or (now_ist.hour == AFTERNOON_TSL_HOUR and now_ist.minute >= AFTERNOON_TSL_MINUTE))
         profile = self._premium_risk_profile(premium, dte_days)
-        premium_floor = max(
+        premium_floor = min(
+            self._premium_risk_profile(premium, dte_days)["initial_pct"],
+            max(
             PREM_SL_MIN_PCT * profile["expiry_factor"],
             PREM_SL_MIN_PCT - 0.02 * min(
                 1.0, max(0.0, float(premium or 0.0)) / PREM_RISK_REFERENCE
+            ),
             ),
         )
         if is_after_1pm:
