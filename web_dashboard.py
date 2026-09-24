@@ -499,11 +499,14 @@ def update_market_intraday_series(market, current_net_mtm, net_pct, start_hour, 
     now_minutes = now.hour * 60 + now.minute + now.second / 60.0
     def point_minutes(point):
         try:
-            if point.get("ts") is not None:
-                return datetime.fromtimestamp(float(point["ts"]), tz=IST).hour * 60 + datetime.fromtimestamp(float(point["ts"]), tz=IST).minute + datetime.fromtimestamp(float(point["ts"]), tz=IST).second / 60.0
             text = str(point.get("time", point.get("time_short", "")))
-            parts = text.split(":")
-            return int(parts[0]) * 60 + int(parts[1]) + (float(parts[2]) / 60.0 if len(parts) > 2 else 0.0)
+            if ":" in text:
+                parts = text.split(":")
+                return int(parts[0]) * 60 + int(parts[1]) + (float(parts[2]) / 60.0 if len(parts) > 2 else 0.0)
+            if point.get("ts") is not None:
+                stamp = datetime.fromtimestamp(float(point["ts"]), tz=IST)
+                return stamp.hour * 60 + stamp.minute + stamp.second / 60.0
+            return None
         except (AttributeError, TypeError, ValueError, IndexError):
             return None
 
