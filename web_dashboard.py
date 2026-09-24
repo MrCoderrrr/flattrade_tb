@@ -35,6 +35,7 @@ def get_ist_now() -> datetime:
     return datetime.now(IST)
 
 PUBLIC_URL_FILE = os.path.join(PROJECT_ROOT, "public_url.txt")
+TUNNEL_LOG_FILE = os.path.join(PROJECT_ROOT, "tunnel.log")
 LIVE_PUBLIC_URL = ""
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -571,58 +572,87 @@ def get_aggregated_dashboard_state() -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # CLOUDFLARE QUICK TUNNEL MANAGER
 # ─────────────────────────────────────────────────────────────────────────────
+def send_telegram_url_alert(url: str):
+    bot_token = "8850507396:AAFwFm2_WxPdSM52JcCpJUj8V1rz9x3G-kE"
+    chat_id = "6307066850"
+    msg = (
+        f"👑 *FLATTRADE ALGO PRO DASHBOARD IS LIVE*\n\n"
+        f"॥ जय श्री कृष्ण ॥\n\n"
+        f"🌐 *Active Live Dashboard URL:*\n`{url}`\n\n"
+        f"👉 [Click Here To Open Dashboard]({url})\n\n"
+        f"📊 Track real-time NIFTY & MCX performance, live charts, and activate tokens."
+    )
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{bot_token}/sendMessage",
+            json={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"},
+            timeout=5
+        )
+    except Exception:
+        pass
+
+def extract_url_from_tunnel_log():
+    if not os.path.exists(TUNNEL_LOG_FILE):
+        return None
+    try:
+        with open(TUNNEL_LOG_FILE, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+            matches = re.findall(r"https://[-a-zA-Z0-9.]*trycloudflare\.com", content)
+            if matches:
+                return matches[-1]
+    except Exception:
+        pass
+    return None
+
 def run_tunnel_manager(port: int = 8000):
     global LIVE_PUBLIC_URL
-    # 1. First, check if a tunnel is already running and load its existing URL
+    last_notified_url = ""
+
+    # Load initial URL from public_url.txt if present
     if os.path.exists(PUBLIC_URL_FILE):
         try:
             with open(PUBLIC_URL_FILE, "r") as f:
                 saved = f.read().strip()
                 if saved.startswith("https://") and "trycloudflare.com" in saved:
                     LIVE_PUBLIC_URL = saved
+                    last_notified_url = saved
         except Exception:
             pass
 
     while True:
         try:
-            # If an existing cloudflared process is already alive and running, KEEP IT! Do not restart it!
-            if check_process_running("cloudflared tunnel"):
-                if not LIVE_PUBLIC_URL and os.path.exists(PUBLIC_URL_FILE):
-                    try:
-                        with open(PUBLIC_URL_FILE, "r") as f:
-                            LIVE_PUBLIC_URL = f.read().strip()
-                    except Exception:
-                        pass
+            is_running = check_process_running("cloudflared tunnel")
+
+            url_from_log = extract_url_from_tunnel_log()
+            if url_from_log and url_from_log != LIVE_PUBLIC_URL:
+                LIVE_PUBLIC_URL = url_from_log
+                print(f"[TUNNEL] Active URL established: {LIVE_PUBLIC_URL}", flush=True)
+                try:
+                    with open(PUBLIC_URL_FILE, "w") as f:
+                        f.write(f"{LIVE_PUBLIC_URL}\n")
+                except Exception:
+                    pass
+
+            if not is_running:
+                print(f"[TUNNEL] Launching detached Cloudflare tunnel on port {port}...", flush=True)
+                subprocess.Popen(
+                    ["cloudflared", "tunnel", "--url", f"http://127.0.0.1:{port}", "--logfile", TUNNEL_LOG_FILE],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True
+                )
                 time.sleep(3)
                 continue
 
-            print(f"[TUNNEL] Launching Cloudflare Tunnel for 127.0.0.1:{port}...", flush=True)
-            proc = subprocess.Popen(
-                ["cloudflared", "tunnel", "--url", f"http://127.0.0.1:{port}"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1
-            )
+            if LIVE_PUBLIC_URL and LIVE_PUBLIC_URL != last_notified_url:
+                last_notified_url = LIVE_PUBLIC_URL
+                print(f"[TUNNEL] Notifying Telegram of URL: {LIVE_PUBLIC_URL}", flush=True)
+                send_telegram_url_alert(LIVE_PUBLIC_URL)
 
-            for line in iter(proc.stdout.readline, ""):
-                match = re.search(r"https://[-a-zA-Z0-9.]*trycloudflare\.com", line)
-                if match:
-                    url = match.group(0)
-                    LIVE_PUBLIC_URL = url
-                    print(f"\n=======================================================", flush=True)
-                    print(f"🚀 LIVE PUBLIC DASHBOARD LINK ESTABLISHED:", flush=True)
-                    print(f"👉 {url}", flush=True)
-                    print(f"=======================================================\n", flush=True)
-                    try:
-                        with open(PUBLIC_URL_FILE, "w") as f:
-                            f.write(f"{url}\n")
-                    except Exception:
-                        pass
-            proc.wait()
         except Exception as e:
             print(f"[TUNNEL ERROR] {e}", flush=True)
-        time.sleep(5)
+
+        time.sleep(3)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
