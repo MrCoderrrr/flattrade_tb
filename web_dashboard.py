@@ -23,6 +23,7 @@ import threading
 import subprocess
 import hashlib
 import shutil
+import csv
 import requests
 from datetime import datetime, timezone, timedelta
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -246,6 +247,150 @@ def get_mcx_snapshot():
         "mcx_state_paper.json",
     ])
 
+TRADE_STORE_FILE = os.path.join(PROJECT_ROOT, "dashboard_trade_store.json")
+
+def _trade_date(value, fallback=None):
+    text = str(value or "").strip()
+    if text:
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).date()
+        except ValueError:
+            try:
+                return datetime.strptime(text[:10], "%Y-%m-%d").date()
+            except ValueError:
+                pass
+    return fallback or get_ist_now().date()
+
+def _normalise_trade(row, market, fallback_date=None):
+    if not isinstance(row, dict):
+        return None
+    action = str(row.get("action", row.get("Action", "EXIT"))).upper()
+    if action not in {"EXIT", "CLOSE", "SQUARE_OFF", "SQUAREOFF"}:
+        return None
+    raw_time = row.get("timestamp", row.get("Timestamp", row.get("time", "")))
+    trade_date = _trade_date(raw_time, fallback_date)
+    pnl_value = row.get("pnl", row.get("PnL", row.get("realized_pnl")))
+    try:
+        pnl = float(pnl_value)
+    except (TypeError, ValueError):
+        return None
+    if raw_time:
+        try:
+            trade_time = datetime.fromisoformat(str(raw_time).replace("Z", "+00:00")).strftime("%H:%M:%S")
+        except ValueError:
+            trade_time = str(raw_time).split()[-1][:8]
+    else:
+        trade_time = "--:--:--"
+    timestamp = f"{trade_date.isoformat()} {trade_time}"
+    leg = str(row.get("leg", row.get("Leg", "TRADE")))
+    strike = row.get("strike", row.get("Strike", ""))
+    reason = str(row.get("reason", row.get("Reason", "SQUARE_OFF")))
+    qty = row.get("qty", row.get("Qty", 0))
+    try:
+        qty = int(float(qty or 0))
+    except (TypeError, ValueError):
+        qty = 0
+    return {
+        "id": "|".join([market, timestamp, leg, str(strike), f"{pnl:.4f}", reason]),
+        "market": market,
+        "date": trade_date.isoformat(),
+        "time": trade_time,
+        "timestamp": timestamp,
+        "leg": leg,
+        "strike": strike,
+        "qty": qty,
+        "entry": float(row.get("entry", row.get("entry_price", 0.0)) or 0.0),
+        "exit": float(row.get("exit", row.get("price", 0.0)) or 0.0),
+        "pnl": round(pnl, 2),
+        "reason": reason,
+    }
+
+def _trade_metrics(trades):
+    ordered = sorted(trades, key=lambda t: str(t.get("timestamp", "")))
+    wins = [t["pnl"] for t in ordered if t["pnl"] > 0]
+    losses = [t["pnl"] for t in ordered if t["pnl"] < 0]
+    gross_win = sum(wins)
+    gross_loss = abs(sum(losses))
+    equity = peak = max_dd = 0.0
+    for trade in ordered:
+        equity += trade["pnl"]
+        peak = max(peak, equity)
+        max_dd = max(max_dd, peak - equity)
+    count = len(ordered)
+    decided = len(wins) + len(losses)
+    base = 200000.0
+    return {
+        "count": count,
+        "wins": len(wins),
+        "losses": len(losses),
+        "breakeven": count - decided,
+        "win_pct": (len(wins) / decided * 100.0) if decided else 0.0,
+        "gross_profit": round(gross_win, 2),
+        "gross_loss": round(gross_loss, 2),
+        "profit_factor": round(gross_win / gross_loss, 2) if gross_loss else (0.0 if not gross_win else None),
+        "avg_win": round(gross_win / len(wins), 2) if wins else 0.0,
+        "avg_loss": round(sum(losses) / len(losses), 2) if losses else 0.0,
+        "risk_reward": round((gross_win / len(wins)) / (gross_loss / len(losses)), 2) if wins and losses else 0.0,
+        "max_drawdown": round(max_dd, 2),
+        "max_drawdown_pct": round((max_dd / base) * 100.0, 4),
+        "net_pnl": round(sum(t["pnl"] for t in ordered), 2),
+    }
+
+def get_trade_analytics(nifty_snapshot=None, mcx_snapshot=None):
+    observed = []
+    today = get_ist_now().date()
+    for market, snapshot in (("NIFTY", nifty_snapshot or {}), ("MCX", mcx_snapshot or {})):
+        for row in snapshot.get("trade_log", []) or []:
+            trade = _normalise_trade(row, market, today)
+            if trade:
+                observed.append(trade)
+
+    csv_candidates = [
+        "tradingbot/data/logs/trade_book/trades_v2_paper.csv",
+        "data/logs/trade_book/trades_v2_paper.csv",
+    ]
+    for relative_path in csv_candidates:
+        filepath = os.path.join(PROJECT_ROOT, relative_path)
+        if not os.path.exists(filepath):
+            continue
+        try:
+            with open(filepath, "r", encoding="utf-8", newline="") as f:
+                for row in csv.DictReader(f):
+                    trade = _normalise_trade(row, "NIFTY")
+                    if trade:
+                        observed.append(trade)
+        except (OSError, csv.Error):
+            pass
+
+    stored = load_json_safe(TRADE_STORE_FILE, [])
+    if not isinstance(stored, list):
+        stored = []
+    by_id = {str(t.get("id")): t for t in stored if isinstance(t, dict) and t.get("id")}
+    for trade in observed:
+        by_id[trade["id"]] = trade
+    all_trades = sorted(by_id.values(), key=lambda t: str(t.get("timestamp", "")))
+    if len(all_trades) != len(stored) or any(t not in stored for t in all_trades):
+        try:
+            temp_file = f"{TRADE_STORE_FILE}.tmp"
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(all_trades, f, indent=2)
+            os.replace(temp_file, TRADE_STORE_FILE)
+        except Exception:
+            pass
+
+    today_trades = [t for t in all_trades if t.get("date") == today.isoformat()]
+    by_market = {
+        market: [t for t in today_trades if t.get("market") == market]
+        for market in ("NIFTY", "MCX")
+    }
+    return {
+        "all": _trade_metrics(all_trades),
+        "today": _trade_metrics(today_trades),
+        "nifty": _trade_metrics(by_market["NIFTY"]),
+        "mcx": _trade_metrics(by_market["MCX"]),
+        "today_trades": today_trades,
+    }
+
 # ─────────────────────────────────────────────────────────────────────────────
 # INTRADAY PNL TIME-SERIES ENGINE (09:15 - SESSION CLOSE)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -300,6 +445,58 @@ def update_intraday_pnl_series(current_net_mtm: float, net_pct: float):
         _save_intraday_series(today_str, INTRADAY_PNL_SERIES)
 
     return INTRADAY_PNL_SERIES
+
+MARKET_INTRADAY_SERIES = {"NIFTY": [], "MCX": []}
+MARKET_INTRADAY_DATES = {"NIFTY": None, "MCX": None}
+MARKET_INTRADAY_FILE = os.path.join(PROJECT_ROOT, "market_intraday_series.json")
+
+def update_market_intraday_series(market, current_net_mtm, net_pct, start_hour, start_minute, end_hour, end_minute):
+    """Maintain a persisted per-market intraday curve for the UI."""
+    now = get_ist_now()
+    today_str = str(now.date())
+    market_key = str(market).upper()
+    if market_key not in MARKET_INTRADAY_SERIES:
+        return []
+
+    if MARKET_INTRADAY_DATES[market_key] != today_str:
+        saved = load_json_safe(MARKET_INTRADAY_FILE, {})
+        saved_series = saved.get(today_str, {}).get(market_key, []) if isinstance(saved, dict) else []
+        MARKET_INTRADAY_DATES[market_key] = today_str
+        MARKET_INTRADAY_SERIES[market_key] = [p for p in saved_series[-1500:] if isinstance(p, dict)]
+        if not MARKET_INTRADAY_SERIES[market_key]:
+            MARKET_INTRADAY_SERIES[market_key] = [{
+                "time": f"{start_hour:02d}:{start_minute:02d}",
+                "pnl": 0.0, "pct": 0.0,
+                "ts": now.replace(hour=start_hour, minute=start_minute, second=0).timestamp()
+            }]
+
+    session_start = start_hour * 60 + start_minute
+    session_end = end_hour * 60 + end_minute
+    now_minutes = now.hour * 60 + now.minute + now.second / 60.0
+    if session_start <= now_minutes <= session_end:
+        now_ts = now.timestamp()
+        series = MARKET_INTRADAY_SERIES[market_key]
+        if not series or now_ts - series[-1].get("ts", 0) >= 4.0:
+            series.append({
+                "time": now.strftime("%H:%M:%S"),
+                "time_short": now.strftime("%H:%M"),
+                "pnl": round(float(current_net_mtm), 2),
+                "pct": round(float(net_pct), 4),
+                "ts": now_ts
+            })
+            MARKET_INTRADAY_SERIES[market_key] = series[-1500:]
+            saved = load_json_safe(MARKET_INTRADAY_FILE, {})
+            if not isinstance(saved, dict):
+                saved = {}
+            saved.setdefault(today_str, {})[market_key] = MARKET_INTRADAY_SERIES[market_key]
+            try:
+                temp_file = f"{MARKET_INTRADAY_FILE}.tmp"
+                with open(temp_file, "w", encoding="utf-8") as f:
+                    json.dump(saved, f)
+                os.replace(temp_file, MARKET_INTRADAY_FILE)
+            except Exception:
+                pass
+    return MARKET_INTRADAY_SERIES[market_key]
 
 def get_history_analytics():
     pnl_data = get_pnl_tracker_data()
@@ -416,6 +613,7 @@ def get_aggregated_dashboard_state() -> dict:
     pnl_data = get_pnl_tracker_data()
     nifty_snap = get_nifty_snapshot() or {}
     mcx_snap = get_mcx_snapshot() or {}
+    trade_analytics = get_trade_analytics(nifty_snap, mcx_snap)
 
     scheduler_running = check_process_running("daily_scheduler.py")
     nifty_running = check_process_running("nifty_paper_v3.py") or check_process_running("upv2_paper.py")
@@ -462,8 +660,10 @@ def get_aggregated_dashboard_state() -> dict:
     capital_growth_pct = ((live_capital - base_capital) / base_capital) * 100.0
     circuit_limit = round(-live_capital * 0.018, 2)
 
-    nifty_trades = int(nifty_snap.get("trades_today", 0) or 0)
-    mcx_trades = int(mcx_snap.get("trades_today", 0) or 0)
+    # Count completed, deduplicated trade records. Snapshot counters include
+    # legs/entries and can remain stale across a session boundary.
+    nifty_trades = trade_analytics["nifty"]["count"]
+    mcx_trades = trade_analytics["mcx"]["count"]
     total_trades = nifty_trades + mcx_trades
 
     # Normalizing NIFTY positions
@@ -537,7 +737,9 @@ def get_aggregated_dashboard_state() -> dict:
 
     # Normalized Trade History
     nifty_trades_list = []
-    for t in nifty_snap.get("trade_log", []):
+    for t in trade_analytics["today_trades"]:
+        if t.get("market") != "NIFTY":
+            continue
         nifty_trades_list.append({
             "market": "NIFTY",
             "time": t.get("time", ""),
@@ -550,7 +752,9 @@ def get_aggregated_dashboard_state() -> dict:
         })
 
     mcx_trades_list = []
-    for t in mcx_snap.get("trade_log", []):
+    for t in trade_analytics["today_trades"]:
+        if t.get("market") != "MCX":
+            continue
         mcx_trades_list.append({
             "market": "MCX",
             "time": t.get("time", ""),
@@ -579,6 +783,13 @@ def get_aggregated_dashboard_state() -> dict:
     mcx_ema = mcx_snap.get("ema", {}) or {}
     mcx_sig = mcx_ema.get("confirmed_signal", 0)
     mcx_sig_str = "BULLISH ▲" if mcx_sig > 0 else ("BEARISH ▼" if mcx_sig < 0 else "FLAT ━")
+
+    nifty_intraday_series = update_market_intraday_series(
+        "NIFTY", nifty_net, (nifty_net / base_capital) * 100.0, 9, 15, 15, 35
+    )
+    mcx_intraday_series = update_market_intraday_series(
+        "MCX", mcx_net, (mcx_net / base_capital) * 100.0, 16, 0, 23, 24
+    )
 
     return {
         "status": "success",
@@ -630,7 +841,9 @@ def get_aggregated_dashboard_state() -> dict:
             "signal": nifty_ema_sig_str,
             "hold_time": nifty_ind.get("hold_time", 0.0),
             "positions": nifty_positions,
-            "trades": nifty_trades_list
+            "trades": nifty_trades_list,
+            "intraday_series": nifty_intraday_series,
+            "analytics": trade_analytics["nifty"]
         },
         "mcx": {
             "active": mcx_running,
@@ -653,12 +866,15 @@ def get_aggregated_dashboard_state() -> dict:
             "signal": mcx_sig_str,
             "hold_time": mcx_ema.get("hold_time", 0.0),
             "positions": mcx_positions,
-            "trades": mcx_trades_list
+            "trades": mcx_trades_list,
+            "intraday_series": mcx_intraday_series,
+            "analytics": trade_analytics["mcx"]
         },
         "positions": nifty_positions + mcx_positions,
         "recent_trades": all_trades[:35],
         "intraday_series": update_intraday_pnl_series(combined_net, combined_net_pct),
-        "history_analytics": get_history_analytics()
+        "history_analytics": get_history_analytics(),
+        "trade_analytics": trade_analytics,
     }
 
 
@@ -1939,6 +2155,30 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; scroll-behavior: auto !important; }
     }
+
+    .trade-stats-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin:0 0 20px; }
+    .trade-stat-card { padding:13px 15px; border:1px solid rgba(133,174,221,.16); border-radius:15px; background:linear-gradient(145deg,rgba(13,26,49,.84),rgba(8,14,28,.8)); box-shadow:inset 0 1px 0 rgba(255,255,255,.08); }
+    .trade-stat-card span { display:block; color:var(--text-dim); font:700 .62rem var(--mono); letter-spacing:.1em; }
+    .trade-stat-card strong { display:block; margin-top:7px; color:var(--text); font:800 1.2rem var(--mono); }
+    .trade-stat-card small { display:block; margin-top:5px; color:var(--text-muted); font:500 .62rem var(--mono); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .market-chart-panel { margin:0 0 16px; padding:15px 17px 12px; border:1px solid rgba(133,174,221,.16); border-radius:18px; background:linear-gradient(145deg,rgba(10,23,44,.88),rgba(7,12,25,.82)); box-shadow:inset 0 1px 0 rgba(255,255,255,.08); }
+    .market-chart-heading { display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:7px; font-family:var(--mono); }
+    .market-chart-heading b { font:800 .76rem var(--display); letter-spacing:.05em; }
+    .market-chart-heading small { display:block; margin-top:3px; color:var(--text-dim); font-size:.62rem; }
+    .market-chart-heading strong { color:var(--green); font-size:.9rem; }
+    #nifty-market-canvas, #mcx-market-canvas { display:block; width:100%; height:148px; }
+    .mcx-chart-panel { border-color:rgba(255,200,87,.2); }
+    @media (max-width:768px) {
+      .trade-stats-grid { grid-template-columns:repeat(2,minmax(0,1fr)); gap:7px; margin-bottom:14px; }
+      .trade-stat-card { padding:10px 11px; border-radius:12px; }
+      .trade-stat-card strong { font-size:1rem; }
+      .trade-stat-card small { font-size:.54rem; }
+      .market-chart-panel { padding:11px 11px 8px; border-radius:15px; }
+      .market-chart-heading b { font-size:.66rem; }
+      .market-chart-heading small { font-size:.54rem; }
+      .market-chart-heading strong { font-size:.75rem; }
+      #nifty-market-canvas, #mcx-market-canvas { height:128px; }
+    }
   </style>
 </head>
 <body>
@@ -2085,10 +2325,22 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       </div>
     </div>
 
+    <!-- Persisted trade intelligence -->
+    <div class="trade-stats-grid" aria-label="Trade performance statistics">
+      <div class="trade-stat-card"><span>WIN RATE</span><strong id="stat-win-rate">0.0%</strong><small id="stat-win-detail">0 wins / 0 losses</small></div>
+      <div class="trade-stat-card"><span>RISK : REWARD</span><strong id="stat-risk-reward">0.00 : 1</strong><small>Average win ÷ average loss</small></div>
+      <div class="trade-stat-card"><span>MAX DRAWDOWN</span><strong id="stat-max-dd">₹0.00</strong><small id="stat-max-dd-pct">0.00% of initial capital</small></div>
+      <div class="trade-stat-card"><span>COMPLETED TRADES</span><strong id="stat-trade-count">0</strong><small id="stat-profit-factor">Profit factor 0.00</small></div>
+    </div>
+
     <!-- ═══════════════════════════════════════════════════════════════════════ -->
     <!-- TAB 1: NIFTY 50 DEDICATED COMMAND CENTER                               -->
     <!-- ═══════════════════════════════════════════════════════════════════════ -->
     <div id="view-nifty" class="view-section active">
+      <div class="market-chart-panel">
+        <div class="market-chart-heading"><div><b>⚡ NIFTY SESSION CURVE</b><small>09:15 — 15:35 IST • persisted intraday trail</small></div><strong id="nifty-chart-value">₹0.00</strong></div>
+        <canvas id="nifty-market-canvas" aria-label="NIFTY live P&L chart"></canvas>
+      </div>
       <div class="panel-box">
         <div class="panel-hdr">
           <div class="panel-title">
@@ -2207,6 +2459,10 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
     <!-- TAB 2: MCX NATURAL GAS DEDICATED COMMAND CENTER                        -->
     <!-- ═══════════════════════════════════════════════════════════════════════ -->
     <div id="view-mcx" class="view-section">
+      <div class="market-chart-panel mcx-chart-panel">
+        <div class="market-chart-heading"><div><b>🛢️ MCX NATURAL GAS CURVE</b><small>16:00 — 23:24 IST • starts at the MCX session open</small></div><strong id="mcx-chart-value">₹0.00</strong></div>
+        <canvas id="mcx-market-canvas" aria-label="MCX live P&L chart"></canvas>
+      </div>
       <div class="panel-box">
         <div class="panel-hdr">
           <div class="panel-title">
@@ -2858,17 +3114,33 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         ctx.fillStyle = grad;
         ctx.fill();
 
-        // 5. Stroke glowing curve
-        ctx.beginPath();
-        ctx.moveTo(points[0].x, points[0].y);
+        // 5. Thin segmented stroke: every section is green above zero and
+        // red below zero, including the exact crossing point.
+        const drawThinSegment = (a, b, color) => {
+          ctx.beginPath();
+          ctx.moveTo(a.x, a.y);
+          ctx.lineTo(b.x, b.y);
+          ctx.lineWidth = 1.25;
+          ctx.lineCap = 'round';
+          ctx.strokeStyle = color;
+          ctx.shadowColor = color;
+          ctx.shadowBlur = 4;
+          ctx.stroke();
+        };
         for (let i = 1; i < points.length; i++) {
-          ctx.lineTo(points[i].x, points[i].y);
+          const a = points[i - 1];
+          const b = points[i];
+          const aPositive = a.pnl >= 0;
+          const bPositive = b.pnl >= 0;
+          if (aPositive === bPositive || a.pnl === 0 || b.pnl === 0) {
+            drawThinSegment(a, b, (aPositive && bPositive) ? '#35e0a1' : '#ff5d78');
+          } else {
+            const t = Math.abs(a.pnl) / (Math.abs(a.pnl) + Math.abs(b.pnl));
+            const cross = { x: a.x + (b.x - a.x) * t, y: zeroY, pnl: 0 };
+            drawThinSegment(a, cross, aPositive ? '#35e0a1' : '#ff5d78');
+            drawThinSegment(cross, b, bPositive ? '#35e0a1' : '#ff5d78');
+          }
         }
-        ctx.lineWidth = 2.6;
-        ctx.strokeStyle = isPos ? '#10b981' : '#f43f5e';
-        ctx.shadowColor = isPos ? 'rgba(16, 185, 129, 0.65)' : 'rgba(244, 63, 94, 0.65)';
-        ctx.shadowBlur = 12;
-        ctx.stroke();
         ctx.shadowBlur = 0;
       }
 
@@ -3010,6 +3282,8 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
     function startCanvasAnimationLoop() {
       function loop() {
         drawIntradayCanvas();
+        drawMarketCanvas('NIFTY');
+        drawMarketCanvas('MCX');
         chartAnimFrame = requestAnimationFrame(loop);
       }
       if (!chartAnimFrame) {
@@ -3030,6 +3304,74 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       window.addEventListener('resize', () => {
         drawIntradayCanvas();
       });
+    }
+
+    const marketChartState = {
+      NIFTY: { series: [], value: 0, pct: 0, start: 555, end: 935 },
+      MCX: { series: [], value: 0, pct: 0, start: 960, end: 1404 }
+    };
+
+    function renderMarketChart(market, series, value, pct) {
+      const state = marketChartState[market];
+      if (!state) return;
+      state.series = Array.isArray(series) ? series : [];
+      state.value = Number(value) || 0;
+      state.pct = Number(pct) || 0;
+      const valueEl = document.getElementById(`${market.toLowerCase()}-chart-value`);
+      if (valueEl) {
+        valueEl.innerText = fmtINR(state.value, true);
+        valueEl.style.color = state.value >= 0 ? 'var(--green)' : 'var(--red)';
+      }
+    }
+
+    function drawMarketCanvas(market) {
+      const canvas = document.getElementById(`${market.toLowerCase()}-market-canvas`);
+      const state = marketChartState[market];
+      if (!canvas || !state) return;
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      const w = rect.width, h = rect.height;
+      if (!w || !h) return;
+      if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+        canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr);
+      }
+      const ctx = canvas.getContext('2d');
+      ctx.save(); ctx.scale(dpr, dpr); ctx.clearRect(0, 0, w, h);
+      const left = 42, right = 12, top = 12, bottom = 22;
+      const plotW = Math.max(10, w - left - right), plotH = Math.max(10, h - top - bottom);
+      const toMin = (value) => {
+        const parts = String(value || '').split(':').map(Number);
+        return (parts[0] || 0) * 60 + (parts[1] || 0) + (parts[2] || 0) / 60;
+      };
+      const toX = (minute) => left + Math.max(0, Math.min(1, (minute - state.start) / (state.end - state.start))) * plotW;
+      const values = state.series.map(p => Number(p.pnl) || 0).concat([state.value, 0]);
+      const min = Math.min(...values), max = Math.max(...values);
+      const spread = Math.max(100, max - min), yMin = min - spread * .2, yMax = max + spread * .2;
+      const toY = (value) => top + (1 - ((value - yMin) / (yMax - yMin))) * plotH;
+      const zeroY = toY(0);
+
+      ctx.strokeStyle = 'rgba(148,163,184,.12)'; ctx.lineWidth = 1; ctx.setLineDash([3, 5]);
+      for (let i = 0; i < 5; i++) { const y = top + plotH * i / 4; ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(left + plotW, y); ctx.stroke(); }
+      ctx.setLineDash([]); ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.beginPath(); ctx.moveTo(left, zeroY); ctx.lineTo(left + plotW, zeroY); ctx.stroke();
+      ctx.font = '9px "JetBrains Mono", monospace'; ctx.fillStyle = 'rgba(148,163,184,.75)'; ctx.textAlign = 'left'; ctx.fillText(`₹${Math.round(max)}`, 4, top + 5); ctx.fillText(`₹0`, 10, zeroY + 3); ctx.fillText(`₹${Math.round(min)}`, 4, top + plotH);
+
+      let points = state.series.map(p => ({ x: toX(toMin(p.time || p.time_short)), y: toY(Number(p.pnl) || 0), pnl: Number(p.pnl) || 0 })).sort((a,b) => a.x - b.x);
+      if (!points.length) points = [{ x: toX(state.start), y: zeroY, pnl: 0 }];
+      if (points.length > 1) {
+        const fill = ctx.createLinearGradient(0, top, 0, top + plotH);
+        fill.addColorStop(0, 'rgba(53,224,161,.12)'); fill.addColorStop(.5, 'rgba(85,214,255,.025)'); fill.addColorStop(1, 'rgba(255,93,120,.12)');
+        ctx.beginPath(); ctx.moveTo(points[0].x, zeroY); ctx.lineTo(points[0].x, points[0].y); points.slice(1).forEach(p => ctx.lineTo(p.x,p.y)); ctx.lineTo(points[points.length-1].x, zeroY); ctx.closePath(); ctx.fillStyle = fill; ctx.fill();
+        for (let i = 1; i < points.length; i++) {
+          const a = points[i-1], b = points[i], same = (a.pnl >= 0) === (b.pnl >= 0);
+          const draw = (x,y,color) => { ctx.beginPath(); ctx.moveTo(x.x,x.y); ctx.lineTo(y.x,y.y); ctx.strokeStyle=color; ctx.lineWidth=1.15; ctx.lineCap='round'; ctx.stroke(); };
+          if (same || a.pnl === 0 || b.pnl === 0) draw(a,b,a.pnl >= 0 ? '#35e0a1' : '#ff5d78');
+          else { const t=Math.abs(a.pnl)/(Math.abs(a.pnl)+Math.abs(b.pnl)); const cross={x:a.x+(b.x-a.x)*t,y:zeroY}; draw(a,cross,a.pnl>=0?'#35e0a1':'#ff5d78'); draw(cross,b,b.pnl>=0?'#35e0a1':'#ff5d78'); }
+        }
+      }
+      const last = points[points.length - 1], positive = state.value >= 0;
+      ctx.beginPath(); ctx.arc(last.x,last.y,3.5,0,Math.PI*2); ctx.fillStyle='#fff'; ctx.shadowColor=positive?'#35e0a1':'#ff5d78'; ctx.shadowBlur=10; ctx.fill(); ctx.shadowBlur=0;
+      ctx.fillStyle='rgba(148,163,184,.72)'; ctx.textAlign='center'; ctx.fillText(market === 'MCX' ? '16:00' : '09:15', left, h - 4); ctx.fillText(market === 'MCX' ? '23:24' : '15:35', left + plotW, h - 4);
+      ctx.restore();
     }
 
     // ── Day-of-Week Cumulative Bar Chart Renderer ──
@@ -3251,8 +3593,20 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         tradesCountPill.innerText = `${p.total_trades || 0} TRADES`;
       }
 
+      const analytics = data.trade_analytics || {};
+      const allStats = analytics.all || {};
+      const setStat = (id, value) => { const el = document.getElementById(id); if (el) el.innerText = value; };
+      setStat('stat-win-rate', `${(allStats.win_pct || 0).toFixed(1)}%`);
+      setStat('stat-win-detail', `${allStats.wins || 0} wins / ${allStats.losses || 0} losses`);
+      setStat('stat-risk-reward', `${(allStats.risk_reward || 0).toFixed(2)} : 1`);
+      setStat('stat-max-dd', fmtINR(allStats.max_drawdown || 0, true));
+      setStat('stat-max-dd-pct', `${(allStats.max_drawdown_pct || 0).toFixed(2)}% of initial capital`);
+      setStat('stat-trade-count', `${allStats.count || 0}`);
+      setStat('stat-profit-factor', `Profit factor ${allStats.profit_factor == null ? '∞' : (allStats.profit_factor || 0).toFixed(2)}`);
+
       // ── NIFTY TAB DATA ──
       const n = data.nifty || {};
+      renderMarketChart('NIFTY', n.intraday_series, n.net_pnl, n.net_pct);
       document.getElementById('n-spot').innerText = n.spot ? n.spot.toFixed(2) : '--';
       document.getElementById('n-atm').innerText = n.atm || '--';
       document.getElementById('n-adx').innerText = n.adx ? n.adx.toFixed(1) : '--';
@@ -3288,6 +3642,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
 
       // ── MCX TAB DATA ──
       const m = data.mcx || {};
+      renderMarketChart('MCX', m.intraday_series, m.net_pnl, m.net_pct);
       document.getElementById('m-spot').innerText = m.spot ? m.spot.toFixed(2) : '--';
       document.getElementById('m-atm').innerText = m.atm || '--';
       document.getElementById('m-expiry').innerText = m.expiry + (m.is_rolled_over ? ' (ROLL)' : '');
