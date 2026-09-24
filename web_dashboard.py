@@ -217,13 +217,7 @@ def get_pnl_tracker_data():
         d = load_json_safe(p)
         if d:
             return d
-    return {
-        "current_capital": 200000.0,
-        "today_pnl": 0.0,
-        "mtd_pnl": 0.0,
-        "ytd_pnl": 0.0,
-        "daily_pnl": {}
-    }
+    return {}
 
 def get_nifty_snapshot():
     return load_current_snapshot([
@@ -305,7 +299,7 @@ def _normalise_trade(row, market, fallback_date=None):
         "reason": reason,
     }
 
-def _trade_metrics(trades):
+def _trade_metrics(trades, base_capital=None):
     ordered = sorted(trades, key=lambda t: str(t.get("timestamp", "")))
     wins = [t["pnl"] for t in ordered if t["pnl"] > 0]
     losses = [t["pnl"] for t in ordered if t["pnl"] < 0]
@@ -318,7 +312,6 @@ def _trade_metrics(trades):
         max_dd = max(max_dd, peak - equity)
     count = len(ordered)
     decided = len(wins) + len(losses)
-    base = 200000.0
     return {
         "count": count,
         "wins": len(wins),
@@ -332,11 +325,11 @@ def _trade_metrics(trades):
         "avg_loss": round(sum(losses) / len(losses), 2) if losses else 0.0,
         "risk_reward": round((gross_win / len(wins)) / (gross_loss / len(losses)), 2) if wins and losses else 0.0,
         "max_drawdown": round(max_dd, 2),
-        "max_drawdown_pct": round((max_dd / base) * 100.0, 4),
+        "max_drawdown_pct": round((max_dd / base_capital) * 100.0, 4) if base_capital and base_capital > 0 else None,
         "net_pnl": round(sum(t["pnl"] for t in ordered), 2),
     }
 
-def get_trade_analytics(nifty_snapshot=None, mcx_snapshot=None):
+def get_trade_analytics(nifty_snapshot=None, mcx_snapshot=None, base_capital=None):
     observed = []
     today = get_ist_now().date()
     for market, snapshot in (("NIFTY", nifty_snapshot or {}), ("MCX", mcx_snapshot or {})):
@@ -384,10 +377,10 @@ def get_trade_analytics(nifty_snapshot=None, mcx_snapshot=None):
         for market in ("NIFTY", "MCX")
     }
     return {
-        "all": _trade_metrics(all_trades),
-        "today": _trade_metrics(today_trades),
-        "nifty": _trade_metrics(by_market["NIFTY"]),
-        "mcx": _trade_metrics(by_market["MCX"]),
+        "all": _trade_metrics(all_trades, base_capital),
+        "today": _trade_metrics(today_trades, base_capital),
+        "nifty": _trade_metrics(by_market["NIFTY"], base_capital),
+        "mcx": _trade_metrics(by_market["MCX"], base_capital),
         "today_trades": today_trades,
     }
 
@@ -506,7 +499,7 @@ def get_history_analytics():
     if base_capital <= 0.0 and stored_capital > 0.0:
         base_capital = stored_capital - stored_ytd
     if base_capital <= 0.0:
-        base_capital = 200000.0
+        base_capital = None
     daily_map = dict(pnl_data.get("daily_pnl", {}))
 
     trade_csv = os.path.join(PROJECT_ROOT, "data", "logs", "trade_book", "trades_v2_paper.csv")
@@ -543,7 +536,7 @@ def get_history_analytics():
 
     for d_str in reversed(last_30_dates):
         val = float(daily_map[d_str])
-        pct_2l = (val / base_capital) * 100.0
+        pct_2l = (val / base_capital) * 100.0 if base_capital else None
         try:
             dt = datetime.strptime(d_str, "%Y-%m-%d")
             weekday = dt.strftime("%A")
@@ -578,20 +571,21 @@ def get_history_analytics():
         item = day_of_week_map[day_name]
         cnt = item["count"]
         pnl = item["total_pnl"]
-        pct = (pnl / base_capital) * 100.0
+        pct = (pnl / base_capital) * 100.0 if base_capital else None
         win_rate = (item["wins"] / cnt * 100.0) if cnt > 0 else 0.0
-        dow_list.append({
-            "day": day_name,
-            "total_pnl": pnl,
-            "pct": pct,
-            "count": cnt,
-            "win_rate": win_rate
-        })
+        if cnt > 0:
+            dow_list.append({
+                "day": day_name,
+                "total_pnl": pnl,
+                "pct": pct,
+                "count": cnt,
+                "win_rate": win_rate
+            })
 
     month_list = []
     for m_name, m_data in month_map.items():
         pnl = m_data["total_pnl"]
-        pct = (pnl / base_capital) * 100.0
+        pct = (pnl / base_capital) * 100.0 if base_capital else None
         cnt = m_data["days"]
         wr = (m_data["wins"] / cnt * 100.0) if cnt > 0 else 0.0
         month_list.append({
@@ -613,7 +607,7 @@ def get_aggregated_dashboard_state() -> dict:
     pnl_data = get_pnl_tracker_data()
     nifty_snap = get_nifty_snapshot() or {}
     mcx_snap = get_mcx_snapshot() or {}
-    trade_analytics = get_trade_analytics(nifty_snap, mcx_snap)
+    trade_analytics = None
 
     scheduler_running = check_process_running("daily_scheduler.py")
     nifty_running = check_process_running("nifty_paper_v3.py") or check_process_running("upv2_paper.py")
@@ -645,7 +639,8 @@ def get_aggregated_dashboard_state() -> dict:
     if base_capital <= 0.0 and stored_capital > 0.0:
         base_capital = stored_capital - stored_ytd
     if base_capital <= 0.0:
-        base_capital = 200000.0
+        base_capital = None
+    trade_analytics = get_trade_analytics(nifty_snap, mcx_snap, base_capital)
 
     # The tracker commits completed sessions. Add today's live result exactly
     # once so Live Capital, MTD and YTD all share one consistent basis.
@@ -655,10 +650,10 @@ def get_aggregated_dashboard_state() -> dict:
     stored_mtd = float(pnl_data.get("mtd_pnl", 0.0) or 0.0)
     mtd_pnl = stored_mtd + today_realized_delta + combined_unrealized
     ytd_pnl = stored_ytd + today_realized_delta + combined_unrealized
-    live_capital = base_capital + ytd_pnl
-    combined_net_pct = (combined_net / base_capital) * 100.0
-    capital_growth_pct = ((live_capital - base_capital) / base_capital) * 100.0
-    circuit_limit = round(-live_capital * 0.018, 2)
+    live_capital = (base_capital + ytd_pnl) if base_capital is not None else None
+    combined_net_pct = (combined_net / base_capital) * 100.0 if base_capital else None
+    capital_growth_pct = ((live_capital - base_capital) / base_capital) * 100.0 if base_capital else None
+    circuit_limit = round(-live_capital * 0.018, 2) if live_capital is not None else None
 
     # Count completed, deduplicated trade records. Snapshot counters include
     # legs/entries and can remain stale across a session boundary.
@@ -675,8 +670,11 @@ def get_aggregated_dashboard_state() -> dict:
             ltp = float(pos.get("ltp", pos.get("_last_ltp", entry)) or entry)
             strike = pos.get("strike", 0)
             side = pos.get("side", "SELL")
-            qty = pos.get("qty", 65)
-            pnl = float(pos.get("pnl", ((entry - ltp) if side == "SELL" else (ltp - entry)) * qty) or 0.0)
+            qty = pos.get("qty")
+            raw_pnl = pos.get("pnl")
+            pnl = float(raw_pnl) if raw_pnl is not None else (
+                float(((entry - ltp) if side == "SELL" else (ltp - entry)) * qty) if qty is not None else None
+            )
             sl_state = pos.get("dual_sl_state", {})
             current_sl = float(sl_state.get("current_premium_sl", 0.0) or 0.0)
             is_solo = bool(sl_state.get("solo_mode", False))
@@ -707,7 +705,7 @@ def get_aggregated_dashboard_state() -> dict:
                 "display_leg": f"{pos.get('leg')}*" if pos.get("solo_mode") else pos.get("leg"),
                 "strike": pos.get("strike", 0),
                 "side": pos.get("side", "SELL"),
-                "qty": pos.get("qty", 1250),
+                "qty": pos.get("qty"),
                 "entry": float(pos.get("entry", 0.0) or 0.0),
                 "ltp": float(pos.get("ltp", 0.0) or 0.0),
                 "sl": float(pos.get("sl", 0.0) or 0.0),
@@ -726,11 +724,12 @@ def get_aggregated_dashboard_state() -> dict:
                 "display_leg": f"{leg}*" if sl_state.get("solo_mode") else leg,
                 "strike": pos.get("strike", 0),
                 "side": pos.get("side", "SELL"),
-                "qty": pos.get("qty", 1250),
+                "qty": pos.get("qty"),
                 "entry": entry,
                 "ltp": ltp,
                 "sl": float(sl_state.get("current_sl", 0.0) or 0.0),
-                "pnl": float(((entry - ltp) if pos.get("side") == "SELL" else (ltp - entry)) * pos.get("qty", 1250)),
+                "pnl": (float(((entry - ltp) if pos.get("side") == "SELL" else (ltp - entry)) * pos.get("qty"))
+                        if pos.get("qty") is not None else None),
                 "tsym": pos.get("tsym", leg),
                 "is_solo": bool(sl_state.get("solo_mode", False))
             })
@@ -770,25 +769,25 @@ def get_aggregated_dashboard_state() -> dict:
 
     nifty_ind = nifty_snap.get("indicators", {}) or {}
     kama_val = nifty_ind.get("kama")
-    kama_str = f"{kama_val:.1f}" if kama_val is not None else "WARMUP"
-    trend_val = nifty_ind.get("trend", 0)
-    trend_label = "BULLISH ▲" if trend_val == 1 else ("BEARISH ▼" if trend_val == -1 else "FLAT ━")
-    regime = nifty_ind.get("regime", "CHOP")
-    adx_val = float(nifty_ind.get("adx", 18.0) or 18.0)
-    atr_val = float(nifty_ind.get("atr", 35.0) or 35.0)
+    kama_str = f"{kama_val:.1f}" if kama_val is not None else None
+    trend_val = nifty_ind.get("trend")
+    trend_label = "BULLISH ▲" if trend_val == 1 else ("BEARISH ▼" if trend_val == -1 else None)
+    regime = nifty_ind.get("regime")
+    adx_val = nifty_ind.get("adx")
+    atr_val = nifty_ind.get("atr")
 
-    nifty_ema_sig = nifty_ind.get("confirmed_signal", 0)
-    nifty_ema_sig_str = "BULLISH ▲" if nifty_ema_sig > 0 else ("BEARISH ▼" if nifty_ema_sig < 0 else "FLAT ━")
+    nifty_ema_sig = nifty_ind.get("confirmed_signal")
+    nifty_ema_sig_str = ("BULLISH ▲" if nifty_ema_sig > 0 else ("BEARISH ▼" if nifty_ema_sig < 0 else "FLAT ━")) if nifty_ema_sig is not None else None
 
     mcx_ema = mcx_snap.get("ema", {}) or {}
-    mcx_sig = mcx_ema.get("confirmed_signal", 0)
-    mcx_sig_str = "BULLISH ▲" if mcx_sig > 0 else ("BEARISH ▼" if mcx_sig < 0 else "FLAT ━")
+    mcx_sig = mcx_ema.get("confirmed_signal")
+    mcx_sig_str = ("BULLISH ▲" if mcx_sig > 0 else ("BEARISH ▼" if mcx_sig < 0 else "FLAT ━")) if mcx_sig is not None else None
 
     nifty_intraday_series = update_market_intraday_series(
-        "NIFTY", nifty_net, (nifty_net / base_capital) * 100.0, 9, 15, 15, 35
+        "NIFTY", nifty_net, (nifty_net / base_capital) * 100.0 if base_capital else None, 9, 15, 15, 35
     )
     mcx_intraday_series = update_market_intraday_series(
-        "MCX", mcx_net, (mcx_net / base_capital) * 100.0, 16, 0, 23, 24
+        "MCX", mcx_net, (mcx_net / base_capital) * 100.0 if base_capital else None, 16, 0, 23, 24
     )
 
     return {
@@ -812,7 +811,7 @@ def get_aggregated_dashboard_state() -> dict:
             "base_capital": base_capital,
             "capital_growth_pct": capital_growth_pct,
             "circuit_limit": circuit_limit,
-            "circuit_used_pct": min(100.0, max(0.0, (abs(combined_net) / abs(circuit_limit)) * 100.0)) if combined_net < 0 and circuit_limit != 0 else 0.0,
+            "circuit_used_pct": min(100.0, max(0.0, (abs(combined_net) / abs(circuit_limit)) * 100.0)) if combined_net < 0 and circuit_limit else None,
             "mtd_pnl": mtd_pnl,
             "ytd_pnl": ytd_pnl,
             "total_trades": total_trades,
@@ -820,26 +819,26 @@ def get_aggregated_dashboard_state() -> dict:
         },
         "nifty": {
             "active": nifty_running,
-            "mode": nifty_snap.get("mode", "STANDBY"),
+            "mode": nifty_snap.get("mode"),
             "spot": float(nifty_snap.get("spot", 0.0) or 0.0),
             "atm": int(nifty_snap.get("atm", 0) or 0),
             "realized_pnl": nifty_realized,
             "unrealized_pnl": nifty_unrealized,
             "net_pnl": nifty_net,
-            "net_pct": (nifty_net / base_capital) * 100.0,
+            "net_pct": (nifty_net / base_capital) * 100.0 if base_capital else None,
             "trades_today": nifty_trades,
             "regime": regime,
             "adx": adx_val,
             "kama": kama_str,
             "trend": trend_label,
             "atr": atr_val,
-            "ema15": nifty_ind.get("ema_15", 0.0),
-            "ema90": nifty_ind.get("ema_90", 0.0),
-            "ema300": nifty_ind.get("ema_300", 0.0),
-            "slow_slope": nifty_ind.get("slow_slope", 0.0),
-            "vr": nifty_ind.get("vr", 1.0),
+            "ema15": nifty_ind.get("ema_15"),
+            "ema90": nifty_ind.get("ema_90"),
+            "ema300": nifty_ind.get("ema_300"),
+            "slow_slope": nifty_ind.get("slow_slope"),
+            "vr": nifty_ind.get("vr"),
             "signal": nifty_ema_sig_str,
-            "hold_time": nifty_ind.get("hold_time", 0.0),
+            "hold_time": nifty_ind.get("hold_time"),
             "positions": nifty_positions,
             "trades": nifty_trades_list,
             "intraday_series": nifty_intraday_series,
@@ -849,22 +848,22 @@ def get_aggregated_dashboard_state() -> dict:
             "active": mcx_running,
             "spot": float(mcx_snap.get("spot", 0.0) or 0.0),
             "atm": int(mcx_snap.get("atm", 0) or 0),
-            "expiry": mcx_snap.get("expiry", "Front Month"),
+            "expiry": mcx_snap.get("expiry"),
             "is_rolled_over": bool(mcx_snap.get("is_rolled_over", False)),
             "realized_pnl": mcx_realized,
             "unrealized_pnl": mcx_unrealized,
             "net_pnl": mcx_net,
-            "net_pct": (mcx_net / base_capital) * 100.0,
+            "net_pct": (mcx_net / base_capital) * 100.0 if base_capital else None,
             "trades_today": mcx_trades,
             "reversal_latched": bool(mcx_snap.get("reversal_latched", False)),
             "cooldown_remaining": mcx_snap.get("cooldown_remaining", 0),
-            "ema15": mcx_ema.get("ema_15", 0.0),
-            "ema90": mcx_ema.get("ema_90", 0.0),
-            "ema300": mcx_ema.get("ema_300", 0.0),
-            "slow_slope": mcx_ema.get("slow_slope", 0.0),
-            "vr": mcx_ema.get("vr", 1.0),
+            "ema15": mcx_ema.get("ema_15"),
+            "ema90": mcx_ema.get("ema_90"),
+            "ema300": mcx_ema.get("ema_300"),
+            "slow_slope": mcx_ema.get("slow_slope"),
+            "vr": mcx_ema.get("vr"),
             "signal": mcx_sig_str,
-            "hold_time": mcx_ema.get("hold_time", 0.0),
+            "hold_time": mcx_ema.get("hold_time"),
             "positions": mcx_positions,
             "trades": mcx_trades_list,
             "intraday_series": mcx_intraday_series,
@@ -2777,7 +2776,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
 
   <script>
     let activeTab = 'nifty';
-    let dashboardBaseCapital = 200000.0;
+    let dashboardBaseCapital = null;
 
     function toggleMobileDrawer() {
       const drawer = document.getElementById('mobile-drawer');
@@ -2833,16 +2832,20 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
     }
 
     function fmtINR(val, plus=false) {
-      if (val === undefined || val === null || isNaN(val)) return '₹0.00';
+      if (val === undefined || val === null || !Number.isFinite(Number(val))) return 'Not enough data';
       const num = parseFloat(val);
       const sign = num > 0 ? (plus ? '+' : '') : (num < 0 ? '-' : '');
       return `${sign}₹${Math.abs(num).toLocaleString('en-IN', {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
     }
 
     function fmtPct(val) {
-      if (val === undefined || val === null || isNaN(val)) return '+0.00%';
+      if (val === undefined || val === null || !Number.isFinite(Number(val))) return 'Not enough data';
       const num = parseFloat(val);
       return `${num >= 0 ? '+' : ''}${num.toFixed(2)}%`;
+    }
+
+    function dataOrNA(value, formatter = (v) => v) {
+      return value === undefined || value === null || value === '' ? 'Not enough data' : formatter(value);
     }
 
     function applyClass(el, val) {
@@ -2907,8 +2910,8 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
 
     // ── Live Intraday Canvas Chart State & Engine ──
     let chartSeries = [];
-    let chartCurNet = 0.0;
-    let chartCurPct = 0.0;
+    let chartCurNet = null;
+    let chartCurPct = null;
     let chartAnimFrame = null;
     let chartMouseX = null;
 
@@ -2916,8 +2919,8 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       if (Array.isArray(series)) {
         chartSeries = series;
       }
-      if (curNet !== undefined && !isNaN(curNet)) chartCurNet = parseFloat(curNet);
-      if (curPct !== undefined && !isNaN(curPct)) chartCurPct = parseFloat(curPct);
+      if (curNet !== undefined && curNet !== null && Number.isFinite(Number(curNet))) chartCurNet = parseFloat(curNet);
+      if (curPct !== undefined && curPct !== null && Number.isFinite(Number(curPct))) chartCurPct = parseFloat(curPct);
 
       const curNetEl = document.getElementById('chart-cur-mtm');
       if (curNetEl) {
@@ -2952,6 +2955,15 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       const padBottom = 26;
       const plotW = Math.max(10, w - padLeft - padRight);
       const plotH = Math.max(10, h - padTop - padBottom);
+
+      if (!chartSeries.length && chartCurNet === null) {
+        ctx.fillStyle = 'rgba(148,163,184,.8)';
+        ctx.font = '11px "JetBrains Mono", monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('Not enough data', padLeft + plotW / 2, padTop + plotH / 2);
+        ctx.restore();
+        return;
+      }
 
       // Fixed grid: 09:15 (555m) to 15:35 (935m) = 380 min
       const startMin = 555;
@@ -3294,12 +3306,12 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       const state = marketChartState[market];
       if (!state) return;
       state.series = Array.isArray(series) ? series : [];
-      state.value = Number(value) || 0;
-      state.pct = Number(pct) || 0;
+      state.value = Number.isFinite(Number(value)) ? Number(value) : null;
+      state.pct = Number.isFinite(Number(pct)) ? Number(pct) : null;
       const valueEl = document.getElementById(`${market.toLowerCase()}-chart-value`);
       if (valueEl) {
         valueEl.innerText = fmtINR(state.value, true);
-        valueEl.style.color = state.value >= 0 ? 'var(--green)' : 'var(--red)';
+        valueEl.style.color = state.value === null ? 'var(--text-dim)' : (state.value >= 0 ? 'var(--green)' : 'var(--red)');
       }
     }
 
@@ -3323,8 +3335,19 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         return (parts[0] || 0) * 60 + (parts[1] || 0) + (parts[2] || 0) / 60;
       };
       const toX = (minute) => left + Math.max(0, Math.min(1, (minute - state.start) / (state.end - state.start))) * plotW;
-      const values = state.series.map(p => Number(p.pnl) || 0).concat([state.value, 0]);
-      const min = Math.min(...values), max = Math.max(...values);
+      const values = state.series.map(p => Number(p.pnl)).filter(Number.isFinite);
+      if (Number.isFinite(state.value)) values.push(state.value);
+      if (!values.length) {
+        ctx.fillStyle = 'rgba(148,163,184,.8)';
+        ctx.font = '11px "JetBrains Mono", monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('Not enough data', left + plotW / 2, top + plotH / 2);
+        ctx.restore();
+        return;
+      }
+      const minValue = Math.min(...values), maxValue = Math.max(...values);
+      values.push(0);
+      const min = Math.min(...values, minValue), max = Math.max(...values, maxValue);
       const spread = Math.max(100, max - min), yMin = min - spread * .2, yMax = max + spread * .2;
       const toY = (value) => top + (1 - ((value - yMin) / (yMax - yMin))) * plotH;
       const zeroY = toY(0);
@@ -3334,8 +3357,16 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       ctx.setLineDash([]); ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.beginPath(); ctx.moveTo(left, zeroY); ctx.lineTo(left + plotW, zeroY); ctx.stroke();
       ctx.font = '9px "JetBrains Mono", monospace'; ctx.fillStyle = 'rgba(148,163,184,.75)'; ctx.textAlign = 'left'; ctx.fillText(`₹${Math.round(max)}`, 4, top + 5); ctx.fillText(`₹0`, 10, zeroY + 3); ctx.fillText(`₹${Math.round(min)}`, 4, top + plotH);
 
-      let points = state.series.map(p => ({ x: toX(toMin(p.time || p.time_short)), y: toY(Number(p.pnl) || 0), pnl: Number(p.pnl) || 0 })).sort((a,b) => a.x - b.x);
-      if (!points.length) points = [{ x: toX(state.start), y: zeroY, pnl: 0 }];
+      let points = state.series.map(p => ({ x: toX(toMin(p.time || p.time_short)), y: toY(Number(p.pnl)), pnl: Number(p.pnl) })).filter(p => Number.isFinite(p.pnl)).sort((a,b) => a.x - b.x);
+      if (!points.length && Number.isFinite(state.value)) points = [{ x: toX(state.end), y: toY(state.value), pnl: state.value }];
+      if (!points.length) {
+        ctx.fillStyle = 'rgba(148,163,184,.8)';
+        ctx.font = '11px "JetBrains Mono", monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('Not enough data', left + plotW / 2, top + plotH / 2);
+        ctx.restore();
+        return;
+      }
       if (points.length > 1) {
         const fill = ctx.createLinearGradient(0, top, 0, top + plotH);
         fill.addColorStop(0, 'rgba(53,224,161,.12)'); fill.addColorStop(.5, 'rgba(85,214,255,.025)'); fill.addColorStop(1, 'rgba(255,93,120,.12)');
@@ -3347,7 +3378,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
           else { const t=Math.abs(a.pnl)/(Math.abs(a.pnl)+Math.abs(b.pnl)); const cross={x:a.x+(b.x-a.x)*t,y:zeroY}; draw(a,cross,a.pnl>=0?'#35e0a1':'#ff5d78'); draw(cross,b,b.pnl>=0?'#35e0a1':'#ff5d78'); }
         }
       }
-      const last = points[points.length - 1], positive = state.value >= 0;
+      const last = points[points.length - 1], positive = (state.value ?? last.pnl) >= 0;
       ctx.beginPath(); ctx.arc(last.x,last.y,3.5,0,Math.PI*2); ctx.fillStyle='#fff'; ctx.shadowColor=positive?'#35e0a1':'#ff5d78'; ctx.shadowBlur=10; ctx.fill(); ctx.shadowBlur=0;
       ctx.fillStyle='rgba(148,163,184,.72)'; ctx.textAlign='center'; ctx.fillText(market === 'MCX' ? '16:00' : '09:15', left, h - 4); ctx.fillText(market === 'MCX' ? '23:24' : '15:35', left + plotW, h - 4);
       ctx.restore();
@@ -3358,15 +3389,11 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       const container = document.getElementById('dow-bars-container');
       if (!container) return;
 
-      const defaultDOW = [
-        { day: 'Monday', total_pnl: 0, pct: 0, count: 0, win_rate: 0 },
-        { day: 'Tuesday', total_pnl: 0, pct: 0, count: 0, win_rate: 0 },
-        { day: 'Wednesday', total_pnl: 0, pct: 0, count: 0, win_rate: 0 },
-        { day: 'Thursday', total_pnl: 0, pct: 0, count: 0, win_rate: 0 },
-        { day: 'Friday', total_pnl: 0, pct: 0, count: 0, win_rate: 0 }
-      ];
-
-      const list = (Array.isArray(dowList) && dowList.length > 0) ? dowList : defaultDOW;
+      if (!Array.isArray(dowList) || dowList.length === 0) {
+        container.innerHTML = `<div style="grid-column:1/-1; text-align:center; color:var(--text-dim); padding:20px; font-family:var(--mono);">Not enough data</div>`;
+        return;
+      }
+      const list = dowList;
 
       let maxAbs = 1000;
       list.forEach(d => {
@@ -3491,11 +3518,11 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
 
       // KPI Performance
       const p = data.performance || {};
-      dashboardBaseCapital = parseFloat(p.base_capital) > 0 ? parseFloat(p.base_capital) : 200000.0;
+      dashboardBaseCapital = parseFloat(p.base_capital) > 0 ? parseFloat(p.base_capital) : null;
       const baseCapitalEl = document.getElementById('base-capital-label');
       if (baseCapitalEl) baseCapitalEl.innerText = fmtINR(dashboardBaseCapital);
-      const netMtm = p.combined_net_mtm || 0.0;
-      const netPct = p.combined_net_pct || 0.0;
+      const netMtm = Number.isFinite(Number(p.combined_net_mtm)) ? Number(p.combined_net_mtm) : null;
+      const netPct = Number.isFinite(Number(p.combined_net_pct)) ? Number(p.combined_net_pct) : null;
 
       const netEl = document.getElementById('net-mtm-val');
       netEl.innerText = fmtINR(netMtm, true);
@@ -3539,9 +3566,9 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         capRetEl.className = 'tag-pct ' + (capRetPct >= 0 ? 'pos' : 'neg');
       }
 
-      const usedPct = p.circuit_used_pct || 0;
-      document.getElementById('circuit-fill-bar').style.width = `${Math.min(100, usedPct)}%`;
-      document.getElementById('circuit-used-text').innerText = `${usedPct.toFixed(1)}% Used`;
+      const usedPct = Number.isFinite(Number(p.circuit_used_pct)) ? Number(p.circuit_used_pct) : null;
+      document.getElementById('circuit-fill-bar').style.width = usedPct === null ? '0%' : `${Math.min(100, usedPct)}%`;
+      document.getElementById('circuit-used-text').innerText = usedPct === null ? 'Not enough data' : `${usedPct.toFixed(1)}% Used`;
 
       // MTD with the same initial-capital denominator as Live Capital Growth.
       const mtdPct = (p.mtd_pnl / dashboardBaseCapital) * 100.0;
@@ -3575,26 +3602,26 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       const analytics = data.trade_analytics || {};
       const allStats = analytics.all || {};
       const setStat = (id, value) => { const el = document.getElementById(id); if (el) el.innerText = value; };
-      setStat('stat-win-rate', `${(allStats.win_pct || 0).toFixed(1)}%`);
+      setStat('stat-win-rate', allStats.win_pct == null ? 'Not enough data' : `${allStats.win_pct.toFixed(1)}%`);
       const todayStats = analytics.today || {};
-      setStat('stat-win-detail', `${allStats.wins || 0} wins / ${allStats.losses || 0} losses • today ${(todayStats.win_pct || 0).toFixed(1)}%`);
-      setStat('stat-risk-reward', `${(allStats.risk_reward || 0).toFixed(2)} : 1`);
-      setStat('stat-max-dd', fmtINR(allStats.max_drawdown || 0, true));
-      setStat('stat-max-dd-pct', `${(allStats.max_drawdown_pct || 0).toFixed(2)}% of initial capital`);
+      setStat('stat-win-detail', allStats.count ? `${allStats.wins} wins / ${allStats.losses} losses • today ${todayStats.win_pct == null ? 'Not enough data' : `${todayStats.win_pct.toFixed(1)}%`}` : 'Not enough data');
+      setStat('stat-risk-reward', allStats.risk_reward == null || !allStats.wins || !allStats.losses ? 'Not enough data' : `${allStats.risk_reward.toFixed(2)} : 1`);
+      setStat('stat-max-dd', allStats.count ? fmtINR(allStats.max_drawdown, true) : 'Not enough data');
+      setStat('stat-max-dd-pct', allStats.max_drawdown_pct == null ? 'Not enough data' : `${allStats.max_drawdown_pct.toFixed(2)}% of initial capital`);
       setStat('stat-trade-count', `${todayStats.count || 0}`);
       setStat('stat-profit-factor', `${allStats.count || 0} in ledger • Profit factor ${allStats.profit_factor == null ? '∞' : (allStats.profit_factor || 0).toFixed(2)}`);
 
       // ── NIFTY TAB DATA ──
       const n = data.nifty || {};
       renderMarketChart('NIFTY', n.intraday_series, n.net_pnl, n.net_pct);
-      document.getElementById('n-spot').innerText = n.spot ? n.spot.toFixed(2) : '--';
-      document.getElementById('n-atm').innerText = n.atm || '--';
-      document.getElementById('n-adx').innerText = n.adx ? n.adx.toFixed(1) : '--';
-      document.getElementById('n-regime').innerText = n.regime || '--';
-      document.getElementById('n-kama').innerText = n.kama || '--';
-      document.getElementById('n-trend').innerText = n.trend || '--';
-      document.getElementById('n-atr').innerText = n.atr ? n.atr.toFixed(1) : '--';
-      document.getElementById('n-signal').innerText = n.signal || '--';
+      document.getElementById('n-spot').innerText = dataOrNA(n.spot, v => Number(v).toFixed(2));
+      document.getElementById('n-atm').innerText = dataOrNA(n.atm);
+      document.getElementById('n-adx').innerText = dataOrNA(n.adx, v => Number(v).toFixed(1));
+      document.getElementById('n-regime').innerText = dataOrNA(n.regime);
+      document.getElementById('n-kama').innerText = dataOrNA(n.kama);
+      document.getElementById('n-trend').innerText = dataOrNA(n.trend);
+      document.getElementById('n-atr').innerText = dataOrNA(n.atr, v => Number(v).toFixed(1));
+      document.getElementById('n-signal').innerText = dataOrNA(n.signal);
 
       const nNetEl = document.getElementById('n-net-pnl');
       nNetEl.innerText = fmtINR(n.net_pnl, true);
@@ -3623,14 +3650,14 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       // ── MCX TAB DATA ──
       const m = data.mcx || {};
       renderMarketChart('MCX', m.intraday_series, m.net_pnl, m.net_pct);
-      document.getElementById('m-spot').innerText = m.spot ? m.spot.toFixed(2) : '--';
-      document.getElementById('m-atm').innerText = m.atm || '--';
-      document.getElementById('m-expiry').innerText = m.expiry + (m.is_rolled_over ? ' (ROLL)' : '');
-      document.getElementById('m-signal').innerText = m.signal || '--';
-      document.getElementById('m-ema15').innerText = m.ema15 ? m.ema15.toFixed(2) : '--';
-      document.getElementById('m-ema90').innerText = m.ema90 ? m.ema90.toFixed(2) : '--';
-      document.getElementById('m-slope').innerText = (m.slow_slope !== undefined) ? m.slow_slope.toFixed(3) : '--';
-      document.getElementById('m-vr').innerText = m.vr ? m.vr.toFixed(2) : '--';
+      document.getElementById('m-spot').innerText = dataOrNA(m.spot, v => Number(v).toFixed(2));
+      document.getElementById('m-atm').innerText = dataOrNA(m.atm);
+      document.getElementById('m-expiry').innerText = dataOrNA(m.expiry, v => v + (m.is_rolled_over ? ' (ROLL)' : ''));
+      document.getElementById('m-signal').innerText = dataOrNA(m.signal);
+      document.getElementById('m-ema15').innerText = dataOrNA(m.ema15, v => Number(v).toFixed(2));
+      document.getElementById('m-ema90').innerText = dataOrNA(m.ema90, v => Number(v).toFixed(2));
+      document.getElementById('m-slope').innerText = dataOrNA(m.slow_slope, v => Number(v).toFixed(3));
+      document.getElementById('m-vr').innerText = dataOrNA(m.vr, v => Number(v).toFixed(2));
 
       const mNetEl = document.getElementById('m-net-pnl');
       mNetEl.innerText = fmtINR(m.net_pnl, true);
