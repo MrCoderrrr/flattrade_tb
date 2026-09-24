@@ -622,7 +622,7 @@ def get_aggregated_dashboard_state() -> dict:
     hhmm = now_ist.strftime("%H:%M")
     is_weekday = now_ist.weekday() < 5
     nifty_session_active = is_weekday and "09:15" <= hhmm < "15:35"
-    mcx_session_active = is_weekday and "15:30" <= hhmm < "23:25"
+    mcx_session_active = is_weekday and "16:00" <= hhmm <= "23:24"
 
     nifty_realized = float(nifty_snap.get("realized_pnl", 0.0) or 0.0)
     nifty_unrealized = float(nifty_snap.get("unrealized_pnl", 0.0) or 0.0)
@@ -2330,7 +2330,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       <div class="trade-stat-card"><span>WIN RATE</span><strong id="stat-win-rate">0.0%</strong><small id="stat-win-detail">0 wins / 0 losses</small></div>
       <div class="trade-stat-card"><span>RISK : REWARD</span><strong id="stat-risk-reward">0.00 : 1</strong><small>Average win ÷ average loss</small></div>
       <div class="trade-stat-card"><span>MAX DRAWDOWN</span><strong id="stat-max-dd">₹0.00</strong><small id="stat-max-dd-pct">0.00% of initial capital</small></div>
-      <div class="trade-stat-card"><span>COMPLETED TRADES</span><strong id="stat-trade-count">0</strong><small id="stat-profit-factor">Profit factor 0.00</small></div>
+      <div class="trade-stat-card"><span>LEDGER TRADES</span><strong id="stat-trade-count">0</strong><small id="stat-profit-factor">0 completed today • Profit factor 0.00</small></div>
     </div>
 
     <!-- ═══════════════════════════════════════════════════════════════════════ -->
@@ -2471,7 +2471,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
           </div>
           <div style="display:flex; align-items:center; gap:8px;">
             <div id="mcx-status-chip" class="status-chip chip-dim">STANDBY</div>
-            <div id="mcx-session-chip" class="status-chip chip-dim">15:30 - 23:25 IST</div>
+            <div id="mcx-session-chip" class="status-chip chip-dim">16:00 - 23:24 IST</div>
           </div>
         </div>
 
@@ -3602,7 +3602,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       setStat('stat-max-dd', fmtINR(allStats.max_drawdown || 0, true));
       setStat('stat-max-dd-pct', `${(allStats.max_drawdown_pct || 0).toFixed(2)}% of initial capital`);
       setStat('stat-trade-count', `${allStats.count || 0}`);
-      setStat('stat-profit-factor', `Profit factor ${allStats.profit_factor == null ? '∞' : (allStats.profit_factor || 0).toFixed(2)}`);
+      setStat('stat-profit-factor', `${(analytics.today?.count || 0)} today • Profit factor ${allStats.profit_factor == null ? '∞' : (allStats.profit_factor || 0).toFixed(2)}`);
 
       // ── NIFTY TAB DATA ──
       const n = data.nifty || {};
@@ -3675,7 +3675,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
 
       const mSess = document.getElementById('mcx-session-chip');
       mSess.className = 'status-chip ' + (sys.mcx_session_active ? 'chip-amber' : 'chip-dim');
-      mSess.innerText = sys.mcx_session_active ? 'MARKET OPEN' : 'SESSION: 15:30 - 23:25';
+      mSess.innerText = sys.mcx_session_active ? 'MARKET OPEN' : 'SESSION: 16:00 - 23:24';
 
       document.getElementById('m-pos-count').innerText = (m.positions || []).length;
       document.getElementById('m-pos-tbody').innerHTML = renderPositionsRows(m.positions);
