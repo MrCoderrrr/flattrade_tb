@@ -1639,7 +1639,7 @@ class NaturalGasPaperBot:
                     print(f'[AUTO] {MCX_EXIT_HOUR}:{MCX_EXIT_MINUTE:02d} IST — squaring off all positions...', flush=True)
                     self._close_all('SESSION_END')
                     self.positions.clear()
-                    self._render_dashboard(spot, atm, ema_snap)
+                    self._render_dashboard(locals().get('spot', 0.0), locals().get('atm', 0.0), locals().get('ema_snap', {}))
                     final_pct = (self.total_realized_pnl / CAPITAL) * 100.0
                     pnl_col = GR if self.total_realized_pnl >= 0 else RD
                     sign = '+' if self.total_realized_pnl >= 0 else ''
@@ -1692,7 +1692,7 @@ class NaturalGasPaperBot:
                             self._enter_leg('PE', atm, 'SELL', reason="Balanced Straddle Entry")
                         self._consume_reversal()
 
-                    self._render_dashboard(spot, atm, ema_snap)
+                    self._render_dashboard(locals().get('spot', 0.0), locals().get('atm', 0.0), locals().get('ema_snap', {}))
                     time.sleep(1.0)
                     continue
 
@@ -1748,14 +1748,14 @@ class NaturalGasPaperBot:
                     self._close_leg(leg, reason, exit_price=exit_px)
 
                 # ── STEP 4: Render Dashboard ─────────────────
-                self._render_dashboard(spot, atm, ema_snap)
+                self._render_dashboard(locals().get('spot', 0.0), locals().get('atm', 0.0), locals().get('ema_snap', {}))
                 time.sleep(1.0)
 
             except KeyboardInterrupt:
                 print('\n[STOP] KeyboardInterrupt — squaring off all positions...', flush=True)
                 self._close_all('KEYBOARD_INTERRUPT')
                 self.positions.clear()
-                self._render_dashboard(spot, atm, ema_snap)
+                self._render_dashboard(locals().get('spot', 0.0), locals().get('atm', 0.0), locals().get('ema_snap', {}))
                 final_pct = (self.total_realized_pnl / CAPITAL) * 100.0
                 sign = '+' if self.total_realized_pnl >= 0 else ''
                 pnl_col = GR if self.total_realized_pnl >= 0 else RD
