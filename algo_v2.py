@@ -378,7 +378,7 @@ CAPITAL                 = 195784.0
 LOT_SIZE                = 65
 CAPITAL_BUFFER          = 0.95
 MARGIN_IRON_CONDOR      = 95_000
-PORTFOLIO_CIRCUIT_PCT   = 1.8
+PORTFOLIO_CIRCUIT_PCT   = 2.5
 
 # --- REAL-MONEY SAFETY & GOVERNANCE ---
 TELEGRAM_BOT_TOKEN        = ""
@@ -410,12 +410,12 @@ PREM_SL_ATR_MULT_STRANGLE = 1.0
 PREM_SL_ATR_MULT_ORPHAN   = 1.5
 
 # --- REENTRY CAPS ---
-KAMA_REVERSAL_ATR_RATIO   = 0.15
+KAMA_REVERSAL_ATR_RATIO   = 0.30   # Requires stronger KAMA reversal before re-entry (was 0.15 — too easy to trigger)
 KAMA_CONSECUTIVE_BARS     = 2
-MAX_REENTRIES_PER_LEG     = 2
-MAX_REENTRIES_TOTAL       = 4
-MAX_STRANGLE_RESETS       = 2
-BACKOFF_BASE_SEC          = 60
+MAX_REENTRIES_PER_LEG     = 1      # Max 1 re-entry per leg per session (was 2 — 2 reentries on a trending day = 4 SL hits)
+MAX_REENTRIES_TOTAL       = 2      # Max 2 total re-entries per session (was 4)
+MAX_STRANGLE_RESETS       = 3      # Max strangle resets per session (was 2)
+BACKOFF_BASE_SEC          = 120    # Backoff base 120s (was 60s — doubled to reduce frequency of reentry)
 KAMA_PERIOD             = 10          # KAMA Efficiency Ratio lookback (10 bars)
 KAMA_FAST_EMA           = 3           # KAMA Fast EMA constant (3)
 KAMA_SLOW_EMA           = 30          # KAMA Slow EMA constant (30)
@@ -1257,7 +1257,7 @@ class ExecutionEngine:
         if getattr(self.broker, "paper_trading", False): return True, f"Paper fill confirmed"
         return False, "INCONCLUSIVE_IN_LIVE_MODE"
 
-    def _enter_leg(self, leg: str, strike: int, side: str, spot: float, atr: float, dte_days: float = 2.0) -> bool:
+    def _enter_leg(self, leg: str, strike: int, side: str, spot: float, atr: float, dte_days: float = 2.0, current_iv: float = 15.0) -> bool:
         base = leg.split("_")[0]
         q = self.market_data.streamer.get_live_quote(strike, base)
         tsym = q.get("tsym", f"NIFTY{strike}{base}")
@@ -1360,8 +1360,15 @@ class ExecutionEngine:
             log_alert(f"⚠️ The position {leg} is STILL OPEN in the market! Manual intervention required.")
             return 0.0
 
-        # Only reach here if placed_successfully == True
+        # Fresh LTP fetch for PnL calculation — force evict cache so we don't use stale price
+        base = pos["base"]
+        self._ltp_cache.pop(f"{pos['strike']}_{base}", None)
         ltp = self._get_ltp(pos["strike"], base)
+        # Final safety: if fetch returns 0 use last known entry price (prevents division errors)
+        if ltp <= 0:
+            ltp = pos["entry_price"]
+            log_warn(f"Exit LTP fetch returned 0 for {leg}. Using entry price {ltp:.2f} as exit for PnL — slippage may be understated.")
+
         if pos["side"] == "SELL":
             pnl = (pos["entry_price"] - ltp) * close_qty
         else:
@@ -1444,10 +1451,16 @@ class ExecutionEngine:
         self.mode = "COOLDOWN"
         self._save_state()
 
-    def _check_cooldown_and_reenter(self, spot: float, atm: int, atr: float, regime: str, trend: int, dte_days: float = 2.0):
+    def _check_cooldown_and_reenter(self, spot: float, atm: int, atr: float, regime: str, trend: int, dte_days: float = 2.0, current_iv: float = 15.0):
         if regime == "TREND": return
         if self.strangle_resets_today >= MAX_STRANGLE_RESETS: return
         
+        # ADX high-trend guard: when ADX > 30, market is strongly trending — skip reentry to avoid chasing
+        adx = self.current_indicators.get("adx", 18.0)
+        if adx > 30.0:
+            log_info(f"ADX={adx:.1f} > 30 (strong trend). Skipping re-entry to avoid directional loss.")
+            return
+
         reversal_req = KAMA_REVERSAL_ATR_RATIO * atr
         current_kama = float(self.current_indicators.get("kama", spot) or spot)
         
@@ -1486,7 +1499,7 @@ class ExecutionEngine:
                 has_short = sum(1 for p in self.positions.values() if p.get("side") == "SELL")
                 if has_short >= MAX_CONCURRENT_SHORT_LEGS: continue
                 
-                if self._enter_leg(leg, strike, "SELL", spot, atr, dte_days):
+                if self._enter_leg(leg, strike, "SELL", spot, atr, dte_days, current_iv):
                     cd["active"] = False
                     cd["reentries_today"] = cd.get("reentries_today", 0) + 1
                     self.total_reentries_today += 1
@@ -1825,9 +1838,9 @@ class ExecutionEngine:
                         ce_h_ok = True
                         pe_h_ok = True
                         if "CE_HEDGE" not in self.positions:
-                            ce_h_ok = self._enter_leg("CE_HEDGE", ce_hedge, "BUY", spot, atr, dte_days)
+                            ce_h_ok = self._enter_leg("CE_HEDGE", ce_hedge, "BUY", spot, atr, dte_days, current_iv)
                         if "PE_HEDGE" not in self.positions:
-                            pe_h_ok = self._enter_leg("PE_HEDGE", pe_hedge, "BUY", spot, atr, dte_days)
+                            pe_h_ok = self._enter_leg("PE_HEDGE", pe_hedge, "BUY", spot, atr, dte_days, current_iv)
                             
                         if not (ce_h_ok and pe_h_ok):
                             log_alert("⚠️ Hedge entry failed after 3 tries. Aborting short leg entry to protect capital.")
@@ -1839,9 +1852,9 @@ class ExecutionEngine:
                         ce_s_ok = True
                         pe_s_ok = True
                         if "PE" not in self.positions:
-                            pe_s_ok = self._enter_leg("PE", pe_strike, "SELL", spot, atr, dte_days)
+                            pe_s_ok = self._enter_leg("PE", pe_strike, "SELL", spot, atr, dte_days, current_iv)
                         if "CE" not in self.positions:
-                            ce_s_ok = self._enter_leg("CE", ce_strike, "SELL", spot, atr, dte_days)
+                            ce_s_ok = self._enter_leg("CE", ce_strike, "SELL", spot, atr, dte_days, current_iv)
                             
                         # CRITICAL RULE: If either short leg failed after 3 retries, square off all short legs -> ONLY HEDGES LEFT!
                         if not (ce_s_ok and pe_s_ok):
@@ -1883,7 +1896,7 @@ class ExecutionEngine:
                                 self._trigger_leg_cooldown(leg, spot)
 
                     # Dynamic re-entry (3m cooldown removed - checks immediately on 1m bar)
-                    self._check_cooldown_and_reenter(spot, atm, atr, regime, trend, dte_days=dte_days)
+                    self._check_cooldown_and_reenter(spot, atm, atr, regime, trend, dte_days=dte_days, current_iv=current_iv)
 
                     # Dynamic Chop Regime Strike Adjustment (Only when in active trading, not HEDGES_ONLY)
                     if regime == "CHOP" and self.mode != "HEDGES_ONLY":
