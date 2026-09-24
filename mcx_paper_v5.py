@@ -111,6 +111,125 @@ SWING_REVERSAL_PTS  = 0.80         # 0.80 pts pullback threshold (reverted to ye
 
 TELEGRAM_TOKEN = '8850507396:AAFwFm2_WxPdSM52JcCpJUj8V1rz9x3G-kE'
 CHAT_ID        = '6307066850'
+CAPITAL        = 200000.0
+PROJECT_ROOT   = os.path.dirname(os.path.abspath(__file__))
+
+# ─────────────────────────────────────────────
+# MCX PnL & MTD TRACKER
+# ─────────────────────────────────────────────
+class MCXDBManager:
+    def __init__(self, filename: str = "mcx_pnl_tracker.json"):
+        self.filename = filename
+        self.data = self._load()
+
+    def _get_ist_str(self) -> str:
+        return get_ist_now().strftime("%Y-%m-%d")
+
+    def _load(self) -> dict:
+        base_cap = globals().get("CAPITAL", 200000.0)
+        target_file = self.filename
+        if not os.path.isabs(target_file):
+            cand = os.path.join(PROJECT_ROOT, self.filename)
+            if os.path.exists(cand):
+                target_file = cand
+
+        d = None
+        if os.path.exists(target_file):
+            try:
+                with open(target_file, 'r', encoding='utf-8') as f:
+                    d = json.load(f)
+            except Exception:
+                pass
+
+        if d is None or not isinstance(d, dict):
+            d = {
+                "mtd_pnl": 0.0,
+                "ytd_pnl": 0.0,
+                "current_capital": base_cap,
+                "base_capital": base_cap,
+                "today_pnl": 0.0,
+                "last_date": "",
+                "intraday_date": "",
+                "daily_pnl": {}
+            }
+
+        if "daily_pnl" not in d or not isinstance(d["daily_pnl"], dict):
+            d["daily_pnl"] = {}
+        if "base_capital" not in d:
+            d["base_capital"] = base_cap
+        return d
+
+    def _save(self):
+        target_file = self.filename
+        if not os.path.isabs(target_file):
+            target_file = os.path.join(PROJECT_ROOT, self.filename)
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(target_file)), exist_ok=True)
+            with open(target_file, 'w', encoding='utf-8') as f:
+                json.dump(self.data, f, indent=2)
+            tb_file = os.path.join(PROJECT_ROOT, "tradingbot", self.filename)
+            if os.path.exists(os.path.dirname(tb_file)):
+                with open(tb_file, 'w', encoding='utf-8') as f:
+                    json.dump(self.data, f, indent=2)
+        except Exception as e:
+            print(f"[WARN] Failed to save {target_file}: {e}", flush=True)
+
+    def commit_daily_pnl(self, realized_pnl: float, date_str: Optional[str] = None):
+        today_str = date_str or self._get_ist_str()
+        month_prefix = today_str[:7]
+        year_prefix = today_str[:4]
+        base_cap = float(self.data.get("base_capital", CAPITAL) or CAPITAL)
+
+        daily_map = self.data.setdefault("daily_pnl", {})
+        daily_map[today_str] = round(float(realized_pnl), 2)
+
+        mtd_sum = round(sum(v for d, v in daily_map.items() if d.startswith(month_prefix)), 2)
+        ytd_sum = round(sum(v for d, v in daily_map.items() if d.startswith(year_prefix)), 2)
+
+        self.data["mtd_pnl"] = mtd_sum
+        self.data["ytd_pnl"] = ytd_sum
+        self.data["current_capital"] = round(base_cap + ytd_sum, 2)
+        self.data["today_pnl"] = round(float(realized_pnl), 2)
+        self.data["last_date"] = today_str
+        self.data["intraday_date"] = today_str
+        self._save()
+
+        # Record to daily_pnl_mcx_paper.csv
+        for log_dir in [os.path.join(PROJECT_ROOT, "data", "logs"), os.path.join(PROJECT_ROOT, "tradingbot", "data", "logs")]:
+            try:
+                os.makedirs(log_dir, exist_ok=True)
+                csv_path = os.path.join(log_dir, "daily_pnl_mcx_paper.csv")
+                rows = []
+                found = False
+                fieldnames = ["date", "daily_pnl", "mtd_pnl", "ytd_pnl", "current_capital"]
+                if os.path.exists(csv_path) and os.path.getsize(csv_path) > 0:
+                    import csv
+                    with open(csv_path, "r", encoding="utf-8") as f:
+                        reader = csv.DictReader(f)
+                        fieldnames = reader.fieldnames or fieldnames
+                        for r in reader:
+                            if r.get("date") == today_str:
+                                r["daily_pnl"] = f"{realized_pnl:.2f}"
+                                r["mtd_pnl"] = f"{mtd_sum:.2f}"
+                                r["ytd_pnl"] = f"{ytd_sum:.2f}"
+                                r["current_capital"] = f"{base_cap + ytd_sum:.2f}"
+                                found = True
+                            rows.append(r)
+                if not found:
+                    rows.append({
+                        "date": today_str,
+                        "daily_pnl": f"{realized_pnl:.2f}",
+                        "mtd_pnl": f"{mtd_sum:.2f}",
+                        "ytd_pnl": f"{ytd_sum:.2f}",
+                        "current_capital": f"{base_cap + ytd_sum:.2f}"
+                    })
+                with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                    import csv
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    writer.writeheader()
+                    writer.writerows(rows)
+            except Exception as e:
+                print(f"[WARN] Failed writing to daily_pnl_mcx_paper.csv: {e}", flush=True)
 
 # ─────────────────────────────────────────────
 # CONTINUOUS STREAMING EMA MOMENTUM ENGINE
@@ -338,6 +457,7 @@ class NaturalGasPaperBot:
         self._extreme_spot         = 0.0
         self._reversal_pullback    = 0.0
 
+        self.db                    = MCXDBManager()
         self._load_state()
 
     # ── State persistence ─────────────────────
@@ -353,6 +473,8 @@ class NaturalGasPaperBot:
             }
             with open(self.state_file, 'w') as f:
                 json.dump(state, f, indent=2)
+            if hasattr(self, 'db'):
+                self.db.commit_daily_pnl(self.total_realized_pnl)
         except Exception as e:
             print(f'[WARN] Failed saving MCX state: {e}', flush=True)
 
@@ -383,6 +505,8 @@ class NaturalGasPaperBot:
                     curr_sl = float(sl_st.get('current_sl', new_sl))
                     sl_st['current_sl'] = min(curr_sl, new_sl)
                     sl_st['solo_mode'] = not is_strangle_restored
+                if hasattr(self, 'db'):
+                    self.db.commit_daily_pnl(self.total_realized_pnl)
                 print(f'[STATE] Restored: {len(self.positions)} open legs | '
                       f'Realized PnL: ₹{self.total_realized_pnl:,.2f} | '
                       f'Trades: {self.trades_today} | Strangle SL: {DEFAULT_SL_PCT*100:.0f}% | Solo TSL: {DEFAULT_TSL_PCT*100:.0f}%', flush=True)
@@ -1072,6 +1196,8 @@ class NaturalGasPaperBot:
                     "unrealized_pnl": total_unreal,
                     "net_pnl": net,
                     "net_pct": net_pct,
+                    "mtd_pnl": self.db.data.get("mtd_pnl", self.total_realized_pnl) if hasattr(self, 'db') else self.total_realized_pnl,
+                    "ytd_pnl": self.db.data.get("ytd_pnl", self.total_realized_pnl) if hasattr(self, 'db') else self.total_realized_pnl,
                     "trade_log": getattr(self, "trade_log", [])
                 }
                 snap_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_snapshot_mcx_paper.json")

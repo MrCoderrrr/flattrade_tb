@@ -1,0 +1,12 @@
+{
+  "mtd_pnl": 812.5,
+  "ytd_pnl": 812.5,
+  "current_capital": 200812.5,
+  "base_capital": 200000.0,
+  "today_pnl": 812.5,
+  "last_date": "2026-09-24",
+  "intraday_date": "2026-09-24",
+  "daily_pnl": {
+    "2026-09-24": 812.5
+  }
+}
