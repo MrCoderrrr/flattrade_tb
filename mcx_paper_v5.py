@@ -105,14 +105,6 @@ LOT_SIZE            = 1250         # 1 lot = 1250 units
 DEFAULT_SL_PCT      = 0.12         # 12% initial stop-loss per leg (Strangle active)
 REENTRY_SL_PCT      = 0.12         # 12% initial stop-loss for reversal re-entry
 DEFAULT_TSL_PCT     = 0.07         # 7% trailing stop-loss (Solo surviving leg)
-PREM_RISK_REFERENCE  = 25.0        # Natural-gas option premium where high-premium taper is fully applied
-PREM_INITIAL_PCT_HIGH = 0.08
-PREM_INITIAL_PCT_LOW  = 0.12
-PREM_INITIAL_MIN_PTS  = 0.60
-PREM_INITIAL_MAX_PTS  = 2.50
-PREM_TRAIL_MIN_PTS    = 0.40
-PREM_TRAIL_MAX_PTS    = 2.00
-PREM_EXPIRY_FLOOR     = 0.65
 POST_CLOSE_COOLDOWN = 60.0         # 60s cooldown after close (reverted to yesterday)
 REENTRY_COOLDOWN_S  = 30.0         # 30s min between single-leg re-entries (reverted to yesterday)
 SWING_REVERSAL_PTS  = 0.80         # 0.80 pts pullback threshold (reverted to yesterday)
@@ -752,44 +744,6 @@ class NaturalGasPaperBot:
                 pass
         return pos.get('_last_ltp', pos['entry_price'])
 
-    def _option_dte_days(self) -> float:
-        expiry = getattr(self, 'target_opt_expiry_ts', None)
-        if expiry is None:
-            return 30.0
-        try:
-            expiry_date = pd.Timestamp(expiry).date()
-            return max(0.0, float((expiry_date - get_ist_now().date()).days))
-        except (TypeError, ValueError):
-            return 30.0
-
-    def _premium_risk_profile(self, premium: float) -> dict:
-        """Compress MCX option risk as premium rises and expiry approaches."""
-        premium_ratio = min(1.0, max(0.0, float(premium or 0.0)) / PREM_RISK_REFERENCE)
-        dte_ratio = min(1.0, self._option_dte_days() / 30.0)
-        expiry_factor = PREM_EXPIRY_FLOOR + (1.0 - PREM_EXPIRY_FLOOR) * dte_ratio
-        initial_pct = PREM_INITIAL_PCT_LOW - (
-            PREM_INITIAL_PCT_LOW - PREM_INITIAL_PCT_HIGH
-        ) * premium_ratio
-        initial_points = (
-            PREM_INITIAL_MIN_PTS
-            + (PREM_INITIAL_MAX_PTS - PREM_INITIAL_MIN_PTS) * premium_ratio
-        ) * expiry_factor
-        trail_points = (
-            PREM_TRAIL_MIN_PTS
-            + (PREM_TRAIL_MAX_PTS - PREM_TRAIL_MIN_PTS) * premium_ratio
-        ) * expiry_factor
-        trail_pct = min(
-            DEFAULT_TSL_PCT,
-            initial_pct,
-            max(0.045, DEFAULT_TSL_PCT - 0.02 * premium_ratio),
-        )
-        return {
-            'initial_pct': initial_pct,
-            'initial_points': initial_points,
-            'trail_pct': trail_pct,
-            'trail_points': trail_points,
-        }
-
     # ── Enter a single leg ────────────────────
     def _enter_leg(self, leg: str, strike: float, side: str = 'SELL',
                    loss_stop_pct: float = DEFAULT_SL_PCT,
@@ -808,12 +762,7 @@ class NaturalGasPaperBot:
             return None
 
         qty        = LOT_SIZE
-        risk = self._premium_risk_profile(ltp)
-        initial_pct = min(loss_stop_pct, risk['initial_pct'])
-        initial_sl = round_to_tick(min(
-            ltp * (1.0 + initial_pct),
-            ltp + risk['initial_points'],
-        ))
+        initial_sl = round_to_tick(ltp * (1.0 + loss_stop_pct))
         now_ts     = time.time()
 
         pos = {
@@ -826,16 +775,14 @@ class NaturalGasPaperBot:
             'entry_price':   ltp,
             '_last_ltp':     ltp,
             '_last_ltp_ts':  now_ts,
-            'loss_stop_pct': initial_pct,
-            'tsl_pct':       min(tsl_pct, risk['trail_pct']),
+            'loss_stop_pct': loss_stop_pct,
+            'tsl_pct':       tsl_pct,
             'sl_state': {
                 'lowest_ltp':    ltp,
                 'current_sl':    initial_sl,
                 'initial_sl':    initial_sl,
-                'loss_stop_pct': initial_pct,
-                'tsl_pct':       min(tsl_pct, risk['trail_pct']),
-                'initial_points': risk['initial_points'],
-                'trail_points': risk['trail_points'],
+                'loss_stop_pct': loss_stop_pct,
+                'tsl_pct':       tsl_pct,
             }
         }
         self.positions[leg] = pos
@@ -915,9 +862,9 @@ class NaturalGasPaperBot:
         its current strike (atm == strike), we do NOT exit and immediately re-enter this leg.
         Instead:
         1. Enter ONLY the missing leg at ATM.
-        2. Reset the surviving leg's adaptive SL/TSL from current live_ltp.
-        3. Keep its original entry price so P&L remains unrealized.
-        This saves unnecessary market orders, bid-ask spreads, and slippage.
+        2. Lock in the solo run's accrued profit into self.total_realized_pnl.
+        3. Reset the leg's entry_price to current live_ltp and SL to a fresh 15% strangle SL.
+        4. Saves 2 unnecessary market orders, bid-ask spreads, and slippage!
         """
         pos = self.positions.get(solo_leg)
         if not pos:
@@ -938,21 +885,15 @@ class NaturalGasPaperBot:
         # 2. Update SL/TSL in-place while keeping actual entry price and unrealized PnL intact
         actual_entry = pos['entry_price']
         pos['_last_ltp'] = live_ltp
-        risk = self._premium_risk_profile(live_ltp)
-        pos['loss_stop_pct'] = risk['initial_pct']
-        pos['tsl_pct'] = risk['trail_pct']
-        fresh_sl = round_to_tick(min(
-            live_ltp * (1.0 + risk['initial_pct']),
-            live_ltp + risk['initial_points'],
-        ))
+        pos['loss_stop_pct'] = DEFAULT_SL_PCT
+        pos['tsl_pct'] = DEFAULT_TSL_PCT
+        fresh_sl = round_to_tick(live_ltp * (1.0 + DEFAULT_SL_PCT))
         pos['sl_state'] = {
             'lowest_ltp': live_ltp,
             'current_sl': fresh_sl,
             'initial_sl': fresh_sl,
-            'loss_stop_pct': risk['initial_pct'],
-            'tsl_pct': risk['trail_pct'],
-            'initial_points': risk['initial_points'],
-            'trail_points': risk['trail_points'],
+            'loss_stop_pct': DEFAULT_SL_PCT,
+            'tsl_pct': DEFAULT_TSL_PCT,
             'solo_mode': False
         }
 
@@ -992,22 +933,14 @@ class NaturalGasPaperBot:
             state['lowest_ltp'] = round(lowest, 2)
 
         is_strangle = ('CE' in self.positions and 'PE' in self.positions)
-        risk = self._premium_risk_profile(entry_prem)
-        initial_sl  = round_to_tick(min(
-            entry_prem * (1.0 + min(pos['loss_stop_pct'], risk['initial_pct'])),
-            entry_prem + risk['initial_points'],
-        ))
+        initial_sl  = round_to_tick(entry_prem * (1.0 + pos['loss_stop_pct']))
 
         if is_strangle:
             # ── STRANGLE IS ON (both legs open) ──
             # Each leg has a 12% stop loss tracked with best LTP stored
             state['solo_mode'] = False
             initial_sl  = state.get('initial_sl', round_to_tick(entry_prem * (1.0 + DEFAULT_SL_PCT)))
-            low_risk = self._premium_risk_profile(lowest)
-            strangle_sl = round_to_tick(min(
-                lowest * (1.0 + low_risk['initial_pct']),
-                lowest + low_risk['initial_points'],
-            ))
+            strangle_sl = round_to_tick(lowest * (1.0 + DEFAULT_SL_PCT))
             target_sl   = min(strangle_sl, initial_sl)
             current_sl  = min(target_sl, state.get('current_sl', initial_sl))
             state['current_sl'] = current_sl
@@ -1018,12 +951,9 @@ class NaturalGasPaperBot:
         else:
             # ── STRANGLE IS OFF (One leg squared off -> Solo surviving leg gets 7% TSL) ──
             state['solo_mode'] = True
-            low_risk = self._premium_risk_profile(lowest)
-            pos['tsl_pct'] = low_risk['trail_pct']
-            solo_tsl = round_to_tick(min(
-                lowest * (1.0 + low_risk['trail_pct']),
-                lowest + low_risk['trail_points'],
-            ))
+            pos['tsl_pct'] = DEFAULT_TSL_PCT
+            # 7% TSL tracked with best LTP stored
+            solo_tsl = round_to_tick(lowest * (1.0 + DEFAULT_TSL_PCT))
             if 'current_sl' in state:
                 current_sl = min(solo_tsl, state['current_sl'])
             else:
@@ -1031,7 +961,7 @@ class NaturalGasPaperBot:
             state['current_sl'] = current_sl
 
             if live_ltp >= current_sl:
-                return True, f'Solo adaptive TSL Hit on {leg} ({live_ltp:.2f} >= {current_sl:.2f})'
+                return True, f'Solo 7% TSL Hit on {leg} ({live_ltp:.2f} >= {current_sl:.2f})'
 
         return False, ''
 
@@ -1558,21 +1488,15 @@ class NaturalGasPaperBot:
                                 surv_ltp = self._get_leg_ltp(surv_pos)
                                 surv_actual_entry = surv_pos.get('entry_price', surv_ltp)
                                 surv_pos['_last_ltp'] = surv_ltp
-                                risk = self._premium_risk_profile(surv_ltp)
-                                surv_pos['loss_stop_pct'] = risk['initial_pct']
-                                surv_pos['tsl_pct'] = risk['trail_pct']
-                                fresh_surv_sl = round_to_tick(min(
-                                    surv_ltp * (1.0 + risk['initial_pct']),
-                                    surv_ltp + risk['initial_points'],
-                                ))
+                                surv_pos['loss_stop_pct'] = DEFAULT_SL_PCT
+                                surv_pos['tsl_pct'] = DEFAULT_TSL_PCT
+                                fresh_surv_sl = round_to_tick(surv_ltp * (1.0 + DEFAULT_SL_PCT))
                                 surv_pos['sl_state'] = {
                                     'lowest_ltp': surv_ltp,
                                     'current_sl': fresh_surv_sl,
                                     'initial_sl': fresh_surv_sl,
-                                    'loss_stop_pct': risk['initial_pct'],
-                                    'tsl_pct': risk['trail_pct'],
-                                    'initial_points': risk['initial_points'],
-                                    'trail_points': risk['trail_points'],
+                                    'loss_stop_pct': DEFAULT_SL_PCT,
+                                    'tsl_pct': DEFAULT_TSL_PCT,
                                     'solo_mode': False
                                 }
                                 print(f'[RESHAPE SURVIVOR] {surviving_leg} {int(surviving_strike)} preserved (Entry: {surv_actual_entry:.2f}, Live: {surv_ltp:.2f}) | '
