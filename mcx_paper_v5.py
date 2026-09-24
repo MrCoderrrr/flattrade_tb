@@ -135,8 +135,8 @@ BREAKEVEN_PROFIT_POINTS    = 0.50   # 0.50 points profit triggers instant Break-
 SL_DEBOUNCE_SECONDS        = 2.0    # 2 seconds persistence before SL fires (eliminates single-tick bid-ask spread glitches)
 
 # Cooldowns
-POST_CLOSE_COOLDOWN        = 45.0   # 45s cooldown after both legs close
-REENTRY_COOLDOWN_S         = 15.0   # 15s cooldown after leg close before re-entry check
+POST_CLOSE_COOLDOWN        = 0.0   # 45s cooldown after both legs close
+REENTRY_COOLDOWN_S         = 0.0   # 15s cooldown after leg close before re-entry check
 SWING_REVERSAL_PTS         = 0.80   # 0.80 pts pullback threshold
 
 # EMA Engine Sensitivity Tuning (Noise Filtered)
