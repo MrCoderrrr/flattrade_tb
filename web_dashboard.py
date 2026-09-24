@@ -480,6 +480,19 @@ def update_market_intraday_series(market, current_net_mtm, net_pct, start_hour, 
         seed_points = seed_series if isinstance(seed_series, list) else []
         source_series = [p for p in (saved_series + seed_points) if isinstance(p, dict)]
         source_series.sort(key=lambda p: float(p.get("ts", 0.0) or 0.0))
+        # Older dashboard versions seeded the NIFTY curve with synthetic zero
+        # points. Do not render that as a real P&L track; a genuinely flat
+        # active session will still append fresh zero-valued observations below.
+        numeric_pnls = []
+        for point in source_series:
+            try:
+                value = float(point.get("pnl"))
+                if value == value:
+                    numeric_pnls.append(value)
+            except (TypeError, ValueError):
+                pass
+        if market_key == "NIFTY" and not seed_points and numeric_pnls and all(abs(value) < 1e-9 for value in numeric_pnls):
+            source_series = []
         MARKET_INTRADAY_SERIES[market_key] = source_series[-5000:]
     session_start = start_hour * 60 + start_minute
     session_end = end_hour * 60 + end_minute
