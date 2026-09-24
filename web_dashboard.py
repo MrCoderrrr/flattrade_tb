@@ -472,12 +472,12 @@ def update_market_intraday_series(market, current_net_mtm, net_pct, start_hour, 
 
     val_pnl = float(current_net_mtm) if current_net_mtm is not None else 0.0
     val_pct = float(net_pct) if net_pct is not None else 0.0
+    seed_points = seed_series if isinstance(seed_series, list) else []
 
     if MARKET_INTRADAY_DATES[market_key] != today_str:
         saved = load_json_safe(MARKET_INTRADAY_FILE, {})
         saved_series = saved.get(today_str, {}).get(market_key, []) if isinstance(saved, dict) else []
         MARKET_INTRADAY_DATES[market_key] = today_str
-        seed_points = seed_series if isinstance(seed_series, list) else []
         source_series = [p for p in (saved_series + seed_points) if isinstance(p, dict)]
         source_series.sort(key=lambda p: float(p.get("ts", 0.0) or 0.0))
         # Older dashboard versions seeded the NIFTY curve with synthetic zero
