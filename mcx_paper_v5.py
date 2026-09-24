@@ -882,15 +882,8 @@ class NaturalGasPaperBot:
             print(f'[WARN] Failed to enter {other_leg} at {other_strike}, falling back to leg close.', flush=True)
             return False
 
-        # 2. Lock in accrued profit for solo_leg & update entry price
-        old_entry = pos['entry_price']
-        run_pnl = (old_entry - live_ltp) * pos['qty']
-        self.total_realized_pnl += run_pnl
-        sign = '+' if run_pnl >= 0 else ''
-        tot_sign = '+' if self.total_realized_pnl >= 0 else ''
-
-        # 3. Update entry_price to current live_ltp and refresh SL/TSL in-place
-        pos['entry_price'] = live_ltp
+        # 2. Update SL/TSL in-place while keeping actual entry price and unrealized PnL intact
+        actual_entry = pos['entry_price']
         pos['_last_ltp'] = live_ltp
         pos['loss_stop_pct'] = DEFAULT_SL_PCT
         pos['tsl_pct'] = DEFAULT_TSL_PCT
@@ -908,21 +901,21 @@ class NaturalGasPaperBot:
         self._consume_reversal()
         self._save_state()
 
-        # 4. Telegram alert
+        # 3. Telegram alert
+        tot_sign = '+' if self.total_realized_pnl >= 0 else ''
         tg = '\n'.join([
             '<pre>',
             '━━━ MCX IN-PLACE RECALIBRATION (v5.0) ━━━',
             '',
-            f'  Preserved Open: {solo_leg} {int(pos["strike"])} (Entry: {old_entry:.2f} -> {live_ltp:.2f})',
-            f'  Locked Profit: {sign}₹{run_pnl:,.2f}',
+            f'  Preserved Open: {solo_leg} {int(pos["strike"])} (Entry: {actual_entry:.2f}, Live: {live_ltp:.2f})',
             f'  Entered: {other_leg} {int(other_strike)} SELL',
-            f'  SL Reset: {DEFAULT_SL_PCT*100:.0f}% (₹{fresh_sl:.2f})',
+            f'  SL Reset: {DEFAULT_SL_PCT*100:.0f}% on best premium (₹{fresh_sl:.2f})',
             f'  Total Realized: {tot_sign}₹{self.total_realized_pnl:,.2f}',
             '',
-            '  *Entry price updated • Zero exit/entry slippage*',
+            '  *Actual entry preserved • SL/TSL reset on best premium*',
             '</pre>'
         ])
-        print(f'[RECALIBRATE ROLL] {solo_leg} {int(pos["strike"])} (Entry: {old_entry:.2f} -> {live_ltp:.2f}) | Locked: {sign}₹{run_pnl:,.2f} | Reset SL: ₹{fresh_sl:.2f}', flush=True)
+        print(f'[RECALIBRATE ROLL] {solo_leg} {int(pos["strike"])} (Entry: {actual_entry:.2f}, Live: {live_ltp:.2f}) | Strangle SL Reset: ₹{fresh_sl:.2f}', flush=True)
         send_telegram(tg)
         return True
 
@@ -946,7 +939,7 @@ class NaturalGasPaperBot:
             # ── STRANGLE IS ON (both legs open) ──
             # Each leg has a 12% stop loss tracked with best LTP stored
             state['solo_mode'] = False
-            initial_sl  = round_to_tick(entry_prem * (1.0 + DEFAULT_SL_PCT))
+            initial_sl  = state.get('initial_sl', round_to_tick(entry_prem * (1.0 + DEFAULT_SL_PCT)))
             strangle_sl = round_to_tick(lowest * (1.0 + DEFAULT_SL_PCT))
             target_sl   = min(strangle_sl, initial_sl)
             current_sl  = min(target_sl, state.get('current_sl', initial_sl))
@@ -1489,13 +1482,11 @@ class NaturalGasPaperBot:
                             self._consume_reversal()
 
                             # Reshape surviving leg & update entry price to current LTP
+                            # Reshape surviving leg: preserve actual entry, reset best premium & SL/TSL
                             surv_pos = self.positions.get(surviving_leg)
                             if surv_pos:
                                 surv_ltp = self._get_leg_ltp(surv_pos)
-                                surv_old_entry = surv_pos.get('entry_price', surv_ltp)
-                                surv_run_pnl = (surv_old_entry - surv_ltp) * surv_pos['qty']
-                                self.total_realized_pnl += surv_run_pnl
-                                surv_pos['entry_price'] = surv_ltp
+                                surv_actual_entry = surv_pos.get('entry_price', surv_ltp)
                                 surv_pos['_last_ltp'] = surv_ltp
                                 surv_pos['loss_stop_pct'] = DEFAULT_SL_PCT
                                 surv_pos['tsl_pct'] = DEFAULT_TSL_PCT
@@ -1508,8 +1499,8 @@ class NaturalGasPaperBot:
                                     'tsl_pct': DEFAULT_TSL_PCT,
                                     'solo_mode': False
                                 }
-                                print(f'[RESHAPE SURVIVOR] {surviving_leg} {int(surviving_strike)} entry reset {surv_old_entry:.2f} -> {surv_ltp:.2f} | '
-                                      f'Locked PnL: ₹{surv_run_pnl:,.2f} | Fresh SL: ₹{fresh_surv_sl:.2f}', flush=True)
+                                print(f'[RESHAPE SURVIVOR] {surviving_leg} {int(surviving_strike)} preserved (Entry: {surv_actual_entry:.2f}, Live: {surv_ltp:.2f}) | '
+                                      f'Fresh Strangle SL: ₹{fresh_surv_sl:.2f}', flush=True)
                                 self._save_state()
 
                 # ── STEP 4: CHECK TSL/SL FOR ALL OPEN LEGS ───

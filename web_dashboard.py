@@ -481,7 +481,7 @@ def update_market_intraday_series(market, current_net_mtm, net_pct, start_hour, 
         saved = load_json_safe(MARKET_INTRADAY_FILE, {})
         saved_series = saved.get(today_str, {}).get(market_key, []) if isinstance(saved, dict) else []
         MARKET_INTRADAY_DATES[market_key] = today_str
-        MARKET_INTRADAY_SERIES[market_key] = [p for p in saved_series[-1500:] if isinstance(p, dict)]
+        MARKET_INTRADAY_SERIES[market_key] = [p for p in saved_series[-5000:] if isinstance(p, dict)]
         if not MARKET_INTRADAY_SERIES[market_key]:
             MARKET_INTRADAY_SERIES[market_key] = [{
                 "time": f"{start_hour:02d}:{start_minute:02d}",
@@ -495,7 +495,7 @@ def update_market_intraday_series(market, current_net_mtm, net_pct, start_hour, 
     if session_start <= now_minutes <= session_end:
         now_ts = now.timestamp()
         series = MARKET_INTRADAY_SERIES[market_key]
-        if not series or now_ts - series[-1].get("ts", 0) >= 4.0:
+        if not series or now_ts - series[-1].get("ts", 0) >= 10.0:
             series.append({
                 "time": now.strftime("%H:%M:%S"),
                 "time_short": now.strftime("%H:%M"),
@@ -503,7 +503,7 @@ def update_market_intraday_series(market, current_net_mtm, net_pct, start_hour, 
                 "pct": round(val_pct, 4),
                 "ts": now_ts
             })
-            MARKET_INTRADAY_SERIES[market_key] = series[-1500:]
+            MARKET_INTRADAY_SERIES[market_key] = series[-5000:]
             saved = load_json_safe(MARKET_INTRADAY_FILE, {})
             if not isinstance(saved, dict):
                 saved = {}
@@ -878,7 +878,7 @@ def get_aggregated_dashboard_state() -> dict:
         "NIFTY", nifty_net, (nifty_net / base_capital) * 100.0 if base_capital else None, 9, 15, 15, 35
     )
     mcx_intraday_series = update_market_intraday_series(
-        "MCX", mcx_net, (mcx_net / base_capital) * 100.0 if base_capital else None, 15, 30, 23, 24
+        "MCX", mcx_net, (mcx_net / base_capital) * 100.0 if base_capital else None, 16, 0, 23, 24
     )
 
     return {
@@ -2901,6 +2901,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
 
     function switchTab(tabName) {
       activeTab = tabName;
+      chartAnimStart = performance.now();
       document.querySelectorAll('.view-section').forEach(el => el.classList.remove('active'));
       document.querySelectorAll('.seg-tab').forEach(el => el.className = 'seg-tab');
       document.querySelectorAll('.drawer-nav-btn').forEach(el => el.className = 'drawer-nav-btn');
@@ -3221,6 +3222,9 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
     let chartAnimFrame = null;
     let chartMouseX = null;
     let lastDashboardData = null;
+    let chartAnimStart = performance.now();
+    const CHART_ANIM_DURATION = 500; // 0.5s smooth sweep
+    let lastActiveChartTab = null;
 
     let chartConfig = {
       market: 'NIFTY',
@@ -3248,6 +3252,11 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       const p = data.performance || {};
       const sys = data.system || {};
 
+      if (lastActiveChartTab !== activeTab) {
+        lastActiveChartTab = activeTab;
+        chartAnimStart = performance.now();
+      }
+
       let isLiveActive = false;
       let liveChipText = 'LIVE STREAM';
       let liveChipClass = 'chip-green';
@@ -3259,15 +3268,15 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
           isLive: isLiveActive,
           title: isLiveActive ? 'LIVE MCX NATURAL GAS P&L TRAJECTORY' : 'MCX NATURAL GAS P&L TRAJECTORY',
           icon: '🛢️',
-          timeline: '15:30 ➔ 23:24 IST',
-          startMin: 930,
+          timeline: '16:00 ➔ 23:24 IST',
+          startMin: 960,
           endMin: 1404,
           timeTicks: [
-            { label: '15:30', m: 930 },
-            { label: '17:00', m: 1020 },
-            { label: '18:30', m: 1110 },
-            { label: '20:00', m: 1200 },
-            { label: '21:30', m: 1290 },
+            { label: '16:00', m: 960 },
+            { label: '17:30', m: 1050 },
+            { label: '19:00', m: 1140 },
+            { label: '20:30', m: 1230 },
+            { label: '22:00', m: 1320 },
             { label: '23:24', m: 1404 }
           ]
         };
@@ -3519,10 +3528,44 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
 
       points.sort((a, b) => a.x - b.x);
 
-      // 4. Fill gradient under the curve down to zeroY
+      // 0.5s smooth left-to-right animation following today's PnL trajectory
+      const elapsedAnim = performance.now() - chartAnimStart;
+      const animProgress = Math.min(1.0, Math.max(0.0, elapsedAnim / CHART_ANIM_DURATION));
+      const easeProgress = 1.0 - Math.pow(1.0 - animProgress, 3); // cubic ease-out
+
+      const firstPt = points[0];
+      const finalPt = points[points.length - 1];
+      const targetSweepX = firstPt.x + (finalPt.x - firstPt.x) * easeProgress;
+
+      let leadPt = finalPt;
+      if (animProgress < 1.0 && points.length > 1) {
+        leadPt = finalPt;
+        for (let i = 1; i < points.length; i++) {
+          if (targetSweepX <= points[i].x) {
+            const pA = points[i - 1];
+            const pB = points[i];
+            const span = pB.x - pA.x;
+            const t = span > 0 ? (targetSweepX - pA.x) / span : 0;
+            leadPt = {
+              x: targetSweepX,
+              y: pA.y + (pB.y - pA.y) * t,
+              pnl: pA.pnl + (pB.pnl - pA.pnl) * t,
+              pct: pA.pct + (pB.pct - pA.pct) * t,
+              time: pB.time || pB.time_short
+            };
+            break;
+          }
+        }
+      }
+
+      // 4. Fill gradient under the curve down to zeroY and 5. Thin segmented stroke
       if (points.length > 1) {
-        const lastPt = points[points.length - 1];
-        const isPos = (chartCurNet !== null ? chartCurNet : lastPt.pnl) >= 0;
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(padLeft - 2, 0, Math.max(0, leadPt.x - padLeft + 4), h);
+        ctx.clip();
+
+        const isPos = (chartCurNet !== null ? chartCurNet : finalPt.pnl) >= 0;
         const grad = ctx.createLinearGradient(0, padTop, 0, padTop + plotH);
         if (isPos) {
           grad.addColorStop(0, 'rgba(16, 185, 129, 0.28)');
@@ -3540,7 +3583,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         for (let i = 1; i < points.length; i++) {
           ctx.lineTo(points[i].x, points[i].y);
         }
-        ctx.lineTo(lastPt.x, zeroY);
+        ctx.lineTo(finalPt.x, zeroY);
         ctx.closePath();
         ctx.fillStyle = grad;
         ctx.fill();
@@ -3572,35 +3615,35 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
           }
         }
         ctx.shadowBlur = 0;
+        ctx.restore();
       }
 
       // 6. Refined Calm Market Dot & Organic Breathing Glow
-      const lastPt = points[points.length - 1];
       const nowMs = Date.now();
-      const isCurPos = (chartCurNet !== null ? chartCurNet : lastPt.pnl) >= 0;
+      const isCurPos = (chartCurNet !== null ? chartCurNet : leadPt.pnl) >= 0;
 
       // Smooth slow organic breathing phase (3.4s cycle)
       const breath = (Math.sin(nowMs / 540) + 1) / 2;
 
       // Subtle Soft Ambient Radial Nebula behind dot
       const glowR = 18 + breath * 14;
-      const nebula = ctx.createRadialGradient(lastPt.x, lastPt.y, 2, lastPt.x, lastPt.y, glowR);
+      const nebula = ctx.createRadialGradient(leadPt.x, leadPt.y, 2, leadPt.x, leadPt.y, glowR);
       nebula.addColorStop(0, isCurPos ? `rgba(16, 185, 129, ${0.35 + 0.15 * breath})` : `rgba(244, 63, 94, ${0.35 + 0.15 * breath})`);
       nebula.addColorStop(0.5, isCurPos ? `rgba(16, 185, 129, ${0.08 * breath})` : `rgba(244, 63, 94, ${0.08 * breath})`);
       nebula.addColorStop(1, 'rgba(0, 0, 0, 0)');
       ctx.fillStyle = nebula;
       ctx.beginPath();
-      ctx.arc(lastPt.x, lastPt.y, glowR, 0, Math.PI * 2);
+      ctx.arc(leadPt.x, leadPt.y, glowR, 0, Math.PI * 2);
       ctx.fill();
 
-      if (chartConfig.isLive) {
+      if (chartConfig.isLive || animProgress < 1.0) {
         // Smooth Concentric Expanding Ripple Waves (Slow water-drop effect)
         // Wave 1 (2.8s period)
         const wave1 = (nowMs % 2800) / 2800;
         const r1 = 6 + wave1 * 26;
         const a1 = (1 - wave1) * 0.45;
         ctx.beginPath();
-        ctx.arc(lastPt.x, lastPt.y, r1, 0, Math.PI * 2);
+        ctx.arc(leadPt.x, leadPt.y, r1, 0, Math.PI * 2);
         ctx.strokeStyle = isCurPos ? `rgba(16, 185, 129, ${a1})` : `rgba(244, 63, 94, ${a1})`;
         ctx.lineWidth = 1.6 * (1 - wave1 * 0.6);
         ctx.stroke();
@@ -3610,21 +3653,21 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         const r2 = 6 + wave2 * 26;
         const a2 = (1 - wave2) * 0.45;
         ctx.beginPath();
-        ctx.arc(lastPt.x, lastPt.y, r2, 0, Math.PI * 2);
+        ctx.arc(leadPt.x, leadPt.y, r2, 0, Math.PI * 2);
         ctx.strokeStyle = isCurPos ? `rgba(16, 185, 129, ${a2})` : `rgba(244, 63, 94, ${a2})`;
         ctx.lineWidth = 1.6 * (1 - wave2 * 0.6);
         ctx.stroke();
 
         // Inner Breathing Halo Ring
         ctx.beginPath();
-        ctx.arc(lastPt.x, lastPt.y, 6.5 + breath * 2.2, 0, Math.PI * 2);
+        ctx.arc(leadPt.x, leadPt.y, 6.5 + breath * 2.2, 0, Math.PI * 2);
         ctx.strokeStyle = isCurPos ? `rgba(52, 211, 153, ${0.65 + 0.35 * breath})` : `rgba(251, 113, 133, ${0.65 + 0.35 * breath})`;
         ctx.lineWidth = 1.8;
         ctx.stroke();
 
         // Radiant Core Jewel Dot
         ctx.beginPath();
-        ctx.arc(lastPt.x, lastPt.y, 4.2, 0, Math.PI * 2);
+        ctx.arc(leadPt.x, leadPt.y, 4.2, 0, Math.PI * 2);
         ctx.fillStyle = '#ffffff';
         ctx.shadowColor = isCurPos ? '#10b981' : '#f43f5e';
         ctx.shadowBlur = 12 + breath * 6;
@@ -3633,19 +3676,19 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       } else {
         // Settled static pin dot for finalized session
         ctx.beginPath();
-        ctx.arc(lastPt.x, lastPt.y, 5.0, 0, Math.PI * 2);
+        ctx.arc(leadPt.x, leadPt.y, 5.0, 0, Math.PI * 2);
         ctx.fillStyle = isCurPos ? '#10b981' : '#f43f5e';
         ctx.fill();
 
         ctx.beginPath();
-        ctx.arc(lastPt.x, lastPt.y, 2.0, 0, Math.PI * 2);
+        ctx.arc(leadPt.x, leadPt.y, 2.0, 0, Math.PI * 2);
         ctx.fillStyle = '#ffffff';
         ctx.fill();
 
         ctx.font = '10px "JetBrains Mono", monospace';
         ctx.fillStyle = isCurPos ? '#10b981' : '#f43f5e';
         ctx.textAlign = 'right';
-        ctx.fillText(`EXIT LOCKED • ${fmtINR(lastPt.pnl, true)}`, Math.min(w - padRight, lastPt.x), padTop + 14);
+        ctx.fillText(`EXIT LOCKED • ${fmtINR(leadPt.pnl, true)}`, Math.min(w - padRight, leadPt.x), padTop + 14);
       }
 
       // Subtle Vertical Tracking Guide
@@ -3653,13 +3696,13 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       ctx.setLineDash([3, 4]);
       ctx.strokeStyle = isCurPos ? 'rgba(16, 185, 129, 0.25)' : 'rgba(244, 63, 94, 0.25)';
       ctx.lineWidth = 1;
-      ctx.moveTo(lastPt.x, padTop);
-      ctx.lineTo(lastPt.x, padTop + plotH);
+      ctx.moveTo(leadPt.x, padTop);
+      ctx.lineTo(leadPt.x, padTop + plotH);
       ctx.stroke();
       ctx.setLineDash([]);
 
       // 8. Interactive crosshair on hover
-      if (chartMouseX !== null && chartMouseX >= padLeft && chartMouseX <= lastPt.x) {
+      if (chartMouseX !== null && chartMouseX >= padLeft && chartMouseX <= leadPt.x) {
         let closest = points[0];
         let minD = Math.abs(points[0].x - chartMouseX);
         for (let i = 1; i < points.length; i++) {
