@@ -2223,45 +2223,66 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         ctx.shadowBlur = 0;
       }
 
-      // 6. Animated Cyberpunk Laser Sweep
+      // 6. Refined Calm Market Dot & Organic Breathing Glow
       const lastPt = points[points.length - 1];
-      const activeW = Math.max(10, lastPt.x - padLeft);
       const nowMs = Date.now();
-      const scanX = padLeft + ((nowMs / 22) % activeW);
-
-      const laserGrad = ctx.createLinearGradient(0, padTop, 0, padTop + plotH);
-      laserGrad.addColorStop(0, 'rgba(56, 189, 248, 0)');
-      laserGrad.addColorStop(0.5, 'rgba(56, 189, 248, 0.55)');
-      laserGrad.addColorStop(1, 'rgba(56, 189, 248, 0)');
-      ctx.fillStyle = laserGrad;
-      ctx.fillRect(scanX - 1.5, padTop, 3, plotH);
-
-      // 7. Pulsing Beacon at Current Head Position
-      const pulsePhase = (Math.sin(nowMs / 180) + 1) / 2;
-      const outerR = 5 + pulsePhase * 9;
       const isCurPos = chartCurNet >= 0;
-      const haloColor = isCurPos ? 'rgba(16, 185, 129, ' : 'rgba(244, 63, 94, ';
 
-      // Outer radar ring
+      // Smooth slow organic breathing phase (3.4s cycle)
+      const breath = (Math.sin(nowMs / 540) + 1) / 2;
+
+      // Subtle Soft Ambient Radial Nebula behind dot
+      const glowR = 18 + breath * 14;
+      const nebula = ctx.createRadialGradient(lastPt.x, lastPt.y, 2, lastPt.x, lastPt.y, glowR);
+      nebula.addColorStop(0, isCurPos ? `rgba(16, 185, 129, ${0.35 + 0.15 * breath})` : `rgba(244, 63, 94, ${0.35 + 0.15 * breath})`);
+      nebula.addColorStop(0.5, isCurPos ? `rgba(16, 185, 129, ${0.08 * breath})` : `rgba(244, 63, 94, ${0.08 * breath})`);
+      nebula.addColorStop(1, 'rgba(0, 0, 0, 0)');
+      ctx.fillStyle = nebula;
       ctx.beginPath();
-      ctx.arc(lastPt.x, lastPt.y, outerR, 0, Math.PI * 2);
-      ctx.strokeStyle = haloColor + (0.65 * (1 - pulsePhase)) + ')';
-      ctx.lineWidth = 2;
+      ctx.arc(lastPt.x, lastPt.y, glowR, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Smooth Concentric Expanding Ripple Waves (Slow water-drop effect)
+      // Wave 1 (2.8s period)
+      const wave1 = (nowMs % 2800) / 2800;
+      const r1 = 6 + wave1 * 26;
+      const a1 = (1 - wave1) * 0.45;
+      ctx.beginPath();
+      ctx.arc(lastPt.x, lastPt.y, r1, 0, Math.PI * 2);
+      ctx.strokeStyle = isCurPos ? `rgba(16, 185, 129, ${a1})` : `rgba(244, 63, 94, ${a1})`;
+      ctx.lineWidth = 1.6 * (1 - wave1 * 0.6);
       ctx.stroke();
 
-      // Inner glowing core
+      // Wave 2 (staggered by 1.4s)
+      const wave2 = ((nowMs + 1400) % 2800) / 2800;
+      const r2 = 6 + wave2 * 26;
+      const a2 = (1 - wave2) * 0.45;
       ctx.beginPath();
-      ctx.arc(lastPt.x, lastPt.y, 4.5, 0, Math.PI * 2);
+      ctx.arc(lastPt.x, lastPt.y, r2, 0, Math.PI * 2);
+      ctx.strokeStyle = isCurPos ? `rgba(16, 185, 129, ${a2})` : `rgba(244, 63, 94, ${a2})`;
+      ctx.lineWidth = 1.6 * (1 - wave2 * 0.6);
+      ctx.stroke();
+
+      // Inner Breathing Halo Ring
+      ctx.beginPath();
+      ctx.arc(lastPt.x, lastPt.y, 6.5 + breath * 2.2, 0, Math.PI * 2);
+      ctx.strokeStyle = isCurPos ? `rgba(52, 211, 153, ${0.65 + 0.35 * breath})` : `rgba(251, 113, 133, ${0.65 + 0.35 * breath})`;
+      ctx.lineWidth = 1.8;
+      ctx.stroke();
+
+      // Radiant Core Jewel Dot
+      ctx.beginPath();
+      ctx.arc(lastPt.x, lastPt.y, 4.2, 0, Math.PI * 2);
       ctx.fillStyle = '#ffffff';
       ctx.shadowColor = isCurPos ? '#10b981' : '#f43f5e';
-      ctx.shadowBlur = 10;
+      ctx.shadowBlur = 12 + breath * 6;
       ctx.fill();
       ctx.shadowBlur = 0;
 
-      // Vertical tracer dashed line
+      // Subtle Vertical Tracking Guide
       ctx.beginPath();
-      ctx.setLineDash([2, 3]);
-      ctx.strokeStyle = haloColor + '0.45)';
+      ctx.setLineDash([3, 4]);
+      ctx.strokeStyle = isCurPos ? 'rgba(16, 185, 129, 0.25)' : 'rgba(244, 63, 94, 0.25)';
       ctx.lineWidth = 1;
       ctx.moveTo(lastPt.x, padTop);
       ctx.lineTo(lastPt.x, padTop + plotH);
