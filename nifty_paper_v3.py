@@ -3,7 +3,7 @@
 🚀 NIFTY 50 PAPER TRADING ENGINE (VERSION 3.0)
 ================================================================================
 Production-Ready Algorithmic Paper Trading Engine for NIFTY 50 Options.
-Core Architecture: Adaptive KAMA-ADX Hedged Strangle (upv2_paper engine).
+Core Architecture: Adaptive KAMA-ADX Hedged Strangle (upv3_paper engine).
 
 Key Rules:
 1. Strict 1-Minute Execution Cadence with 1-second continuous tick evaluation.
@@ -16,7 +16,7 @@ Key Rules:
 ================================================================================
 """
 import sys
-from upv2_paper import ExecutionEngine, prompt_user_variables
+from upv3_paper import ExecutionEngine, prompt_user_variables
 
 
 def main():
