@@ -499,62 +499,27 @@ class NaturalGasPaperBot:
                 self.trades_today       = int(state.get('trades_today', 0))
                 self.last_reentry_ts    = float(state.get('last_reentry_ts', 0.0))
                 self.last_any_close_ts  = float(state.get('last_any_close_ts', 0.0))
+                # Ensure all active positions adhere to updated DEFAULT_SL_PCT (12%) / DEFAULT_TSL_PCT (7%)
+                is_strangle_restored = ('CE' in self.positions and 'PE' in self.positions)
                 for leg, pos in self.positions.items():
+                    pos['loss_stop_pct'] = DEFAULT_SL_PCT
+                    pos['tsl_pct'] = DEFAULT_TSL_PCT
                     sl_st = pos.get('sl_state', {})
-                    pos['sl_state'] = sl_st
+                    sl_st['loss_stop_pct'] = DEFAULT_SL_PCT
+                    sl_st['tsl_pct'] = DEFAULT_TSL_PCT
+                    lowest = float(sl_st.get('lowest_ltp', pos.get('entry_price', 0.0)))
+                    pct = DEFAULT_SL_PCT if is_strangle_restored else DEFAULT_TSL_PCT
+                    new_sl = round_to_tick(lowest * (1.0 + pct))
+                    curr_sl = float(sl_st.get('current_sl', new_sl))
+                    sl_st['current_sl'] = min(curr_sl, new_sl)
+                    sl_st['solo_mode'] = not is_strangle_restored
                 if hasattr(self, 'db'):
                     self.db.commit_daily_pnl(self.total_realized_pnl)
                 print(f'[STATE] Restored: {len(self.positions)} open legs | '
                       f'Realized PnL: ₹{self.total_realized_pnl:,.2f} | '
-                      f'Trades: {self.trades_today}', flush=True)
+                      f'Trades: {self.trades_today} | Strangle SL: {DEFAULT_SL_PCT*100:.0f}% | Solo TSL: {DEFAULT_TSL_PCT*100:.0f}%', flush=True)
         except Exception as e:
             print(f'[WARN] Error loading MCX state: {e}', flush=True)
-
-    def _apply_adaptive_risk_to_open_positions(self):
-        """Rebuild stops for restored positions after the target expiry is known."""
-        is_strangle = all(
-            leg in self.positions and self.positions[leg].get('side') == 'SELL'
-            for leg in ('CE', 'PE')
-        )
-        for pos in self.positions.values():
-            if pos.get('side') != 'SELL':
-                continue
-            state = pos.setdefault('sl_state', {})
-            lowest = float(state.get('lowest_ltp', pos.get('_last_ltp', pos.get('entry_price', 0.0))))
-            if lowest <= 0:
-                lowest = float(pos.get('entry_price', 0.0))
-            risk = self._premium_risk_profile(lowest)
-            if is_strangle:
-                current_sl = round_to_tick(min(
-                    lowest * (1.0 + risk['initial_pct']),
-                    lowest + risk['initial_points'],
-                ))
-                solo_mode = False
-            else:
-                current_sl = round_to_tick(min(
-                    lowest * (1.0 + risk['trail_pct']),
-                    lowest + risk['trail_points'],
-                ))
-                solo_mode = True
-            pos['loss_stop_pct'] = risk['initial_pct']
-            pos['tsl_pct'] = risk['trail_pct']
-            state.update({
-                'lowest_ltp': lowest,
-                'current_sl': current_sl,
-                'initial_sl': current_sl,
-                'loss_stop_pct': risk['initial_pct'],
-                'tsl_pct': risk['trail_pct'],
-                'initial_points': risk['initial_points'],
-                'trail_points': risk['trail_points'],
-                'solo_mode': solo_mode,
-            })
-        if self.positions:
-            self._save_state()
-            print(
-                f'[RISK] Restored open legs recalibrated with adaptive '
-                f'premium/DTE rules (DTE: {self._option_dte_days():.1f}).',
-                flush=True,
-            )
 
     # ── Authentication ────────────────────────
     def authenticate(self):
@@ -792,7 +757,6 @@ class NaturalGasPaperBot:
         if expiry is None:
             return 30.0
         try:
-            import pandas as pd
             expiry_date = pd.Timestamp(expiry).date()
             return max(0.0, float((expiry_date - get_ist_now().date()).days))
         except (TypeError, ValueError):
@@ -1473,7 +1437,6 @@ class NaturalGasPaperBot:
     def run(self):
         self.authenticate()
         self._get_mcx_csv()
-        self._apply_adaptive_risk_to_open_positions()
 
         DIM = f'{Fore.WHITE}{Style.DIM}'
         CY  = f'{Fore.CYAN}{Style.BRIGHT}'
