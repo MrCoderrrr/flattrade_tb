@@ -1258,27 +1258,25 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
     @media (max-width: 768px) {
       .container { padding: 10px 8px 30px; }
       header {
-        flex-direction: column;
-        align-items: stretch;
+        flex-direction: row;
+        align-items: center;
+        justify-content: space-between;
         gap: 12px;
-        padding: 14px;
+        padding: 12px 14px;
+        position: sticky;
+        top: 8px;
+        z-index: 1000;
       }
       .brand-wrap {
         justify-content: flex-start;
+        flex: 1;
+        min-width: 0;
       }
-      .brand-title { font-size: 1.1rem; }
-      .brand-subtitle { font-size: 0.68rem; flex-wrap: wrap; }
+      .brand-title { font-size: 1.05rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .brand-subtitle { font-size: 0.65rem; }
       .header-ctrls {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 8px;
-        flex-wrap: wrap;
-        width: 100%;
+        display: none !important; /* Managed seamlessly inside Hamburger drawer on mobile */
       }
-      .live-badge { padding: 5px 10px; font-size: 0.7rem; }
-      .time-chip { padding: 5px 10px; font-size: 0.75rem; }
-      .btn-action { padding: 6px 11px; font-size: 0.75rem; }
 
       .royal-banner-wrap { margin-bottom: 12px; }
       .royal-auspicious-bar { padding: 6px 14px; }
@@ -1448,6 +1446,190 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       transform: translateY(-3px);
       box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
     }
+
+    /* ─── Premium Mobile Hamburger Menu & Slide-out Drawer ─── */
+    .btn-hamburger {
+      display: none;
+      width: 42px;
+      height: 42px;
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      border-radius: 12px;
+      color: #fff;
+      cursor: pointer;
+      align-items: center;
+      justify-content: center;
+      flex-direction: column;
+      gap: 5px;
+      padding: 9px;
+      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.15);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      transition: all 0.2s ease;
+      flex-shrink: 0;
+    }
+    .btn-hamburger:hover {
+      background: rgba(255, 255, 255, 0.12);
+      border-color: rgba(56, 189, 248, 0.4);
+    }
+    .btn-hamburger span {
+      display: block;
+      width: 100%;
+      height: 2px;
+      background: #e2e8f0;
+      border-radius: 2px;
+      transition: transform 0.28s ease, opacity 0.28s ease;
+    }
+    .btn-hamburger.active span:nth-child(1) {
+      transform: translateY(7px) rotate(45deg);
+    }
+    .btn-hamburger.active span:nth-child(2) {
+      opacity: 0;
+    }
+    .btn-hamburger.active span:nth-child(3) {
+      transform: translateY(-7px) rotate(-45deg);
+    }
+
+    /* Mobile Drawer Overlay */
+    .mobile-drawer-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.75);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      z-index: 99990;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    .mobile-drawer-overlay.active {
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    /* Mobile Drawer Panel */
+    .mobile-drawer {
+      position: fixed;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      width: 84%;
+      max-width: 320px;
+      background: rgba(14, 21, 37, 0.96);
+      border-left: 1px solid rgba(255, 255, 255, 0.14);
+      box-shadow: -15px 0 45px rgba(0, 0, 0, 0.85);
+      backdrop-filter: blur(36px) saturate(200%);
+      -webkit-backdrop-filter: blur(36px) saturate(200%);
+      z-index: 99995;
+      transform: translateX(105%);
+      transition: transform 0.32s cubic-bezier(0.16, 1, 0.3, 1);
+      display: flex;
+      flex-direction: column;
+      padding: 22px 18px;
+      overflow-y: auto;
+    }
+    .mobile-drawer.active {
+      transform: translateX(0);
+    }
+
+    .drawer-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-bottom: 16px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+      margin-bottom: 20px;
+    }
+    .drawer-title {
+      font-family: var(--display);
+      font-weight: 800;
+      font-size: 1.05rem;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .drawer-close {
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      color: var(--text-dim);
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1rem;
+    }
+
+    .drawer-nav-section {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      margin-bottom: 24px;
+    }
+    .drawer-nav-btn {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 13px 16px;
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      color: #cbd5e1;
+      font-family: var(--display);
+      font-size: 0.94rem;
+      font-weight: 700;
+      cursor: pointer;
+      text-align: left;
+      transition: all 0.2s ease;
+    }
+    .drawer-nav-btn:hover, .drawer-nav-btn.active {
+      background: rgba(56, 189, 248, 0.16);
+      border-color: rgba(56, 189, 248, 0.45);
+      color: #fff;
+    }
+    .drawer-nav-btn.active-nifty {
+      background: rgba(56, 189, 248, 0.2);
+      border-color: var(--primary);
+      color: #fff;
+    }
+    .drawer-nav-btn.active-mcx {
+      background: rgba(245, 158, 11, 0.2);
+      border-color: var(--amber);
+      color: #fff;
+    }
+    .drawer-nav-btn.active-overview {
+      background: rgba(168, 85, 247, 0.2);
+      border-color: #c084fc;
+      color: #fff;
+    }
+
+    .drawer-actions {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      margin-top: auto;
+      padding-top: 18px;
+      border-top: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    .drawer-action-btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      padding: 12px;
+      border-radius: 12px;
+      font-family: var(--display);
+      font-weight: 700;
+      font-size: 0.88rem;
+      cursor: pointer;
+    }
+
+    @media (max-width: 768px) {
+      .btn-hamburger { display: flex; }
+      .segmented-tabs-bar { display: none !important; }
+    }
   </style>
 </head>
 <body>
@@ -1494,6 +1676,13 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
           <span>🔗</span> <span id="copy-btn-text">Share Link</span>
         </button>
       </div>
+
+      <!-- Mobile Hamburger Button -->
+      <button class="btn-hamburger" id="hamburger-btn" onclick="toggleMobileDrawer()" aria-label="Open Navigation Menu">
+        <span></span>
+        <span></span>
+        <span></span>
+      </button>
     </header>
 
     <!-- ─── Segmented Navigation Switcher ─── -->
@@ -1952,26 +2141,128 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- ─── Mobile Slide-out Drawer Navigation ─── -->
+  <div class="mobile-drawer-overlay" id="drawer-overlay" onclick="closeMobileDrawer()"></div>
+  <aside class="mobile-drawer" id="mobile-drawer" aria-label="Mobile Navigation">
+    <div class="drawer-header">
+      <div class="drawer-title">
+        <span style="font-size:1.2rem;">⚡</span>
+        <span>Navigation Menu</span>
+      </div>
+      <button class="drawer-close" onclick="closeMobileDrawer()" aria-label="Close menu">✕</button>
+    </div>
+
+    <!-- Live Status Pill in Drawer -->
+    <div style="background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.08); border-radius:14px; padding:12px 14px; margin-bottom:18px; display:flex; justify-content:space-between; align-items:center;">
+      <div style="display:flex; align-items:center; gap:8px;">
+        <span class="dot-pulse"></span>
+        <span style="font-size:0.75rem; font-family:var(--mono); font-weight:700; color:var(--green);" id="drawer-stream-status">LIVE STREAMING</span>
+      </div>
+      <div style="font-family:var(--mono); font-size:0.8rem; font-weight:700; color:#fff;" id="drawer-live-clock">--:--:-- IST</div>
+    </div>
+
+    <!-- Navigation Section Tabs -->
+    <div style="font-size:0.7rem; font-weight:800; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.08em; margin-bottom:10px; padding-left:4px;">
+      Trading Engines
+    </div>
+    <div class="drawer-nav-section">
+      <button class="drawer-nav-btn active-nifty" id="drawer-btn-nifty" onclick="switchTab('nifty')">
+        <span style="font-size:1.1rem;">⚡</span>
+        <div style="flex:1;">
+          <div>NIFTY 50 Options</div>
+          <div style="font-size:0.7rem; color:var(--text-dim); font-family:var(--mono); font-weight:400;">KAMA-ADX & Straddle</div>
+        </div>
+      </button>
+
+      <button class="drawer-nav-btn" id="drawer-btn-mcx" onclick="switchTab('mcx')">
+        <span style="font-size:1.1rem;">🛢️</span>
+        <div style="flex:1;">
+          <div>MCX Natural Gas</div>
+          <div style="font-size:0.7rem; color:var(--text-dim); font-family:var(--mono); font-weight:400;">EMA Trend Pullback</div>
+        </div>
+      </button>
+
+      <button class="drawer-nav-btn" id="drawer-btn-overview" onclick="switchTab('overview')">
+        <span style="font-size:1.1rem;">📊</span>
+        <div style="flex:1;">
+          <div>Unified Overview</div>
+          <div style="font-size:0.7rem; color:var(--text-dim); font-family:var(--mono); font-weight:400;">Multi-Asset Positions</div>
+        </div>
+      </button>
+    </div>
+
+    <!-- Quick Actions in Drawer -->
+    <div class="drawer-actions">
+      <button class="drawer-action-btn" onclick="closeMobileDrawer(); openAuthModal();" style="background:linear-gradient(135deg, rgba(168, 85, 247, 0.25), rgba(147, 51, 234, 0.35)); border:1px solid rgba(168, 85, 247, 0.45); color:#f3e8ff;">
+        <span>🔑</span> <span id="drawer-auth-text">Flattrade Broker Auth</span>
+      </button>
+
+      <button class="drawer-action-btn" onclick="copyPublicLink(); closeMobileDrawer();" style="background:rgba(255, 255, 255, 0.05); border:1px solid rgba(255, 255, 255, 0.12); color:#e2e8f0;">
+        <span>🔗</span> <span>Share Public Link</span>
+      </button>
+
+      <div style="text-align:center; margin-top:10px; font-size:0.72rem; color:var(--gold); font-family:var(--display); font-weight:700;">
+        ॥ जय श्री कृष्ण ॥
+      </div>
+    </div>
+  </aside>
+
   <div class="toast-box" id="toast">Link copied to clipboard!</div>
 
   <script>
     let activeTab = 'nifty';
 
+    function toggleMobileDrawer() {
+      const drawer = document.getElementById('mobile-drawer');
+      const overlay = document.getElementById('drawer-overlay');
+      const btn = document.getElementById('hamburger-btn');
+      const isOpen = drawer.classList.contains('active');
+      if (isOpen) {
+        closeMobileDrawer();
+      } else {
+        drawer.classList.add('active');
+        overlay.classList.add('active');
+        if (btn) btn.classList.add('active');
+        document.body.style.overflow = 'hidden';
+      }
+    }
+
+    function closeMobileDrawer() {
+      const drawer = document.getElementById('mobile-drawer');
+      const overlay = document.getElementById('drawer-overlay');
+      const btn = document.getElementById('hamburger-btn');
+      if (drawer) drawer.classList.remove('active');
+      if (overlay) overlay.classList.remove('active');
+      if (btn) btn.classList.remove('active');
+      document.body.style.overflow = '';
+    }
+
     function switchTab(tabName) {
       activeTab = tabName;
       document.querySelectorAll('.view-section').forEach(el => el.classList.remove('active'));
       document.querySelectorAll('.seg-tab').forEach(el => el.className = 'seg-tab');
+      document.querySelectorAll('.drawer-nav-btn').forEach(el => el.className = 'drawer-nav-btn');
 
       if (tabName === 'nifty') {
         document.getElementById('view-nifty').classList.add('active');
-        document.getElementById('tab-btn-nifty').classList.add('active-nifty');
+        const tabEl = document.getElementById('tab-btn-nifty');
+        if (tabEl) tabEl.classList.add('active-nifty');
+        const dBtn = document.getElementById('drawer-btn-nifty');
+        if (dBtn) dBtn.classList.add('active-nifty');
       } else if (tabName === 'mcx') {
         document.getElementById('view-mcx').classList.add('active');
-        document.getElementById('tab-btn-mcx').classList.add('active-mcx');
+        const tabEl = document.getElementById('tab-btn-mcx');
+        if (tabEl) tabEl.classList.add('active-mcx');
+        const dBtn = document.getElementById('drawer-btn-mcx');
+        if (dBtn) dBtn.classList.add('active-mcx');
       } else {
         document.getElementById('view-overview').classList.add('active');
-        document.getElementById('tab-btn-overview').classList.add('active-overview');
+        const tabEl = document.getElementById('tab-btn-overview');
+        if (tabEl) tabEl.classList.add('active-overview');
+        const dBtn = document.getElementById('drawer-btn-overview');
+        if (dBtn) dBtn.classList.add('active-overview');
       }
+      closeMobileDrawer();
     }
 
     function fmtINR(val, plus=false) {
@@ -2557,7 +2848,11 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
 
       // Clock
       if (data.timestamp_ist) {
-        document.getElementById('live-clock').innerText = data.timestamp_ist.split(' ')[1] + ' IST';
+        const timeStr = data.timestamp_ist.split(' ')[1] + ' IST';
+        const clk = document.getElementById('live-clock');
+        if (clk) clk.innerText = timeStr;
+        const dClk = document.getElementById('drawer-live-clock');
+        if (dClk) dClk.innerText = timeStr;
       }
 
       // KPI Performance
@@ -2795,22 +3090,26 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
           const previewEl = document.getElementById('modal-token-preview');
           const chipEl = document.getElementById('modal-token-chip');
           const headerBtnText = document.getElementById('auth-header-text');
+          const drawerAuthText = document.getElementById('drawer-auth-text');
 
           if (d.token_exists && d.is_today) {
             previewEl.innerText = `${d.token_preview} (Updated ${d.last_updated})`;
             chipEl.className = 'status-chip chip-green';
             chipEl.innerText = 'VALID TODAY';
-            headerBtnText.innerText = 'Token Active';
+            if (headerBtnText) headerBtnText.innerText = 'Token Active';
+            if (drawerAuthText) drawerAuthText.innerText = 'Token Active (Flattrade)';
           } else if (d.token_exists) {
             previewEl.innerText = `${d.token_preview} (Expired ${d.last_updated})`;
             chipEl.className = 'status-chip chip-amber';
             chipEl.innerText = 'EXPIRED / RENEW';
-            headerBtnText.innerText = 'Renew Token';
+            if (headerBtnText) headerBtnText.innerText = 'Renew Token';
+            if (drawerAuthText) drawerAuthText.innerText = 'Renew Flattrade Token';
           } else {
             previewEl.innerText = 'No Token Found';
             chipEl.className = 'status-chip chip-dim';
             chipEl.innerText = 'LOGIN NEEDED';
-            headerBtnText.innerText = 'Login Needed';
+            if (headerBtnText) headerBtnText.innerText = 'Login Needed';
+            if (drawerAuthText) drawerAuthText.innerText = 'Login to Flattrade';
           }
         })
         .catch(() => {});
