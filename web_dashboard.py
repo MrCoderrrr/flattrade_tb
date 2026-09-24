@@ -251,6 +251,26 @@ def get_mcx_snapshot():
 # ─────────────────────────────────────────────────────────────────────────────
 INTRADAY_PNL_SERIES = []
 INTRADAY_SERIES_DATE = None
+INTRADAY_SERIES_FILE = os.path.join(PROJECT_ROOT, "intraday_pnl_series.json")
+
+def _load_saved_intraday_series(today_str: str):
+    saved = load_json_safe(INTRADAY_SERIES_FILE, {})
+    if not isinstance(saved, dict) or saved.get("date") != today_str:
+        return []
+    series = saved.get("series", [])
+    if not isinstance(series, list):
+        return []
+    return [point for point in series[-1500:] if isinstance(point, dict)]
+
+def _save_intraday_series(today_str: str, series):
+    try:
+        temp_file = f"{INTRADAY_SERIES_FILE}.tmp"
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump({"date": today_str, "series": series[-1500:]}, f)
+        os.replace(temp_file, INTRADAY_SERIES_FILE)
+    except Exception:
+        # A graph cache must never affect the dashboard response.
+        pass
 
 def update_intraday_pnl_series(current_net_mtm: float, net_pct: float):
     global INTRADAY_PNL_SERIES, INTRADAY_SERIES_DATE
@@ -259,7 +279,7 @@ def update_intraday_pnl_series(current_net_mtm: float, net_pct: float):
 
     if INTRADAY_SERIES_DATE != today_str:
         INTRADAY_SERIES_DATE = today_str
-        INTRADAY_PNL_SERIES = [{
+        INTRADAY_PNL_SERIES = _load_saved_intraday_series(today_str) or [{
             "time": "09:15",
             "pnl": 0.0,
             "pct": 0.0,
@@ -277,6 +297,7 @@ def update_intraday_pnl_series(current_net_mtm: float, net_pct: float):
         })
         if len(INTRADAY_PNL_SERIES) > 1500:
             INTRADAY_PNL_SERIES.pop(0)
+        _save_intraday_series(today_str, INTRADAY_PNL_SERIES)
 
     return INTRADAY_PNL_SERIES
 
@@ -1683,6 +1704,216 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       .btn-hamburger { display: flex; }
       .segmented-tabs-bar { display: none !important; }
     }
+
+    /* ═══════════════════════════════════════════════════════════════════════
+       ORBIT COMMAND UI — responsive redesign layer
+       The data IDs stay stable so the live engine/API remains untouched.
+    ═══════════════════════════════════════════════════════════════════════ */
+    :root {
+      --bg: #050816;
+      --card-bg: rgba(11, 18, 35, 0.82);
+      --card-border: rgba(148, 163, 184, 0.16);
+      --text: #f8fbff;
+      --text-muted: #9aaac4;
+      --text-dim: #62718b;
+      --primary: #55d6ff;
+      --primary-glow: rgba(85, 214, 255, 0.32);
+      --green: #35e0a1;
+      --red: #ff5d78;
+      --amber: #ffc857;
+      --purple: #b18cff;
+      --display: 'Space Grotesk', sans-serif;
+      --sans: 'Plus Jakarta Sans', sans-serif;
+      --mono: 'JetBrains Mono', monospace;
+    }
+
+    html { background: var(--bg); scroll-behavior: smooth; }
+    body {
+      background:
+        linear-gradient(rgba(85, 214, 255, 0.025) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(85, 214, 255, 0.025) 1px, transparent 1px),
+        radial-gradient(circle at 12% -8%, rgba(19, 107, 190, 0.28), transparent 34%),
+        radial-gradient(circle at 92% 8%, rgba(130, 58, 202, 0.18), transparent 30%),
+        #050816;
+      background-size: 42px 42px, 42px 42px, auto, auto, auto;
+      color: var(--text);
+      overflow-x: hidden;
+    }
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      z-index: -1;
+      background: radial-gradient(ellipse at center, transparent 35%, rgba(2, 5, 15, 0.55) 100%);
+    }
+    .container { max-width: 1540px; padding: 18px 22px 72px; }
+    .royal-banner-wrap { margin-bottom: 12px; }
+    .royal-auspicious-bar {
+      padding: 6px 18px;
+      border-color: rgba(255, 200, 87, 0.26);
+      background: rgba(18, 24, 45, 0.72);
+      box-shadow: 0 0 30px rgba(255, 200, 87, 0.1), inset 0 1px 0 rgba(255,255,255,.12);
+    }
+    header {
+      position: sticky;
+      top: 14px;
+      z-index: 1000;
+      min-height: 72px;
+      padding: 12px 16px;
+      border-radius: 22px;
+      border-color: rgba(133, 174, 221, 0.22);
+      background: linear-gradient(105deg, rgba(12, 22, 43, .94), rgba(12, 17, 34, .82));
+      box-shadow: 0 18px 55px rgba(0,0,0,.42), inset 0 1px 0 rgba(255,255,255,.14);
+    }
+    .brand-logo {
+      width: 48px; height: 48px; border-radius: 15px;
+      background: linear-gradient(145deg, #31c4f4, #536dff 58%, #9e57ff);
+      box-shadow: 0 0 28px rgba(85, 214, 255, .28), inset 0 1px 0 rgba(255,255,255,.5);
+    }
+    .brand-title { font-size: 1.18rem; letter-spacing: -.045em; }
+    .brand-subtitle { letter-spacing: .04em; }
+    .header-ctrls { gap: 8px; }
+    .live-badge, .time-chip, .data-age {
+      min-height: 34px; display: inline-flex; align-items: center; justify-content: center;
+      border-radius: 10px; font-family: var(--mono); font-size: .68rem; font-weight: 800;
+      letter-spacing: .035em; white-space: nowrap;
+    }
+    .live-badge { padding: 6px 11px; }
+    .time-chip { padding: 6px 11px; background: rgba(255,255,255,.06); }
+    .data-age {
+      padding: 6px 10px; color: var(--text-muted); background: rgba(255,255,255,.035);
+      border: 1px solid rgba(255,255,255,.1); transition: color .25s ease, border-color .25s ease;
+    }
+    .data-age::before { content: '●'; color: var(--green); margin-right: 6px; font-size: .55rem; }
+    .btn-action { min-height: 34px; padding: 7px 11px; border-radius: 10px; font-size: .72rem; }
+    .segmented-tabs-bar { margin: 18px 0 16px; }
+    .segmented-tabs {
+      width: min(720px, 100%); padding: 4px; border-radius: 15px;
+      background: rgba(9, 16, 32, .88); border-color: rgba(133,174,221,.2);
+      box-shadow: 0 14px 34px rgba(0,0,0,.3), inset 0 1px 0 rgba(255,255,255,.1);
+    }
+    .seg-tab { flex: 1; justify-content: center; padding: 10px 14px; font-size: .79rem; border-radius: 11px; }
+    .seg-tab.active-nifty, .seg-tab.active-mcx, .seg-tab.active-overview { box-shadow: 0 0 22px rgba(85,214,255,.16), inset 0 1px 0 rgba(255,255,255,.22); }
+    .kpi-row { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 18px; }
+    .kpi-card {
+      min-height: 148px; padding: 17px 18px; border-radius: 19px; border-color: rgba(133,174,221,.2);
+      background: linear-gradient(145deg, rgba(14, 27, 50, .92), rgba(10, 15, 30, .82));
+      box-shadow: 0 14px 38px rgba(0,0,0,.28), inset 0 1px 0 rgba(255,255,255,.1);
+    }
+    .kpi-card::after {
+      content: ''; position: absolute; inset: auto -35px -45px auto; width: 130px; height: 100px;
+      background: radial-gradient(circle, rgba(85,214,255,.14), transparent 70%); pointer-events: none;
+    }
+    .kpi-card:hover { transform: translateY(-4px); border-color: rgba(85,214,255,.45); box-shadow: 0 22px 48px rgba(0,0,0,.45), 0 0 25px rgba(85,214,255,.08); }
+    .kpi-label { font-size: .68rem; letter-spacing: .1em; }
+    .kpi-val { font-size: clamp(1.45rem, 2.2vw, 2rem); margin-top: 12px; }
+    .kpi-sub { margin-top: 10px; font-size: .69rem; }
+    .tag-pct { font-size: .69rem; border-radius: 7px; }
+    .panel-box, .table-card {
+      border-color: rgba(133,174,221,.18);
+      background: linear-gradient(145deg, rgba(12, 22, 42, .9), rgba(8, 13, 27, .83));
+      box-shadow: 0 18px 48px rgba(0,0,0,.3), inset 0 1px 0 rgba(255,255,255,.08);
+    }
+    .panel-box { border-radius: 22px; padding: 20px; }
+    .panel-hdr { border-bottom-color: rgba(133,174,221,.14); }
+    .panel-title { letter-spacing: -.025em; }
+    .telemetry-grid { gap: 8px; }
+    .tel-item { padding: 11px 13px; border-color: rgba(133,174,221,.12); background: rgba(255,255,255,.028); }
+    .tel-item:hover { background: rgba(85,214,255,.07); border-color: rgba(85,214,255,.3); transform: translateY(-2px); }
+    .tel-val { font-size: 1rem; }
+    .table-card { border-radius: 18px; }
+    th { padding: 11px 14px; background: rgba(85,214,255,.045); font-size: .65rem; }
+    td { padding: 13px 14px; font-size: .77rem; }
+    tr { transition: background .2s ease; }
+    tr:hover td { background: rgba(85,214,255,.055); }
+    .view-section.active { animation: orbitEnter .42s cubic-bezier(.16,1,.3,1); }
+    @keyframes orbitEnter { from { opacity: 0; transform: translateY(12px) scale(.992); } to { opacity: 1; transform: translateY(0) scale(1); } }
+    #intraday-canvas { cursor: crosshair; }
+    .panel-box:has(#intraday-canvas) { padding: 18px 20px 20px !important; }
+    .panel-box:has(#intraday-canvas) > div:nth-child(2) {
+      background: linear-gradient(180deg, rgba(2,7,18,.88), rgba(3,8,18,.62)) !important;
+      border-color: rgba(85,214,255,.16) !important; box-shadow: inset 0 0 35px rgba(17, 85, 137, .1);
+      height: 272px !important;
+    }
+    .circuit-track { background: rgba(255,255,255,.08); }
+    .circuit-fill { box-shadow: 0 0 12px rgba(255,200,87,.45); }
+    .toast-box { bottom: 24px; border-color: var(--primary); background: rgba(6,12,26,.96); }
+    .mobile-drawer { background: rgba(6, 13, 28, .98); }
+
+    @media (max-width: 1050px) {
+      .kpi-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .data-age { display: none; }
+    }
+    @media (max-width: 768px) {
+      body { padding-bottom: 92px; }
+      .container { padding: 9px 9px 36px; }
+      .royal-auspicious-bar { max-width: 100%; overflow: hidden; white-space: nowrap; }
+      .royal-krishna-badge { font-size: .72rem; }
+      header { top: 7px; min-height: 62px; padding: 9px 10px; border-radius: 17px; }
+      .brand-wrap { gap: 9px; }
+      .brand-logo { width: 40px; height: 40px; border-radius: 12px; font-size: 18px; }
+      .brand-title { font-size: .88rem; }
+      .brand-subtitle { font-size: .55rem; letter-spacing: 0; }
+      header .header-ctrls { display: flex !important; gap: 5px; }
+      header .header-ctrls .btn-action { display: none; }
+      header .live-badge, header .time-chip { display: inline-flex; padding: 5px 7px; font-size: .58rem; }
+      header .live-badge { max-width: 32px; overflow: hidden; }
+      header .live-badge #stream-status { display: none; }
+      .btn-hamburger { display: none; }
+      .segmented-tabs-bar {
+        display: flex !important; position: fixed; left: 9px; right: 9px; bottom: 9px; z-index: 10000;
+        margin: 0; padding: 5px; border-radius: 18px; background: rgba(7,14,29,.9);
+        border: 1px solid rgba(133,174,221,.25); backdrop-filter: blur(24px); box-shadow: 0 12px 38px rgba(0,0,0,.65);
+      }
+      .segmented-tabs { width: 100%; border: 0; box-shadow: none; background: transparent; gap: 3px; }
+      .seg-tab { min-height: 44px; padding: 6px 4px; gap: 3px; flex-direction: column; font-size: .59rem; }
+      .seg-tab span:first-child { font-size: .95rem; line-height: 1; }
+      .seg-tab span:last-child { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 31vw; }
+      .kpi-row { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+      .kpi-card { min-height: 125px; padding: 13px 12px; border-radius: 15px; }
+      .kpi-label { font-size: .57rem; letter-spacing: .065em; }
+      .kpi-val { font-size: 1.2rem; margin-top: 10px; }
+      .kpi-sub { font-size: .58rem; line-height: 1.35; }
+      .kpi-sub b { display: inline-block; }
+      .panel-box { padding: 13px; border-radius: 17px; margin-bottom: 14px; }
+      .panel-hdr { gap: 8px; padding-bottom: 11px; margin-bottom: 12px; }
+      .panel-title { font-size: .88rem; line-height: 1.25; }
+      .panel-title > span:last-child { display: none; }
+      .status-chip { padding: 4px 7px; font-size: .58rem; }
+      .telemetry-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+      .tel-item { padding: 9px 10px; border-radius: 11px; }
+      .tel-label { font-size: .56rem; }
+      .tel-val { font-size: .82rem; margin-top: 2px; }
+      .panel-box:has(#intraday-canvas) { padding: 13px !important; }
+      .panel-box:has(#intraday-canvas) > div:first-child { gap: 5px; }
+      .panel-box:has(#intraday-canvas) > div:first-child > div:first-child > span:nth-child(2) { font-size: .84rem !important; }
+      .panel-box:has(#intraday-canvas) > div:first-child > div:last-child { width: 100%; justify-content: space-between; font-size: .61rem !important; }
+      .panel-box:has(#intraday-canvas) > div:nth-child(2) { height: 220px !important; border-radius: 12px !important; }
+      .table-card { margin-bottom: 15px; border-radius: 14px; }
+      .table-scroll { overscroll-behavior-x: contain; }
+      table { min-width: 760px; }
+      th { padding: 10px 11px; font-size: .58rem; }
+      td { padding: 11px; font-size: .68rem; }
+      .view-section > div[style*="justify-content:space-between"] h3 { font-size: .86rem !important; }
+      .history-cards-flex { grid-template-columns: repeat(2, minmax(0,1fr)); gap: 7px; }
+      .hist-box { padding: 11px !important; }
+      .day-feed-card { min-width: 145px; padding: 11px; }
+    }
+    @media (max-width: 420px) {
+      .container { padding-left: 6px; padding-right: 6px; }
+      .brand-subtitle { display: none; }
+      .brand-title { font-size: .82rem; }
+      .brand-logo { width: 36px; height: 36px; }
+      .time-chip { font-size: .54rem !important; }
+      .kpi-val { font-size: 1.08rem; }
+      .kpi-card { min-height: 116px; padding: 11px 10px; }
+      .kpi-sub { font-size: .54rem; }
+      .segmented-tabs-bar { left: 6px; right: 6px; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; scroll-behavior: auto !important; }
+    }
   </style>
 </head>
 <body>
@@ -1722,6 +1953,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
           <span id="stream-status">LIVE STREAMING</span>
         </div>
         <div class="time-chip" id="live-clock">--:--:-- IST</div>
+        <div class="data-age" id="data-age" aria-live="polite">SYNCING DATA</div>
         <button class="btn-action" id="btn-auth-header" onclick="openAuthModal()" style="border-color:rgba(168, 85, 247, 0.4); background:rgba(168, 85, 247, 0.12); color:#c084fc;">
           <span>🔑</span> <span id="auth-header-text">Broker Auth</span>
         </button>
@@ -2906,6 +3138,8 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         if (clk) clk.innerText = timeStr;
         const dClk = document.getElementById('drawer-live-clock');
         if (dClk) dClk.innerText = timeStr;
+        const dataAge = document.getElementById('data-age');
+        if (dataAge) dataAge.innerText = `UPDATED ${timeStr}`;
       }
 
       // KPI Performance
