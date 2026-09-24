@@ -40,6 +40,7 @@ def get_ist_now() -> datetime:
 PUBLIC_URL_FILE = os.path.join(PROJECT_ROOT, "public_url.txt")
 TUNNEL_LOG_FILE = os.path.join(PROJECT_ROOT, "tunnel.log")
 LIVE_PUBLIC_URL = ""
+_dashboard_lock_file = None
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FLATTRADE AUTHENTICATION & TOKEN SERVICES
@@ -4435,7 +4436,29 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
 
 
 def start_server(port: int = 8000):
-    server = ThreadingHTTPServer(("0.0.0.0", port), DashboardHTTPHandler)
+    global _dashboard_lock_file
+    try:
+        import fcntl
+        lock_path = os.path.join(PROJECT_ROOT, ".web_dashboard.lock")
+        _dashboard_lock_file = open(lock_path, "a+")
+        fcntl.flock(_dashboard_lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _dashboard_lock_file.seek(0)
+        _dashboard_lock_file.truncate()
+        _dashboard_lock_file.write(f"{os.getpid()}\n")
+        _dashboard_lock_file.flush()
+    except (IOError, BlockingIOError):
+        print("[WEB DASHBOARD] Another dashboard instance is already running; exiting.", flush=True)
+        return
+
+    class ReusableThreadingHTTPServer(ThreadingHTTPServer):
+        allow_reuse_address = True
+
+    try:
+        server = ReusableThreadingHTTPServer(("0.0.0.0", port), DashboardHTTPHandler)
+    except OSError as exc:
+        print(f"[WEB DASHBOARD] Failed to bind port {port}: {exc}", flush=True)
+        return
+
     print(f"[WEB DASHBOARD] Listening at http://0.0.0.0:{port}", flush=True)
 
     t = threading.Thread(target=run_tunnel_manager, args=(port,), daemon=True)

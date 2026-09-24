@@ -2795,10 +2795,10 @@ class ExecutionEngine:
             )
             pos["dual_sl_state"] = sl_state
 
+        # This is a new solo/strangle anchor. Do not carry forward the
+        # breached stop, otherwise the open leg would trigger again
+        # immediately instead of getting fresh room from the current LTP.
         new_sl = round(ltp * (1.0 + trail_pct), 2)
-        existing_sl = sl_state.get("current_premium_sl", 0.0)
-        if existing_sl > 0:
-            new_sl = min(new_sl, existing_sl)
         sl_state["entry_premium"] = ltp        # Baseline anchor price when other leg exited
         sl_state["best_premium"] = ltp         # Start trailing from this exact LTP
         sl_state["current_premium_sl"] = new_sl
@@ -2956,10 +2956,10 @@ class ExecutionEngine:
         When a solo surviving leg hits its TSL and the target strangle strike is identical to
         its current strike (atm == strike), we do NOT exit and immediately re-enter this leg.
         Instead:
-        1. Lock in the solo run's accrued profit into self.realized_pnl and trade log.
-        2. Reset the leg's entry_price to current ltp_premium and SL to a fresh 15% strangle SL.
-        3. Enter ONLY the missing leg at ATM (and ensure its hedge is active).
-        4. Saves 2 unnecessary market orders, bid-ask spreads, and slippage!
+        1. Enter ONLY the missing leg at ATM (and ensure its hedge is active).
+        2. Re-arm the surviving leg's TSL from the current premium.
+        3. Keep the original entry price so its P&L remains unrealized until exit.
+        This saves 2 unnecessary market orders, bid-ask spreads, and slippage.
         """
         pos = self.positions.get(solo_leg)
         if not pos:
@@ -2980,14 +2980,22 @@ class ExecutionEngine:
             hedge_strike = atm + hedge_dist if other_leg == "CE" else atm - hedge_dist
             hedge_ok = self._enter_leg(other_hedge, hedge_strike, "BUY", spot, atr, dte_days)
             if not hedge_ok:
-                log_warn(f"⚠️ Hedge entry failed for {other_hedge}, cannot complete in-place strangle rebalance.")
-                return False
+                log_warn(
+                    f"⚠️ Hedge entry failed for {other_hedge}; keeping {solo_leg} open "
+                    "and postponing its TSL instead of realizing P&L."
+                )
+                self._anchor_surviving_leg_sl(solo_leg, spot)
+                return True
 
         # 2. Enter ONLY the other (missing) leg
         other_ok = self._enter_leg(other_leg, other_strike, "SELL", spot, atr, dte_days)
         if not other_ok:
-            log_warn(f"⚠️ Entry of missing {other_leg} failed, falling back to standard leg exit.")
-            return False
+            log_warn(
+                f"⚠️ Entry of missing {other_leg} failed; keeping {solo_leg} open "
+                "and postponing its TSL instead of realizing P&L."
+            )
+            self._anchor_surviving_leg_sl(solo_leg, spot)
+            return True
 
         # 3. Log recalibration only. The short leg remains open, so this P&L
         # stays unrealized/pending and is realized only by _exit_leg.
