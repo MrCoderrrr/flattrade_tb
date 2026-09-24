@@ -733,11 +733,14 @@ PREM_SL_INITIAL_PCT_EXPIRY= 0.12   # 12% initial SL on Expiry Day afternoon
 PREM_SL_MIN_PCT          = 0.085  # 8.5% tight trail baseline when deep in profit (was 7%)
 PREM_SL_MAX_PCT          = 0.15   # 15% trail ceiling at breakeven (was 12%)
 
-# Hybrid premium protection for high-priced weekly options. Percentage-only
-# stops become too wide in rupees when the option premium is large.
-PREM_INITIAL_MAX_POINTS   = 35.0   # cap initial adverse move in premium points
-PREM_TRAIL_MAX_POINTS     = 22.0   # cap trailing adverse move from the best premium
-PREM_MAX_PROFIT_GIVEBACK  = 0.35   # never give back more than 35% of peak open profit
+# Hybrid premium protection for high-priced weekly options.
+# Caps stop loss distance so high premiums don't create huge rupee risk,
+# and locks in profit once trend is captured so it cannot bounce back into a loss.
+PREM_INITIAL_MAX_POINTS   = 18.0   # Cap initial adverse move in points (was 35.0 — too wide on high premiums!)
+PREM_TRAIL_MAX_POINTS     = 10.0   # Cap trailing distance from peak in points (was 22.0 — allowed too much giveback!)
+PREM_MAX_PROFIT_GIVEBACK  = 0.20   # Maximum 20% giveback of peak profit (locks in >=80% of captured trend!)
+BREAKEVEN_PROFIT_PCT      = 0.04   # 4% profit triggers instant Break-Even Lock (SL capped at entry price)
+BREAKEVEN_PROFIT_POINTS   = 5.0    # 5.0 points profit triggers instant Break-Even Lock
 
 # Weekly expiry safety. Weekly options have much higher gamma near expiry, so
 # theta decay is not a reason to hold short legs into the final move.
@@ -759,12 +762,12 @@ SOLO_LEG_TSL_PCT          = 0.09   # 9% TSL anchored to LTP when other leg exits
 OPENING_NOISE_SHIELD_HOUR   = 9
 OPENING_NOISE_SHIELD_MINUTE = 25   # 09:25 AM IST — 10m clean warmup to absorb opening volatility
 
-# --- REENTRY CAPS ---
-KAMA_REVERSAL_ATR_RATIO   = 0.30   # Stronger reversal required before re-entry (was 0.15 — too easy to trigger)
+# --- REENTRY CAPS: INFINITY (No Cap, continuous re-entry per user specification) ---
+KAMA_REVERSAL_ATR_RATIO   = 0.20   # Balanced KAMA reversal threshold for dynamic re-entry
 KAMA_CONSECUTIVE_BARS     = 2
-MAX_REENTRIES_PER_LEG     = 2      # Max 2 re-entries per leg per session (was 999 = unlimited SL cascade)
-MAX_REENTRIES_TOTAL       = 3      # Max 3 total re-entries per session (was 999)
-MAX_STRANGLE_RESETS       = 3      # Max strangle resets per session (was 999)
+MAX_REENTRIES_PER_LEG     = 999    # Unlimited re-entry per leg (re-entry is infinity)
+MAX_REENTRIES_TOTAL       = 999    # Unlimited total re-entries per session
+MAX_STRANGLE_RESETS       = 999    # Unlimited strangle resets per session
 KAMA_PERIOD             = 10          # KAMA Efficiency Ratio lookback (10 bars)
 KAMA_FAST_EMA           = 3           # KAMA Fast EMA constant (3)
 KAMA_SLOW_EMA           = 30          # KAMA Slow EMA constant (30)
@@ -1925,8 +1928,7 @@ class RiskManager:
         if is_solo:
             # ─────────────────────────────────────────────────────────────
             # SOLO LEG MODE: When other leg was removed, this leg was anchored
-            # to its LTP. Best premium is tracked from that anchor point,
-            # and the SL is trailed strictly at 7% (or 5% after 1 PM / 0 DTE).
+            # to its LTP. Best premium is tracked from that anchor point.
             # ─────────────────────────────────────────────────────────────
             anchor_prem = float(sl_state.get("entry_premium", current_premium))
             if current_premium > 0 and current_premium < sl_state.get("best_premium", anchor_prem):
@@ -1937,6 +1939,22 @@ class RiskManager:
                 best_prem * (1.0 + active_tsl_pct),
                 best_prem + PREM_TRAIL_MAX_POINTS,
             ), 2)
+
+            # High Premium & Trend-Capture Profit Protection for Solo Mode:
+            solo_profit = anchor_prem - best_prem
+            solo_profit_pct = (solo_profit / anchor_prem) if anchor_prem > 0 else 0.0
+
+            # 1. Break-Even Lock: as soon as in profit, SL can NEVER exceed anchor price!
+            if solo_profit >= BREAKEVEN_PROFIT_POINTS or solo_profit_pct >= BREAKEVEN_PROFIT_PCT:
+                new_trail_sl = min(new_trail_sl, anchor_prem)
+
+            # 2. Dynamic Profit Ratchet: lock in captured trend
+            if solo_profit >= 10.0 or solo_profit_pct >= 0.10:
+                new_trail_sl = min(new_trail_sl, anchor_prem - (0.40 * solo_profit))
+            if solo_profit >= 20.0 or solo_profit_pct >= 0.20:
+                new_trail_sl = min(new_trail_sl, anchor_prem - (0.65 * solo_profit))
+            if solo_profit >= 35.0 or solo_profit_pct >= 0.35:
+                new_trail_sl = min(new_trail_sl, anchor_prem - (0.80 * solo_profit))
 
             # Strict Ratchet: Stop loss can never move backwards (upwards)
             if "current_premium_sl" in sl_state:
@@ -1966,7 +1984,6 @@ class RiskManager:
 
         best_prem = sl_state.get("best_premium", entry_prem)
 
-        # 15% initial SL (gives options room to breathe)
         is_after_1pm = (now_ist.hour > AFTERNOON_TSL_HOUR or (now_ist.hour == AFTERNOON_TSL_HOUR and now_ist.minute >= AFTERNOON_TSL_MINUTE))
         is_expiry = (dte_days <= EXPIRY_0DTE_THRESHOLD)
         initial_pct = PREM_SL_INITIAL_PCT_EXPIRY if (is_expiry and is_after_1pm) else PREM_SL_INITIAL_PCT
@@ -1981,8 +1998,8 @@ class RiskManager:
         else:
             if entry_prem <= 0.0:
                 return False, ""
-            # Phase B: in profit — dynamic trail down to active_tsl_pct (7%, or 5% after 1 PM / 0 DTE)
-            profit_pct = (entry_prem - best_prem) / entry_prem  # 0.0 → 1.0
+            profit = entry_prem - best_prem
+            profit_pct = profit / entry_prem  # 0.0 → 1.0
 
             trail_ceiling = PREM_SL_MAX_PCT
             trail_floor = active_tsl_pct
@@ -1994,19 +2011,38 @@ class RiskManager:
                 best_prem + PREM_TRAIL_MAX_POINTS,
             ), 2)
 
-            # Protect a meaningful portion of the best open profit. This
-            # prevents a high-premium bounce from returning most of the move
-            # even when the percentage trail is still technically intact.
-            peak_profit = entry_prem - best_prem
-            if profit_pct >= 0.10:
-                giveback_stop = entry_prem - ((1.0 - PREM_MAX_PROFIT_GIVEBACK) * peak_profit)
-                trail_sl = min(trail_sl, giveback_stop)
+            # ─────────────────────────────────────────────────────────
+            # HIGH-PREMIUM & TREND-CAPTURE PROFIT PROTECTION:
+            # When the trend is captured, the premium drops significantly.
+            # We MUST NEVER allow a position that saw profit to reverse
+            # and book a loss!
+            # ─────────────────────────────────────────────────────────
+
+            # 1. IMMEDIATE BREAK-EVEN LOCK:
+            # If profit is >= 4% or >= 5.0 points, SL can NEVER be above entry_prem!
+            if profit >= BREAKEVEN_PROFIT_POINTS or profit_pct >= BREAKEVEN_PROFIT_PCT:
+                trail_sl = min(trail_sl, entry_prem)
+
+            # 2. TIERED PROFIT RATCHET (Lock in the captured move):
+            if profit >= 10.0 or profit_pct >= 0.08:
+                trail_sl = min(trail_sl, round(entry_prem - (0.30 * profit), 2))
+            if profit >= 18.0 or profit_pct >= 0.15:
+                trail_sl = min(trail_sl, round(entry_prem - (0.55 * profit), 2))
+            if profit >= 30.0 or profit_pct >= 0.25:
+                trail_sl = min(trail_sl, round(entry_prem - (0.75 * profit), 2))
+            if profit >= 45.0 or profit_pct >= 0.40:
+                trail_sl = min(trail_sl, round(entry_prem - (0.85 * profit), 2))
+
+            # Cap max giveback to 20% of peak profit:
+            giveback_stop = round(entry_prem - ((1.0 - PREM_MAX_PROFIT_GIVEBACK) * profit), 2)
+            trail_sl = min(trail_sl, giveback_stop)
+
             # Never let trail SL exceed initial SL
             prem_sl = min(trail_sl, initial_sl)
-            
+
         # STRICT RATCHET: The stop loss can NEVER move backwards (upwards).
         # It must stay at its tightest point until SL drags it further down.
-        if "current_premium_sl" in sl_state and PREM_SL_MAX_PCT < 9.0:
+        if "current_premium_sl" in sl_state:
             prem_sl = min(prem_sl, sl_state["current_premium_sl"])
 
         sl_state["current_premium_sl"] = prem_sl
@@ -2818,13 +2854,6 @@ class ExecutionEngine:
 
         indicators = self.current_indicators
 
-        # ADX strong-trend guard: when ADX > 30, market is trending — skip all re-entries
-        # This is the primary cause of SL cascades: re-entering a short into a continuing trend
-        adx_now = indicators.get("adx", 18.0)
-        if adx_now > 30.0:
-            log_info(f"[REENTRY BLOCKED] ADX={adx_now:.1f} > 30 — strong trend active. No re-entry until market chops.")
-            return
-
         for leg in ("PE", "CE"):
             cd = self.cooldown_tracker.get(leg)
             if not cd or not cd.get("active", False):
@@ -2871,7 +2900,7 @@ class ExecutionEngine:
                 cd["active"] = False
                 cd["reentries_today"] = cd.get("reentries_today", 0) + 1
                 self.total_reentries_today += 1
-                cd["next_eligible_time"] = time.time() + 120  # 120s cooldown between re-entries (was 15s — too fast, re-entered into same trend)
+                cd["next_eligible_time"] = time.time() + 30   # 30s responsive cooldown between re-entries
                 self.mode = "RUNNING"
                 log_info(f"✅ {leg} re-entered at ATM {strike}. Mode → RUNNING. Total re-entries today: {self.total_reentries_today}")
                 self._save_state()
