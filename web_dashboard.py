@@ -32,6 +32,7 @@ from urllib.parse import urlparse, parse_qs
 IST = timezone(timedelta(hours=5, minutes=30))
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = CURRENT_DIR
+PERCENT_BASE_CAPITAL = 200000.0
 
 def get_ist_now() -> datetime:
     return datetime.now(IST)
@@ -435,20 +436,15 @@ def update_intraday_pnl_series(current_net_mtm: float, net_pct: float):
     global INTRADAY_PNL_SERIES, INTRADAY_SERIES_DATE
     now = get_ist_now()
     today_str = str(now.date())
-    val_pnl = float(current_net_mtm) if current_net_mtm is not None else 0.0
-    val_pct = float(net_pct) if net_pct is not None else 0.0
+    val_pnl = float(current_net_mtm) if current_net_mtm is not None else None
+    val_pct = float(net_pct) if net_pct is not None else None
 
     if INTRADAY_SERIES_DATE != today_str:
         INTRADAY_SERIES_DATE = today_str
-        INTRADAY_PNL_SERIES = _load_saved_intraday_series(today_str) or [{
-            "time": "09:15",
-            "pnl": 0.0,
-            "pct": 0.0,
-            "ts": now.replace(hour=9, minute=15, second=0).timestamp()
-        }]
+        INTRADAY_PNL_SERIES = _load_saved_intraday_series(today_str)
 
     now_ts = now.timestamp()
-    if not INTRADAY_PNL_SERIES or (now_ts - INTRADAY_PNL_SERIES[-1].get("ts", 0)) >= 4.0:
+    if val_pnl is not None and val_pct is not None and (not INTRADAY_PNL_SERIES or (now_ts - INTRADAY_PNL_SERIES[-1].get("ts", 0)) >= 4.0):
         INTRADAY_PNL_SERIES.append({
             "time": now.strftime("%H:%M:%S"),
             "time_short": now.strftime("%H:%M"),
@@ -482,25 +478,32 @@ def update_market_intraday_series(market, current_net_mtm, net_pct, start_hour, 
         saved_series = saved.get(today_str, {}).get(market_key, []) if isinstance(saved, dict) else []
         MARKET_INTRADAY_DATES[market_key] = today_str
         MARKET_INTRADAY_SERIES[market_key] = [p for p in saved_series[-5000:] if isinstance(p, dict)]
-        if not MARKET_INTRADAY_SERIES[market_key]:
-            MARKET_INTRADAY_SERIES[market_key] = [{
-                "time": f"{start_hour:02d}:{start_minute:02d}",
-                "pnl": 0.0, "pct": 0.0,
-                "ts": now.replace(hour=start_hour, minute=start_minute, second=0).timestamp()
-            }]
-
     session_start = start_hour * 60 + start_minute
     session_end = end_hour * 60 + end_minute
     now_minutes = now.hour * 60 + now.minute + now.second / 60.0
-    if session_start <= now_minutes <= session_end:
+    def point_minutes(point):
+        try:
+            if point.get("ts") is not None:
+                return datetime.fromtimestamp(float(point["ts"]), tz=IST).hour * 60 + datetime.fromtimestamp(float(point["ts"]), tz=IST).minute + datetime.fromtimestamp(float(point["ts"]), tz=IST).second / 60.0
+            text = str(point.get("time", point.get("time_short", "")))
+            parts = text.split(":")
+            return int(parts[0]) * 60 + int(parts[1]) + (float(parts[2]) / 60.0 if len(parts) > 2 else 0.0)
+        except (AttributeError, TypeError, ValueError, IndexError):
+            return None
+
+    MARKET_INTRADAY_SERIES[market_key] = [
+        point for point in MARKET_INTRADAY_SERIES[market_key]
+        if session_start <= (point_minutes(point) if point_minutes(point) is not None else -1) <= session_end
+    ][-5000:]
+    if session_start <= now_minutes <= session_end and current_net_mtm is not None and net_pct is not None:
         now_ts = now.timestamp()
         series = MARKET_INTRADAY_SERIES[market_key]
         if not series or now_ts - series[-1].get("ts", 0) >= 10.0:
             series.append({
                 "time": now.strftime("%H:%M:%S"),
                 "time_short": now.strftime("%H:%M"),
-                "pnl": round(val_pnl, 2),
-                "pct": round(val_pct, 4),
+                "pnl": round(float(current_net_mtm), 2),
+                "pct": round(float(net_pct), 4),
                 "ts": now_ts
             })
             MARKET_INTRADAY_SERIES[market_key] = series[-5000:]
@@ -517,11 +520,40 @@ def update_market_intraday_series(market, current_net_mtm, net_pct, start_hour, 
                 pass
     return MARKET_INTRADAY_SERIES[market_key]
 
+def build_combined_intraday_series(nifty_series, mcx_series, nifty_close_pnl):
+    """Join the non-overlapping NIFTY and MCX session curves correctly.
+
+    MCX points are offset by the final NIFTY session P&L, so the overview is a
+    portfolio curve rather than an unrelated second curve starting from zero.
+    Points are filtered to their actual session windows before merging.
+    """
+    combined = []
+    for point in nifty_series or []:
+        try:
+            minute = int(str(point.get("time", point.get("time_short", "0:0"))).split(":")[0]) * 60 + int(str(point.get("time", point.get("time_short", "0:0"))).split(":")[1])
+            if 555 <= minute <= 935 and point.get("pnl") is not None:
+                combined.append(dict(point))
+        except (AttributeError, TypeError, ValueError, IndexError):
+            continue
+    offset = float(nifty_close_pnl or 0.0)
+    for point in mcx_series or []:
+        try:
+            text_time = str(point.get("time", point.get("time_short", "0:0")))
+            parts = text_time.split(":")
+            minute = int(parts[0]) * 60 + int(parts[1])
+            if 960 <= minute <= 1404 and point.get("pnl") is not None:
+                item = dict(point)
+                item["pnl"] = round(offset + float(point["pnl"]), 2)
+                combined.append(item)
+        except (AttributeError, TypeError, ValueError, IndexError):
+            continue
+    return sorted(combined, key=lambda p: float(p.get("ts", 0.0)))
+
 def get_history_analytics():
     pnl_data = get_pnl_tracker_data()
     mcx_pnl_data = get_mcx_pnl_tracker_data()
 
-    base_capital = 195784.0
+    base_capital = PERCENT_BASE_CAPITAL
 
     daily_nifty = {}
     for d, val in pnl_data.get("daily_pnl", {}).items():
@@ -654,8 +686,6 @@ def get_history_analytics():
         total_mtd = monthly_breakdown.get(curr_month, {}).get("total", 0.0)
 
         payload = {
-            "initial_capital": base_capital,
-            "live_capital": round(base_capital + tot_all_days, 2),
             "daily_pnl": daily_breakdown,
             "monthly_pnl": monthly_breakdown,
             "nifty": {
@@ -698,7 +728,7 @@ def get_aggregated_dashboard_state() -> dict:
     hhmm = now_ist.strftime("%H:%M")
     is_weekday = now_ist.weekday() < 5
     nifty_session_active = is_weekday and "09:15" <= hhmm < "15:35"
-    mcx_session_active = is_weekday and "15:30" <= hhmm <= "23:24"
+    mcx_session_active = is_weekday and "16:00" <= hhmm <= "23:24"
 
     nifty_realized = float(nifty_snap.get("realized_pnl", 0.0) or 0.0)
     nifty_unrealized = float(nifty_snap.get("unrealized_pnl", 0.0) or 0.0)
@@ -741,21 +771,13 @@ def get_aggregated_dashboard_state() -> dict:
 
     # 3. Single Shared Capital Account
     # Both NIFTY and MCX reuse the exact same initial account capital (not separate funds)
-    account_initial_capital = 195784.0
-    combined_net_pct = (combined_net / account_initial_capital) * 100.0 if account_initial_capital else 0.0
+    account_initial_capital = PERCENT_BASE_CAPITAL
+    combined_net_pct = (combined_net / account_initial_capital) * 100.0
     combined_mtd_pnl = round(nifty_mtd_pnl + mcx_mtd_pnl, 2)
     combined_ytd_pnl = round(nifty_ytd_pnl + mcx_ytd_pnl, 2)
 
-    # Live Capital = Initial Fund + all days' PnL of both strategies
-    unified_live_capital = round(account_initial_capital + combined_ytd_pnl, 2)
-    unified_growth_pct = round(((unified_live_capital - account_initial_capital) / account_initial_capital) * 100.0, 2) if account_initial_capital else 0.0
-    unified_circuit_limit = round(-unified_live_capital * 0.018, 2)
-    unified_circuit_used = min(100.0, max(0.0, (abs(combined_net) / abs(unified_circuit_limit)) * 100.0)) if combined_net < 0 and unified_circuit_limit else 0.0
-
-    nifty_circuit_limit = unified_circuit_limit
-    nifty_circuit_used = min(100.0, max(0.0, (abs(nifty_net) / abs(unified_circuit_limit)) * 100.0)) if nifty_net < 0 and unified_circuit_limit else 0.0
-    mcx_circuit_limit = unified_circuit_limit
-    mcx_circuit_used = min(100.0, max(0.0, (abs(mcx_net) / abs(unified_circuit_limit)) * 100.0)) if mcx_net < 0 and unified_circuit_limit else 0.0
+    # All dashboard percentages use the fixed ₹2,00,000 reporting base.
+    # No live-capital or account-growth value is derived or exposed.
 
     # Build 2-part daily history without any overwriting
     daily_breakdown = {}
@@ -779,10 +801,7 @@ def get_aggregated_dashboard_state() -> dict:
         monthly_breakdown[mk]["mcx"] = round(monthly_breakdown[mk]["mcx"] + b["mcx"], 2)
         monthly_breakdown[mk]["total"] = round(monthly_breakdown[mk]["total"] + b["total"], 2)
 
-    live_capital = unified_live_capital
     base_capital = account_initial_capital
-    capital_growth_pct = unified_growth_pct
-    circuit_limit = unified_circuit_limit
     mtd_pnl = combined_mtd_pnl
     ytd_pnl = combined_ytd_pnl
 
@@ -925,6 +944,9 @@ def get_aggregated_dashboard_state() -> dict:
     mcx_intraday_series = update_market_intraday_series(
         "MCX", mcx_net, (mcx_net / base_capital) * 100.0 if base_capital else None, 16, 0, 23, 24
     )
+    combined_intraday_series = build_combined_intraday_series(
+        nifty_intraday_series, mcx_intraday_series, nifty_net
+    )
 
     return {
         "status": "success",
@@ -943,11 +965,6 @@ def get_aggregated_dashboard_state() -> dict:
             "combined_net_pct": (combined_net / account_initial_capital) * 100.0 if account_initial_capital else 0.0,
             "combined_realized": combined_realized,
             "combined_unrealized": combined_unrealized,
-            "current_capital": unified_live_capital,
-            "base_capital": account_initial_capital,
-            "capital_growth_pct": unified_growth_pct,
-            "circuit_limit": unified_circuit_limit,
-            "circuit_used_pct": unified_circuit_used,
             "mtd_pnl": combined_mtd_pnl,
             "combined_mtd_pct": (combined_mtd_pnl / account_initial_capital) * 100.0 if account_initial_capital else 0.0,
             "ytd_pnl": combined_ytd_pnl,
@@ -966,11 +983,6 @@ def get_aggregated_dashboard_state() -> dict:
             "unrealized_pnl": nifty_unrealized,
             "net_pnl": nifty_net,
             "net_pct": (nifty_net / account_initial_capital) * 100.0 if account_initial_capital else 0.0,
-            "base_capital": account_initial_capital,
-            "current_capital": unified_live_capital,
-            "capital_growth_pct": unified_growth_pct,
-            "circuit_limit": unified_circuit_limit,
-            "circuit_used_pct": nifty_circuit_used,
             "mtd_pnl": nifty_mtd_pnl,
             "mtd_pct": (nifty_mtd_pnl / account_initial_capital) * 100.0 if account_initial_capital else 0.0,
             "ytd_pnl": nifty_ytd_pnl,
@@ -1004,11 +1016,6 @@ def get_aggregated_dashboard_state() -> dict:
             "unrealized_pnl": mcx_unrealized,
             "net_pnl": mcx_net,
             "net_pct": (mcx_net / account_initial_capital) * 100.0 if account_initial_capital else 0.0,
-            "base_capital": account_initial_capital,
-            "current_capital": unified_live_capital,
-            "capital_growth_pct": unified_growth_pct,
-            "circuit_limit": unified_circuit_limit,
-            "circuit_used_pct": mcx_circuit_used,
             "mtd_pnl": mcx_mtd_pnl,
             "mtd_pct": (mcx_mtd_pnl / account_initial_capital) * 100.0 if account_initial_capital else 0.0,
             "ytd_pnl": mcx_ytd_pnl,
@@ -1031,7 +1038,7 @@ def get_aggregated_dashboard_state() -> dict:
         },
         "positions": nifty_positions + mcx_positions,
         "recent_trades": all_trades[:35],
-        "intraday_series": update_intraday_pnl_series(combined_net, combined_net_pct),
+        "intraday_series": combined_intraday_series,
         "history_analytics": get_history_analytics(),
         "trade_analytics": trade_analytics,
     }
@@ -2407,7 +2414,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         </div>
         <div class="kpi-val" id="net-mtm-val">₹0.00</div>
         <div class="kpi-sub">
-          <span><span id="kpi-capital-sub-label">Initial capital</span>: <b id="base-capital-label" style="color:#fff;">₹1,95,784.00</b></span>
+          <span>Percent base: <b style="color:#fff;">₹2,00,000</b></span>
         </div>
       </div>
 
@@ -2420,22 +2427,6 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         <div class="kpi-val" id="realized-val">₹0.00</div>
         <div class="kpi-sub">
           <span><span id="kpi-unrealized-label">Floating MTM</span>: <b id="unrealized-val" style="color:#fff;">₹0.00</b> <span id="unrealized-pct" style="font-weight:700;">(+0.00%)</span></span>
-        </div>
-      </div>
-
-      <!-- Live Capital & Circuit Limit -->
-      <div class="kpi-card">
-        <div class="kpi-label">
-          <span id="kpi-capital-title">Live Capital</span>
-          <span id="capital-return-pct" class="tag-pct" style="font-size:0.75rem;">+0.00%</span>
-        </div>
-        <div class="kpi-val" id="capital-val">₹1,95,784.00</div>
-        <div class="circuit-track">
-          <div class="circuit-fill" id="circuit-fill-bar"></div>
-        </div>
-        <div class="kpi-sub" style="justify-content:space-between; margin-top:6px;">
-          <span><span id="kpi-circuit-label">Circuit Break</span>: <b id="circuit-val" style="color:var(--red);">-₹3,600</b></span>
-          <span id="circuit-used-text" style="font-size:0.7rem; color:var(--text-dim);">0% Used</span>
         </div>
       </div>
 
@@ -2921,7 +2912,8 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
 
   <script>
     let activeTab = 'nifty';
-    let dashboardBaseCapital = 195784.0;
+    const DASHBOARD_PERCENT_BASE = 200000.0;
+    let dashboardBaseCapital = DASHBOARD_PERCENT_BASE;
 
     function toggleMobileDrawer() {
       const drawer = document.getElementById('mobile-drawer');
@@ -2988,85 +2980,71 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       const m = data.mcx || {};
       const sys = data.system || {};
 
-      dashboardBaseCapital = 195784.0;
-      const baseCap = 195784.0;
+      dashboardBaseCapital = DASHBOARD_PERCENT_BASE;
+      const baseCap = DASHBOARD_PERCENT_BASE;
 
-      // Single shared live capital account for both strategies
       const sharedBaseCap = baseCap;
-      const sharedLiveCap = Number.isFinite(Number(p.current_capital)) ? Number(p.current_capital) : baseCap;
-      const sharedGrowthPct = Number.isFinite(Number(p.capital_growth_pct)) ? Number(p.capital_growth_pct) : (((sharedLiveCap - sharedBaseCap) / sharedBaseCap) * 100.0);
-      const sharedCircuit = Number.isFinite(Number(p.circuit_limit)) ? Number(p.circuit_limit) : -sharedLiveCap * 0.018;
 
-      let netMtm = 0.0;
-      let netPct = 0.0;
-      let realPnl = 0.0;
-      let unrealPnl = 0.0;
+      let netMtm = null;
+      let netPct = null;
+      let realPnl = null;
+      let unrealPnl = null;
       let netTitle = 'Net MTM P&L';
       let realTitle = 'Realized Booked';
       let unrealLabel = 'Floating MTM';
-      let capTitle = 'Live Capital (Shared Fund)';
-      let capSubLabel = 'Initial Fund';
-      let capSubValue = fmtINR(sharedBaseCap);
-      let capVal = sharedLiveCap;
-      let capRetPct = sharedGrowthPct;
-      let circVal = sharedCircuit;
-      let usedPct = null;
       let mtdTitle = 'MTD Performance';
-      let mtdVal = 0.0;
-      let mtdPct = 0.0;
+      let mtdVal = null;
+      let mtdPct = null;
       let ytdLabel = 'Year-to-Date';
-      let ytdVal = 0.0;
-      let ytdPct = 0.0;
+      let ytdVal = null;
+      let ytdPct = null;
       let tradeCount = 0;
 
       if (activeTab === 'nifty') {
-        netMtm = Number.isFinite(Number(n.net_pnl)) ? Number(n.net_pnl) : 0.0;
-        netPct = (netMtm / sharedBaseCap) * 100.0;
-        realPnl = Number.isFinite(Number(n.realized_pnl)) ? Number(n.realized_pnl) : 0.0;
-        unrealPnl = Number.isFinite(Number(n.unrealized_pnl)) ? Number(n.unrealized_pnl) : 0.0;
+        netMtm = Number.isFinite(Number(n.net_pnl)) ? Number(n.net_pnl) : null;
+        netPct = netMtm === null ? null : (netMtm / sharedBaseCap) * 100.0;
+        realPnl = Number.isFinite(Number(n.realized_pnl)) ? Number(n.realized_pnl) : null;
+        unrealPnl = Number.isFinite(Number(n.unrealized_pnl)) ? Number(n.unrealized_pnl) : null;
         netTitle = sys.nifty_session_active ? 'NIFTY Net MTM (Live)' : 'NIFTY Net MTM (Session Locked)';
         realTitle = 'NIFTY Realized';
         unrealLabel = 'NIFTY Floating';
-        usedPct = Number.isFinite(Number(n.circuit_used_pct)) ? Number(n.circuit_used_pct) : null;
         mtdTitle = 'NIFTY MTD Performance';
-        mtdVal = Number.isFinite(Number(n.mtd_pnl)) ? Number(n.mtd_pnl) : 0.0;
-        mtdPct = (mtdVal / sharedBaseCap) * 100.0;
+        mtdVal = Number.isFinite(Number(n.mtd_pnl)) ? Number(n.mtd_pnl) : null;
+        mtdPct = mtdVal === null ? null : (mtdVal / sharedBaseCap) * 100.0;
         ytdLabel = 'NIFTY YTD';
-        ytdVal = Number.isFinite(Number(n.ytd_pnl)) ? Number(n.ytd_pnl) : 0.0;
-        ytdPct = (ytdVal / sharedBaseCap) * 100.0;
+        ytdVal = Number.isFinite(Number(n.ytd_pnl)) ? Number(n.ytd_pnl) : null;
+        ytdPct = ytdVal === null ? null : (ytdVal / sharedBaseCap) * 100.0;
         tradeCount = n.trades_today || (n.trades || []).length || 0;
       } else if (activeTab === 'mcx') {
-        netMtm = Number.isFinite(Number(m.net_pnl)) ? Number(m.net_pnl) : 0.0;
-        netPct = (netMtm / sharedBaseCap) * 100.0;
-        realPnl = Number.isFinite(Number(m.realized_pnl)) ? Number(m.realized_pnl) : 0.0;
-        unrealPnl = Number.isFinite(Number(m.unrealized_pnl)) ? Number(m.unrealized_pnl) : 0.0;
+        netMtm = Number.isFinite(Number(m.net_pnl)) ? Number(m.net_pnl) : null;
+        netPct = netMtm === null ? null : (netMtm / sharedBaseCap) * 100.0;
+        realPnl = Number.isFinite(Number(m.realized_pnl)) ? Number(m.realized_pnl) : null;
+        unrealPnl = Number.isFinite(Number(m.unrealized_pnl)) ? Number(m.unrealized_pnl) : null;
         netTitle = sys.mcx_session_active ? 'MCX Net MTM (Live)' : 'MCX Net MTM';
         realTitle = 'MCX Realized';
         unrealLabel = 'MCX Floating';
-        usedPct = Number.isFinite(Number(m.circuit_used_pct)) ? Number(m.circuit_used_pct) : null;
         mtdTitle = 'MCX MTD Performance';
-        mtdVal = Number.isFinite(Number(m.mtd_pnl)) ? Number(m.mtd_pnl) : 0.0;
-        mtdPct = (mtdVal / sharedBaseCap) * 100.0;
+        mtdVal = Number.isFinite(Number(m.mtd_pnl)) ? Number(m.mtd_pnl) : null;
+        mtdPct = mtdVal === null ? null : (mtdVal / sharedBaseCap) * 100.0;
         ytdLabel = 'MCX YTD';
-        ytdVal = Number.isFinite(Number(m.ytd_pnl)) ? Number(m.ytd_pnl) : 0.0;
-        ytdPct = (ytdVal / sharedBaseCap) * 100.0;
+        ytdVal = Number.isFinite(Number(m.ytd_pnl)) ? Number(m.ytd_pnl) : null;
+        ytdPct = ytdVal === null ? null : (ytdVal / sharedBaseCap) * 100.0;
         tradeCount = m.trades_today || (m.trades || []).length || 0;
       } else {
         // Unified overview
-        netMtm = Number.isFinite(Number(p.combined_net_mtm)) ? Number(p.combined_net_mtm) : 0.0;
-        netPct = (netMtm / sharedBaseCap) * 100.0;
-        realPnl = Number.isFinite(Number(p.combined_realized)) ? Number(p.combined_realized) : 0.0;
-        unrealPnl = Number.isFinite(Number(p.combined_unrealized)) ? Number(p.combined_unrealized) : 0.0;
+        netMtm = Number.isFinite(Number(p.combined_net_mtm)) ? Number(p.combined_net_mtm) : null;
+        netPct = netMtm === null ? null : (netMtm / sharedBaseCap) * 100.0;
+        realPnl = Number.isFinite(Number(p.combined_realized)) ? Number(p.combined_realized) : null;
+        unrealPnl = Number.isFinite(Number(p.combined_unrealized)) ? Number(p.combined_unrealized) : null;
         netTitle = 'Unified Net MTM (NIFTY + MCX)';
         realTitle = 'Unified Realized';
         unrealLabel = 'Unified Floating';
-        usedPct = Number.isFinite(Number(p.circuit_used_pct)) ? Number(p.circuit_used_pct) : null;
         mtdTitle = 'Unified MTD (NIFTY + MCX)';
-        mtdVal = Number.isFinite(Number(p.mtd_pnl)) ? Number(p.mtd_pnl) : 0.0;
-        mtdPct = (mtdVal / sharedBaseCap) * 100.0;
+        mtdVal = Number.isFinite(Number(p.mtd_pnl)) ? Number(p.mtd_pnl) : null;
+        mtdPct = mtdVal === null ? null : (mtdVal / sharedBaseCap) * 100.0;
         ytdLabel = 'Unified YTD';
-        ytdVal = Number.isFinite(Number(p.ytd_pnl)) ? Number(p.ytd_pnl) : 0.0;
-        ytdPct = (ytdVal / sharedBaseCap) * 100.0;
+        ytdVal = Number.isFinite(Number(p.ytd_pnl)) ? Number(p.ytd_pnl) : null;
+        ytdPct = ytdVal === null ? null : (ytdVal / sharedBaseCap) * 100.0;
         tradeCount = p.total_trades || 0;
       }
 
@@ -3080,7 +3058,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       const netPctEl = document.getElementById('net-mtm-pct');
       if (netPctEl) {
         netPctEl.innerText = fmtPct(netPct);
-        netPctEl.className = 'tag-pct ' + (netPct >= 0 ? 'pos' : 'neg');
+        netPctEl.className = 'tag-pct ' + (netPct === null ? '' : (netPct >= 0 ? 'pos' : 'neg'));
       }
 
       const realTitleEl = document.getElementById('kpi-realized-title');
@@ -3090,11 +3068,11 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         realEl.innerText = fmtINR(realPnl, true);
         applyClass(realEl, realPnl);
       }
-      const realPct = (realPnl / sharedBaseCap) * 100.0;
+      const realPct = realPnl === null ? null : (realPnl / sharedBaseCap) * 100.0;
       const realPctEl = document.getElementById('realized-pct');
       if (realPctEl) {
         realPctEl.innerText = fmtPct(realPct);
-        realPctEl.className = 'tag-pct ' + (realPct >= 0 ? 'pos' : 'neg');
+        realPctEl.className = 'tag-pct ' + (realPct === null ? '' : (realPct >= 0 ? 'pos' : 'neg'));
       }
 
       const unrealLabelEl = document.getElementById('kpi-unrealized-label');
@@ -3104,35 +3082,12 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         unrealEl.innerText = fmtINR(unrealPnl, true);
         applyClass(unrealEl, unrealPnl);
       }
-      const unrealPct = (unrealPnl / sharedBaseCap) * 100.0;
+      const unrealPct = unrealPnl === null ? null : (unrealPnl / sharedBaseCap) * 100.0;
       const unrealPctEl = document.getElementById('unrealized-pct');
       if (unrealPctEl) {
         unrealPctEl.innerText = `(${fmtPct(unrealPct)})`;
-        unrealPctEl.style.color = unrealPnl >= 0 ? 'var(--green)' : 'var(--red)';
+        unrealPctEl.style.color = unrealPnl === null ? 'var(--text-dim)' : (unrealPnl >= 0 ? 'var(--green)' : 'var(--red)');
       }
-
-      const capTitleEl = document.getElementById('kpi-capital-title');
-      if (capTitleEl) capTitleEl.innerText = capTitle;
-      const capSubLabelEl = document.getElementById('kpi-capital-sub-label');
-      if (capSubLabelEl) capSubLabelEl.innerText = capSubLabel;
-      const baseCapitalEl = document.getElementById('base-capital-label');
-      if (baseCapitalEl) baseCapitalEl.innerText = capSubValue;
-
-      // Strategy or Account Level Capital
-      const capValEl = document.getElementById('capital-val');
-      if (capValEl) capValEl.innerText = fmtINR(capVal);
-      const circValEl = document.getElementById('circuit-val');
-      if (circValEl) circValEl.innerText = fmtINR(circVal);
-      const capRetEl = document.getElementById('capital-return-pct');
-      if (capRetEl) {
-        capRetEl.innerText = `${fmtPct(capRetPct)} Growth`;
-        capRetEl.className = 'tag-pct ' + (capRetPct >= 0 ? 'pos' : 'neg');
-      }
-
-      const cFill = document.getElementById('circuit-fill-bar');
-      if (cFill) cFill.style.width = usedPct === null ? '0%' : `${Math.min(100, Math.max(0, usedPct))}%`;
-      const cText = document.getElementById('circuit-used-text');
-      if (cText) cText.innerText = usedPct === null ? '0% Used' : `${usedPct.toFixed(1)}% Used`;
 
       // Strategy or Account Level MTD & YTD
       const mtdTitleEl = document.getElementById('kpi-mtd-title');
@@ -3145,7 +3100,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       const mtdPctEl = document.getElementById('mtd-pct');
       if (mtdPctEl) {
         mtdPctEl.innerText = fmtPct(mtdPct);
-        mtdPctEl.className = 'tag-pct ' + (mtdPct >= 0 ? 'pos' : 'neg');
+        mtdPctEl.className = 'tag-pct ' + (mtdPct === null ? '' : (mtdPct >= 0 ? 'pos' : 'neg'));
       }
 
       const ytdLabelEl = document.getElementById('kpi-ytd-label');
@@ -3158,7 +3113,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       const ytdPctEl = document.getElementById('ytd-pct');
       if (ytdPctEl) {
         ytdPctEl.innerText = `(${fmtPct(ytdPct)})`;
-        ytdPctEl.style.color = ytdPct >= 0 ? 'var(--green)' : 'var(--red)';
+        ytdPctEl.style.color = ytdPct === null ? 'var(--text-dim)' : (ytdPct >= 0 ? 'var(--green)' : 'var(--red)');
       }
 
       const tradesCountPill = document.getElementById('trades-count-pill');
@@ -3316,8 +3271,8 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
           ]
         };
         chartSeries = Array.isArray(m.intraday_series) ? m.intraday_series : [];
-        chartCurNet = Number.isFinite(Number(m.net_pnl)) ? Number(m.net_pnl) : 0.0;
-        chartCurPct = Number.isFinite(Number(m.net_pct)) ? Number(m.net_pct) : 0.0;
+        chartCurNet = Number.isFinite(Number(m.net_pnl)) ? Number(m.net_pnl) : null;
+        chartCurPct = Number.isFinite(Number(m.net_pct)) ? Number(m.net_pct) : null;
         liveChipText = isLiveActive ? 'LIVE STREAM' : 'STANDBY';
         liveChipClass = isLiveActive ? 'chip-green' : 'chip-dim';
       } else if (activeTab === 'overview') {
@@ -3340,8 +3295,8 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
           ]
         };
         chartSeries = Array.isArray(data.intraday_series) ? data.intraday_series : [];
-        chartCurNet = Number.isFinite(Number(p.combined_net_mtm)) ? Number(p.combined_net_mtm) : 0.0;
-        chartCurPct = Number.isFinite(Number(p.combined_net_pct)) ? Number(p.combined_net_pct) : 0.0;
+        chartCurNet = Number.isFinite(Number(p.combined_net_mtm)) ? Number(p.combined_net_mtm) : null;
+        chartCurPct = Number.isFinite(Number(p.combined_net_pct)) ? Number(p.combined_net_pct) : null;
         liveChipText = isLiveActive ? 'UNIFIED STREAM' : 'MARKET CLOSED';
         liveChipClass = isLiveActive ? 'chip-green' : 'chip-dim';
       } else {
@@ -3366,10 +3321,21 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
           ]
         };
         chartSeries = Array.isArray(n.intraday_series) ? n.intraday_series : [];
-        chartCurNet = Number.isFinite(Number(n.net_pnl)) ? Number(n.net_pnl) : 0.0;
-        chartCurPct = Number.isFinite(Number(n.net_pct)) ? Number(n.net_pct) : 0.0;
+        chartCurNet = Number.isFinite(Number(n.net_pnl)) ? Number(n.net_pnl) : null;
+        chartCurPct = Number.isFinite(Number(n.net_pct)) ? Number(n.net_pct) : null;
         liveChipText = isLiveActive ? 'LIVE STREAM' : 'SESSION CLOSED (15:35)';
         liveChipClass = isLiveActive ? 'chip-green' : 'chip-dim';
+      }
+
+      // Keep the visible endpoint synchronized with the latest live value.
+      // The persisted series is sampled every few seconds; without this point
+      // the dot and trajectory lag behind the header during fast moves.
+      if (isLiveActive && chartCurNet !== null) {
+        const liveTime = data.time_str || '';
+        const lastPoint = chartSeries[chartSeries.length - 1];
+        if (!lastPoint || lastPoint.time !== liveTime || Number(lastPoint.pnl) !== chartCurNet) {
+          chartSeries = chartSeries.concat([{ time: liveTime, pnl: chartCurNet, pct: chartCurPct }]).slice(-5000);
+        }
       }
 
       const iconEl = document.getElementById('chart-market-icon');
@@ -3386,7 +3352,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       const curNetEl = document.getElementById('chart-cur-mtm');
       if (curNetEl) {
         curNetEl.innerText = `${fmtINR(chartCurNet, true)} (${fmtPct(chartCurPct)})`;
-        curNetEl.style.color = chartCurNet >= 0 ? 'var(--green)' : 'var(--red)';
+        curNetEl.style.color = chartCurNet === null ? 'var(--text-dim)' : (chartCurNet >= 0 ? 'var(--green)' : 'var(--red)');
       }
     }
 
@@ -3400,7 +3366,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       const curNetEl = document.getElementById('chart-cur-mtm');
       if (curNetEl) {
         curNetEl.innerText = `${fmtINR(chartCurNet, true)} (${fmtPct(chartCurPct)})`;
-        curNetEl.style.color = chartCurNet >= 0 ? 'var(--green)' : 'var(--red)';
+        curNetEl.style.color = chartCurNet === null ? 'var(--text-dim)' : (chartCurNet >= 0 ? 'var(--green)' : 'var(--red)');
       }
     }
 
@@ -3511,7 +3477,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       ctx.fillStyle = '#94a3b8';
       ctx.fillText('₹0 (0%)', padLeft - 6, zeroY + 3.5);
 
-      const baseCap = (dashboardBaseCapital && dashboardBaseCapital > 0) ? dashboardBaseCapital : 195784.0;
+      const baseCap = DASHBOARD_PERCENT_BASE;
 
       // Upper guideline
       const upperPnl = maxPnl > 0 ? maxPnl : 1000;
@@ -3548,17 +3514,22 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       if (chartSeries.length > 0) {
         for (const pt of chartSeries) {
           const m = timeStrToMin(pt.time || pt.time_short);
+          const pnl = Number(pt.pnl);
+          if (!Number.isFinite(pnl) || m < startMin - 0.01 || m > endMin + 0.01) continue;
           const px = minToX(m);
-          const py = pnlToY(Number(pt.pnl) || 0);
-          points.push({ x: px, y: py, pnl: Number(pt.pnl) || 0, pct: Number(pt.pct) || 0, time: pt.time || pt.time_short });
+          const py = pnlToY(pnl);
+          const pct = Number(pt.pct);
+          points.push({ x: px, y: py, pnl, pct: Number.isFinite(pct) ? pct : null, time: pt.time || pt.time_short });
         }
       }
 
       if (points.length === 0) {
-        const startX = minToX(startMin);
-        const startY = pnlToY(0.0);
-        const firstTickLabel = chartConfig.timeTicks[0]?.label || '09:15';
-        points.push({ x: startX, y: startY, pnl: 0, pct: 0, time: firstTickLabel });
+        ctx.fillStyle = 'rgba(148,163,184,.8)';
+        ctx.font = '11px "JetBrains Mono", monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('Not enough data', padLeft + plotW / 2, padTop + plotH / 2);
+        ctx.restore();
+        return;
       }
 
       points.sort((a, b) => a.x - b.x);
@@ -3840,7 +3811,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
             <div style="font-family:var(--mono); font-size:0.75rem; font-weight:800; margin-bottom:6px;" class="${colorClass}">
               ${fmtINR(d.total_pnl, true)}
               <div style="font-size:0.65rem; font-weight:700; opacity:0.85; margin-top:2px;">
-                <span style="color:var(--cyan);">⚡ ${fmtINR(d.nifty_pnl||0, true)}</span> <span style="color:var(--amber); margin-left:4px;">🛢️ ${fmtINR(d.mcx_pnl||0, true)}</span>
+                <span style="color:var(--cyan);">⚡ ${fmtINR(d.nifty_pnl, true)}</span> <span style="color:var(--amber); margin-left:4px;">🛢️ ${fmtINR(d.mcx_pnl, true)}</span>
               </div>
             </div>
             <div class="dow-bar-track">
@@ -3869,27 +3840,27 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         const isPos = m.total_pnl >= 0;
         const cClass = isPos ? 'positive' : 'negative';
         const tagClass = isPos ? 'pos' : 'neg';
-        const wr = Math.round(m.win_rate || 0);
+        const wr = Number.isFinite(Number(m.win_rate)) ? Math.round(Number(m.win_rate)) : null;
 
         return `
           <div class="hist-box" style="padding:16px; border-radius:16px; position:relative; overflow:hidden;">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
               <div class="hist-title" style="font-size:0.8rem; font-weight:700; color:var(--text-muted);">${m.month}</div>
-              <span class="tag-pct ${tagClass}" style="font-size:0.75rem;">${fmtPct(m.pct)} on Cap</span>
+              <span class="tag-pct ${tagClass}" style="font-size:0.75rem;">${fmtPct(m.pct)} on ₹2L base</span>
             </div>
             <div class="hist-num ${cClass}" style="font-size:1.35rem; margin-bottom:8px;">
               ${fmtINR(m.total_pnl, true)}
             </div>
             <div style="display:flex; justify-content:space-between; align-items:center; font-size:0.72rem; margin-bottom:8px; padding:4px 8px; background:rgba(255,255,255,0.03); border-radius:6px; font-family:var(--mono);">
-              <span><span style="color:var(--cyan); font-weight:700;">⚡ NIFTY:</span> ${fmtINR(m.nifty_pnl || 0, true)}</span>
-              <span><span style="color:var(--amber); font-weight:700;">🛢️ MCX:</span> ${fmtINR(m.mcx_pnl || 0, true)}</span>
+              <span><span style="color:var(--cyan); font-weight:700;">⚡ NIFTY:</span> ${fmtINR(m.nifty_pnl, true)}</span>
+              <span><span style="color:var(--amber); font-weight:700;">🛢️ MCX:</span> ${fmtINR(m.mcx_pnl, true)}</span>
             </div>
             <div style="font-size:0.74rem; color:var(--text-dim); display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
               <span>${m.days} Trading Days</span>
-              <span style="color:${wr >= 50 ? 'var(--green)' : 'var(--amber)'}; font-weight:700;">${wr}% Win Rate</span>
+              <span style="color:${wr === null ? 'var(--text-dim)' : (wr >= 50 ? 'var(--green)' : 'var(--amber)')}; font-weight:700;">${wr === null ? 'Not enough data' : `${wr}% Win Rate`}</span>
             </div>
             <div class="circuit-track" style="height:4px; margin-top:0;">
-              <div style="height:100%; width:${wr}%; background:${wr >= 50 ? 'var(--green)' : 'var(--amber)'}; border-radius:999px;"></div>
+              <div style="height:100%; width:${wr === null ? 0 : wr}%; background:${wr !== null && wr >= 50 ? 'var(--green)' : 'var(--amber)'}; border-radius:999px;"></div>
             </div>
           </div>
         `;
@@ -3926,11 +3897,11 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
               ${fmtINR(d.pnl, true)}
             </div>
             <div style="display:flex; justify-content:space-between; align-items:center; font-size:0.68rem; margin-bottom:6px; padding:3px 6px; background:rgba(255,255,255,0.03); border-radius:4px; font-family:var(--mono);">
-              <span style="color:${(d.nifty_pnl||0)>=0?'var(--green)':'var(--red)'};"><span style="color:var(--cyan); font-weight:700;">⚡</span> ${fmtINR(d.nifty_pnl || 0, true)}</span>
-              <span style="color:${(d.mcx_pnl||0)>=0?'var(--green)':'var(--red)'};"><span style="color:var(--amber); font-weight:700;">🛢️</span> ${fmtINR(d.mcx_pnl || 0, true)}</span>
+              <span style="color:${d.nifty_pnl === undefined || d.nifty_pnl === null ? 'var(--text-dim)' : (d.nifty_pnl>=0?'var(--green)':'var(--red)')};"><span style="color:var(--cyan); font-weight:700;">⚡</span> ${fmtINR(d.nifty_pnl, true)}</span>
+              <span style="color:${d.mcx_pnl === undefined || d.mcx_pnl === null ? 'var(--text-dim)' : (d.mcx_pnl>=0?'var(--green)':'var(--red)')};"><span style="color:var(--amber); font-weight:700;">🛢️</span> ${fmtINR(d.mcx_pnl, true)}</span>
             </div>
             <div style="font-size:0.72rem; font-weight:700;" class="${cClass}">
-              ${fmtPct(d.pct)} on Cap
+              ${fmtPct(d.pct)} on ₹2L base
             </div>
           </div>
         `;
@@ -3986,7 +3957,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       document.getElementById('n-net-pct').innerText = fmtPct(n.net_pct);
       document.getElementById('n-trades').innerText = n.trades_today || 0;
 
-      const nBaseCap = n.base_capital || 195784.0;
+      const nBaseCap = DASHBOARD_PERCENT_BASE;
       const nRealPct = (n.realized_pnl / nBaseCap) * 100.0;
       const nUnrealPct = (n.unrealized_pnl / nBaseCap) * 100.0;
       document.getElementById('n-realized').innerText = `${fmtINR(n.realized_pnl, true)} (${fmtPct(nRealPct)})`;
@@ -4030,7 +4001,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       document.getElementById('m-net-pct').innerText = fmtPct(m.net_pct);
       document.getElementById('m-trades').innerText = m.trades_today || 0;
 
-      const mBaseCap = m.base_capital || 195784.0;
+      const mBaseCap = DASHBOARD_PERCENT_BASE;
       const mRealPct = (m.realized_pnl / mBaseCap) * 100.0;
       const mUnrealPct = (m.unrealized_pnl / mBaseCap) * 100.0;
       const mRealEl = document.getElementById('m-realized');
@@ -4056,7 +4027,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
 
       const mSess = document.getElementById('mcx-session-chip');
       mSess.className = 'status-chip ' + (sys.mcx_session_active ? 'chip-amber' : 'chip-dim');
-      mSess.innerText = sys.mcx_session_active ? 'MARKET OPEN' : 'SESSION: 15:30 - 23:24';
+      mSess.innerText = sys.mcx_session_active ? 'MARKET OPEN' : 'SESSION: 16:00 - 23:24';
 
       document.getElementById('m-pos-count').innerText = (m.positions || []).length;
       document.getElementById('m-pos-tbody').innerHTML = renderPositionsRows(m.positions, !sys.mcx_session_active, 'MCX');
