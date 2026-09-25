@@ -4,7 +4,7 @@
 ================================================================================
 Automatically manages the lifecycle of paper trading engines in IST:
 - NIFTY Engine (upv2_paper.py): Mon-Fri 09:15 - 15:35 IST
-- MCX Engine (mcx_paper_v5.py): Mon-Fri 15:30 - 23:25 IST
+- MCX Engine (mcx_paper_v5.py): Mon-Fri 16:00 - 23:25 IST
 Includes:
 - Single-instance process lock (/tmp/trading_daily_scheduler.lock)
 - Process-group aware clean termination on SIGTERM & SIGINT
@@ -79,8 +79,8 @@ def is_nifty_session(now: datetime) -> bool:
 
 def is_mcx_session(now: datetime) -> bool:
     hhmm = now.strftime("%H:%M")
-    # Monday to Friday: 15:30 to 23:25 IST
-    return now.weekday() < 5 and "15:30" <= hhmm < "23:25"
+    # Monday to Friday: 16:00 to 23:25 IST
+    return now.weekday() < 5 and "16:00" <= hhmm < "23:25"
 
 
 def cleanup_orphans(script_name: str) -> None:
