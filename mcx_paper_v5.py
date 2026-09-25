@@ -108,9 +108,9 @@ MCX_EXIT_MINUTE     = 24
 LOT_SIZE            = 1250         # 1 lot = 1250 units
 CAPITAL             = 200000.0
 
-# ── Stop-Loss Percentages (UPV2-Identical) ─────────────────────────
-STRANGLE_SL_PCT     = 0.12         # 12% initial SL in strangle mode
-SOLO_TSL_PCT        = 0.07         # 7% trailing stop for solo surviving leg
+# ── Stop-Loss Percentages ─────────────────────────────────────────
+STRANGLE_SL_PCT     = 0.10         # 10% initial SL in strangle mode
+SOLO_TSL_PCT        = 0.05         # 5% trailing stop for solo surviving leg
 
 # ── Tick Debounce ─────────────────────────────────────────────────
 SL_DEBOUNCE_SECS    = 2.0          # Price must stay >= SL for 2s before firing
@@ -1274,7 +1274,7 @@ class NaturalGasPaperBot:
             print(TOP)
             title_l = (f'  {CY}MCX NATGAS PAPER v6.5{RS}  {DIM}│{RS}  '
                        f'{YL}UPV2 KAMA + EMA STRANGLE{RS}  {DIM}│{RS}  '
-                       f'{GR}12% SL / 7% TSL{RS}')
+                       f'{GR}10% SL / 5% TSL{RS}')
             title_r = f'{DIM}{now.strftime("%H:%M:%S IST")}{RS}  '
             pad_top = max(1, W - _ansi_len(title_l) - _ansi_len(title_r))
             print(f'{V}{title_l}{" " * pad_top}{title_r}{V}')
