@@ -617,11 +617,11 @@ class NaturalGasPaperBot:
 
                 if solo:
                     new_sl = round_to_tick(best * (1.0 + SOLO_TSL_PCT))
+                    curr_sl = float(sl_st.get('current_sl', new_sl))
+                    sl_st['current_sl'] = min(curr_sl, new_sl)
                 else:
                     new_sl = round_to_tick(entry * (1.0 + STRANGLE_SL_PCT))
-
-                curr_sl = float(sl_st.get('current_sl', new_sl))
-                sl_st['current_sl'] = min(curr_sl, new_sl)
+                    sl_st['current_sl'] = new_sl
                 sl_st['best_premium'] = best
                 sl_st['anchor_ltp'] = anchor
                 sl_st['solo_mode'] = solo
@@ -1094,6 +1094,7 @@ class NaturalGasPaperBot:
             state['best_premium'] = round(best, 2)
 
         if is_solo:
+            # ── SOLO MODE: Trailing Stop Loss (5% above best premium seen) ──
             new_sl = round_to_tick(best * (1.0 + SOLO_TSL_PCT))
             if 'current_sl' in state:
                 prem_sl = min(new_sl, state['current_sl'])
@@ -1101,16 +1102,9 @@ class NaturalGasPaperBot:
                 prem_sl = new_sl
             state['current_sl'] = prem_sl
         else:
+            # ── STRANGLE MODE: Fixed 10% SL (No trailing while strangle is intact) ──
             state['solo_mode'] = False
-            initial_sl = round_to_tick(entry_prem * (1.0 + STRANGLE_SL_PCT))
-            if best >= entry_prem:
-                prem_sl = initial_sl
-            else:
-                trail_sl = round_to_tick(best * (1.0 + SOLO_TSL_PCT))
-                prem_sl  = min(trail_sl, initial_sl)
-
-            if 'current_sl' in state:
-                prem_sl = min(prem_sl, state['current_sl'])
+            prem_sl = round_to_tick(entry_prem * (1.0 + STRANGLE_SL_PCT))
             state['current_sl'] = prem_sl
 
         if live_ltp >= prem_sl:
