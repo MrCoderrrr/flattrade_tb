@@ -1,7 +1,7 @@
 """mcx_paper_v5.py  —  v5.1 (NIFTY-Aligned Precision Hedged Straddle + Noise-Filtered Streaming EMA Engine)
 ================================================================================
 MCX Natural Gas Paper Trading Engine | Version 5.1
-Session Window: 15:30 – 23:24 IST (weekdays & Sundays)
+Session Window: 16:00 – 23:24 IST (weekdays & Sundays)
 Auto Square-Off: 23:24 IST
 
 NIFTY ARCHITECTURE ALIGNMENT & FIXES (Resolves 4k -> 1.5k PnL Degradation):
@@ -105,8 +105,8 @@ def is_expiry_week(today_date: Any, expiry_date: Any) -> bool:
 # ─────────────────────────────────────────────
 TOKEN_FILE          = 'token.txt'
 STRIKE_STEP         = 5.0          # Natural Gas strike step
-MCX_ENTRY_HOUR      = 15           # 15:30 IST open (3:30 PM)
-MCX_ENTRY_MINUTE    = 30
+MCX_ENTRY_HOUR      = 16           # 15:30 IST open (3:30 PM)
+MCX_ENTRY_MINUTE    = 0
 MCX_EXIT_HOUR       = 23
 MCX_EXIT_MINUTE     = 24           # 23:24 IST auto square-off (11:24 PM)
 LOT_SIZE            = 1250         # 1 lot = 1250 units
@@ -1618,12 +1618,12 @@ class NaturalGasPaperBot:
         RS  = Style.RESET_ALL
         print()
         print(f'{DIM}{"="*98}{RS}')
-        print(f'{CY}  MCX NATURAL GAS PAPER TRADING BOT  v5.1  |  15:30 – 23:24 IST (NIFTY LOGIC){RS}')
+        print(f'{CY}  MCX NATURAL GAS PAPER TRADING BOT  v5.1  |  16:00 – 23:24 IST (NIFTY LOGIC){RS}')
         print(f'{DIM}{"="*98}{RS}')
         print(flush=True)
 
         exp_note = f"\nTarget Expiry: {self.target_opt_expiry_str}" + (" (Next Month Rollover Active)" if self.is_rolled_over else "")
-        send_telegram(f'<pre>MCX Natural Gas\nPaper Trading Bot Online (v5.1 NIFTY-Aligned Engine)\nSession: 15:30 – 23:24 IST{exp_note}</pre>')
+        send_telegram(f'<pre>MCX Natural Gas\nPaper Trading Bot Online (v5.1 NIFTY-Aligned Engine)\nSession: 16:00 – 23:24 IST{exp_note}</pre>')
 
         last_wait_msg_ts = 0.0
 
