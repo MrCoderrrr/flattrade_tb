@@ -1,30 +1,43 @@
-"""mcx_paper_v5.py  —  v6.0 (UPV2-Aligned | MCX Natural Gas Precision Engine)
+"""mcx_paper_v5.py  —  v6.5 (UPV2-Identical Architecture | KAMA + Continuous EMA Strangle Engine)
 ================================================================================
-MCX Natural Gas Paper Trading Engine | Version 6.0
+MCX Natural Gas Paper Trading Engine | Version 6.5
 Session Window : 16:00 – 23:24 IST (weekdays)
 Auto Square-Off: 23:24 IST
 
-ARCHITECTURE (Ported from UPV2 + MCX-tuned):
-  1. ContinuousEMAEngine  – Fast:15s  Slow:90s  Anchor:300s
-     - AdaptivePersistence clamped to [3s, 20s]  (fast enough for NatGas bursts)
-     - Signal: Fast > Slow AND anchor slope > 0  → +1 (Bullish)
-              Fast < Slow AND anchor slope < 0  → -1 (Bearish)
-              else 0 (FLAT)
-  2. Pure % stop-loss — NO point clamps, NO ratchets, NO giveback floors:
-     - Strangle mode : 12% initial SL above entry premium
-       → Once in profit, trail strictly at 7% above best (lowest) premium seen
-     - Solo leg mode : On partner exit, re-anchor to live LTP
-       → Trail at 7% above best premium from the re-anchor point (ratchet only down)
-  3. Direction-aware Reversal Detector:
-     - CE re-enters ONLY when EMA signal is ≤ 0  (bullish impulse ended)
-     - PE re-enters ONLY when EMA signal is ≥ 0  (bearish impulse ended)
-  4. Always-One-Leg-Open safety net:
-     - If both legs stop out → immediately re-enter balanced ATM Straddle
-  5. In-Place Strangle Rebalance:
-     - Solo TSL hit AND strike == ATM → preserve leg, enter missing partner, reset SL
-  6. 2-second tick debounce on every SL trigger
-  7. Trade log includes ISO timestamp for web dashboard compatibility
-  8. sl_risk injected into snapshot for web dashboard Max SL Risk tile
+EXACT UPV2 ARCHITECTURE & FLOW:
+  1. Balanced Strangle Entry:
+     - Enters CE SELL and PE SELL at ATM strike (Step: 5.0 pts).
+     - Initial SL: 12% above entry premium.
+     - Once in profit (decay), trails at 7% above best (lowest) premium seen.
+  2. When One Leg Breaks (Hits SL):
+     - The broken leg is squared off (closed).
+     - The surviving leg stays OPEN, immediately re-anchors to live LTP,
+       and trails with a 7% TSL (solo_mode = True).
+     - The broken leg enters COOLDOWN mode awaiting reversal.
+  3. Continuous EMA + 1-Minute KAMA Reversal Engine (Identical to UPV2):
+     - ContinuousEMAEngine: Fast=15s, Slow=90s, Anchor=300s, Adaptive Persistence.
+     - KAMA Engine (Kaufman Adaptive Moving Average):
+       Lookback=10, Fast=3, Slow=30, Threshold=0.05 pts.
+     - Reversal Detection (ReversionDetector):
+       * CE Reversal: CE was stopped because market went UP.
+         Re-enters when KAMA 1m slope turns DOWN (slope <= -0.05)
+         OR Continuous EMA confirms bearish lock (sig == -1)
+         OR Bullish momentum exhausts (sig <= 0 and slope <= 0).
+       * PE Reversal: PE was stopped because market went DOWN.
+         Re-enters when KAMA 1m slope turns UP (slope >= +0.05)
+         OR Continuous EMA confirms bullish lock (sig == +1)
+         OR Bearish momentum exhausts (sig >= 0 and slope >= 0).
+  4. Squared Leg Re-enters at ATM:
+     - As soon as the reversal signal confirms, the squared leg re-enters
+       at current ATM strike.
+     - Strangle is now fully restored (both legs open again with fresh 12% SL).
+  5. In-Place Rebalance:
+     - If solo leg hits its 7% TSL while its strike == ATM, preserve the leg
+       and enter the missing partner to save slippage/spreads.
+  6. Always-On Safety Net:
+     - If both legs stop out (0 open legs), immediately re-enters balanced ATM straddle.
+  7. Anti-Whipsaw Debounce:
+     - 2.0-second tick debounce filter on all SL/TSL triggers.
 ================================================================================
 """
 
@@ -42,6 +55,7 @@ import urllib.request
 import zipfile
 import io
 import requests
+import numpy as np
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple, Any
@@ -62,7 +76,7 @@ except Exception as e:
     _noren_import_error = str(e)
 
 # ─────────────────────────────────────────────
-# IST helpers
+# IST Timezone helpers
 # ─────────────────────────────────────────────
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -83,52 +97,255 @@ def is_expiry_week(today_date: Any, expiry_date: Any) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# CONFIGURATION  (all tuned for MCX Natural Gas)
+# CONFIGURATION  (MCX Natural Gas Tuned)
 # ═══════════════════════════════════════════════════════════════════
+TOKEN_FILE          = 'token.txt'
+STRIKE_STEP         = 5.0          # Natural Gas strike step
+MCX_ENTRY_HOUR      = 16
+MCX_ENTRY_MINUTE    = 0
+MCX_EXIT_HOUR       = 23
+MCX_EXIT_MINUTE     = 24
+LOT_SIZE            = 1250         # 1 lot = 1250 units
+CAPITAL             = 200000.0
 
-TOKEN_FILE       = 'token.txt'
-STRIKE_STEP      = 5.0          # Natural Gas strike grid
-MCX_ENTRY_HOUR   = 16
-MCX_ENTRY_MINUTE = 0
-MCX_EXIT_HOUR    = 23
-MCX_EXIT_MINUTE  = 24
-LOT_SIZE         = 1250         # 1 lot = 1250 units
-CAPITAL          = 200000.0
-
-# ── Stop-Loss percentages (pure % — no point clamps) ──────────────
-STRANGLE_SL_PCT  = 0.12    # 12 % initial SL in strangle mode
-SOLO_TSL_PCT     = 0.07    # 7 % trailing SL for solo surviving leg
+# ── Stop-Loss Percentages (UPV2-Identical) ─────────────────────────
+STRANGLE_SL_PCT     = 0.12         # 12% initial SL in strangle mode
+SOLO_TSL_PCT        = 0.07         # 7% trailing stop for solo surviving leg
 
 # ── Tick Debounce ─────────────────────────────────────────────────
-SL_DEBOUNCE_SECS = 2.0     # price must stay >= SL for 2s before firing
+SL_DEBOUNCE_SECS    = 2.0          # Price must stay >= SL for 2s before firing
 
-# ── Cooldowns ─────────────────────────────────────────────────────
-POST_CLOSE_COOLDOWN = 0.0  # seconds between both-legs-closed and next entry
-REENTRY_COOLDOWN_S  = 0.0  # seconds before re-entering missing leg
+# ── Cooldowns & Re-Entry Debounce ─────────────────────────────────
+REENTRY_COOLDOWN_S  = 5.0          # 5 seconds minimum after a stop before reversal check
 
-# ── Momentum Bias Threshold for Deferring a Leg at Open ───────────
-STRONG_TREND_HOLD_S   = 20.0   # EMA must be locked for this long
-STRONG_TREND_SPREAD   = 0.30   # EMA15-EMA90 spread to call "strong"
+# ── KAMA Parameters (UPV2-Identical, Tuned to MCX Price Scale) ─────
+KAMA_PERIOD         = 10           # Lookback period (10 bars)
+KAMA_FAST_EMA       = 3            # Fast EMA constant
+KAMA_SLOW_EMA       = 30           # Slow EMA constant
+KAMA_MIN_SLOPE      = 0.05         # 0.05 pts (1 tick) threshold to detect slope turn
 
-# ── EMA Engine (MCX-tuned) ────────────────────────────────────────
-# Natural Gas makes fast 3–10s micro-bursts — persistence must react quickly
-EMA_FAST_HL      = 15.0    # 15s half-life  (fast momentum)
-EMA_SLOW_HL      = 90.0    # 90s half-life  (trend anchor)
-EMA_ANCHOR_HL    = 300.0   # 300s half-life (anchor slope)
-PERSISTENCE_MIN  = 3.0     # minimum signal hold before confirming (seconds)
-PERSISTENCE_MAX  = 20.0    # maximum persistence cap (NatGas is faster than Nifty)
-
-# ── Reversal: swing pullback threshold ────────────────────────────
-SWING_REVERSAL_PTS = 0.60   # NatGas tick = 0.05, so 0.60 = 12 ticks pullback
+# ── Continuous Streaming EMA Engine (UPV2-Identical) ───────────────
+EMA_FAST_HL         = 15.0         # 15s half-life (fast momentum)
+EMA_SLOW_HL         = 90.0         # 90s half-life (trend baseline)
+EMA_ANCHOR_HL       = 300.0        # 300s half-life (anchor drift)
+PERSISTENCE_MIN     = 3.0          # Clamped minimum hold time (seconds)
+PERSISTENCE_MAX     = 20.0         # Clamped maximum hold time (seconds)
 
 # ── Telegram ──────────────────────────────────────────────────────
-TELEGRAM_TOKEN = '8850507396:AAFwFm2_WxPdSM52JcCpJUj8V1rz9x3G-kE'
-CHAT_ID        = '6307066850'
-PROJECT_ROOT   = os.path.dirname(os.path.abspath(__file__))
+TELEGRAM_TOKEN      = '8850507396:AAFwFm2_WxPdSM52JcCpJUj8V1rz9x3G-kE'
+CHAT_ID             = '6307066850'
+PROJECT_ROOT        = os.path.dirname(os.path.abspath(__file__))
 
 
 # ═══════════════════════════════════════════════════════════════════
-# MCX PnL / MTD TRACKER
+# KAMA & INDICATORS (Ported from UPV2 Indicators Module)
+# ═══════════════════════════════════════════════════════════════════
+class Indicators:
+    @staticmethod
+    def calculate_kama(
+        closes: np.ndarray,
+        period: int = KAMA_PERIOD,
+        fast: int = KAMA_FAST_EMA,
+        slow: int = KAMA_SLOW_EMA,
+        min_slope: float = KAMA_MIN_SLOPE
+    ) -> Tuple[Optional[float], Optional[float], int, float]:
+        """
+        Calculates Kaufman Adaptive Moving Average (KAMA) and its slope.
+        Returns: (current_kama, prev_kama, trend_flag, kama_slope)
+          trend_flag: +1 (UP), -1 (DOWN), 0 (FLAT)
+        """
+        if closes is None:
+            return None, None, 0, 0.0
+        closes = np.asarray(closes, dtype=float)
+        valid_mask = ~np.isnan(closes) & ~np.isinf(closes)
+        closes = closes[valid_mask]
+        if len(closes) < period + 1:
+            return None, None, 0, 0.0
+
+        kama = np.zeros(len(closes))
+        kama[period - 1] = np.mean(closes[:period])
+
+        fast_sc = 2.0 / (fast + 1.0)
+        slow_sc = 2.0 / (slow + 1.0)
+
+        for i in range(period, len(closes)):
+            change = abs(closes[i] - closes[i - period])
+            volatility = np.sum(np.abs(np.diff(closes[i - period:i + 1])))
+            er = (change / volatility) if volatility > 1e-6 else 0.0
+            er = min(1.0, max(0.0, er))
+            sc = (er * (fast_sc - slow_sc) + slow_sc) ** 2
+            kama[i] = kama[i - 1] + sc * (closes[i] - kama[i - 1])
+
+        current_kama = float(kama[-1])
+        prev_kama = float(kama[-2])
+        kama_slope = current_kama - prev_kama
+
+        if kama_slope > min_slope:
+            trend = 1
+        elif kama_slope < -min_slope:
+            trend = -1
+        else:
+            trend = 0
+
+        return current_kama, prev_kama, trend, kama_slope
+
+
+# ═══════════════════════════════════════════════════════════════════
+# CONTINUOUS STREAMING EMA ENGINE (Ported from UPV2)
+# ═══════════════════════════════════════════════════════════════════
+class ContinuousEMA:
+    def __init__(self, half_life_seconds: float):
+        self.half_life_seconds = float(half_life_seconds)
+        self.value: Optional[float] = None
+        self.timestamp: Optional[float] = None
+
+    def update(self, value: float, timestamp: float) -> float:
+        if self.value is None or self.timestamp is None:
+            self.value = value
+        else:
+            dt = max(0.0, timestamp - self.timestamp)
+            alpha = 1.0 - math.exp(-math.log(2) * dt / self.half_life_seconds)
+            self.value += alpha * (value - self.value)
+        self.timestamp = timestamp
+        return self.value
+
+
+class RollingVolatility:
+    def __init__(self, window: int):
+        self.values = deque(maxlen=window)
+
+    def update(self, value: float) -> Optional[float]:
+        self.values.append(float(value))
+        if len(self.values) < 2:
+            return None
+        mean = sum(self.values) / len(self.values)
+        variance = sum((x - mean) ** 2 for x in self.values) / (len(self.values) - 1)
+        return math.sqrt(max(0.0, variance))
+
+
+class ContinuousEMAEngine:
+    def __init__(self):
+        self.emas = {
+            EMA_FAST_HL: ContinuousEMA(EMA_FAST_HL),
+            EMA_SLOW_HL: ContinuousEMA(EMA_SLOW_HL),
+            EMA_ANCHOR_HL: ContinuousEMA(EMA_ANCHOR_HL),
+        }
+        self.slow_history: deque = deque(maxlen=60)
+        self.rv = {60: RollingVolatility(60), 300: RollingVolatility(300)}
+        self.raw_signal: int = 0
+        self.signal_start_ts: Optional[float] = None
+        self.confirmed_signal: int = 0
+        self.latest_snapshot: Dict[str, Any] = {}
+
+    def update(self, spot: float, now_ts: float) -> Dict[str, Any]:
+        if spot <= 0:
+            return self.latest_snapshot
+
+        for ema in self.emas.values():
+            ema.update(spot, now_ts)
+
+        anchor_val = self.emas[EMA_ANCHOR_HL].value or spot
+        self.slow_history.append((now_ts, anchor_val))
+
+        rv60 = self.rv[60].update(spot)
+        rv300 = self.rv[300].update(spot)
+        vr = (rv60 / rv300) if rv60 is not None and rv300 and rv300 > 0 else 1.0
+
+        p_req = max(PERSISTENCE_MIN, min(PERSISTENCE_MAX, 10.0 / max(float(vr), 1e-12)))
+
+        slow_slope = 0.0
+        if len(self.slow_history) >= 2:
+            dt = self.slow_history[-1][0] - self.slow_history[0][0]
+            if dt >= 5.0:
+                slow_slope = ((self.slow_history[-1][1] - self.slow_history[0][1]) / dt) * 60.0
+
+        fast_val = self.emas[EMA_FAST_HL].value if self.emas[EMA_FAST_HL].value is not None else spot
+        slow_val = self.emas[EMA_SLOW_HL].value if self.emas[EMA_SLOW_HL].value is not None else spot
+
+        if fast_val > slow_val and slow_slope > 0:
+            sig = 1
+        elif fast_val < slow_val and slow_slope < 0:
+            sig = -1
+        else:
+            sig = 0
+
+        if sig != 0:
+            if sig != self.raw_signal:
+                self.raw_signal = sig
+                self.signal_start_ts = now_ts
+        else:
+            self.raw_signal = 0
+            self.signal_start_ts = None
+            self.confirmed_signal = 0
+
+        hold_time = (now_ts - self.signal_start_ts) if self.signal_start_ts else 0.0
+        prev_confirmed = self.confirmed_signal
+        if self.raw_signal != 0 and hold_time >= p_req:
+            self.confirmed_signal = self.raw_signal
+        else:
+            self.confirmed_signal = 0
+
+        if self.confirmed_signal != prev_confirmed:
+            d = {1: "BULLISH▲", -1: "BEARISH▼", 0: "FLAT━"}
+            print(f"[EMA] {d.get(prev_confirmed,'?')} → {d.get(self.confirmed_signal,'?')} "
+                  f"(F={fast_val:.2f} S={slow_val:.2f} slope={slow_slope:+.3f}/m "
+                  f"VR={vr:.2f} hold={hold_time:.1f}s p_req={p_req:.1f}s)", flush=True)
+
+        self.latest_snapshot = {
+            "ema_15": fast_val,
+            "ema_90": slow_val,
+            "ema_300": anchor_val,
+            "slow_slope": slow_slope,
+            "rv60": rv60 or 0.0,
+            "rv300": rv300 or 0.0,
+            "vr": vr,
+            "persistence_req": p_req,
+            "raw_signal": self.raw_signal,
+            "hold_time": hold_time,
+            "confirmed_signal": self.confirmed_signal,
+        }
+        return self.latest_snapshot
+
+
+# ═══════════════════════════════════════════════════════════════════
+# REVERSION DETECTOR (UPV2-Identical KAMA + Continuous EMA Confluence)
+# ═══════════════════════════════════════════════════════════════════
+class ReversionDetector:
+    """
+    Direction-Aware Reversal Detection ported from UPV2:
+      - CE was stopped because market surged UP.
+        Re-enter when KAMA 1m slope turns DOWN (kama_slope <= -0.05)
+        OR Continuous EMA confirms bearish lock (sig == -1)
+        OR Bullish impulse exhausts (sig <= 0 AND kama_slope <= 0).
+      - PE was stopped because market dumped DOWN.
+        Re-enter when KAMA 1m slope turns UP (kama_slope >= +0.05)
+        OR Continuous EMA confirms bullish lock (sig == +1)
+        OR Bearish impulse exhausts (sig >= 0 AND kama_slope >= 0).
+    """
+
+    @classmethod
+    def is_reversal_for_ce(cls, kama_slope: float, confirmed_sig: int) -> Tuple[bool, str]:
+        if kama_slope <= -KAMA_MIN_SLOPE:
+            return True, f"KAMA_DOWNTURN(slope={kama_slope:+.3f})"
+        if confirmed_sig == -1:
+            return True, "EMA_BEARISH_LOCK(-1)"
+        if confirmed_sig <= 0 and kama_slope <= 0.0:
+            return True, f"BULLISH_EXHAUSTED(ema={confirmed_sig}, kama_slope={kama_slope:+.3f})"
+        return False, ""
+
+    @classmethod
+    def is_reversal_for_pe(cls, kama_slope: float, confirmed_sig: int) -> Tuple[bool, str]:
+        if kama_slope >= KAMA_MIN_SLOPE:
+            return True, f"KAMA_UPTURN(slope={kama_slope:+.3f})"
+        if confirmed_sig == 1:
+            return True, "EMA_BULLISH_LOCK(+1)"
+        if confirmed_sig >= 0 and kama_slope >= 0.0:
+            return True, f"BEARISH_EXHAUSTED(ema={confirmed_sig}, kama_slope={kama_slope:+.3f})"
+        return False, ""
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PnL & DATABASE MANAGER
 # ═══════════════════════════════════════════════════════════════════
 class MCXDBManager:
     def __init__(self, filename: str = "mcx_pnl_tracker.json"):
@@ -200,7 +417,6 @@ class MCXDBManager:
         self.data["intraday_date"]   = today_str
         self._save()
 
-        # Write to daily CSV
         for log_dir in [
             os.path.join(PROJECT_ROOT, "data", "logs"),
             os.path.join(PROJECT_ROOT, "tradingbot", "data", "logs"),
@@ -236,185 +452,16 @@ class MCXDBManager:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# CONTINUOUS STREAMING EMA ENGINE  (UPV2 port, MCX-tuned)
-# ═══════════════════════════════════════════════════════════════════
-class ContinuousEMA:
-    """Continuous exponential moving average with half-life in seconds."""
-    def __init__(self, half_life_seconds: float):
-        self.half_life_seconds = float(half_life_seconds)
-        self.value: Optional[float] = None
-        self.timestamp: Optional[float] = None
-
-    def update(self, value: float, timestamp: float) -> float:
-        if self.value is None or self.timestamp is None:
-            self.value = value
-        else:
-            dt    = max(0.0, timestamp - self.timestamp)
-            alpha = 1.0 - math.exp(-math.log(2) * dt / self.half_life_seconds)
-            self.value += alpha * (value - self.value)
-        self.timestamp = timestamp
-        return self.value
-
-
-class RollingVolatility:
-    """Sample rolling standard deviation over a fixed window of ticks."""
-    def __init__(self, window: int):
-        self.values = deque(maxlen=window)
-
-    def update(self, value: float) -> Optional[float]:
-        self.values.append(float(value))
-        if len(self.values) < 2:
-            return None
-        mean     = sum(self.values) / len(self.values)
-        variance = sum((x - mean) ** 2 for x in self.values) / (len(self.values) - 1)
-        return math.sqrt(max(0.0, variance))
-
-
-class ContinuousEMAEngine:
-    """
-    Continuous streaming EMA engine (UPV2 logic, MCX-tuned persistence).
-
-    Signal logic (matches UPV2 exactly):
-      +1 Bullish : Fast > Slow  AND  anchor slope > 0
-      -1 Bearish : Fast < Slow  AND  anchor slope < 0
-       0 Flat    : everything else
-
-    Persistence clamped to [PERSISTENCE_MIN, PERSISTENCE_MAX].
-    AdaptivePersistence: P_raw = 10 / VR  → lower VR = calmer market = longer hold.
-    For NatGas (high VR bursts) this resolves quickly — typical hold = 3–8s.
-    """
-    def __init__(self):
-        self.emas = {
-            EMA_FAST_HL:   ContinuousEMA(EMA_FAST_HL),
-            EMA_SLOW_HL:   ContinuousEMA(EMA_SLOW_HL),
-            EMA_ANCHOR_HL: ContinuousEMA(EMA_ANCHOR_HL),
-        }
-        # Sliding 60-entry history for anchor slope (each entry = 1 tick ≈ 1 second)
-        self.slow_history: deque = deque(maxlen=60)
-        self.rv = {60: RollingVolatility(60), 300: RollingVolatility(300)}
-        self.raw_signal:       int            = 0
-        self.signal_start_ts:  Optional[float] = None
-        self.confirmed_signal: int            = 0
-        self.latest_snapshot:  Dict[str, Any] = {}
-
-    def update(self, spot: float, now_ts: float) -> Dict[str, Any]:
-        if spot <= 0:
-            return self.latest_snapshot
-
-        for ema in self.emas.values():
-            ema.update(spot, now_ts)
-
-        anchor_val = self.emas[EMA_ANCHOR_HL].value or spot
-        self.slow_history.append((now_ts, anchor_val))
-
-        rv60  = self.rv[60].update(spot)
-        rv300 = self.rv[300].update(spot)
-        vr    = (rv60 / rv300) if rv60 is not None and rv300 and rv300 > 0 else 1.0
-
-        # AdaptivePersistence: P = 10/VR clamped to [MIN, MAX]
-        p_req = max(PERSISTENCE_MIN, min(PERSISTENCE_MAX, 10.0 / max(float(vr), 1e-12)))
-
-        # Anchor slope over available history (points per minute)
-        slow_slope = 0.0
-        if len(self.slow_history) >= 2:
-            dt = self.slow_history[-1][0] - self.slow_history[0][0]
-            if dt >= 5.0:
-                slow_slope = ((self.slow_history[-1][1] - self.slow_history[0][1]) / dt) * 60.0
-
-        fast_val = self.emas[EMA_FAST_HL].value if self.emas[EMA_FAST_HL].value is not None else spot
-        slow_val = self.emas[EMA_SLOW_HL].value if self.emas[EMA_SLOW_HL].value is not None else spot
-
-        # Direction signal (UPV2-identical logic)
-        if fast_val > slow_val and slow_slope > 0:
-            sig = 1
-        elif fast_val < slow_val and slow_slope < 0:
-            sig = -1
-        else:
-            sig = 0
-
-        if sig != 0:
-            if sig != self.raw_signal:
-                self.raw_signal      = sig
-                self.signal_start_ts = now_ts
-        else:
-            self.raw_signal      = 0
-            self.signal_start_ts = None
-            self.confirmed_signal = 0
-
-        hold_time     = (now_ts - self.signal_start_ts) if self.signal_start_ts else 0.0
-        prev_confirmed = self.confirmed_signal
-        if self.raw_signal != 0 and hold_time >= p_req:
-            self.confirmed_signal = self.raw_signal
-        else:
-            self.confirmed_signal = 0
-
-        if self.confirmed_signal != prev_confirmed:
-            d = {1: "BULLISH▲", -1: "BEARISH▼", 0: "FLAT━"}
-            print(f"[EMA] {d.get(prev_confirmed,'?')} → {d.get(self.confirmed_signal,'?')}  "
-                  f"(F={fast_val:.2f} S={slow_val:.2f} slope={slow_slope:+.3f}/m "
-                  f"VR={vr:.2f} hold={hold_time:.1f}s p_req={p_req:.1f}s)", flush=True)
-
-        self.latest_snapshot = {
-            "ema_15":         fast_val,
-            "ema_90":         slow_val,
-            "ema_300":        anchor_val,
-            "slow_slope":     slow_slope,
-            "rv60":           rv60 or 0.0,
-            "rv300":          rv300 or 0.0,
-            "vr":             vr,
-            "persistence_req": p_req,
-            "raw_signal":     self.raw_signal,
-            "hold_time":      hold_time,
-            "confirmed_signal": self.confirmed_signal,
-        }
-        return self.latest_snapshot
-
-
-# ═══════════════════════════════════════════════════════════════════
-# DIRECTION-AWARE REVERSAL DETECTOR  (UPV2 port)
-# ═══════════════════════════════════════════════════════════════════
-class ReversionDetector:
-    """
-    Determines whether the missing leg can safely re-enter.
-
-    CE was stopped because market surged UP.
-      → Re-enter CE when the bullish impulse fades: confirmed_signal <= 0
-    PE was stopped because market crashed DOWN.
-      → Re-enter PE when the bearish impulse fades: confirmed_signal >= 0
-
-    Also triggers if price has pulled back >= SWING_REVERSAL_PTS from extreme.
-    """
-
-    @staticmethod
-    def can_reenter_ce(confirmed_signal: int, reversal_latched: bool) -> Tuple[bool, str]:
-        if reversal_latched:
-            return True, "SWING_PULLBACK"
-        if confirmed_signal <= 0:
-            return True, f"EMA_SIG={confirmed_signal}(bullish_faded)"
-        return False, ""
-
-    @staticmethod
-    def can_reenter_pe(confirmed_signal: int, reversal_latched: bool) -> Tuple[bool, str]:
-        if reversal_latched:
-            return True, "SWING_PULLBACK"
-        if confirmed_signal >= 0:
-            return True, f"EMA_SIG={confirmed_signal}(bearish_faded)"
-        return False, ""
-
-
-# ═══════════════════════════════════════════════════════════════════
-# TELEGRAM HELPERS
+# TELEGRAM NOTIFICATIONS
 # ═══════════════════════════════════════════════════════════════════
 _last_tg_dash_msg_ids: Dict[str, int] = {}
-_last_tg_dash_edit_ts:  float         = 0.0
+_last_tg_dash_edit_ts: float         = 0.0
 _tg_rate_limited_until: float         = 0.0
-
 
 def _get_tg_chat_ids() -> List[str]:
     if isinstance(CHAT_ID, list):
         return [str(c).strip() for c in CHAT_ID if str(c).strip()]
     return [c.strip() for c in str(CHAT_ID).split(',') if c.strip()]
-
 
 def send_telegram(msg: str):
     global _last_tg_dash_msg_ids
@@ -433,43 +480,35 @@ def send_telegram(msg: str):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# UTILITY
+# UTILITY FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════
 def round_to_price(value: float, step: float = STRIKE_STEP) -> float:
     return round_to_tick(math.floor(value / step + 0.5) * step)
 
-
 def round_to_tick(value: float) -> float:
-    """MCX Natural Gas min tick = 0.05"""
     return round(value * 20.0) / 20.0
-
 
 def _ansi_len(s: str) -> int:
     return len(re.sub(r'\x1b\[[0-9;]*m', '', s))
 
-
 def _pad(row: str, width: int) -> str:
     return row + ' ' * max(0, width - _ansi_len(row))
-
 
 def _fmt_pnl(val: float, width: int = 12) -> Tuple[str, str]:
     if abs(val) < 1e-4:
         val = 0.0
-    sign    = '+' if val > 0 else ('-' if val < 0 else ' ')
+    sign = '+' if val > 0 else ('-' if val < 0 else ' ')
     pnl_str = f"{sign}₹{abs(val):,.2f}"
     return sign, f"{pnl_str:>{width}}"
 
 
 # ═══════════════════════════════════════════════════════════════════
-# MAIN BOT ENGINE
+# NATURAL GAS PAPER BOT (v6.5)
 # ═══════════════════════════════════════════════════════════════════
 class NaturalGasPaperBot:
 
-    # ──────────────────────────────────────────
-    # Init
-    # ──────────────────────────────────────────
     def __init__(self):
-        # Single-instance lock
+        # Single-instance process lock
         self._lock_file = None
         try:
             import fcntl
@@ -483,56 +522,62 @@ class NaturalGasPaperBot:
             print("\n❌ [FATAL] Another MCX instance is already running! Aborting.", flush=True)
             sys.exit(0)
 
-        self.api                    = NorenApiPy() if NorenApiPy else None
+        self.api = NorenApiPy() if NorenApiPy else None
         self.positions: Dict[str, Dict] = {}
-        self.ema_engine             = ContinuousEMAEngine()
-        self.total_realized_pnl     = 0.0
-        self.trades_today           = 0
-        self.trade_log: List[Dict]  = []
+        self.ema_engine = ContinuousEMAEngine()
+
+        # ── KAMA & 1-Minute Bar Tracking (UPV2-Identical) ───────────
+        self.bars_1m: deque = deque(maxlen=60)
+        self.last_completed_1m_key: str = ""
+        self.current_kama: Optional[float] = None
+        self.prev_kama: Optional[float] = None
+        self.kama_slope: float = 0.0
+        self.kama_trend: int = 0
+
+        # ── Cooldown Tracker (UPV2-Identical) ───────────────────────
+        self.cooldown_tracker: Dict[str, Dict[str, Any]] = {
+            "CE": {"active": False, "stopped_time": 0.0, "next_eligible_time": 0.0, "reason": ""},
+            "PE": {"active": False, "stopped_time": 0.0, "next_eligible_time": 0.0, "reason": ""},
+        }
+
+        self.total_realized_pnl: float = 0.0
+        self.trades_today: int = 0
+        self.trade_log: List[Dict] = []
+        self.last_reentry_ts: float = 0.0
+        self.last_any_close_ts: float = 0.0
 
         # State file
         self.state_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                        'mcx_state_paper_v5.json')
 
         # Market data cache
-        self._mcx_master              = None
-        self._spot_cache              = {'ts': 0.0, 'val': 0.0}
-        self.front_month_futs_token:  Optional[str] = None
+        self._mcx_master = None
+        self._spot_cache = {'ts': 0.0, 'val': 0.0}
+        self.front_month_futs_token: Optional[str] = None
         self.front_month_futs_symbol: Optional[str] = None
-        self.target_opt_expiry_ts:    Optional[Any] = None
-        self.target_opt_expiry_str:   str           = ""
-        self.is_rolled_over:          bool          = False
+        self.target_opt_expiry_ts: Optional[Any] = None
+        self.target_opt_expiry_str: str = ""
+        self.is_rolled_over: bool = False
 
-        # Re-entry tracking
-        self.last_reentry_ts   = 0.0
-        self.last_any_close_ts = 0.0
-
-        # Reversal / swing tracking
-        self._reversal_latched  = False
-        self._spot_history: deque = deque(maxlen=60)
-        self._extreme_spot      = 0.0
-
-        # Dashboard timestamps
-        self._last_console_dash_ts = 0.0
-
-        # PnL tracker
+        self._last_console_dash_ts: float = 0.0
         self.db = MCXDBManager()
 
-        # Load today's state
+        # Load persisted state
         self._load_state()
 
     # ──────────────────────────────────────────
-    # State persistence
+    # State Persistence
     # ──────────────────────────────────────────
     def _save_state(self):
         try:
             state = {
-                'date':               get_ist_now().strftime('%Y-%m-%d'),
-                'positions':          self.positions,
+                'date': get_ist_now().strftime('%Y-%m-%d'),
+                'positions': self.positions,
                 'total_realized_pnl': self.total_realized_pnl,
-                'trades_today':       self.trades_today,
-                'last_reentry_ts':    self.last_reentry_ts,
-                'last_any_close_ts':  self.last_any_close_ts,
+                'trades_today': self.trades_today,
+                'last_reentry_ts': self.last_reentry_ts,
+                'last_any_close_ts': self.last_any_close_ts,
+                'cooldown_tracker': self.cooldown_tracker,
             }
             with open(self.state_file, 'w') as f:
                 json.dump(state, f, indent=2)
@@ -548,7 +593,7 @@ class NaturalGasPaperBot:
             with open(self.state_file, 'r') as f:
                 state = json.load(f)
             if state.get('date') != today_str:
-                return  # Different day — start fresh
+                return
 
             self.positions          = state.get('positions', {})
             self.total_realized_pnl = float(state.get('total_realized_pnl', 0.0))
@@ -556,33 +601,36 @@ class NaturalGasPaperBot:
             self.last_reentry_ts    = float(state.get('last_reentry_ts', 0.0))
             self.last_any_close_ts  = float(state.get('last_any_close_ts', 0.0))
 
+            saved_cd = state.get('cooldown_tracker')
+            if isinstance(saved_cd, dict):
+                for k, v in saved_cd.items():
+                    if k in self.cooldown_tracker:
+                        self.cooldown_tracker[k].update(v)
+
             is_strangle = ('CE' in self.positions and 'PE' in self.positions)
             for leg, pos in self.positions.items():
                 sl_st = pos.setdefault('sl_state', {})
-                # Rebuild SL state cleanly
-                entry   = float(pos.get('entry_price', 0.0))
-                best    = float(sl_st.get('best_premium', entry))
-                solo    = not is_strangle
+                entry = float(pos.get('entry_price', 0.0))
+                best = float(sl_st.get('best_premium', entry))
+                solo = not is_strangle
+                anchor = float(sl_st.get('anchor_ltp', entry))
 
                 if solo:
-                    anchor = float(sl_st.get('anchor_ltp', entry))
                     new_sl = round_to_tick(best * (1.0 + SOLO_TSL_PCT))
                 else:
-                    anchor = entry
                     new_sl = round_to_tick(entry * (1.0 + STRANGLE_SL_PCT))
 
                 curr_sl = float(sl_st.get('current_sl', new_sl))
-                sl_st['current_sl']    = min(curr_sl, new_sl)  # ratchet to tightest
-                sl_st['best_premium']  = best
-                sl_st['anchor_ltp']    = anchor
-                sl_st['solo_mode']     = solo
+                sl_st['current_sl'] = min(curr_sl, new_sl)
+                sl_st['best_premium'] = best
+                sl_st['anchor_ltp'] = anchor
+                sl_st['solo_mode'] = solo
                 sl_st['breach_start_ts'] = 0.0
 
             self.db.commit_daily_pnl(self.total_realized_pnl)
             mode = "strangle" if is_strangle else ("solo" if self.positions else "flat")
-            print(f'[STATE] Restored: {len(self.positions)} leg(s) | '
-                  f'mode={mode} | Realized=₹{self.total_realized_pnl:,.2f} | '
-                  f'Trades={self.trades_today}', flush=True)
+            print(f'[STATE] Restored: {len(self.positions)} leg(s) | mode={mode} | '
+                  f'Realized=₹{self.total_realized_pnl:,.2f} | Trades={self.trades_today}', flush=True)
         except Exception as e:
             print(f'[WARN] Error loading MCX state: {e}', flush=True)
 
@@ -608,16 +656,10 @@ class NaturalGasPaperBot:
         with open(token_path, 'r') as f:
             access_token = f.read().strip()
         self.api.set_session(userid=str(USER_ID).strip(), password='', usertoken=access_token)
-        try:
-            limits = self.api.get_limits()
-            if not limits or limits.get('stat') != 'Ok':
-                print('[WARN] Token validation notice: proceeding in paper mode.', flush=True)
-        except Exception as e:
-            print(f'[WARN] Session warning: {e}', flush=True)
-        print(f'[OK] MCX NatGas v6.0 PAPER bot authenticated.', flush=True)
+        print(f'[OK] MCX NatGas v6.5 authenticated from {token_path}.', flush=True)
 
     # ──────────────────────────────────────────
-    # MCX symbol master
+    # MCX Symbol Master
     # ──────────────────────────────────────────
     def _get_mcx_csv(self):
         if self._mcx_master is not None:
@@ -698,7 +740,7 @@ class NaturalGasPaperBot:
             return None
 
     # ──────────────────────────────────────────
-    # Live spot price
+    # Live Spot Price
     # ──────────────────────────────────────────
     def get_spot(self) -> float:
         now_ts = time.time()
@@ -737,7 +779,7 @@ class NaturalGasPaperBot:
         return self._spot_cache['val']
 
     # ──────────────────────────────────────────
-    # Option symbol lookup
+    # Option Symbol Lookup
     # ──────────────────────────────────────────
     def find_option_symbol(self, strike: float, option_type: str) -> Optional[Dict]:
         import pandas as pd
@@ -782,7 +824,7 @@ class NaturalGasPaperBot:
             return None
 
     # ──────────────────────────────────────────
-    # Live LTP for open leg
+    # Live LTP for Open Leg
     # ──────────────────────────────────────────
     def _get_leg_ltp(self, pos: dict, max_age: float = 0.8) -> float:
         now_ts = time.time()
@@ -810,22 +852,41 @@ class NaturalGasPaperBot:
         return pos.get('_last_ltp', pos['entry_price'])
 
     # ──────────────────────────────────────────
-    # DTE helper
+    # 1-Minute Bar & KAMA Live Aggregator
     # ──────────────────────────────────────────
-    def _get_dte_days(self) -> float:
-        if not self.target_opt_expiry_ts:
-            return 20.0
-        try:
-            import pandas as pd
-            today_date  = get_ist_now().date()
-            expiry_date = pd.to_datetime(self.target_opt_expiry_ts).date()
-            dte = (expiry_date - today_date).days
-            return float(max(0, dte))
-        except Exception:
-            return 20.0
+    def _update_kama(self, spot: float, now: datetime):
+        """
+        Maintains 1-minute close prices and updates KAMA live on every tick.
+        """
+        current_min_key = now.strftime("%Y-%m-%d %H:%M")
+        if self.last_completed_1m_key == "":
+            self.last_completed_1m_key = current_min_key
+            self.bars_1m.append(spot)
+        elif current_min_key != self.last_completed_1m_key:
+            self.bars_1m.append(spot)
+            self.last_completed_1m_key = current_min_key
+
+        # Calculate KAMA on historical 1m closes + current live spot
+        closes = list(self.bars_1m)
+        if closes and closes[-1] != spot:
+            closes.append(spot)
+
+        if len(closes) >= KAMA_PERIOD + 1:
+            kama, prev_kama, trend, slope = Indicators.calculate_kama(
+                np.array(closes), period=KAMA_PERIOD, fast=KAMA_FAST_EMA, slow=KAMA_SLOW_EMA
+            )
+            self.current_kama = kama
+            self.prev_kama = prev_kama
+            self.kama_trend = trend
+            self.kama_slope = slope
+        else:
+            self.current_kama = spot
+            self.prev_kama = spot
+            self.kama_trend = 0
+            self.kama_slope = 0.0
 
     # ──────────────────────────────────────────
-    # Enter a single leg
+    # Enter a Single Leg
     # ──────────────────────────────────────────
     def _enter_leg(self, leg: str, strike: float, side: str = 'SELL',
                    reason: str = "Standard Entry") -> Optional[dict]:
@@ -838,10 +899,9 @@ class NaturalGasPaperBot:
         tsym = match['tsym']
         ltp  = float(match.get('lp', 0.0))
         if ltp <= 0:
-            print(f'[WARN] LTP=0 for {tsym}. Skipping.', flush=True)
+            print(f'[WARN] LTP=0 for {tsym}. Skipping entry.', flush=True)
             return None
 
-        # ── Clean UPV2-style SL state (pure % only) ───────────────
         initial_sl = round_to_tick(ltp * (1.0 + STRANGLE_SL_PCT))
         now_ts     = time.time()
 
@@ -856,9 +916,9 @@ class NaturalGasPaperBot:
             '_last_ltp':    ltp,
             '_last_ltp_ts': now_ts,
             'sl_state': {
-                'best_premium':   ltp,        # lowest seen (best for seller)
-                'anchor_ltp':     ltp,        # reference point for solo anchoring
-                'current_sl':     initial_sl, # 12% above entry (strangle mode)
+                'best_premium':   ltp,
+                'anchor_ltp':     ltp,
+                'current_sl':     initial_sl,
                 'initial_sl':     initial_sl,
                 'solo_mode':      False,
                 'breach_start_ts': 0.0,
@@ -866,23 +926,28 @@ class NaturalGasPaperBot:
         }
         self.positions[leg] = pos
         self.trades_today  += 1
+
+        # Clear cooldown for this leg
+        if leg in self.cooldown_tracker:
+            self.cooldown_tracker[leg]["active"] = False
+
         self._save_state()
 
-        tg = (f'<pre>\n━━━ MCX TRADE OPENED (v6.0) ━━━\n\n'
+        tg = (f'<pre>\n━━━ MCX TRADE OPENED (v6.5) ━━━\n\n'
               f'  {leg:<4} Strike {int(strike)}  {side} @ {ltp:.2f}\n'
               f'  SL   {STRANGLE_SL_PCT*100:.0f}%  →  {initial_sl:.2f}\n'
-              f'  Qty  {LOT_SIZE}\n  {tsym}\n</pre>')
-        print(f'[ENTRY] {side} {LOT_SIZE}x {leg} Strike={int(strike)} ({tsym}) @ ₹{ltp:.2f}', flush=True)
+              f'  Qty  {LOT_SIZE}\n  {tsym}\n  Reason: {reason}\n</pre>')
+        print(f'[ENTRY] {side} {LOT_SIZE}x {leg} Strike={int(strike)} ({tsym}) @ ₹{ltp:.2f} | {reason}', flush=True)
         send_telegram(tg)
         return pos
 
     # ──────────────────────────────────────────
-    # Re-anchor surviving leg to live LTP (solo mode)
+    # Re-Anchor Surviving Leg (Solo Trailing Mode)
     # ──────────────────────────────────────────
     def _anchor_surviving_leg(self, surviving_leg: str):
         """
-        When partner leg exits, immediately re-anchor the surviving leg.
-        New SL = live_ltp * (1 + 7%)  — ratchets only downward from here.
+        When partner leg breaks (hits SL), surviving leg re-anchors to live LTP
+        and trails with a 7% TSL (solo_mode = True).
         """
         pos = self.positions.get(surviving_leg)
         if not pos:
@@ -898,12 +963,12 @@ class NaturalGasPaperBot:
         state['breach_start_ts'] = 0.0
         pos['_last_ltp']         = ltp
 
-        print(f'🎯 [SOLO ANCHOR] {surviving_leg} anchored @ LTP=₹{ltp:.2f} | '
-              f'TSL=₹{new_sl:.2f} ({SOLO_TSL_PCT*100:.0f}%)', flush=True)
+        print(f'🎯 [SOLO ANCHOR] {surviving_leg} re-anchored @ live LTP=₹{ltp:.2f} | '
+              f'TSL=₹{new_sl:.2f} ({SOLO_TSL_PCT*100:.0f}%). Solo Trailing Active!', flush=True)
         self._save_state()
 
     # ──────────────────────────────────────────
-    # Close a single leg
+    # Close a Single Leg
     # ──────────────────────────────────────────
     def _close_leg(self, leg: str, reason: str, exit_price: Optional[float] = None):
         pos = self.positions.get(leg)
@@ -917,7 +982,6 @@ class NaturalGasPaperBot:
         sign     = '+' if pnl >= 0 else ''
         tot_sign = '+' if self.total_realized_pnl >= 0 else ''
 
-        # Trade log (ISO timestamp for web dashboard)
         self.trade_log.append({
             'leg':       leg,
             'tsym':      pos.get('tsym', leg),
@@ -932,7 +996,7 @@ class NaturalGasPaperBot:
             'action':    'EXIT',
         })
 
-        tg = (f'<pre>\n━━━ MCX TRADE CLOSED (v6.0) ━━━\n\n'
+        tg = (f'<pre>\n━━━ MCX TRADE CLOSED (v6.5) ━━━\n\n'
               f'  {leg:<4} {int(pos["strike"]):<5} {reason}\n'
               f'  Entry  {pos["entry_price"]:.2f}\n'
               f'  Exit   {ltp:.2f}\n'
@@ -943,12 +1007,22 @@ class NaturalGasPaperBot:
         send_telegram(tg)
         del self.positions[leg]
 
-        # Re-anchor surviving leg immediately
+        now_ts = time.time()
+        self.last_any_close_ts = now_ts
+
+        # ── Trigger Cooldown for the stopped leg (Awaiting Reversal) ──
+        self.cooldown_tracker[leg] = {
+            "active": True,
+            "stopped_time": now_ts,
+            "next_eligible_time": now_ts + REENTRY_COOLDOWN_S,
+            "reason": reason,
+        }
+
+        # If exactly 1 surviving leg remains, re-anchor it to live LTP
         if len(self.positions) == 1:
             surviving = list(self.positions.keys())[0]
             self._anchor_surviving_leg(surviving)
 
-        self.last_any_close_ts = time.time()
         self._save_state()
 
     def _close_all(self, reason: str):
@@ -961,25 +1035,23 @@ class NaturalGasPaperBot:
     def _rebalance_in_place(self, solo_leg: str, atm: float, live_ltp: float) -> bool:
         """
         Solo leg's TSL was hit AND its strike == ATM.
-        Instead of exiting: preserve the leg, enter the missing partner, reset SL state.
+        Preserve the leg in-place, enter the missing partner at ATM, and reset SL state.
         """
         pos = self.positions.get(solo_leg)
         if not pos:
             return False
 
-        other_leg    = 'PE' if solo_leg == 'CE' else 'CE'
+        other_leg = 'PE' if solo_leg == 'CE' else 'CE'
         other_strike = atm
 
         print(f'[IN-PLACE REBALANCE] {solo_leg} TSL hit at ₹{live_ltp:.2f} (strike={int(pos["strike"])} == ATM={int(atm)}). '
-              f'Preserving & entering {other_leg} at {int(atm)}...', flush=True)
+              f'Preserving & entering {other_leg} at ATM {int(atm)}...', flush=True)
 
         other_pos = self._enter_leg(other_leg, other_strike, 'SELL',
                                     reason=f"In-place rebalance (partner of {solo_leg})")
         if not other_pos:
-            print(f'[WARN] Failed to enter {other_leg} for rebalance — falling back to close.', flush=True)
             return False
 
-        # Reset the preserved leg's SL state to fresh strangle mode
         actual_entry = pos['entry_price']
         pos['_last_ltp'] = live_ltp
         fresh_sl = round_to_tick(live_ltp * (1.0 + STRANGLE_SL_PCT))
@@ -993,10 +1065,10 @@ class NaturalGasPaperBot:
         }
 
         self.last_reentry_ts = time.time()
-        self._reversal_latched = False
+        self.cooldown_tracker[other_leg]["active"] = False
         self._save_state()
 
-        tg = (f'<pre>\n━━━ MCX IN-PLACE REBALANCE (v6.0) ━━━\n\n'
+        tg = (f'<pre>\n━━━ MCX IN-PLACE REBALANCE (v6.5) ━━━\n\n'
               f'  Preserved: {solo_leg} {int(pos["strike"])} (Entry={actual_entry:.2f} Live={live_ltp:.2f})\n'
               f'  Entered:   {other_leg} {int(other_strike)}\n'
               f'  SL reset:  {STRANGLE_SL_PCT*100:.0f}% → ₹{fresh_sl:.2f}\n</pre>')
@@ -1004,21 +1076,9 @@ class NaturalGasPaperBot:
         return True
 
     # ──────────────────────────────────────────
-    # SL / TSL engine  (UPV2 logic — pure %)
+    # SL / TSL Check (UPV2 Logic)
     # ──────────────────────────────────────────
     def _update_sl_and_check(self, leg: str, live_ltp: float) -> Tuple[bool, str]:
-        """
-        Returns (sl_triggered: bool, reason: str).
-
-        Strangle mode (both legs open):
-          - Phase A (not in profit): hold at entry * 1.12
-          - Phase B (in profit):     trail at best_premium * 1.07  (ratchet down only)
-
-        Solo mode (partner exited, re-anchored):
-          - Always trail at best_premium * 1.07  (ratchet down only)
-
-        2-second debounce on every breach.
-        """
         pos = self.positions.get(leg)
         if not pos or pos['side'] != 'SELL' or live_ltp <= 0:
             return False, ''
@@ -1028,42 +1088,31 @@ class NaturalGasPaperBot:
         now_ts     = time.time()
         is_solo    = bool(state.get('solo_mode', False))
 
-        # Update best (lowest) premium ever seen
         best = float(state.get('best_premium', entry_prem))
         if live_ltp < best:
             best = live_ltp
             state['best_premium'] = round(best, 2)
 
         if is_solo:
-            # ── SOLO LEG MODE ──────────────────────────────────────
-            # Pure 7% TSL above best premium, ratchet only downward
             new_sl = round_to_tick(best * (1.0 + SOLO_TSL_PCT))
-            # Ratchet: SL can never go higher than it was
             if 'current_sl' in state:
                 prem_sl = min(new_sl, state['current_sl'])
             else:
                 prem_sl = new_sl
             state['current_sl'] = prem_sl
-
         else:
-            # ── STRANGLE MODE (both legs open) ─────────────────────
             state['solo_mode'] = False
             initial_sl = round_to_tick(entry_prem * (1.0 + STRANGLE_SL_PCT))
-
             if best >= entry_prem:
-                # Phase A: not in profit yet — hold at initial SL
                 prem_sl = initial_sl
             else:
-                # Phase B: in profit — trail at 7% above best
                 trail_sl = round_to_tick(best * (1.0 + SOLO_TSL_PCT))
                 prem_sl  = min(trail_sl, initial_sl)
 
-            # Ratchet: SL can never go higher
             if 'current_sl' in state:
                 prem_sl = min(prem_sl, state['current_sl'])
             state['current_sl'] = prem_sl
 
-        # 2-second debounce
         if live_ltp >= prem_sl:
             breach_start = state.get('breach_start_ts', 0.0)
             if breach_start <= 0.0:
@@ -1079,49 +1128,55 @@ class NaturalGasPaperBot:
         return False, ''
 
     # ──────────────────────────────────────────
-    # Reversal / swing tracker
+    # Check Cooldown & Re-Enter Squared Leg (UPV2-Identical)
     # ──────────────────────────────────────────
-    def _update_reversal_tracker(self, spot: float, confirmed_signal: int):
+    def _check_cooldown_and_reenter(self, spot: float, atm: float, confirmed_sig: int):
         """
-        Tracks extreme spot price while a solo leg is open.
-        Sets _reversal_latched when price pulls back >= SWING_REVERSAL_PTS from extreme.
+        Runs EVERY TICK.
+        Checks KAMA + Continuous EMA reversal for each squared leg and re-enters at ATM
+        when reversal confirms.
         """
-        self._spot_history.append(spot)
-        short_legs = [leg for leg, p in self.positions.items() if p['side'] == 'SELL']
-        if len(short_legs) != 1:
-            self._extreme_spot = 0.0
-            return
+        now_ts = time.time()
+        kama_slope = getattr(self, "kama_slope", 0.0)
 
-        surviving = short_legs[0]
-        if self._extreme_spot <= 0:
-            self._extreme_spot = spot
+        for leg in ("CE", "PE"):
+            cd = self.cooldown_tracker.get(leg)
+            if not cd or not cd.get("active", False):
+                continue
+            if now_ts < cd.get("next_eligible_time", 0.0):
+                continue
 
-        if surviving == 'PE':
-            # PE open → market went DOWN → track low and watch for bounce UP
-            if spot < self._extreme_spot:
-                self._extreme_spot = spot
-            pullback = spot - self._extreme_spot
-            if pullback >= SWING_REVERSAL_PTS:
-                self._reversal_latched = True
+            # Check Reversion Signal
+            if leg == "CE":
+                signal, reason = ReversionDetector.is_reversal_for_ce(kama_slope, confirmed_sig)
+            else:
+                signal, reason = ReversionDetector.is_reversal_for_pe(kama_slope, confirmed_sig)
 
-        elif surviving == 'CE':
-            # CE open → market went UP → track high and watch for pullback DOWN
-            if spot > self._extreme_spot:
-                self._extreme_spot = spot
-            pullback = self._extreme_spot - spot
-            if pullback >= SWING_REVERSAL_PTS:
-                self._reversal_latched = True
+            if not signal:
+                continue
+
+            # Reversal confirmed: Re-enter squared leg at ATM
+            print(f"✅ [{leg} REVERSAL CONFIRMED] {reason}. Re-entering {leg} at ATM Strike {int(atm)}...", flush=True)
+            if self._enter_leg(leg, atm, 'SELL', reason=f"Reversal confirmed ({reason})"):
+                self.last_reentry_ts = now_ts
+                cd["active"] = False
+
+                # Strangle fully restored: Clear solo mode on all open legs
+                for ln, p in self.positions.items():
+                    if 'sl_state' in p:
+                        p['sl_state']['solo_mode'] = False
+                        p['sl_state']['breach_start_ts'] = 0.0
+                self._save_state()
 
     # ──────────────────────────────────────────
-    # Always-one-leg-open safety net
+    # Always-One-Leg-Open Safety Net (UPV2-Identical)
     # ──────────────────────────────────────────
-    def _ensure_always_one_leg_open(self, atm: float, confirmed_sig: int):
+    def _ensure_always_one_leg_open(self, atm: float):
         """
-        If zero short legs remain, immediately re-enter a balanced ATM straddle.
-        This is the last-resort safety net — should only fire when both legs hit SL
-        in quick succession.
+        Safety net when 0 legs are open (both stopped out in rapid succession).
+        Immediately re-enters balanced 2-leg ATM straddle.
         """
-        print(f'⚠️ [ALWAYS-ON] 0 short legs open. Re-entering balanced ATM Straddle at {int(atm)}...', flush=True)
+        print(f'⚠️ [ALWAYS-ON] 0 legs open. Re-entering balanced ATM Straddle at {int(atm)}...', flush=True)
         entered_any = False
         for leg in ('CE', 'PE'):
             if leg in self.positions and self.positions[leg].get('side') == 'SELL':
@@ -1130,13 +1185,12 @@ class NaturalGasPaperBot:
                 entered_any = True
                 print(f'✅ [ALWAYS-ON] Entered {leg} SELL at ATM {int(atm)}.', flush=True)
         if entered_any:
-            self._reversal_latched = False
+            for leg in ("CE", "PE"):
+                self.cooldown_tracker[leg]["active"] = False
             self._save_state()
-        else:
-            print('[WARN] Always-On: could not enter any leg. Retrying next tick.', flush=True)
 
     # ──────────────────────────────────────────
-    # Console + Telegram dashboard
+    # Render Dashboard (Console & Web)
     # ──────────────────────────────────────────
     def _render_dashboard(self, spot: float, atm: float, ema_snap: Dict[str, Any]):
         global _last_tg_dash_msg_ids, _last_tg_dash_edit_ts, _tg_rate_limited_until
@@ -1144,8 +1198,7 @@ class NaturalGasPaperBot:
         now    = get_ist_now()
         now_ts = time.time()
 
-        # ── Build snap_rows & compute PnL ─────────────────────────
-        snap_rows    = []
+        snap_rows = []
         total_unreal = 0.0
         sl_risk_total = 0.0
 
@@ -1159,7 +1212,6 @@ class NaturalGasPaperBot:
             best = pos.get('sl_state', {}).get('best_premium', pos['entry_price'])
 
             if is_short and sl > 0.0:
-                # Risk if SL hits right now = (Entry - SL) * Qty  (negative = loss)
                 sl_risk_total += (pos['entry_price'] - sl) * pos['qty']
 
             snap_rows.append({
@@ -1179,7 +1231,7 @@ class NaturalGasPaperBot:
         net     = self.total_realized_pnl + total_unreal
         net_pct = (net / CAPITAL) * 100.0
 
-        # ── Console (every 1 s) ────────────────────────────────────
+        # ── Console Dashboard (Every 1 second) ─────────────────────
         if now_ts - self._last_console_dash_ts >= 1.0:
             self._last_console_dash_ts = now_ts
 
@@ -1203,22 +1255,25 @@ class NaturalGasPaperBot:
             ema15 = ema_snap.get("ema_15", spot)
             ema90 = ema_snap.get("ema_90", spot)
             slope = ema_snap.get("slow_slope", 0.0)
-            vr    = ema_snap.get("vr", 1.0)
-            preq  = ema_snap.get("persistence_req", 5.0)
             sig   = ema_snap.get("confirmed_signal", 0)
-            hold  = ema_snap.get("hold_time", 0.0)
-
             sig_str = f"{GR}▲ UP{RS}" if sig > 0 else (f"{RD}▼ DOWN{RS}" if sig < 0 else f"{YL}━ FLAT{RS}")
 
-            cooldown_left = max(0.0, POST_CLOSE_COOLDOWN - (now_ts - self.last_any_close_ts))
-            cooldown_tag  = f"  {YL}[COOLDOWN {cooldown_left:.0f}s]{RS}" if cooldown_left > 0 else ""
-            reversal_tag  = f"  {MG}[REVERSAL LATCHED]{RS}" if self._reversal_latched else ""
+            kama_val = self.current_kama or spot
+            kama_slp = getattr(self, "kama_slope", 0.0)
+            kama_tr  = getattr(self, "kama_trend", 0)
+            kama_str = f"{GR}▲ UP{RS}" if kama_tr > 0 else (f"{RD}▼ DOWN{RS}" if kama_tr < 0 else f"{YL}━ FLAT{RS}")
+
+            # Cooldown indicators
+            cd_info = []
+            for ln in ("CE", "PE"):
+                if self.cooldown_tracker.get(ln, {}).get("active"):
+                    cd_info.append(f"{MG}[AWAITING {ln} REVERSAL]{RS}")
+            cd_tag = "  " + " ".join(cd_info) if cd_info else ""
 
             print()
             print(TOP)
-
-            title_l = (f'  {CY}MCX NATGAS PAPER v6.0{RS}  {DIM}│{RS}  '
-                       f'{YL}UPV2-ALIGNED EMA ENGINE{RS}  {DIM}│{RS}  '
+            title_l = (f'  {CY}MCX NATGAS PAPER v6.5{RS}  {DIM}│{RS}  '
+                       f'{YL}UPV2 KAMA + EMA STRANGLE{RS}  {DIM}│{RS}  '
                        f'{GR}12% SL / 7% TSL{RS}')
             title_r = f'{DIM}{now.strftime("%H:%M:%S IST")}{RS}  '
             pad_top = max(1, W - _ansi_len(title_l) - _ansi_len(title_r))
@@ -1231,21 +1286,22 @@ class NaturalGasPaperBot:
                        f'{DIM}ATM:{RS} {YL}{int(atm):<5}{RS}  '
                        f'{DIM}EXPIRY:{RS} {exp_badge}  '
                        f'{DIM}TRADES:{RS} {WH}{self.trades_today}{RS}'
-                       f'{reversal_tag}{cooldown_tag}')
+                       f'{cd_tag}')
             print(f'{V}{_pad(ind_row, W)}{V}')
             print(MIDS)
 
-            mom_row = (f'  {CY}EMA ENGINE:{RS} {DIM}FAST:{RS} {WH}{ema15:>8.2f}{RS}  '
-                       f'{DIM}SLOW:{RS} {WH}{ema90:>8.2f}{RS}  '
-                       f'{DIM}SLOPE/m:{RS} {WH}{slope:>+6.3f}{RS}  '
-                       f'{DIM}VR:{RS} {WH}{vr:>4.2f}{RS}  '
-                       f'{DIM}PERSIST:{RS} {YL}{preq:>4.1f}s{RS}  '
-                       f'{DIM}SIGNAL:{RS} {sig_str} {DIM}({hold:.1f}s){RS}')
+            mom_row = (f'  {CY}EMA(15/90/300):{RS} {DIM}F:{RS}{WH}{ema15:>7.2f}{RS} '
+                       f'{DIM}S:{RS}{WH}{ema90:>7.2f}{RS} '
+                       f'{DIM}SLOPE:{RS}{WH}{slope:>+6.3f}{RS} '
+                       f'{DIM}SIG:{RS}{sig_str}  {VS}  '
+                       f'{CY}KAMA(1m):{RS} {WH}{kama_val:>7.2f}{RS} '
+                       f'{DIM}SLOPE:{RS}{WH}{kama_slp:>+6.3f}{RS} '
+                       f'{DIM}DIR:{RS}{kama_str}')
             print(f'{V}{_pad(mom_row, W)}{V}')
             print(MID)
 
             if not snap_rows:
-                msg = f'  {YL}No open positions — scanning for ATM entry...{RS}'
+                msg = f'  {YL}No open positions — awaiting entry...{RS}'
                 print(f'{V}{_pad(msg, W)}{V}')
             else:
                 hdr = (f'  {"LEG":<7} {VS} {"CONTRACT":<22} {VS} {"STRIKE":>7} {VS} {"SIDE":<5} {VS} '
@@ -1269,13 +1325,7 @@ class NaturalGasPaperBot:
                            f"  {pnl_col}{pnl_fmt}{RS}  ")
                     print(f'{V}{_pad(row, W)}{V}')
 
-                if any(r.get('solo_mode') for r in snap_rows):
-                    print(MIDS)
-                    solo_msg = f'  {CY}🎯 SOLO TSL ACTIVE (*):{RS} Partner exited — {SOLO_TSL_PCT*100:.0f}% trailing stop re-anchored to live LTP'
-                    print(f'{V}{_pad(solo_msg, W)}{V}')
-
             print(MID)
-
             real_sign,  real_fmt  = _fmt_pnl(self.total_realized_pnl, width=10)
             unreal_sign, unreal_fmt = _fmt_pnl(total_unreal, width=10)
             net_sign,   net_fmt   = _fmt_pnl(net, width=10)
@@ -1292,27 +1342,29 @@ class NaturalGasPaperBot:
             print(BOT)
             sys.stdout.flush()
 
-        # ── Write live snapshot for web dashboard ─────────────────
+        # ── Write Live Snapshot for Web Dashboard ──────────────────
         try:
             mcx_snap = {
-                "timestamp":       now.strftime("%Y-%m-%d %H:%M:%S"),
-                "spot":            spot,
-                "atm":             int(atm),
-                "expiry":          self.target_opt_expiry_str,
-                "is_rolled_over":  self.is_rolled_over,
-                "trades_today":    self.trades_today,
-                "reversal_latched": self._reversal_latched,
-                "cooldown_remaining": max(0, int(POST_CLOSE_COOLDOWN - (now_ts - self.last_any_close_ts))),
-                "ema":             ema_snap,
-                "positions":       snap_rows,
-                "realized_pnl":    round(self.total_realized_pnl, 2),
-                "unrealized_pnl":  round(total_unreal, 2),
-                "net_pnl":         round(net, 2),
-                "net_pct":         round(net_pct, 4),
-                "sl_risk":         round(sl_risk_total, 2),
-                "mtd_pnl":         self.db.data.get("mtd_pnl", self.total_realized_pnl) if hasattr(self, 'db') else self.total_realized_pnl,
-                "ytd_pnl":         self.db.data.get("ytd_pnl", self.total_realized_pnl) if hasattr(self, 'db') else self.total_realized_pnl,
-                "trade_log":       self.trade_log,
+                "timestamp":          now.strftime("%Y-%m-%d %H:%M:%S"),
+                "spot":               spot,
+                "atm":                int(atm),
+                "expiry":             self.target_opt_expiry_str,
+                "is_rolled_over":     self.is_rolled_over,
+                "trades_today":       self.trades_today,
+                "kama":               round(self.current_kama or spot, 2),
+                "kama_slope":         round(getattr(self, "kama_slope", 0.0), 4),
+                "kama_trend":         getattr(self, "kama_trend", 0),
+                "cooldown_tracker":   self.cooldown_tracker,
+                "ema":                ema_snap,
+                "positions":          snap_rows,
+                "realized_pnl":       round(self.total_realized_pnl, 2),
+                "unrealized_pnl":     round(total_unreal, 2),
+                "net_pnl":            round(net, 2),
+                "net_pct":            round(net_pct, 4),
+                "sl_risk":            round(sl_risk_total, 2),
+                "mtd_pnl":            self.db.data.get("mtd_pnl", self.total_realized_pnl) if hasattr(self, 'db') else self.total_realized_pnl,
+                "ytd_pnl":            self.db.data.get("ytd_pnl", self.total_realized_pnl) if hasattr(self, 'db') else self.total_realized_pnl,
+                "trade_log":          self.trade_log,
             }
             snap_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                      "live_snapshot_mcx_paper.json")
@@ -1321,16 +1373,14 @@ class NaturalGasPaperBot:
         except Exception:
             pass
 
-        # ── Telegram live dashboard (every 3 s) ───────────────────
+        # ── Telegram Live Dashboard (Every 3 seconds) ──────────────
         if now_ts - _last_tg_dash_edit_ts < 3.0 or now_ts < _tg_rate_limited_until:
             return
         _last_tg_dash_edit_ts = now_ts
 
-        ema15 = ema_snap.get("ema_15", spot)
-        ema90 = ema_snap.get("ema_90", spot)
-        slope = ema_snap.get("slow_slope", 0.0)
-        sig   = ema_snap.get("confirmed_signal", 0)
+        sig = ema_snap.get("confirmed_signal", 0)
         sig_t = "▲ UP" if sig > 0 else ("▼ DOWN" if sig < 0 else "━ FLAT")
+        kama_slp = getattr(self, "kama_slope", 0.0)
 
         has_ce = 'CE' in self.positions
         has_pe = 'PE' in self.positions
@@ -1343,32 +1393,32 @@ class NaturalGasPaperBot:
         else:
             status_str = "⚙️ SCANNING"
 
-        roll_tag = " ⟳NEXT MO" if self.is_rolled_over else ""
-        r_sign   = '+' if self.total_realized_pnl >= 0 else ''
-        n_sign   = '+' if net >= 0 else ''
+        roll_tag  = " ⟳NEXT MO" if self.is_rolled_over else ""
+        r_sign    = '+' if self.total_realized_pnl >= 0 else ''
+        n_sign    = '+' if net >= 0 else ''
         pnl_badge = "🟢" if net >= 0 else "🔴"
 
-        t  = f"<b>⚡ MCX NATGAS · PAPER v6.0</b>\n"
+        t  = f"<b>⚡ MCX NATGAS · PAPER v6.5</b>\n"
         t += f"<code>🕐 {now.strftime('%H:%M:%S IST')}</code>\n"
         t += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        t += f"<b>SPOT:</b>   <code>{spot:>8.2f}</code>  <b>ATM:</b> <code>{int(atm)}</code>\n"
+        t += f"<b>SPOT:</b> <code>{spot:>8.2f}</code>  <b>ATM:</b> <code>{int(atm)}</code>\n"
         t += f"<b>EXPIRY:</b> <code>{self.target_opt_expiry_str}{roll_tag}</code>\n"
         t += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        t += f"<b>EMA ENGINE</b>  [3–20s persistence]\n<pre>"
-        t += f"  EMA15 : {ema15:>8.2f}\n"
-        t += f"  EMA90 : {ema90:>8.2f}\n"
-        t += f"  SLOPE : {slope:>+8.3f}/m\n"
-        t += f"  VR    : {ema_snap.get('vr',1.0):>8.2f}  P={ema_snap.get('persistence_req',5.0):.1f}s\n"
-        t += f"  SIGNAL: {sig_t:>8}  HOLD={ema_snap.get('hold_time',0.0):.1f}s\n</pre>"
+        t += f"<b>KAMA + EMA REVERSAL ENGINE</b>\n<pre>"
+        t += f"  KAMA  : {self.current_kama or spot:>8.2f} (slope: {kama_slp:>+.3f})\n"
+        t += f"  EMA   : {ema_snap.get('ema_15',spot):>8.2f} (sig: {sig_t})\n"
+        for cd_leg in ("CE", "PE"):
+            if self.cooldown_tracker.get(cd_leg, {}).get("active"):
+                t += f"  *AWAITING {cd_leg} REVERSAL TO RE-ENTER*\n"
+        t += f"</pre>\n"
         t += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         t += f"<b>STATUS:</b> {status_str}  <b>TRADES:</b> <code>{self.trades_today}</code>\n"
-        t += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         t += "<pre>"
         t += f"{'LEG':<6} {'STRIKE':>7} {'ENTRY':>7} {'LTP':>7} {'SL':>8} {'PnL':>10}\n"
         t += f"{'─'*6} {'─'*7} {'─'*7} {'─'*7} {'─'*8} {'─'*10}\n"
         if snap_rows:
             for r in snap_rows:
-                ps  = '+' if r['pnl'] >= 0 else ''
+                ps = '+' if r['pnl'] >= 0 else ''
                 sl_s = f"{r['sl']:>8.2f}" if r['sl'] > 0 else "       —"
                 ltag = f"{r['leg']}*" if r.get('solo_mode') else r['leg']
                 t += f"{ltag:<6} {int(r['strike']):>7} {r['entry']:>7.2f} {r['ltp']:>7.2f} {sl_s} {ps}{r['pnl']:>9,.0f}\n"
@@ -1379,7 +1429,7 @@ class NaturalGasPaperBot:
         t += f"{'─'*48}\n"
         t += f"{'NET MTM':>16}: {pnl_badge}{n_sign}₹{net:>9,.2f} ({net_pct:+.2f}%)\n</pre>"
         t += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        t += f"<b>SL:</b> <code>{STRANGLE_SL_PCT*100:.0f}%</code>  <b>TSL:</b> <code>{SOLO_TSL_PCT*100:.0f}%</code>  <b>LOT:</b> <code>1×{LOT_SIZE}u</code>  <b>MODE:</b> <code>PAPER</code>"
+        t += f"<b>SL:</b> <code>{STRANGLE_SL_PCT*100:.0f}%</code>  <b>TSL:</b> <code>{SOLO_TSL_PCT*100:.0f}%</code>  <b>LOT:</b> <code>1×{LOT_SIZE}u</code>"
 
         chat_ids = _get_tg_chat_ids()
         for cid in chat_ids:
@@ -1423,8 +1473,8 @@ class NaturalGasPaperBot:
             if not trades:
                 msg = f'<pre>━━━ MCX {leg_name} TRADES ━━━\n  No trades.\n</pre>'
             else:
-                leg_tot  = sum(t['pnl'] for t in trades)
-                lt_sign  = '+' if leg_tot >= 0 else ''
+                leg_tot = sum(t['pnl'] for t in trades)
+                lt_sign = '+' if leg_tot >= 0 else ''
                 msg  = f'<pre>━━━ MCX {leg_name} TRADES ({len(trades)}) ━━━\n'
                 msg += f"{'#':<3} {'TIME':<9} {'STRIKE':>7} {'ENTRY':>7} {'EXIT':>7} {'PnL':>10}\n"
                 msg += f"{'─'*3} {'─'*9} {'─'*7} {'─'*7} {'─'*7} {'─'*10}\n"
@@ -1437,26 +1487,16 @@ class NaturalGasPaperBot:
             send_telegram(msg)
             time.sleep(0.4)
 
-        ce_t   = [t for t in self.trade_log if t['leg'] == 'CE']
-        pe_t   = [t for t in self.trade_log if t['leg'] == 'PE']
-        ce_tot = sum(t['pnl'] for t in ce_t)
-        pe_tot = sum(t['pnl'] for t in pe_t)
-        msg  = '<pre>━━━ MCX SESSION SUMMARY ━━━\n'
-        msg += f"  CE: {len(ce_t):>3} trades | wins: {sum(1 for t in ce_t if t['pnl']>=0):>3} | {'+' if ce_tot>=0 else ''}₹{ce_tot:,.0f}\n"
-        msg += f"  PE: {len(pe_t):>3} trades | wins: {sum(1 for t in pe_t if t['pnl']>=0):>3} | {'+' if pe_tot>=0 else ''}₹{pe_tot:,.0f}\n"
-        msg += f"  Total trades : {self.trades_today}\n</pre>"
-        send_telegram(msg)
-        time.sleep(0.4)
-
         badge = "✅ PROFIT" if self.total_realized_pnl >= 0 else "❌ LOSS"
         final_msg = (f'<pre>━━━ MCX FINAL PNL ━━━\n'
                      f'  Realized PnL : {s_sign}₹{self.total_realized_pnl:,.2f}\n'
                      f'  Return on 2L : {final_pct:+.2f}%\n'
+                     f'  Total Trades : {self.trades_today}\n'
                      f'  {badge}\n</pre>')
         send_telegram(final_msg)
 
     # ──────────────────────────────────────────
-    # Main run loop
+    # Main Strategy Execution Loop
     # ──────────────────────────────────────────
     def run(self):
         self.authenticate()
@@ -1464,24 +1504,21 @@ class NaturalGasPaperBot:
 
         DIM = f'{Fore.WHITE}{Style.DIM}'
         CY  = f'{Fore.CYAN}{Style.BRIGHT}'
-        GR  = f'{Fore.GREEN}{Style.BRIGHT}'
-        RD  = f'{Fore.RED}{Style.BRIGHT}'
         RS  = Style.RESET_ALL
 
         print()
         print(f'{DIM}{"="*100}{RS}')
-        print(f'{CY}  MCX NATURAL GAS PAPER TRADING  v6.0  |  UPV2-ALIGNED EMA  |  16:00 – 23:24 IST{RS}')
-        print(f'{CY}  EMA: Fast={EMA_FAST_HL}s  Slow={EMA_SLOW_HL}s  Anchor={EMA_ANCHOR_HL}s  '
-              f'Persist=[{PERSISTENCE_MIN}–{PERSISTENCE_MAX}]s  '
-              f'SL={STRANGLE_SL_PCT*100:.0f}%  TSL={SOLO_TSL_PCT*100:.0f}%{RS}')
+        print(f'{CY}  MCX NATURAL GAS PAPER TRADING v6.5  |  UPV2 KAMA + EMA STRANGLE  |  16:00 – 23:24 IST{RS}')
+        print(f'{CY}  SL: {STRANGLE_SL_PCT*100:.0f}%  TSL: {SOLO_TSL_PCT*100:.0f}%  '
+              f'KAMA: P={KAMA_PERIOD}, F={KAMA_FAST_EMA}, S={KAMA_SLOW_EMA}, Slope_Thr={KAMA_MIN_SLOPE}{RS}')
         print(f'{DIM}{"="*100}{RS}')
         print(flush=True)
 
         exp_note = f"\nTarget Expiry: {self.target_opt_expiry_str}" + \
                    (" (Next Month Rollover)" if self.is_rolled_over else "")
-        send_telegram(f'<pre>MCX Natural Gas\nPaper Trading Bot Online (v6.0 UPV2-Aligned)\n'
+        send_telegram(f'<pre>MCX Natural Gas Online (v6.5 UPV2 KAMA+EMA Engine)\n'
                       f'Session: 16:00 – 23:24 IST{exp_note}\n'
-                      f'SL: {STRANGLE_SL_PCT*100:.0f}%  TSL: {SOLO_TSL_PCT*100:.0f}%</pre>')
+                      f'Strangle SL: {STRANGLE_SL_PCT*100:.0f}% | Solo TSL: {SOLO_TSL_PCT*100:.0f}%</pre>')
 
         last_wait_msg_ts = 0.0
         ema_snap: Dict[str, Any] = {}
@@ -1493,7 +1530,7 @@ class NaturalGasPaperBot:
                 now    = get_ist_now()
                 now_ts = time.time()
 
-                # ── Session guards ────────────────────────────────
+                # ── Session Guards ────────────────────────────────
                 if now.weekday() == 6:
                     print(f'[{now.strftime("%H:%M")}] Sunday — markets closed.', flush=True)
                     time.sleep(60)
@@ -1506,20 +1543,20 @@ class NaturalGasPaperBot:
                     time.sleep(60)
                     continue
 
-                # ── Auto square-off ───────────────────────────────
+                # ── Auto Square-Off at 23:24 IST ──────────────────
                 if now.hour > MCX_EXIT_HOUR or (now.hour == MCX_EXIT_HOUR and now.minute >= MCX_EXIT_MINUTE):
                     if self.positions:
-                        print(f'[AUTO] {MCX_EXIT_HOUR}:{MCX_EXIT_MINUTE:02d} IST — squaring off...', flush=True)
+                        print(f'[AUTO] {MCX_EXIT_HOUR}:{MCX_EXIT_MINUTE:02d} IST — squaring off all positions...', flush=True)
                         self._close_all('SESSION_END')
                     self._render_dashboard(spot, atm, ema_snap)
                     final_pct = (self.total_realized_pnl / CAPITAL) * 100.0
-                    pnl_col   = GR if self.total_realized_pnl >= 0 else RD
+                    pnl_col   = Fore.GREEN if self.total_realized_pnl >= 0 else Fore.RED
                     s         = '+' if self.total_realized_pnl >= 0 else ''
-                    print(f'\n{pnl_col}✅ Session complete. PnL: {s}₹{self.total_realized_pnl:,.2f} ({final_pct:+.2f}%){RS}\n', flush=True)
+                    print(f'\n{pnl_col}✅ Session Complete. PnL: {s}₹{self.total_realized_pnl:,.2f} ({final_pct:+.2f}%){Style.RESET_ALL}\n', flush=True)
                     self._send_eod_trade_summary()
                     break
 
-                # ── Pre-market wait ───────────────────────────────
+                # ── Pre-Market Wait ───────────────────────────────
                 if now.hour < MCX_ENTRY_HOUR or (now.hour == MCX_ENTRY_HOUR and now.minute < MCX_ENTRY_MINUTE):
                     if now_ts - last_wait_msg_ts > 60.0:
                         last_wait_msg_ts = now_ts
@@ -1528,125 +1565,76 @@ class NaturalGasPaperBot:
                     time.sleep(10)
                     continue
 
-                # ── Spot & ATM ────────────────────────────────────
+                # ── Spot & ATM Ingestion ──────────────────────────
                 spot = self.get_spot()
                 if spot <= 50.0:
                     time.sleep(3)
                     continue
                 atm = round_to_price(spot, STRIKE_STEP)
 
-                # ── EMA Engine update ─────────────────────────────
+                # ── Continuous EMA Update ─────────────────────────
                 ema_snap      = self.ema_engine.update(spot, now_ts)
                 confirmed_sig = ema_snap.get("confirmed_signal", 0)
 
-                # ── Reversal tracker ──────────────────────────────
-                self._update_reversal_tracker(spot, confirmed_sig)
+                # ── 1-Minute KAMA Update ──────────────────────────
+                self._update_kama(spot, now)
 
                 # ═════════════════════════════════════════════════
-                # STEP 1: NO POSITIONS → ENTER BALANCED ATM STRADDLE
+                # STEP 1: NO POSITIONS → ENTER BALANCED ATM STRANGLE
                 # ═════════════════════════════════════════════════
                 if not self.positions:
-                    time_since_close = now_ts - self.last_any_close_ts
-                    if time_since_close >= POST_CLOSE_COOLDOWN:
-                        # Defer one leg ONLY on strong, confirmed trend
-                        is_strong_trend = (
-                            confirmed_sig != 0
-                            and ema_snap.get("hold_time", 0.0) >= STRONG_TREND_HOLD_S
-                            and abs(ema_snap.get("ema_15", spot) - ema_snap.get("ema_90", spot)) >= STRONG_TREND_SPREAD
-                        )
-
-                        if is_strong_trend and confirmed_sig == 1:
-                            print(f'[MOMENTUM ENTRY] Bullish (hold>={STRONG_TREND_HOLD_S}s). '
-                                  f'Writing PE only at ATM {int(atm)} (CE deferred).', flush=True)
-                            self._enter_leg('PE', atm, 'SELL', reason="Strong Bullish — PE only")
-                        elif is_strong_trend and confirmed_sig == -1:
-                            print(f'[MOMENTUM ENTRY] Bearish (hold>={STRONG_TREND_HOLD_S}s). '
-                                  f'Writing CE only at ATM {int(atm)} (PE deferred).', flush=True)
-                            self._enter_leg('CE', atm, 'SELL', reason="Strong Bearish — CE only")
-                        else:
-                            print(f'[ENTRY] Balanced ATM Straddle at {int(atm)}.', flush=True)
-                            self._enter_leg('CE', atm, 'SELL', reason="Balanced Straddle")
-                            self._enter_leg('PE', atm, 'SELL', reason="Balanced Straddle")
-                        self._reversal_latched = False
-
+                    print(f'[ENTRY] Entering Balanced ATM Strangle (CE + PE) at Strike {int(atm)}...', flush=True)
+                    self._enter_leg('CE', atm, 'SELL', reason="Initial Strangle Entry")
+                    self._enter_leg('PE', atm, 'SELL', reason="Initial Strangle Entry")
+                    self.cooldown_tracker["CE"]["active"] = False
+                    self.cooldown_tracker["PE"]["active"] = False
                     self._render_dashboard(spot, atm, ema_snap)
                     time.sleep(1.0)
                     continue
 
                 # ═════════════════════════════════════════════════
-                # STEP 2: 1 LEG OPEN → TRY TO RESTORE STRANGLE
-                # (Direction-aware: CE needs bearish fade, PE needs bullish fade)
+                # STEP 2: CHECK COOLDOWN & RE-ENTER SQUARED LEG
+                # (Waits for EMA + KAMA Reversal confluence like in UPV2)
                 # ═════════════════════════════════════════════════
                 short_legs = [leg for leg, p in self.positions.items() if p['side'] == 'SELL']
-
                 if len(short_legs) == 1:
-                    surviving_leg = short_legs[0]
-                    missing_leg   = 'CE' if surviving_leg == 'PE' else 'PE'
-
-                    time_since_reentry = now_ts - self.last_reentry_ts
-                    time_since_close   = now_ts - self.last_any_close_ts
-
-                    if time_since_reentry >= REENTRY_COOLDOWN_S and time_since_close >= REENTRY_COOLDOWN_S:
-                        # Direction-aware reversal check
-                        if missing_leg == 'CE':
-                            can, rev_reason = ReversionDetector.can_reenter_ce(
-                                confirmed_sig, self._reversal_latched)
-                        else:
-                            can, rev_reason = ReversionDetector.can_reenter_pe(
-                                confirmed_sig, self._reversal_latched)
-
-                        if can:
-                            print(f'[RE-ENTER] {rev_reason} → restoring strangle. '
-                                  f'Entering {missing_leg} at ATM {int(atm)}.', flush=True)
-                            if self._enter_leg(missing_leg, atm, 'SELL',
-                                               reason=f"Restore strangle ({rev_reason})"):
-                                self.last_reentry_ts   = now_ts
-                                self._reversal_latched = False
-                                # Both legs now in strangle mode — clear solo flags
-                                for ln in ('CE', 'PE'):
-                                    p = self.positions.get(ln)
-                                    if p and 'sl_state' in p:
-                                        p['sl_state']['solo_mode']       = False
-                                        p['sl_state']['breach_start_ts'] = 0.0
-                                self._save_state()
+                    self._check_cooldown_and_reenter(spot, atm, confirmed_sig)
 
                 # ═════════════════════════════════════════════════
-                # STEP 3: SL / TSL CHECK FOR ALL OPEN LEGS
+                # STEP 3: CHECK SL / TSL ON ALL OPEN LEGS
                 # ═════════════════════════════════════════════════
                 legs_to_close: List[Tuple[str, str, float]] = []
                 for leg in list(self.positions.keys()):
                     pos = self.positions.get(leg)
                     if not pos or pos['side'] != 'SELL':
                         continue
-                    live_ltp         = self._get_leg_ltp(pos)
+                    live_ltp = self._get_leg_ltp(pos)
                     sl_hit, sl_reason = self._update_sl_and_check(leg, live_ltp)
 
                     if sl_hit:
-                        # ── In-place rebalance check (solo TSL + strike == ATM) ──
+                        # In-place rebalance check: if solo leg hits TSL while strike == ATM
                         other_leg  = 'PE' if leg == 'CE' else 'CE'
-                        other_open = (other_leg in self.positions
-                                      and self.positions[other_leg].get('side') == 'SELL')
+                        other_open = (other_leg in self.positions and self.positions[other_leg].get('side') == 'SELL')
 
                         if (not other_open
                                 and abs(pos['strike'] - atm) < 0.01
                                 and pos.get('sl_state', {}).get('solo_mode', False)):
-                            # Guard: do NOT rebalance if EMA is still running against this leg
                             ema_against = ((confirmed_sig == 1 and leg == 'CE') or
                                            (confirmed_sig == -1 and leg == 'PE'))
                             if not ema_against:
                                 if self._rebalance_in_place(leg, atm, live_ltp):
-                                    continue  # Successfully rebalanced! Skip exit.
+                                    continue  # Preserved in-place! Skip exit.
 
                         legs_to_close.append((leg, sl_reason, live_ltp))
 
                 for leg, reason, exit_px in legs_to_close:
-                    print(f'[SL ALERT] {reason}', flush=True)
+                    print(f'[SL TRIGGER] {reason}', flush=True)
                     self._close_leg(leg, reason, exit_price=exit_px)
 
-                # ── ALWAYS-ON: If 0 short legs remain after closures ──
+                # ── ALWAYS-ON SAFETY NET: If 0 legs remain after exits ──
                 active_shorts = [ln for ln, p in self.positions.items() if p['side'] == 'SELL']
                 if not active_shorts:
-                    self._ensure_always_one_leg_open(atm, confirmed_sig)
+                    self._ensure_always_one_leg_open(atm)
 
                 # ═════════════════════════════════════════════════
                 # STEP 4: RENDER DASHBOARD
@@ -1655,18 +1643,18 @@ class NaturalGasPaperBot:
                 time.sleep(1.0)
 
             except KeyboardInterrupt:
-                print('\n[STOP] Keyboard interrupt — squaring off...', flush=True)
+                print('\n[STOP] Keyboard interrupt — squaring off all positions...', flush=True)
                 self._close_all('KEYBOARD_INTERRUPT')
                 self._render_dashboard(spot, atm, ema_snap)
                 final_pct = (self.total_realized_pnl / CAPITAL) * 100.0
-                s         = '+' if self.total_realized_pnl >= 0 else ''
-                pnl_col   = Fore.GREEN if self.total_realized_pnl >= 0 else Fore.RED
+                s = '+' if self.total_realized_pnl >= 0 else ''
+                pnl_col = Fore.GREEN if self.total_realized_pnl >= 0 else Fore.RED
                 print(f'\n{pnl_col}✅ Squared off. PnL: {s}₹{self.total_realized_pnl:,.2f} ({final_pct:+.2f}%){Style.RESET_ALL}\n', flush=True)
                 self._send_eod_trade_summary()
                 break
             except Exception as e:
                 import traceback
-                print(f'[ERROR] Loop exception: {e}', flush=True)
+                print(f'[ERROR] Strategy loop exception: {e}', flush=True)
                 traceback.print_exc()
                 time.sleep(3.0)
 
@@ -1678,5 +1666,5 @@ if __name__ == '__main__':
         bot.run()
     except Exception as e:
         print(f'[FATAL] {e}', flush=True)
-        send_telegram(f'<pre>MCX Bot Fatal Error (v6.0):\n{e}</pre>')
+        send_telegram(f'<pre>MCX Bot Fatal Error (v6.5):\n{e}</pre>')
         sys.exit(1)
