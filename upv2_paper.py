@@ -3000,8 +3000,11 @@ class ExecutionEngine:
         print(f"{V}{ind_bar2}{' ' * pad_ind2}{V}")
         print(MID)
 
+
         unrealized = 0.0
+        sl_risk_total = 0.0
         snap_positions = {}
+
         if not self.positions:
             msg = f"  {c_yellow}No open positions. State: {self.mode}{res}"
             print(f"{V}{msg}{' ' * max(0, W - ansi_len(msg))}{V}")
@@ -3024,9 +3027,18 @@ class ExecutionEngine:
                 unrealized += pnl
 
                 pos_copy = pos.copy()
+
                 pos_copy["ltp"] = ltp
                 pos_copy["pnl"] = pnl
                 snap_positions[leg] = pos_copy
+                
+                if is_short and "dual_sl_state" in pos:
+                    sl_state_local = pos["dual_sl_state"]
+                    curr_sl = float(sl_state_local.get("current_premium_sl", pos["entry_price"] * 1.12))
+                    # PnL if SL hits right now = (Entry - SL) * Qty
+                    risk_pnl = (pos["entry_price"] - curr_sl) * pos["qty"]
+                    sl_risk_total += risk_pnl
+
                 
                 side_col = c_red if is_short else c_green
                 pnl_col = c_green if pnl >= 0 else c_red
@@ -3133,9 +3145,12 @@ class ExecutionEngine:
                     "cooldown_min": 0
                 },
                 "indicators": self.current_indicators,
+
                 "realized_pnl": self.realized_pnl,
                 "unrealized_pnl": unrealized,
+                "sl_risk": sl_risk_total,
                 "total_pnl": today_net_mtm,
+
                 "mtd_pnl": live_mtd,
                 "mtd_return_pct": mtd_ret,
                 "ytd_pnl": live_ytd,

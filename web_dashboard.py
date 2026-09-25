@@ -817,7 +817,12 @@ def get_aggregated_dashboard_state() -> dict:
         mcx_unrealized = 0.0
     mcx_net = float(mcx_snap.get("net_pnl", mcx_realized + mcx_unrealized) or 0.0)
 
+
+    nifty_sl_risk = float(nifty_snap.get("sl_risk", 0.0) or 0.0)
+    mcx_sl_risk = float(mcx_snap.get("sl_risk", 0.0) or 0.0)
+    
     combined_realized = nifty_realized + mcx_realized
+
     combined_unrealized = nifty_unrealized + mcx_unrealized
     combined_net = combined_realized + combined_unrealized
 
@@ -879,7 +884,29 @@ def get_aggregated_dashboard_state() -> dict:
     mtd_pnl = combined_mtd_pnl
     ytd_pnl = combined_ytd_pnl
 
+
     trade_analytics = get_trade_analytics(nifty_snap, mcx_snap, account_initial_capital)
+
+    # Recompute Max Drawdown based on DAILY PnL streak (including today's live PnL)
+    nifty_daily_seq = [b["nifty"] for d, b in sorted(daily_breakdown.items()) if d != today_str]
+    nifty_daily_seq.append(nifty_realized + nifty_unrealized)
+    mcx_daily_seq = [b["mcx"] for d, b in sorted(daily_breakdown.items()) if d != today_str]
+    mcx_daily_seq.append(mcx_realized + mcx_unrealized)
+    combo_daily_seq = [b["total"] for d, b in sorted(daily_breakdown.items()) if d != today_str]
+    combo_daily_seq.append(combined_net)
+
+    def calc_daily_dd(seq):
+        eq, peak, mdd = 0.0, 0.0, 0.0
+        for p in seq:
+            eq += p
+            peak = max(peak, eq)
+            mdd = max(mdd, peak - eq)
+        return mdd
+
+    trade_analytics["nifty"]["max_drawdown"] = round(calc_daily_dd(nifty_daily_seq), 2)
+    trade_analytics["mcx"]["max_drawdown"] = round(calc_daily_dd(mcx_daily_seq), 2)
+    trade_analytics["combined"]["max_drawdown"] = round(calc_daily_dd(combo_daily_seq), 2)
+
 
     # Count completed, deduplicated trade records. Snapshot counters include
     # legs/entries and can remain stale across a session boundary.
@@ -2524,6 +2551,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         </div>
       </div>
 
+
       <!-- MTD & YTD Returns -->
       <div class="kpi-card">
         <div class="kpi-label">
@@ -2532,9 +2560,23 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         </div>
         <div class="kpi-val" id="mtd-val">₹0.00</div>
         <div class="kpi-sub">
-          <span><span id="kpi-ytd-label">Year-to-Date</span>: <b id="ytd-val" style="color:#fff;">₹0.00</b> <span id="ytd-pct" style="font-weight:700;">(+0.00%)</span></span>
+          <span style="color:var(--text-dim)">YTD:</span> 
+          <span id="ytd-val">₹0.00</span>
         </div>
       </div>
+
+      <!-- Max SL Risk -->
+      <div class="kpi-card">
+        <div class="kpi-label">
+          <span id="kpi-slrisk-title" style="color:var(--primary);">Max SL Risk</span>
+        </div>
+        <div class="kpi-val" id="sl-risk-val">₹0.00</div>
+        <div class="kpi-sub">
+          <span style="color:var(--text-dim)">Max DD:</span> 
+          <span id="max-dd-val">₹0.00</span>
+        </div>
+      </div>
+
     </div>
 
     <!-- ─── Live Intraday P&L Tracking Chart ─── -->

@@ -1280,15 +1280,24 @@ class NaturalGasPaperBot:
         now    = get_ist_now()
         now_ts = time.time()
 
+
         snap_rows = []
         total_unreal = 0.0
+        sl_risk_total = 0.0
+
         for leg, pos in list(self.positions.items()):
             ltp = self._get_leg_ltp(pos)
             is_short = (pos['side'] == 'SELL')
             pnl = ((pos['entry_price'] - ltp) if is_short else (ltp - pos['entry_price'])) * pos['qty']
             total_unreal += pnl
+
             sl = pos.get('sl_state', {}).get('current_sl', 0.0)
             best = pos.get('sl_state', {}).get('lowest_ltp', pos['entry_price'])
+            
+            if is_short and sl > 0.0:
+                risk_pnl = (pos['entry_price'] - sl) * pos['qty']
+                sl_risk_total += risk_pnl
+
             snap_rows.append({
                 'leg': leg,
                 'strike': pos['strike'],
