@@ -3250,11 +3250,30 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
 
       const ytdLabelEl = document.getElementById('kpi-ytd-label');
       if (ytdLabelEl) ytdLabelEl.innerText = ytdLabel;
+
       const ytdEl = document.getElementById('ytd-val');
       if (ytdEl) {
         ytdEl.innerText = fmtINR(ytdVal, true);
         applyClass(ytdEl, ytdVal);
       }
+
+      const slRiskEl = document.getElementById('sl-risk-val');
+      let combined_risk = data.performance?.sl_risk || 0.0;
+      if (tab === 'nifty') combined_risk = data.nifty?.sl_risk || 0.0;
+      if (tab === 'mcx') combined_risk = data.mcx?.sl_risk || 0.0;
+      if (slRiskEl) {
+        slRiskEl.innerHTML = fmtINR(combined_risk, true);
+        applyClass(slRiskEl, combined_risk);
+      }
+
+      const maxDdEl = document.getElementById('max-dd-val');
+      let max_dd = data.trade_analytics?.all?.max_drawdown || 0.0;
+      if (tab === 'nifty') max_dd = data.trade_analytics?.nifty?.max_drawdown || 0.0;
+      if (tab === 'mcx') max_dd = data.trade_analytics?.mcx?.max_drawdown || 0.0;
+      if (maxDdEl) {
+        maxDdEl.innerText = fmtINR(max_dd, true);
+      }
+
       const ytdPctEl = document.getElementById('ytd-pct');
       if (ytdPctEl) {
         ytdPctEl.innerText = `(${fmtPct(ytdPct)})`;
