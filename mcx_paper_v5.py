@@ -325,22 +325,22 @@ class ReversionDetector:
 
     @classmethod
     def is_reversal_for_ce(cls, kama_slope: float, confirmed_sig: int) -> Tuple[bool, str]:
+        # CE was stopped because market surged UP.
+        # Re-enter CE strictly on KAMA downturn OR confirmed bearish EMA:
         if kama_slope <= -KAMA_MIN_SLOPE:
             return True, f"KAMA_DOWNTURN(slope={kama_slope:+.3f})"
         if confirmed_sig == -1:
             return True, "EMA_BEARISH_LOCK(-1)"
-        if confirmed_sig <= 0 and kama_slope <= 0.0:
-            return True, f"BULLISH_EXHAUSTED(ema={confirmed_sig}, kama_slope={kama_slope:+.3f})"
         return False, ""
 
     @classmethod
     def is_reversal_for_pe(cls, kama_slope: float, confirmed_sig: int) -> Tuple[bool, str]:
+        # PE was stopped because market dumped DOWN.
+        # Re-enter PE strictly on KAMA upturn OR confirmed bullish EMA:
         if kama_slope >= KAMA_MIN_SLOPE:
             return True, f"KAMA_UPTURN(slope={kama_slope:+.3f})"
         if confirmed_sig == 1:
             return True, "EMA_BULLISH_LOCK(+1)"
-        if confirmed_sig >= 0 and kama_slope >= 0.0:
-            return True, f"BEARISH_EXHAUSTED(ema={confirmed_sig}, kama_slope={kama_slope:+.3f})"
         return False, ""
 
 
@@ -488,6 +488,18 @@ def round_to_price(value: float, step: float = STRIKE_STEP) -> float:
 def round_to_tick(value: float) -> float:
     return round(value * 20.0) / 20.0
 
+def calc_strangle_sl(entry_price: float) -> float:
+    """
+    Calculates Strangle SL buffer:
+    - When premium is high (>= 17.0): Keep SL near premium (10% buffer, capped at 2.00 pts max, min 1.50 pts).
+    - When premium is lower (< 17.0): Ensure strangle legs don't cutoff (at least 1.50 pts buffer or 10%).
+    """
+    if entry_price >= 17.0:
+        pts_buffer = min(2.00, max(1.50, entry_price * STRANGLE_SL_PCT))
+    else:
+        pts_buffer = max(1.50, entry_price * STRANGLE_SL_PCT)
+    return round_to_tick(entry_price + pts_buffer)
+
 def _ansi_len(s: str) -> int:
     return len(re.sub(r'\x1b\[[0-9;]*m', '', s))
 
@@ -578,6 +590,7 @@ class NaturalGasPaperBot:
                 'last_reentry_ts': self.last_reentry_ts,
                 'last_any_close_ts': self.last_any_close_ts,
                 'cooldown_tracker': self.cooldown_tracker,
+                'bars_1m': list(self.bars_1m),
             }
             with open(self.state_file, 'w') as f:
                 json.dump(state, f, indent=2)
@@ -607,6 +620,18 @@ class NaturalGasPaperBot:
                     if k in self.cooldown_tracker:
                         self.cooldown_tracker[k].update(v)
 
+            saved_bars = state.get('bars_1m', [])
+            if saved_bars:
+                self.bars_1m = deque(saved_bars[-60:], maxlen=60)
+                if len(self.bars_1m) >= KAMA_PERIOD + 1:
+                    kama, prev_kama, trend, slope = Indicators.calculate_kama(
+                        np.array(list(self.bars_1m)), period=KAMA_PERIOD, fast=KAMA_FAST_EMA, slow=KAMA_SLOW_EMA
+                    )
+                    self.current_kama = kama
+                    self.prev_kama = prev_kama
+                    self.kama_trend = trend
+                    self.kama_slope = slope
+
             is_strangle = ('CE' in self.positions and 'PE' in self.positions)
             for leg, pos in self.positions.items():
                 sl_st = pos.setdefault('sl_state', {})
@@ -616,12 +641,13 @@ class NaturalGasPaperBot:
                 anchor = float(sl_st.get('anchor_ltp', entry))
 
                 if solo:
-                    new_sl = round_to_tick(best * (1.0 + SOLO_TSL_PCT))
+                    new_sl = round_to_tick(best + max(0.50, best * SOLO_TSL_PCT))
                     curr_sl = float(sl_st.get('current_sl', new_sl))
                     sl_st['current_sl'] = min(curr_sl, new_sl)
                 else:
-                    new_sl = round_to_tick(entry * (1.0 + STRANGLE_SL_PCT))
-                    sl_st['current_sl'] = new_sl
+                    initial_sl = sl_st.get('initial_sl', calc_strangle_sl(entry))
+                    sl_st['initial_sl'] = initial_sl
+                    sl_st['current_sl'] = min(initial_sl, float(sl_st.get('current_sl', initial_sl)))
                 sl_st['best_premium'] = best
                 sl_st['anchor_ltp'] = anchor
                 sl_st['solo_mode'] = solo
@@ -902,7 +928,7 @@ class NaturalGasPaperBot:
             print(f'[WARN] LTP=0 for {tsym}. Skipping entry.', flush=True)
             return None
 
-        initial_sl = round_to_tick(ltp * (1.0 + STRANGLE_SL_PCT))
+        initial_sl = calc_strangle_sl(ltp)
         now_ts     = time.time()
 
         pos = {
@@ -933,11 +959,12 @@ class NaturalGasPaperBot:
 
         self._save_state()
 
+        pts_gap = initial_sl - ltp
         tg = (f'<pre>\n━━━ MCX TRADE OPENED (v6.5) ━━━\n\n'
               f'  {leg:<4} Strike {int(strike)}  {side} @ {ltp:.2f}\n'
-              f'  SL   {STRANGLE_SL_PCT*100:.0f}%  →  {initial_sl:.2f}\n'
+              f'  SL   {initial_sl:.2f} (+{pts_gap:.2f} pts)\n'
               f'  Qty  {LOT_SIZE}\n  {tsym}\n  Reason: {reason}\n</pre>')
-        print(f'[ENTRY] {side} {LOT_SIZE}x {leg} Strike={int(strike)} ({tsym}) @ ₹{ltp:.2f} | {reason}', flush=True)
+        print(f'[ENTRY] {side} {LOT_SIZE}x {leg} Strike={int(strike)} ({tsym}) @ ₹{ltp:.2f} | SL={initial_sl:.2f} | {reason}', flush=True)
         send_telegram(tg)
         return pos
 
@@ -947,13 +974,13 @@ class NaturalGasPaperBot:
     def _anchor_surviving_leg(self, surviving_leg: str):
         """
         When partner leg breaks (hits SL), surviving leg re-anchors to live LTP
-        and trails with a 7% TSL (solo_mode = True).
+        and trails with a 5% TSL (solo_mode = True, min 0.50 pt buffer).
         """
         pos = self.positions.get(surviving_leg)
         if not pos:
             return
         ltp   = self._get_leg_ltp(pos)
-        new_sl = round_to_tick(ltp * (1.0 + SOLO_TSL_PCT))
+        new_sl = round_to_tick(ltp + max(0.50, ltp * SOLO_TSL_PCT))
         state  = pos.setdefault('sl_state', {})
 
         state['anchor_ltp']      = ltp
@@ -1053,8 +1080,9 @@ class NaturalGasPaperBot:
             return False
 
         actual_entry = pos['entry_price']
+        pos['entry_price'] = live_ltp
         pos['_last_ltp'] = live_ltp
-        fresh_sl = round_to_tick(live_ltp * (1.0 + STRANGLE_SL_PCT))
+        fresh_sl = calc_strangle_sl(live_ltp)
         pos['sl_state'] = {
             'best_premium':    live_ltp,
             'anchor_ltp':      live_ltp,
@@ -1071,7 +1099,7 @@ class NaturalGasPaperBot:
         tg = (f'<pre>\n━━━ MCX IN-PLACE REBALANCE (v6.5) ━━━\n\n'
               f'  Preserved: {solo_leg} {int(pos["strike"])} (Entry={actual_entry:.2f} Live={live_ltp:.2f})\n'
               f'  Entered:   {other_leg} {int(other_strike)}\n'
-              f'  SL reset:  {STRANGLE_SL_PCT*100:.0f}% → ₹{fresh_sl:.2f}\n</pre>')
+              f'  SL reset:  → ₹{fresh_sl:.2f}\n</pre>')
         send_telegram(tg)
         return True
 
@@ -1094,17 +1122,18 @@ class NaturalGasPaperBot:
             state['best_premium'] = round(best, 2)
 
         if is_solo:
-            # ── SOLO MODE: Trailing Stop Loss (5% above best premium seen) ──
-            new_sl = round_to_tick(best * (1.0 + SOLO_TSL_PCT))
+            # ── SOLO MODE: Trailing Stop Loss (5% above best premium seen, min 0.50 pt buffer) ──
+            new_sl = round_to_tick(best + max(0.50, best * SOLO_TSL_PCT))
             if 'current_sl' in state:
                 prem_sl = min(new_sl, state['current_sl'])
             else:
                 prem_sl = new_sl
             state['current_sl'] = prem_sl
         else:
-            # ── STRANGLE MODE: Fixed 10% SL (No trailing while strangle is intact) ──
+            # ── STRANGLE MODE: Fixed SL (Tuned for high premium near, low premium no-cutoff) ──
             state['solo_mode'] = False
-            prem_sl = round_to_tick(entry_prem * (1.0 + STRANGLE_SL_PCT))
+            initial_sl = state.get('initial_sl', calc_strangle_sl(entry_prem))
+            prem_sl = min(initial_sl, state.get('current_sl', initial_sl))
             state['current_sl'] = prem_sl
 
         if live_ltp >= prem_sl:
@@ -1134,6 +1163,12 @@ class NaturalGasPaperBot:
         kama_slope = getattr(self, "kama_slope", 0.0)
 
         for leg in ("CE", "PE"):
+            # Guard against duplicate entry if already open
+            if leg in self.positions and self.positions[leg].get("side") == "SELL":
+                if leg in self.cooldown_tracker:
+                    self.cooldown_tracker[leg]["active"] = False
+                continue
+
             cd = self.cooldown_tracker.get(leg)
             if not cd or not cd.get("active", False):
                 continue
@@ -1328,10 +1363,11 @@ class NaturalGasPaperBot:
             unreal_col = GR if total_unreal > 0 else (RD if total_unreal < 0 else YL)
             net_col    = GR if net > 0 else (RD if net < 0 else YL)
 
+            sl_risk_col = GR if sl_risk_total >= 0 else RD
             pnl_row = (f'  {DIM}REALIZED:{RS} {real_col}{real_fmt}{RS}  {VS}  '
                        f'{DIM}UNREALIZED:{RS} {unreal_col}{unreal_fmt}{RS}  {VS}  '
                        f'{DIM}NET MTM:{RS} {net_col}{net_fmt} ({net_pct:+.2f}%){RS}  {VS}  '
-                       f'{DIM}SL RISK:{RS} {RD}{sl_risk_total:+,.0f}{RS}')
+                       f'{DIM}SL RISK:{RS} {sl_risk_col}{sl_risk_total:+,.0f}{RS}')
             print(f'{V}{_pad(pnl_row, W)}{V}')
             print(BOT)
             sys.stdout.flush()
@@ -1578,10 +1614,17 @@ class NaturalGasPaperBot:
                 # ═════════════════════════════════════════════════
                 if not self.positions:
                     print(f'[ENTRY] Entering Balanced ATM Strangle (CE + PE) at Strike {int(atm)}...', flush=True)
-                    self._enter_leg('CE', atm, 'SELL', reason="Initial Strangle Entry")
-                    self._enter_leg('PE', atm, 'SELL', reason="Initial Strangle Entry")
-                    self.cooldown_tracker["CE"]["active"] = False
-                    self.cooldown_tracker["PE"]["active"] = False
+                    ce_pos = self._enter_leg('CE', atm, 'SELL', reason="Initial Strangle Entry")
+                    pe_pos = self._enter_leg('PE', atm, 'SELL', reason="Initial Strangle Entry")
+                    if ce_pos and pe_pos:
+                        self.cooldown_tracker["CE"]["active"] = False
+                        self.cooldown_tracker["PE"]["active"] = False
+                    elif ce_pos and not pe_pos:
+                        self.cooldown_tracker["PE"]["active"] = True
+                        self.cooldown_tracker["PE"]["next_eligible_time"] = time.time()
+                    elif pe_pos and not ce_pos:
+                        self.cooldown_tracker["CE"]["active"] = True
+                        self.cooldown_tracker["CE"]["next_eligible_time"] = time.time()
                     self._render_dashboard(spot, atm, ema_snap)
                     time.sleep(1.0)
                     continue
