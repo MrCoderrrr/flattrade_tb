@@ -905,7 +905,7 @@ def get_aggregated_dashboard_state() -> dict:
 
     trade_analytics["nifty"]["max_drawdown"] = round(calc_daily_dd(nifty_daily_seq), 2)
     trade_analytics["mcx"]["max_drawdown"] = round(calc_daily_dd(mcx_daily_seq), 2)
-    trade_analytics["combined"]["max_drawdown"] = round(calc_daily_dd(combo_daily_seq), 2)
+    trade_analytics["all"]["max_drawdown"] = round(calc_daily_dd(combo_daily_seq), 2)
 
 
     # Count completed, deduplicated trade records. Snapshot counters include
@@ -1087,7 +1087,10 @@ def get_aggregated_dashboard_state() -> dict:
             "combined_realized": combined_realized,
             "combined_unrealized": combined_unrealized,
             "mtd_pnl": combined_mtd_pnl,
+
             "combined_mtd_pct": (combined_mtd_pnl / account_initial_capital) * 100.0 if account_initial_capital else 0.0,
+            "sl_risk": nifty_sl_risk + mcx_sl_risk,
+
             "ytd_pnl": combined_ytd_pnl,
             "combined_ytd_pct": (combined_ytd_pnl / account_initial_capital) * 100.0 if account_initial_capital else 0.0,
             "total_trades": total_trades,
@@ -1108,7 +1111,10 @@ def get_aggregated_dashboard_state() -> dict:
             "mtd_pct": (nifty_mtd_pnl / account_initial_capital) * 100.0 if account_initial_capital else 0.0,
             "ytd_pnl": nifty_ytd_pnl,
             "ytd_pct": (nifty_ytd_pnl / account_initial_capital) * 100.0 if account_initial_capital else 0.0,
+
             "trades_today": nifty_trades,
+            "sl_risk": nifty_sl_risk,
+
             "daily_history": {d: v["nifty"] for d, v in daily_breakdown.items()},
             "regime": regime,
             "adx": adx_val,
@@ -1141,7 +1147,10 @@ def get_aggregated_dashboard_state() -> dict:
             "mtd_pct": (mcx_mtd_pnl / account_initial_capital) * 100.0 if account_initial_capital else 0.0,
             "ytd_pnl": mcx_ytd_pnl,
             "ytd_pct": (mcx_ytd_pnl / account_initial_capital) * 100.0 if account_initial_capital else 0.0,
+
             "trades_today": mcx_trades,
+            "sl_risk": mcx_sl_risk,
+
             "daily_history": {d: v["mcx"] for d, v in daily_breakdown.items()},
             "reversal_latched": bool(mcx_snap.get("reversal_latched", False)),
             "cooldown_remaining": mcx_snap.get("cooldown_remaining", 0),
