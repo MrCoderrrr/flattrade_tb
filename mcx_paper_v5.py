@@ -108,28 +108,49 @@ MCX_EXIT_MINUTE     = 24
 LOT_SIZE            = 1250         # 1 lot = 1250 units
 CAPITAL             = 200000.0
 
-# ── Stop-Loss Percentages ─────────────────────────────────────────
+# ── Stop-Loss Percentages (Fallback / Fixed Mode) ───────────────
 STRANGLE_SL_PCT     = 0.10         # 10% initial SL in strangle mode
 SOLO_TSL_PCT        = 0.05         # 5% trailing stop for solo surviving leg
 
+# ── 1. Regime / Volatility Filter ─────────────────────────────────
+VOL_FILTER_MODE     = 'DELAY'      # 'DELAY', 'SKIP', or 'NONE'
+VOL_ATR_PERIOD      = 30           # Lookback bars for baseline volatility (1m bars)
+VOL_MULTIPLIER      = 1.5          # Threshold multiplier against baseline
+
+# ── 2. Confirmation-Based Exits ───────────────────────────────────
+SL_CONFIRMATION_MINUTES = 1        # Candle close wait time before triggering SL/TSL (0 for tick-level)
+
+# ── 3. Volatility-Scaled Stop Loss ────────────────────────────────
+USE_VOL_SCALED_SL   = True         # If True, overrides fixed % SL with Volatility-based distance
+SL_VOL_MULTIPLIER   = 3.0          # Strangle SL = base_vol * multiplier
+TSL_VOL_MULTIPLIER  = 2.0          # Solo TSL = base_vol * multiplier
+
+# ── 4. Trailing Surviving Leg on Spot Distance ────────────────────
+TRAIL_ON_SPOT_DISTANCE = True      # If True, trails Spot Distance instead of Option LTP
+SPOT_TSL_BUFFER        = 1.5       # Fixed trailing distance in Spot points (used if not vol-scaled)
+
+# ── 5. Consecutive-Stopout Churn Guard (Disabled) ─────────────────
+CHURN_MAX_STOPOUTS     = 9999      # Max consecutive stopouts before penalty (9999 = Disabled)
+CHURN_COOLDOWN_MINUTES = 0         # Cooldown duration after hitting max stopouts (0 = Disabled)
+
 # ── Tick Debounce ─────────────────────────────────────────────────
-SL_DEBOUNCE_SECS    = 2.0          # Price must stay >= SL for 2s before firing
+SL_DEBOUNCE_SECS    = 2.0          # Price must stay >= SL for 2s before firing (intrabar fallback)
 
 # ── Cooldowns & Re-Entry Debounce ─────────────────────────────────
 REENTRY_COOLDOWN_S  = 5.0          # 5 seconds minimum after a stop before reversal check
 
-# ── KAMA Parameters (UPV2-Identical, Tuned to MCX Price Scale) ─────
-KAMA_PERIOD         = 10           # Lookback period (10 bars)
+# ── KAMA Parameters (Highly Sensitive) ────────────────────────────
+KAMA_PERIOD         = 5            # Reduced from 10 to 5 bars for faster reaction
 KAMA_FAST_EMA       = 3            # Fast EMA constant
 KAMA_SLOW_EMA       = 30           # Slow EMA constant
-KAMA_MIN_SLOPE      = 0.05         # 0.05 pts (1 tick) threshold to detect slope turn
+KAMA_MIN_SLOPE      = 0.02         # Lowered from 0.05 to 0.02 for micro-tilt detection
 
-# ── Continuous Streaming EMA Engine (UPV2-Identical) ───────────────
-EMA_FAST_HL         = 15.0         # 15s half-life (fast momentum)
-EMA_SLOW_HL         = 90.0         # 90s half-life (trend baseline)
+# ── Continuous Streaming EMA Engine (Hyper Sensitive) ──────────────
+EMA_FAST_HL         = 10.0         # 10s half-life (lightning fast momentum)
+EMA_SLOW_HL         = 45.0         # 45s half-life (short trend baseline)
 EMA_ANCHOR_HL       = 300.0        # 300s half-life (anchor drift)
-PERSISTENCE_MIN     = 3.0          # Clamped minimum hold time (seconds)
-PERSISTENCE_MAX     = 20.0         # Clamped maximum hold time (seconds)
+PERSISTENCE_MIN     = 1.5          # Clamped minimum hold time (seconds)
+PERSISTENCE_MAX     = 8.0          # Clamped maximum hold time (seconds)
 
 # ── Telegram ──────────────────────────────────────────────────────
 TELEGRAM_TOKEN      = '8850507396:AAFwFm2_WxPdSM52JcCpJUj8V1rz9x3G-kE'
@@ -326,21 +347,23 @@ class ReversionDetector:
     @classmethod
     def is_reversal_for_ce(cls, kama_slope: float, confirmed_sig: int) -> Tuple[bool, str]:
         # CE was stopped because market surged UP.
-        # Re-enter CE strictly on KAMA downturn OR confirmed bearish EMA:
         if kama_slope <= -KAMA_MIN_SLOPE:
             return True, f"KAMA_DOWNTURN(slope={kama_slope:+.3f})"
         if confirmed_sig == -1:
             return True, "EMA_BEARISH_LOCK(-1)"
+        if confirmed_sig <= 0 and kama_slope <= 0.01:
+            return True, f"BULLISH_EXHAUSTION(sig={confirmed_sig}, slope={kama_slope:+.3f})"
         return False, ""
 
     @classmethod
     def is_reversal_for_pe(cls, kama_slope: float, confirmed_sig: int) -> Tuple[bool, str]:
         # PE was stopped because market dumped DOWN.
-        # Re-enter PE strictly on KAMA upturn OR confirmed bullish EMA:
         if kama_slope >= KAMA_MIN_SLOPE:
             return True, f"KAMA_UPTURN(slope={kama_slope:+.3f})"
         if confirmed_sig == 1:
             return True, "EMA_BULLISH_LOCK(+1)"
+        if confirmed_sig >= 0 and kama_slope >= -0.01:
+            return True, f"BEARISH_EXHAUSTION(sig={confirmed_sig}, slope={kama_slope:+.3f})"
         return False, ""
 
 
@@ -539,7 +562,7 @@ class NaturalGasPaperBot:
         self.ema_engine = ContinuousEMAEngine()
 
         # ── KAMA & 1-Minute Bar Tracking (UPV2-Identical) ───────────
-        self.bars_1m: deque = deque(maxlen=60)
+        self.bars_1m: deque = deque(maxlen=120)
         self.last_completed_1m_key: str = ""
         self.current_kama: Optional[float] = None
         self.prev_kama: Optional[float] = None
@@ -551,6 +574,10 @@ class NaturalGasPaperBot:
             "CE": {"active": False, "stopped_time": 0.0, "next_eligible_time": 0.0, "reason": ""},
             "PE": {"active": False, "stopped_time": 0.0, "next_eligible_time": 0.0, "reason": ""},
         }
+        
+        # ── Churn Guard Tracker ───────────────────────────────────────
+        self.stopout_counts: Dict[str, int] = {"CE": 0, "PE": 0}
+        self.churn_cooldown_until: Dict[str, float] = {"CE": 0.0, "PE": 0.0}
 
         self.total_realized_pnl: float = 0.0
         self.trades_today: int = 0
@@ -590,6 +617,8 @@ class NaturalGasPaperBot:
                 'last_reentry_ts': self.last_reentry_ts,
                 'last_any_close_ts': self.last_any_close_ts,
                 'cooldown_tracker': self.cooldown_tracker,
+                'stopout_counts': self.stopout_counts,
+                'churn_cooldown_until': self.churn_cooldown_until,
                 'bars_1m': list(self.bars_1m),
             }
             with open(self.state_file, 'w') as f:
@@ -613,6 +642,9 @@ class NaturalGasPaperBot:
             self.trades_today       = int(state.get('trades_today', 0))
             self.last_reentry_ts    = float(state.get('last_reentry_ts', 0.0))
             self.last_any_close_ts  = float(state.get('last_any_close_ts', 0.0))
+            
+            self.stopout_counts       = state.get('stopout_counts', {"CE": 0, "PE": 0})
+            self.churn_cooldown_until = state.get('churn_cooldown_until', {"CE": 0.0, "PE": 0.0})
 
             saved_cd = state.get('cooldown_tracker')
             if isinstance(saved_cd, dict):
@@ -622,7 +654,7 @@ class NaturalGasPaperBot:
 
             saved_bars = state.get('bars_1m', [])
             if saved_bars:
-                self.bars_1m = deque(saved_bars[-60:], maxlen=60)
+                self.bars_1m = deque(saved_bars[-120:], maxlen=120)
                 if len(self.bars_1m) >= KAMA_PERIOD + 1:
                     kama, prev_kama, trend, slope = Indicators.calculate_kama(
                         np.array(list(self.bars_1m)), period=KAMA_PERIOD, fast=KAMA_FAST_EMA, slow=KAMA_SLOW_EMA
@@ -659,6 +691,20 @@ class NaturalGasPaperBot:
                   f'Realized=₹{self.total_realized_pnl:,.2f} | Trades={self.trades_today}', flush=True)
         except Exception as e:
             print(f'[WARN] Error loading MCX state: {e}', flush=True)
+
+    def get_realized_volatility(self) -> Tuple[float, float]:
+        """
+        Returns (current_vol, baseline_vol) based on standard deviation of 1-minute close returns (points).
+        """
+        if len(self.bars_1m) < 10:
+            return 0.0, 0.0
+            
+        arr = np.array(list(self.bars_1m))
+        diffs = np.abs(np.diff(arr))
+        
+        current_vol = float(np.mean(diffs[-5:])) if len(diffs) >= 5 else 0.0
+        baseline_vol = float(np.mean(diffs[-VOL_ATR_PERIOD:])) if len(diffs) >= VOL_ATR_PERIOD else float(np.mean(diffs))
+        return current_vol, baseline_vol
 
     # ──────────────────────────────────────────
     # Authentication
@@ -1009,6 +1055,41 @@ class NaturalGasPaperBot:
         sign     = '+' if pnl >= 0 else ''
         tot_sign = '+' if self.total_realized_pnl >= 0 else ''
 
+        # Update Churn Guard
+        if "SL" in reason or "TSL" in reason:
+            self.stopout_counts[leg] = self.stopout_counts.get(leg, 0) + 1
+            if self.stopout_counts[leg] >= CHURN_MAX_STOPOUTS:
+                self.churn_cooldown_until[leg] = time.time() + (CHURN_COOLDOWN_MINUTES * 60)
+                reason += " [CHURN MAX REACHED]"
+        else:
+            self.stopout_counts[leg] = 0
+
+        # Change 6: Per-leg close-reason logging
+        curr_vol, base_vol = self.get_realized_volatility()
+        spot = self.get_spot()
+        log_entry = {
+            'timestamp': get_ist_now().strftime('%Y-%m-%d %H:%M:%S'),
+            'leg':       leg,
+            'entry_price': pos['entry_price'],
+            'exit_price':  ltp,
+            'close_reason': reason,
+            'realized_pnl': round(pnl, 2),
+            'spot_price': spot,
+            'curr_vol': round(curr_vol, 4),
+            'base_vol': round(base_vol, 4)
+        }
+        
+        csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mcx_trade_log_v6.csv')
+        file_exists = os.path.isfile(csv_path)
+        try:
+            with open(csv_path, 'a', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=log_entry.keys())
+                if not file_exists:
+                    writer.writeheader()
+                writer.writerow(log_entry)
+        except Exception as e:
+            print(f"[WARN] Failed to write trade log: {e}", flush=True)
+
         self.trade_log.append({
             'leg':       leg,
             'tsym':      pos.get('tsym', leg),
@@ -1115,38 +1196,82 @@ class NaturalGasPaperBot:
         entry_prem = float(pos['entry_price'])
         now_ts     = time.time()
         is_solo    = bool(state.get('solo_mode', False))
+        spot       = self.get_spot()
+        strike     = float(pos.get('strike', 0.0))
+        is_ce      = (leg == 'CE')
 
+        # Compute Volatility metrics
+        curr_vol, base_vol = self.get_realized_volatility()
+
+        # Track Best Premium
         best = float(state.get('best_premium', entry_prem))
         if live_ltp < best:
             best = live_ltp
             state['best_premium'] = round(best, 2)
 
-        if is_solo:
-            # ── SOLO MODE: Trailing Stop Loss (5% above best premium seen, min 0.50 pt buffer) ──
-            new_sl = round_to_tick(best + max(0.50, best * SOLO_TSL_PCT))
-            if 'current_sl' in state:
-                prem_sl = min(new_sl, state['current_sl'])
-            else:
-                prem_sl = new_sl
-            state['current_sl'] = prem_sl
+        # Track Spot Advantage for Spot TSL
+        if spot > 0 and strike > 0:
+            current_adv = (strike - spot) if is_ce else (spot - strike)
+            best_adv = float(state.get('best_spot_adv', current_adv))
+            if current_adv > best_adv:
+                best_adv = current_adv
+                state['best_spot_adv'] = round(best_adv, 2)
         else:
-            # ── STRANGLE MODE: Fixed SL (Tuned for high premium near, low premium no-cutoff) ──
+            current_adv = 0.0
+            best_adv = 0.0
+
+        if is_solo:
+            # ── SOLO MODE: Trailing Stop Loss ──
+            if TRAIL_ON_SPOT_DISTANCE and spot > 0 and strike > 0:
+                buffer_pts = (base_vol * TSL_VOL_MULTIPLIER) if (USE_VOL_SCALED_SL and base_vol > 0) else SPOT_TSL_BUFFER
+                is_breached = (best_adv - current_adv) >= buffer_pts
+                prem_sl = live_ltp  # Dummy for dashboard display
+                reason_fmt = f'Spot-TSL (Adv={current_adv:.2f} < Best-{buffer_pts:.2f})'
+            else:
+                if USE_VOL_SCALED_SL and base_vol > 0:
+                    new_sl = round_to_tick(best + (base_vol * TSL_VOL_MULTIPLIER))
+                else:
+                    new_sl = round_to_tick(best + max(0.50, best * SOLO_TSL_PCT))
+                if 'current_sl' in state:
+                    prem_sl = min(new_sl, state['current_sl'])
+                else:
+                    prem_sl = new_sl
+                state['current_sl'] = prem_sl
+                is_breached = live_ltp >= prem_sl
+                reason_fmt = f'LTP={live_ltp:.2f} >= SL={prem_sl:.2f}'
+        else:
+            # ── STRANGLE MODE: Fixed SL ──
             state['solo_mode'] = False
-            initial_sl = state.get('initial_sl', calc_strangle_sl(entry_prem))
+            if USE_VOL_SCALED_SL and base_vol > 0:
+                initial_sl = round_to_tick(entry_prem + (base_vol * SL_VOL_MULTIPLIER))
+            else:
+                initial_sl = state.get('initial_sl', calc_strangle_sl(entry_prem))
+            state['initial_sl'] = initial_sl
             prem_sl = min(initial_sl, state.get('current_sl', initial_sl))
             state['current_sl'] = prem_sl
+            is_breached = live_ltp >= prem_sl
+            reason_fmt = f'LTP={live_ltp:.2f} >= SL={prem_sl:.2f}'
 
-        if live_ltp >= prem_sl:
+        # ── 2. Confirmation-Based Exit Logic ──
+        if is_breached:
+            state['is_breached'] = True
             breach_start = state.get('breach_start_ts', 0.0)
             if breach_start <= 0.0:
                 state['breach_start_ts'] = now_ts
+                state['breach_min_key'] = get_ist_now().strftime("%M")
+            
+            if SL_CONFIRMATION_MINUTES > 0:
+                curr_min_str = get_ist_now().strftime("%M")
+                if curr_min_str != state['breach_min_key']:
+                    mode_label = 'Solo TSL' if is_solo else 'Strangle SL'
+                    return True, f'{mode_label} (Confirmed) hit on {leg} | {reason_fmt}'
             elif (now_ts - breach_start) >= SL_DEBOUNCE_SECS:
                 mode_label = 'Solo TSL' if is_solo else 'Strangle SL'
-                return True, (f'{mode_label} hit on {leg} | '
-                              f'LTP={live_ltp:.2f} >= SL={prem_sl:.2f} | '
-                              f'Entry={entry_prem:.2f} Best={best:.2f}')
+                return True, f'{mode_label} hit on {leg} | {reason_fmt}'
         else:
+            state['is_breached'] = False
             state['breach_start_ts'] = 0.0
+            state['breach_min_key'] = ""
 
         return False, ''
 
@@ -1183,6 +1308,30 @@ class NaturalGasPaperBot:
 
             if not signal:
                 continue
+
+            # ── 5. Churn Guard Check ──
+            if self.stopout_counts.get(leg, 0) >= CHURN_MAX_STOPOUTS:
+                cooldown_expiry = self.churn_cooldown_until.get(leg, 0.0)
+                if now_ts < cooldown_expiry:
+                    continue  # Still in churn cooldown
+                else:
+                    self.stopout_counts[leg] = 0
+                    self.churn_cooldown_until[leg] = 0.0
+
+            # ── 1. Regime / Volatility Filter ──
+            if VOL_FILTER_MODE != 'NONE':
+                curr_vol, base_vol = self.get_realized_volatility()
+                if base_vol > 0 and curr_vol > (base_vol * VOL_MULTIPLIER):
+                    if VOL_FILTER_MODE == 'DELAY':
+                        # Suppress spam by only printing occasionally or using dashboard
+                        if getattr(self, '_last_vol_delay_print', 0) < now_ts - 10:
+                            print(f"⏳ [{leg} REVERSAL DELAYED] High Vol (Curr {curr_vol:.2f} > Base {base_vol:.2f} * {VOL_MULTIPLIER})", flush=True)
+                            self._last_vol_delay_print = now_ts
+                        continue
+                    elif VOL_FILTER_MODE == 'SKIP':
+                        print(f"🚫 [{leg} REVERSAL SKIPPED] High Vol. Abandoning re-entry for this cycle.", flush=True)
+                        cd["active"] = False
+                        continue
 
             # Reversal confirmed: Re-enter squared leg at ATM
             print(f"✅ [{leg} REVERSAL CONFIRMED] {reason}. Re-entering {leg} at ATM Strike {int(atm)}...", flush=True)
@@ -1264,7 +1413,7 @@ class NaturalGasPaperBot:
         if now_ts - self._last_console_dash_ts >= 1.0:
             self._last_console_dash_ts = now_ts
 
-            W   = 120
+            W   = 130
             DIM = f'{Fore.WHITE}{Style.DIM}'
             CY  = f'{Fore.CYAN}{Style.BRIGHT}'
             WH  = f'{Fore.WHITE}{Style.BRIGHT}'
@@ -1292,39 +1441,53 @@ class NaturalGasPaperBot:
             kama_tr  = getattr(self, "kama_trend", 0)
             kama_str = f"{GR}▲ UP{RS}" if kama_tr > 0 else (f"{RD}▼ DOWN{RS}" if kama_tr < 0 else f"{YL}━ FLAT{RS}")
 
-            # Cooldown indicators
+            # Churn and Cooldown indicators
             cd_info = []
             for ln in ("CE", "PE"):
-                if self.cooldown_tracker.get(ln, {}).get("active"):
-                    cd_info.append(f"{MG}[AWAITING {ln} REVERSAL]{RS}")
+                churn = self.stopout_counts.get(ln, 0)
+                churn_str = f"({churn}/{CHURN_MAX_STOPOUTS})" if churn > 0 else ""
+                expiry = self.churn_cooldown_until.get(ln, 0.0)
+                if now_ts < expiry:
+                    cd_info.append(f"{RD}[{ln} CHURN PENALTY {int(expiry - now_ts)}s]{RS}")
+                elif self.cooldown_tracker.get(ln, {}).get("active"):
+                    cd_info.append(f"{MG}[{ln} WAIT REV {churn_str}]{RS}")
             cd_tag = "  " + " ".join(cd_info) if cd_info else ""
 
             print()
             print(TOP)
+            
+            sl_cfg_str = f"VOL-SCALED ({SL_VOL_MULTIPLIER}x)" if USE_VOL_SCALED_SL else "FIXED 10% SL"
+            if TRAIL_ON_SPOT_DISTANCE:
+                tsl_cfg_str = "SPOT-TSL"
+            else:
+                tsl_cfg_str = f"VOL-TSL ({TSL_VOL_MULTIPLIER}x)" if USE_VOL_SCALED_SL else "FIXED 5% TSL"
+                
             title_l = (f'  {CY}MCX NATGAS PAPER v6.5{RS}  {DIM}│{RS}  '
                        f'{YL}UPV2 KAMA + EMA STRANGLE{RS}  {DIM}│{RS}  '
-                       f'{GR}10% SL / 5% TSL{RS}')
+                       f'{GR}{sl_cfg_str} / {tsl_cfg_str}{RS}')
             title_r = f'{DIM}{now.strftime("%H:%M:%S IST")}{RS}  '
             pad_top = max(1, W - _ansi_len(title_l) - _ansi_len(title_r))
             print(f'{V}{title_l}{" " * pad_top}{title_r}{V}')
             print(MID)
 
+            curr_vol, base_vol = self.get_realized_volatility()
             exp_badge = (f"{YL}{self.target_opt_expiry_str}{RS} ({CY}ROLLOVER{RS})"
                          if self.is_rolled_over else f"{WH}{self.target_opt_expiry_str}{RS}")
-            ind_row = (f'  {DIM}SPOT:{RS} {WH}{spot:>8.2f}{RS}  '
+            ind_row = (f'  {DIM}SPOT:{RS} {WH}{spot:>6.1f}{RS}  '
                        f'{DIM}ATM:{RS} {YL}{int(atm):<5}{RS}  '
+                       f'{DIM}VOL(C/B):{RS} {curr_vol:.2f}/{base_vol:.2f}  '
                        f'{DIM}EXPIRY:{RS} {exp_badge}  '
                        f'{DIM}TRADES:{RS} {WH}{self.trades_today}{RS}'
                        f'{cd_tag}')
             print(f'{V}{_pad(ind_row, W)}{V}')
             print(MIDS)
 
-            mom_row = (f'  {CY}EMA(15/90/300):{RS} {DIM}F:{RS}{WH}{ema15:>7.2f}{RS} '
-                       f'{DIM}S:{RS}{WH}{ema90:>7.2f}{RS} '
-                       f'{DIM}SLOPE:{RS}{WH}{slope:>+6.3f}{RS} '
+            mom_row = (f'  {CY}EMA:{RS} {DIM}F:{RS}{WH}{ema15:>6.1f}{RS} '
+                       f'{DIM}S:{RS}{WH}{ema90:>6.1f}{RS} '
+                       f'{DIM}SLOPE:{RS}{WH}{slope:>+5.2f}{RS} '
                        f'{DIM}SIG:{RS}{sig_str}  {VS}  '
-                       f'{CY}KAMA(1m):{RS} {WH}{kama_val:>7.2f}{RS} '
-                       f'{DIM}SLOPE:{RS}{WH}{kama_slp:>+6.3f}{RS} '
+                       f'{CY}KAMA:{RS} {WH}{kama_val:>6.1f}{RS} '
+                       f'{DIM}SLOPE:{RS}{WH}{kama_slp:>+5.2f}{RS} '
                        f'{DIM}DIR:{RS}{kama_str}')
             print(f'{V}{_pad(mom_row, W)}{V}')
             print(MID)
