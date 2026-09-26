@@ -185,7 +185,7 @@ class ControlHandler(BaseHTTPRequestHandler):
         return market
 
     def _start(self, data: dict[str, Any]) -> Any:
-        fields = {"market", "mode", "multiplier", "capital", "confirmation"}
+        fields = {"market", "mode", "multiplier", "capital", "confirmation", "strategy_id"}
         if set(data) - fields:
             raise RequestError("Unexpected start fields.")
         market = self._market(data)
@@ -210,7 +210,11 @@ class ControlHandler(BaseHTTPRequestHandler):
             today = datetime.now(IST).date().isoformat()
             if confirmation != f"LIVE {market} {today}":
                 raise RequestError("Type the exact market and today's IST date to request a live session.")
-        return self.server.controller.start(market, mode, multiplier, capital, confirmation=confirmation)
+        kwargs = {}
+        if 'strategy_id' in data:
+            from strategy_lab.catalog import resolve
+            kwargs['strategy_id'] = resolve(market, data['strategy_id']).id
+        return self.server.controller.start(market, mode, multiplier, capital, confirmation=confirmation, **kwargs)
 
     def _get(self, head_only: bool = False) -> None:
         try:

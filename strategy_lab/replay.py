@@ -80,18 +80,21 @@ def parse_snapshot(row) -> Snapshot:
         raise DataError("market must be NIFTY/MCX; bars and quotes must be arrays")
     bars = []
     for item in row["bars"]:
-        _object(item, ("timestamp", "open", "high", "low", "close"), ("volume",))
+        _object(item, ("timestamp", "open", "high", "low", "close"), ("volume", "interval_minutes"))
         bar_time = _time(item["timestamp"], "bar timestamp")
-        if bar_time.second or bar_time.microsecond or bar_time.minute % 5:
-            raise DataError("Bar timestamps must be five-minute bar opens")
-        if bar_time + timedelta(minutes=5) > stamp:
+        interval = item.get('interval_minutes', 5)
+        if type(interval) is not int or interval not in (1, 5):
+            raise DataError('Bar interval must be one or five minutes')
+        if bar_time.second or bar_time.microsecond or bar_time.minute % interval:
+            raise DataError("Bar timestamps must align to their interval")
+        if bar_time + timedelta(minutes=interval) > stamp:
             raise DataError("Input includes a future or incomplete bar")
         if bars and bar_time <= bars[-1].timestamp:
             raise DataError("Bars must be strictly chronological without duplicates")
         prices = {key: _number(item[key], key) for key in ("open", "high", "low", "close")}
         if prices["high"] < max(prices.values()) or prices["low"] > min(prices.values()):
             raise DataError("Inconsistent OHLC bounds")
-        bars.append(Bar(bar_time, **prices, volume=_number(item.get("volume", 0), "volume", zero=True)))
+        bars.append(Bar(bar_time, **prices, volume=_number(item.get("volume", 0), "volume", zero=True), interval_minutes=interval))
     quotes, seen_tokens, seen_symbols = [], set(), set()
     for item in row["quotes"]:
         _object(item, ("contract", "timestamp", "bid", "ask", "last"), ("bid_size", "ask_size"))

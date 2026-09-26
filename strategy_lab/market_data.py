@@ -130,24 +130,26 @@ class FlattradeReadOnly:
             raise FeedError("Cannot match Natural Gas options to their underlying future")
         return "MCX", min(futures, key=lambda c: c.expiry).token
 
-    def bars(self, market, now):
-        bucket = (market, now.date(), now.hour, now.minute // 5)
+    def bars(self, market, now, interval=5):
+        bucket = (market, interval, now.date(), now.hour, now.minute // interval)
         if bucket in self._bars_cache:
             return self._bars_cache[bucket]
         exchange, token = self.underlying(market, now)
         start = now.replace(hour=9 if market == "NIFTY" else 16,
                             minute=15 if market == "NIFTY" else 0, second=0, microsecond=0)
+        if interval == 1:
+            start -= timedelta(days=7)
         result = self._call("TPSeries", exch=exchange, token=token,
-                            st=str(int(start.timestamp())), et=str(int(now.timestamp())), intrv="5")
+                            st=str(int(start.timestamp())), et=str(int(now.timestamp())), intrv=str(interval))
         if not isinstance(result, list):
             raise FeedError("No intraday bars available")
         bars = []
         try:
             for row in result:
                 stamp = exchange_time(row["time"])
-                if stamp + timedelta(minutes=5) <= now:
+                if stamp + timedelta(minutes=interval) <= now:
                     bars.append(Bar(stamp, number(row["into"]), number(row["inth"]),
-                                    number(row["intl"]), number(row["intc"]), number(row.get("intv", 0))))
+                                    number(row["intl"]), number(row["intc"]), number(row.get("intv", 0)), interval))
         except (ValueError, KeyError):
             raise FeedError("Malformed intraday bars") from None
         bars.sort(key=lambda b: b.timestamp)
@@ -166,10 +168,17 @@ class FlattradeReadOnly:
                 raise FeedError("Broker returned incomplete depth data") from None
         return result
 
-    def snapshot(self, market, now, held=()):
+    def snapshot(self, market, now, held=(), strategy_id=None):
+        from .catalog import resolve
+        interval = resolve(market, strategy_id).bar_minutes
         if held:
-            return [], self.quotes(held, now)
-        bars = self.bars(market, now)
+            quotes = self.quotes(held, now)
+            try:
+                bars = self.bars(market, now, interval) if interval == 1 else []
+            except FeedError:
+                bars = []  # Missing indicators must not prevent pricing an exit.
+            return bars, quotes
+        bars = self.bars(market, now, interval)
         if not bars:
             return bars, []
         spot = bars[-1].close

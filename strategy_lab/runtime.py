@@ -19,6 +19,8 @@ from pathlib import Path
 from .models import Contract, IST
 from .market_data import FlattradeReadOnly, FeedError
 from .strategies import build_plan, explain_signal
+from .catalog import resolve, catalog
+from . import active_v3
 
 MARKETS = ("NIFTY", "MCX")
 LIVE_REASON = "Live is locked: these candidates have no verified out-of-sample or forward-paper record, and live order reconciliation has not been commissioned."
@@ -113,7 +115,10 @@ class Controller:
         revision = self._revision
         self.lock.release()
         try:
-            bars, quotes = self.feed.snapshot(market, now, held)
+            if isinstance(self.feed, FlattradeReadOnly):
+                bars, quotes = self.feed.snapshot(market, now, held, strategy_id=self.data['sessions'][market].get('strategy_id'))
+            else:
+                bars, quotes = self.feed.snapshot(market, now, held)
         finally:
             self.lock.acquire()
         if revision != self._revision and not held:
@@ -144,19 +149,24 @@ class Controller:
                        halted=account["drawdown"] >= .05 * account["capital"])
         self.data["sessions"] = {m: blank_session() for m in MARKETS}
 
-    def start(self, market, mode, multiplier, capital, confirmation=""):
+    def start(self, market, mode, multiplier, capital, confirmation="", strategy_id=None):
         with self.lock:
             now = self.clock().astimezone(IST)
             if market not in MARKETS or mode not in ("paper", "live"):
                 raise ValueError("Choose NIFTY/MCX and paper/live explicitly")
             if mode == "live":
                 raise ValueError(LIVE_REASON)
+            spec = resolve(market, strategy_id)
+            if not spec.enabled:
+                raise ValueError('Original v1 is archived; its legacy engine is not connected to this paper controller')
             if type(multiplier) is not int or not 1 <= multiplier <= 100:
                 raise ValueError("Multiplier must be an integer from 1 to 100")
             if isinstance(capital, bool) or not isinstance(capital, (int, float)) or not math.isfinite(capital) or capital < 200000 * multiplier:
                 raise ValueError("Each multiplier requires at least ₹200,000 of declared capital")
             self._roll_day(now)
             s = self.data["sessions"][market]
+            if s['date'] and resolve(market, s.get('strategy_id')).id != spec.id:
+                raise ValueError('Strategy version is fixed for this trading day to preserve its risk ledger')
             if s["positions"] or s["state"] not in ("STOPPED", "SESSION_COMPLETE"):
                 raise ValueError("Stop and flatten the existing session before starting")
             if s["locked"] or self.data["account"]["halted"]:
@@ -165,14 +175,14 @@ class Controller:
                 raise ValueError("Both sessions share one account; capital is fixed for the trading day")
             if now.weekday() >= 5:
                 raise ValueError("Regular trading sessions are closed on weekends")
-            if now.strftime("%H:%M") >= ("15:30" if market == "NIFTY" else "23:15"):
+            if now.strftime("%H:%M") >= spec.flatten:
                 raise ValueError("The session's flatten deadline has passed")
             other = self.data["sessions"]["MCX" if market == "NIFTY" else "NIFTY"]
             if other["positions"]:
                 raise ValueError("Flatten the other session before reusing account capital")
             self.data["account"]["capital"] = float(capital)
             self._revision += 1
-            s.update(state="ARMED", mode=mode, multiplier=multiplier, capital=float(capital),
+            s.update(state="ARMED", mode=mode, multiplier=multiplier, capital=float(capital), strategy_id=spec.id,
                      date=now.date().isoformat(), reason="Paper session armed; waiting for valid market data and signal",
                      stop_requested=False, exit_requested=False, paused=False)
             self._event(f"{market}: PAPER session authorized at {multiplier}×; shared capital ₹{capital:,.0f}")
@@ -222,9 +232,12 @@ class Controller:
             now = self.clock().astimezone(IST)
             result = copy.deepcopy(self.data)
             result.update(today=now.date().isoformat(), server_time=now.isoformat(),
+                          strategies=catalog(),
                           live_enabled=False, live_reason=LIVE_REASON,
                           execution="PAPER ONLY — simulated book fills, unvalidated candidates")
-            for s in result["sessions"].values():
+            for market, s in result["sessions"].items():
+                spec = resolve(market, s.get('strategy_id'))
+                s.update(strategy_id=spec.id, max_entries=spec.max_entries, flatten=spec.flatten)
                 stamp = s.get("feed_timestamp")
                 s["feed_age_seconds"] = max(0, (now-datetime.fromisoformat(stamp)).total_seconds()) if stamp else None
                 s["valuation_stale"] = bool(s["positions"] and (s["feed_age_seconds"] is None or s["feed_age_seconds"] > 10))
@@ -236,7 +249,8 @@ class Controller:
         equity = a["lifetime_pnl"] + a["daily_pnl"]
         a["peak_pnl"] = max(a["peak_pnl"], equity)
         a["drawdown"] = a["peak_pnl"] - equity
-        if a["daily_pnl"] <= -.01*a["capital"] or a["drawdown"] >= .05*a["capital"]:
+        a['daily_loss_fraction'] = .05 if any(resolve(m, s.get('strategy_id')).version == 3 and s['date'] for m, s in self.data['sessions'].items()) else .01
+        if a["daily_pnl"] <= -a['daily_loss_fraction']*a["capital"] or a["drawdown"] >= .05*a["capital"]:
             a["halted"] = True
         if a["halted"]:
             for s in self.data["sessions"].values():
@@ -267,9 +281,12 @@ class Controller:
             s["feed_timestamp"] = min(q.timestamp for q in quotes).isoformat()
 
     def _enter(self, market, s, plan, now):
-        if s["positions"] or plan.max_loss is None or plan.max_loss > 2000*s["multiplier"]:
+        spec = resolve(market, s.get('strategy_id'))
+        naked = spec.id == 'mcxv3' and plan.strategy == 'mcxv3' and plan.max_loss is None and all(l.side == 'SELL' for l in plan.legs)
+        limit = (spec.trade_risk_per_unit or 0)*s['multiplier']
+        if s["positions"] or (not naked and (plan.max_loss is None or plan.max_loss > limit)):
             raise ValueError("Invalid portfolio risk")
-        if plan.max_loss + self.data["account"]["drawdown"] >= .05*self.data["account"]["capital"]:
+        if not naked and plan.max_loss + self.data["account"]["drawdown"] >= .05*self.data["account"]["capital"]:
             s["reason"] = "Trade would exceed remaining portfolio drawdown budget"
             return
         positions, fills, costs = [], [], 0.
@@ -304,12 +321,15 @@ class Controller:
                 payoff += (intrinsic-p["entry_price"])*p["quantity"]*(1 if p["side"] == "BUY" else -1)
             payoffs.append(payoff)
         actual_risk = max(0., -min(payoffs)) + costs*2
-        if actual_risk > 2000*s["multiplier"]:
-            s["reason"] = "Executable fill and cost model exceed the ₹2,000 per-unit maximum loss budget"
+        if naked:
+            actual_risk = None  # A stop trigger does not cap naked-option loss.
+        if not naked and actual_risk > limit:
+            s["reason"] = "Executable fill and cost model exceed this strategy's maximum loss budget"
             return
         s.update(positions=positions, state="RUNNING", reason=plan.reason, stop_loss=plan.stop_loss,
                  take_profit=plan.take_profit, trade_costs=costs, max_loss=actual_risk,
-                 entries=s["entries"]+1, entered_at=now.isoformat())
+                 entries=s["entries"]+1, entered_at=now.isoformat(), direction=plan.direction,
+                 reversal_count=0, reversal_bar=None)
         s["costs"] += costs
         s["trades"].extend(fills)
         self._mark(s, [leg.quote for leg in plan.legs], now)
@@ -340,7 +360,10 @@ class Controller:
                 s = self.data["sessions"][market]
                 if s["state"] in ("STOPPED", "SESSION_COMPLETE") and not s["positions"]:
                     continue
-                deadline = "15:30" if market == "NIFTY" else "23:15"
+                spec = resolve(market, s.get('strategy_id'))
+                signal_fn = active_v3.explain_signal if spec.version == 3 else explain_signal
+                plan_fn = active_v3.build_plan if spec.version == 3 else build_plan
+                deadline = spec.flatten
                 ended = s["date"] != now.date().isoformat() or now.strftime("%H:%M") >= deadline or now.weekday() >= 5
                 if ended:
                     s.update(stop_requested=True, exit_requested=bool(s["positions"]),
@@ -350,10 +373,19 @@ class Controller:
                         continue
                 try:
                     if s["positions"]:
-                        _, quotes = self._snapshot(market, now, [contract_from(p["contract"]) for p in s["positions"]])
+                        bars, quotes = self._snapshot(market, now, [contract_from(p["contract"]) for p in s["positions"]])
                         self._mark(s, quotes, self.clock().astimezone(IST))
                         trade_net = s["unrealized_pnl"] - s["trade_costs"] - s["estimated_exit_costs"]
-                        if s["net_pnl"] <= -1000*s["multiplier"]:
+                        if spec.version == 3 and bars and not s['exit_requested']:
+                            signal = signal_fn(market, bars, self.clock().astimezone(IST))
+                            s['signal'] = signal
+                            stamp = bars[-1].timestamp.isoformat()
+                            if signal.get('eligible') and stamp != s.get('reversal_bar'):
+                                s['reversal_bar'] = stamp
+                                s['reversal_count'] = s.get('reversal_count', 0)+1 if signal.get('direction') != s.get('direction') else 0
+                                if s['reversal_count'] >= 2:
+                                    s.update(exit_requested=True, reason='Indicator regime changed for two completed bars')
+                        if s["net_pnl"] <= -spec.session_loss_per_unit*s["multiplier"]:
                             s.update(locked=True, exit_requested=True, reason="Session loss limit reached")
                         elif trade_net <= -s["stop_loss"] or trade_net >= s["take_profit"]:
                             s.update(exit_requested=True, reason="Portfolio stop" if trade_net < 0 else "Portfolio take profit")
@@ -368,16 +400,16 @@ class Controller:
                     if s.get("paused"):
                         s["reason"] = "New entries paused; open positions remain managed"
                         continue
-                    if s["entries"] >= 2:
-                        s.update(state="STOPPED", reason="Two-entry session limit reached", locked=True)
+                    if s["entries"] >= spec.max_entries:
+                        s.update(state="STOPPED", reason="Session entry limit reached", locked=True)
                         continue
-                    if s["last_exit"] and (now-datetime.fromisoformat(s["last_exit"])).total_seconds() < 1800:
-                        s.update(state="COOLDOWN", reason="30-minute cooldown after exit")
+                    if s["last_exit"] and (now-datetime.fromisoformat(s["last_exit"])).total_seconds() < spec.cooldown_seconds:
+                        s.update(state="COOLDOWN", reason=f"{spec.cooldown_seconds}-second cooldown after exit")
                         continue
-                    if market == "MCX" and now.weekday() == 3:
+                    if market == "MCX" and spec.version == 2 and now.weekday() == 3:
                         s.update(state="ARMED", reason="Thursday Natural Gas inventory release exclusion; no new MCX entries")
                         continue
-                    start, cutoff = ("09:45", "14:00") if market == "NIFTY" else ("16:30", "22:30")
+                    start, cutoff = spec.entry_start, spec.entry_end
                     if not start <= now.strftime("%H:%M") < cutoff:
                         s.update(state="ARMED", reason=f"Entry window {start}–{cutoff} IST")
                         continue
@@ -386,14 +418,14 @@ class Controller:
                         continue
                     bars, quotes = self._snapshot(market, now)
                     fresh_now = self.clock().astimezone(IST)
-                    if not bars or (fresh_now-(bars[-1].timestamp+timedelta(minutes=5))).total_seconds() > 360:
+                    if not bars or (fresh_now-(bars[-1].timestamp+timedelta(minutes=spec.bar_minutes))).total_seconds() > (90 if spec.version == 3 else 360):
                         raise FeedError("Completed underlying bars are missing or stale")
                     if quotes:
                         s["feed_timestamp"] = min(q.timestamp for q in quotes).isoformat()
-                    signal = explain_signal(market, bars, fresh_now)
+                    signal = signal_fn(market, bars, fresh_now)
                     s["signal"] = signal
                     s["reason"] = signal.get("reason", "Waiting for a qualifying signal")
-                    plan = build_plan(market, bars, quotes, fresh_now, s["multiplier"], s["capital"])
+                    plan = plan_fn(market, bars, quotes, fresh_now, s["multiplier"], s["capital"])
                     if plan:
                         self._enter(market, s, plan, fresh_now)
                     elif signal.get("eligible"):

@@ -22,6 +22,7 @@ class Bar:
     low: float
     close: float
     volume: float = 0
+    interval_minutes: int = 5
 
 
 @dataclass(frozen=True)
