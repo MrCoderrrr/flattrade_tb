@@ -101,6 +101,8 @@ class ActiveTests(unittest.TestCase):
                     session = c.status()['sessions']['MCX']
                     if minute == 2:
                         self.assertEqual([p['contract']['option_type'] for p in session['positions']], ['PE'])
+                    if minute == 3:
+                        self.assertTrue(session['positions'][0]['trail_armed'])
                     if minute == 6:
                         self.assertEqual(len(session['positions']), 2)
                         self.assertEqual(session['leg_reentries'], 1)

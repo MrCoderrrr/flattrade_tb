@@ -421,7 +421,7 @@ class Controller:
         for p in list(s["positions"]):
             entry, mark = p["entry_price"], p["mark_price"]
             p["best_mark"] = min(p.get("best_mark", entry), mark)
-            if mark <= .92*entry:
+            if len(s["positions"]) == 1 or mark <= .92*entry:
                 p["trail_armed"] = True
             distance = max(p["contract"]["tick_size"], entry*(trail_pct-(.02 if len(s["positions"]) == 1 else 0)))
             stop = entry*(1+stop_pct)
