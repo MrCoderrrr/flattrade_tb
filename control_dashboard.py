@@ -67,7 +67,8 @@ class ControlHTTPServer(ThreadingHTTPServer):
         self.control_token = token or secrets.token_urlsafe(32)
         # Resolve no user-controlled hostname, including hosts-file entries.
         self.dashboard_html = Path(dashboard_path).read_bytes()
-        super().__init__(("127.0.0.1", port), ControlHandler)
+        bind_host = "0.0.0.0" if host == "0.0.0.0" else "127.0.0.1"
+        super().__init__((bind_host, port), ControlHandler)
         actual_port = self.server_address[1]
         self.allowed_hosts = {f"127.0.0.1:{actual_port}", f"localhost:{actual_port}"}
         if allowed_host:
