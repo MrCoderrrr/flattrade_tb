@@ -14,3 +14,9 @@ multiplier.txt
 paper_runtime_state.json
 NFO_symbols_*.csv
 MCX_symbols*.csv
+
+# Private local audit and deployment artifacts
+docs/legacy_strategy_audit.md
+docs/server_sync.md
+*.token
+*.env
