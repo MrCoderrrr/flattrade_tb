@@ -5,11 +5,26 @@ price vote on direction. Neutral conditions sell both near-ATM sides. NIFTY
 always has farther-strike protection; Natural Gas intentionally has none.
 """
 from datetime import timedelta
-from math import isfinite
+from math import isfinite, tanh
 
 from .catalog import resolve
 from .models import Bar, IST, Leg, Plan
 from .strategies import _ema, _valid_quote, _option_type
+
+
+def _kama(closes, period=10, fast=3, slow=30):
+    """Kaufman's adaptive average, seeded with a period SMA."""
+    value = sum(closes[:period]) / period
+    values = [value]
+    fast_sc, slow_sc = 2 / (fast + 1), 2 / (slow + 1)
+    for i in range(period, len(closes)):
+        movement = abs(closes[i] - closes[i-period])
+        noise = sum(abs(closes[j]-closes[j-1]) for j in range(i-period+1, i+1))
+        efficiency = min(1., movement / noise) if noise else 0.
+        smoothing = (efficiency*(fast_sc-slow_sc)+slow_sc)**2
+        value += smoothing*(closes[i]-value)
+        values.append(value)
+    return values
 
 
 def explain_signal(market, bars, now):
@@ -72,6 +87,26 @@ def explain_signal(market, bars, now):
         atr = (atr*13+value)/14
     if atr <= 0:
         return result
+    if market == "MCX":
+        # KAMA is the primary trend measure. EMA confirms direction; efficiency
+        # prevents a noisy price/KAMA cross from being treated as an impulse.
+        kama = _kama(closes, 10, 3, 30)
+        slope = kama[-1]-kama[-2]
+        noise = sum(abs(closes[j]-closes[j-1]) for j in range(len(closes)-10,len(closes)))
+        efficiency = abs(closes[-1]-closes[-11])/noise if noise else 0.
+        ema8, ema21 = _ema(closes, 8)[-1], _ema(closes, 21)[-1]
+        score = (.55*tanh(slope/max(.06*atr, .001)) +
+                 .25*tanh((closes[-1]-kama[-1])/max(.35*atr, .001)) +
+                 .20*tanh((ema8-ema21)/max(.25*atr, .001)))
+        direction = (1 if score >= .62 and efficiency >= .30 and slope > 0 and ema8 > ema21
+                     else -1 if score <= -.62 and efficiency >= .30 and slope < 0 and ema8 < ema21 else 0)
+        return {"eligible": True, "direction": direction,
+                "reason": "KAMA trend impulse" if direction else "KAMA neutral; keep the ATM straddle",
+                "indicators": {"close":closes[-1], "kama":round(kama[-1],4),
+                               "kama_slope":round(slope,4), "ema8":round(ema8,4),
+                               "ema21":round(ema21,4), "efficiency":round(efficiency,4),
+                               "flow_score":round(score,4), "atr14":round(atr,4),
+                               "bar_minutes":1,"last_bar_open":recent[-1].timestamp.isoformat()}}
     volume = sum(b.volume for b in today)
     anchor = sum((b.high+b.low+b.close)/3*(b.volume if volume else 1) for b in today)/(volume or len(today))
     # Small dead bands prevent a one-tick change from voting as a trend.
@@ -101,12 +136,20 @@ def build_plan(market, bars, quotes, now, multiplier, capital):
         family = "MINI" if q.contract.symbol.startswith("NATGASMINI") else market
         groups.setdefault((q.contract.expiry,q.contract.lot_size,q.contract.tick_size,family),[]).append(q)
     direction, spot, atr = signal["direction"],signal["indicators"]["close"],signal["indicators"]["atr14"]
-    sides = ["PE"] if direction == 1 else ["CE"] if direction == -1 else ["PE","CE"]
+    sides = ["PE","CE"] if market == "MCX" or direction == 0 else ["PE"] if direction == 1 else ["CE"]
     for group in sorted(groups):
         chain=groups[group]; quantity=group[1]*multiplier
         shorts,hedges=[],[]
+        common_strike = None
+        if market == "MCX":
+            ce = {q.contract.strike for q in chain if _option_type(q.contract) == "CE"}
+            pe = {q.contract.strike for q in chain if _option_type(q.contract) == "PE"}
+            if not ce.intersection(pe):
+                continue
+            common_strike = min(ce.intersection(pe), key=lambda strike:abs(strike-spot))
         for option in sides:
-            candidates=[q for q in chain if _option_type(q.contract)==option]
+            candidates=[q for q in chain if _option_type(q.contract)==option and
+                        (common_strike is None or q.contract.strike == common_strike)]
             if not candidates:break
             short=min(candidates,key=lambda q:abs(q.contract.strike-spot))
             shorts.append(Leg(short,"SELL",quantity))
@@ -133,8 +176,8 @@ def build_plan(market, bars, quotes, now, multiplier, capital):
         else:
             # None means uncapped by a hedge. Never label a stop as maximum loss.
             max_loss=None
-            stop=min(3000*multiplier,max(1000*multiplier,credit*.12))
-            target=max(500*multiplier,credit*.15-reserve)
+            stop=3000*multiplier  # 1.5% of the minimum ₹2L allocation.
+            target=3000*multiplier
         return Plan("nfv3" if market=="NIFTY" else "mcxv3",legs,signal["reason"],round(stop,2),round(target,2),
                     round(max_loss,2) if max_loss is not None else None,direction)
     return None

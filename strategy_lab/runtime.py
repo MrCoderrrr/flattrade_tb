@@ -18,7 +18,7 @@ from pathlib import Path
 
 from .models import Contract, IST
 from .market_data import FlattradeReadOnly, FeedError
-from .strategies import build_plan, explain_signal
+from .strategies import build_plan, explain_signal, _option_type
 from .catalog import resolve, catalog
 from . import active_v3
 
@@ -383,10 +383,136 @@ class Controller:
                  take_profit=plan.take_profit, trade_costs=costs, max_loss=actual_risk,
                  entries=s["entries"]+1, entered_at=now.isoformat(), direction=plan.direction,
                  reversal_count=0, reversal_bar=None)
+        if spec.id == "mcxv3":
+            s.update(cycle_start_net=s["net_pnl"], trend_count=0, trend_bar=None,
+                     reentry_count=0, reentry_bar=None, leg_reentries=s.get("leg_reentries", 0))
+            for p in positions:
+                p.update(best_mark=p["entry_price"], leg_stop=None, trail_armed=False)
         s["costs"] += costs
         s["trades"].extend(fills)
         self._mark(s, [leg.quote for leg in plan.legs], now)
         self._event(f"{market}: simulated {plan.strategy} entry; {len(positions)} legs")
+
+    def _close_mcx_leg(self, s, position, quotes, now, reason):
+        fee = cost(position["mark_price"], position["quantity"])
+        s["costs"] += fee
+        s["realized_pnl"] += position["unrealized_pnl"]
+        s["trades"].append({"timestamp":now.isoformat(), "symbol":position["symbol"],
+                            "side":"BUY", "quantity":position["quantity"],
+                            "price":position["mark_price"], "cost":fee,
+                            "mode":"paper", "reason":reason, "simulated":True})
+        s["positions"].remove(position)
+        s["last_leg_exit"] = now.isoformat()
+        s["reason"] = reason
+        self._mark(s, quotes, now)
+        if not s["positions"]:
+            s.update(state="COOLDOWN", last_exit=now.isoformat())
+        else:
+            s["missing_armed"] = False
+        self._event(f"MCX: simulated {position['contract']['option_type']} leg exit — {reason}")
+
+    def _manage_mcx_v3(self, s, signal, quotes, now):
+        if s["exit_requested"] or s["stop_requested"]:
+            return
+        indicators = signal.get("indicators", {}) if signal.get("eligible") else {}
+        er, atr, spot = indicators.get("efficiency", .5), indicators.get("atr14", 0.), indicators.get("close", 1.)
+        stop_pct = min(.28, max(.12, .16 + .08*(1-er) + min(.04, 2*atr/spot)))
+        trail_pct = min(.16, max(.05, .05 + .08*(1-er) + min(.03, atr/spot)))
+        for p in list(s["positions"]):
+            entry, mark = p["entry_price"], p["mark_price"]
+            p["best_mark"] = min(p.get("best_mark", entry), mark)
+            if mark <= .92*entry:
+                p["trail_armed"] = True
+            distance = max(p["contract"]["tick_size"], entry*(trail_pct-(.02 if len(s["positions"]) == 1 else 0)))
+            stop = entry*(1+stop_pct)
+            if p["trail_armed"]:
+                stop = min(stop, p["best_mark"]+distance)
+            p["leg_stop"] = round(min(p.get("leg_stop") or stop, stop), 4)
+            p["stop_pct_cap"] = .28
+            if mark >= p["leg_stop"]:
+                self._close_mcx_leg(s, p, quotes, now,
+                                    "MCX premium trailing stop" if p["trail_armed"] else "MCX premium stop")
+                if not s["positions"]:
+                    return
+                remaining_type = _option_type(contract_from(s["positions"][0]["contract"]))
+                s["missing_armed"] = (indicators.get("flow_score", 0.) >= .35 if remaining_type == "PE"
+                                      else indicators.get("flow_score", 0.) <= -.35)
+        if not signal.get("eligible"):
+            return
+        bar = indicators["last_bar_open"]
+        direction = signal["direction"]
+        if len(s["positions"]) == 2:
+            if bar != s.get("trend_bar"):
+                s["trend_bar"] = bar
+                s["trend_count"] = s.get("trend_count", 0)+1 if direction and direction == s.get("trend_direction") else 1 if direction else 0
+                s["trend_direction"] = direction
+            if direction and s["trend_count"] >= 2:
+                losing_type = "CE" if direction > 0 else "PE"
+                losing = next((p for p in s["positions"] if _option_type(contract_from(p["contract"])) == losing_type), None)
+                if losing is not None:
+                    self._close_mcx_leg(s, losing, quotes, now, "Confirmed KAMA/EMA trend impulse")
+                    s["missing_armed"] = True
+            return
+        if len(s["positions"]) != 1 or s.get("paused") or s["entries"] >= resolve("MCX", "mcxv3").max_entries:
+            return
+        held = s["positions"][0]
+        missing = "CE" if _option_type(contract_from(held["contract"])) == "PE" else "PE"
+        score, slope = indicators["flow_score"], indicators["kama_slope"]
+        if not s.get("missing_armed"):
+            if (score >= .35 if missing == "CE" else score <= -.35):
+                s["missing_armed"] = True
+            return
+        reversal = ((score <= -.15 and slope <= 0 and indicators["ema8"] <= indicators["ema21"])
+                    if missing == "CE" else
+                    (score >= .15 and slope >= 0 and indicators["ema8"] >= indicators["ema21"]))
+        if bar != s.get("reentry_bar"):
+            s["reentry_bar"] = bar
+            s["reentry_count"] = s.get("reentry_count", 0)+1 if reversal else 0
+        if not reversal or s["reentry_count"] < 2 or s.get("leg_reentries", 0) >= 12:
+            return
+        if not s.get("last_leg_exit") or (now-datetime.fromisoformat(s["last_leg_exit"])).total_seconds() < 60:
+            return
+        if not resolve("MCX", "mcxv3").entry_start <= now.strftime("%H:%M") < resolve("MCX", "mcxv3").entry_end:
+            return
+        self._account()
+        if s["locked"] or self.data["account"]["halted"] or s["net_pnl"] <= -6000*s["multiplier"]:
+            return
+        try:
+            _, chain = self._snapshot("MCX", now)
+        except FeedError:
+            s["reason"] = "KAMA reversal confirmed; waiting for a fresh option chain"
+            return
+        if s["exit_requested"] or s["stop_requested"]:
+            return
+        candidates = [q for q in chain if _option_type(q.contract) == missing and
+                      q.contract.expiry.isoformat() == held["contract"]["expiry"] and
+                      q.contract.lot_size == held["contract"]["lot_size"] and
+                      q.bid_size >= held["quantity"] and fresh(q, now)]
+        if not candidates:
+            s["reason"] = "KAMA reversal confirmed; waiting for fresh ATM opposite-leg depth"
+            return
+        q = min(candidates, key=lambda item:abs(item.contract.strike-spot))
+        price = q.bid-q.contract.tick_size
+        if price <= 0:
+            return
+        fee = cost(price, held["quantity"])
+        s["positions"].append({"symbol":q.contract.symbol, "contract":contract_dict(q.contract),
+                               "side":"SELL", "quantity":held["quantity"], "entry_price":price,
+                               "mark_price":price, "unrealized_pnl":0., "best_mark":price,
+                               "leg_stop":None, "trail_armed":False})
+        s["costs"] += fee
+        s["trades"].append({"timestamp":now.isoformat(), "symbol":q.contract.symbol,
+                            "side":"SELL", "quantity":held["quantity"], "price":price,
+                            "cost":fee, "mode":"paper", "reason":"KAMA/EMA reversal re-entry",
+                            "simulated":True})
+        s["entries"] += 1
+        s["leg_reentries"] += 1
+        s["reentry_count"] = 0
+        s["trend_count"] = 0
+        s["missing_armed"] = False
+        s["reason"] = "KAMA/EMA reversal; ATM straddle restored"
+        self._mark(s, quotes+[q], now)
+        self._event(f"MCX: simulated ATM {missing} re-entry after confirmed KAMA/EMA reversal")
 
     def _exit(self, market, s, quotes, now):
         self._mark(s, quotes, now)
@@ -428,21 +554,28 @@ class Controller:
                     if s["positions"]:
                         bars, quotes = self._snapshot(market, now, [contract_from(p["contract"]) for p in s["positions"]])
                         self._mark(s, quotes, self.clock().astimezone(IST))
-                        trade_net = s["unrealized_pnl"] - s["trade_costs"] - s["estimated_exit_costs"]
+                        trade_net = (s["net_pnl"] - s.get("cycle_start_net", 0.)) if spec.id == "mcxv3" else s["unrealized_pnl"] - s["trade_costs"] - s["estimated_exit_costs"]
+                        signal = {}
                         if spec.version == 3 and bars and not s['exit_requested']:
                             signal = signal_fn(market, bars, self.clock().astimezone(IST))
                             s['signal'] = signal
-                            stamp = bars[-1].timestamp.isoformat()
-                            if signal.get('eligible') and stamp != s.get('reversal_bar'):
-                                s['reversal_bar'] = stamp
-                                s['reversal_count'] = s.get('reversal_count', 0)+1 if signal.get('direction') != s.get('direction') else 0
-                                if s['reversal_count'] >= 2:
-                                    s.update(exit_requested=True, reason='Indicator regime changed for two completed bars')
+                            if spec.id != "mcxv3":
+                                stamp = bars[-1].timestamp.isoformat()
+                                if signal.get('eligible') and stamp != s.get('reversal_bar'):
+                                    s['reversal_bar'] = stamp
+                                    s['reversal_count'] = s.get('reversal_count', 0)+1 if signal.get('direction') != s.get('direction') else 0
+                                    if s['reversal_count'] >= 2:
+                                        s.update(exit_requested=True, reason='Indicator regime changed for two completed bars')
                         if s["net_pnl"] <= -spec.session_loss_per_unit*s["multiplier"]:
                             s.update(locked=True, exit_requested=True, reason="Session loss limit reached")
-                        elif trade_net <= -s["stop_loss"] or trade_net >= s["take_profit"]:
+                        elif trade_net <= -s["stop_loss"] or (spec.id != "mcxv3" and trade_net >= s["take_profit"]):
                             s.update(exit_requested=True, reason="Portfolio stop" if trade_net < 0 else "Portfolio take profit")
                         self._account()
+                        if spec.id == "mcxv3" and not s["exit_requested"]:
+                            self._manage_mcx_v3(s, signal, quotes, self.clock().astimezone(IST))
+                            if s["net_pnl"] <= -spec.session_loss_per_unit*s["multiplier"]:
+                                s.update(locked=True, exit_requested=bool(s["positions"]), reason="Session loss limit reached")
+                            self._account()
                         if s["exit_requested"]:
                             self._exit(market, s, quotes, self.clock().astimezone(IST))
                         continue

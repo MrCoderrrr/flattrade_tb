@@ -1,4 +1,4 @@
-"""MCX v3: active one-minute EMA/RSI candidate, no hedge, uncapped call risk."""
+"""MCX v3: paper ATM straddle with KAMA/EMA trend and leg management."""
 from strategy_lab.active_v3 import build_plan as _build, explain_signal as _signal
 def build_plan(bars, quotes, now, multiplier=1, capital=200000):
     return _build("MCX", bars, quotes, now, multiplier, capital)
