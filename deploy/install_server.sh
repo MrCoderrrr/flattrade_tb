@@ -34,7 +34,7 @@ Wants=network-online.target
 User=ubuntu
 WorkingDirectory=$BASE/current
 EnvironmentFile=$BASE/runtime.env
-ExecStart=/usr/bin/python3 -u $BASE/current/control_dashboard.py --port 8080 --root $LEGACY --token-file $BASE/control.token --public-origin-file $BASE/public-origin.txt
+ExecStart=/usr/bin/python3 -u $BASE/current/control_dashboard.py --host 0.0.0.0 --allowed-host 54.162.151.193 --port 8080 --root $LEGACY --token-file $BASE/control.token
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=50
@@ -62,8 +62,9 @@ EOF
 sudo install -m 644 "$BASE/strategy-control.service" /etc/systemd/system/strategy-control.service
 sudo install -m 644 "$BASE/strategy-control-tunnel.service" /etc/systemd/system/strategy-control-tunnel.service
 sudo systemctl daemon-reload
-sudo systemctl enable strategy-control.service strategy-control-tunnel.service
-sudo systemctl restart strategy-control.service strategy-control-tunnel.service
+sudo systemctl enable strategy-control.service
+sudo systemctl disable --now strategy-control-tunnel.service || true
+sudo systemctl restart strategy-control.service
 # Old unattended scheduler is retired; its dashboard/history remains available.
 sudo systemctl disable --now trading-scheduler.service
-systemctl is-active strategy-control.service strategy-control-tunnel.service
+systemctl is-active strategy-control.service

@@ -56,9 +56,10 @@ class ControlHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
     def __init__(self, controller: Any, host: str = "127.0.0.1", port: int = 8080,
-                 token: str | None = None, dashboard_path: Path = DASHBOARD_PATH):
-        if host not in {"127.0.0.1", "localhost"}:
-            raise ValueError("The dashboard can bind only to 127.0.0.1 or localhost.")
+                 token: str | None = None, dashboard_path: Path = DASHBOARD_PATH,
+                 allowed_host: str | None = None):
+        if host not in {"127.0.0.1", "localhost"} and not allowed_host:
+            raise ValueError("Public binding requires an explicit allowed host.")
         if token is not None and (not isinstance(token, str) or len(token) < 32
                                   or not token.isascii() or any(c.isspace() for c in token)):
             raise ValueError("The control token must contain at least 32 ASCII characters without spaces.")
@@ -69,6 +70,8 @@ class ControlHTTPServer(ThreadingHTTPServer):
         super().__init__(("127.0.0.1", port), ControlHandler)
         actual_port = self.server_address[1]
         self.allowed_hosts = {f"127.0.0.1:{actual_port}", f"localhost:{actual_port}"}
+        if allowed_host:
+            self.allowed_hosts.add(f"{allowed_host}:{actual_port}")
         if actual_port == 80:
             self.allowed_hosts.update({"127.0.0.1", "localhost"})
         self.allowed_origins = {f"http://{host}" for host in self.allowed_hosts}
@@ -277,9 +280,10 @@ class ControlHandler(BaseHTTPRequestHandler):
 
 
 def create_server(controller: Any, host: str = "127.0.0.1", port: int = 8080,
-                  token: str | None = None, dashboard_path: Path = DASHBOARD_PATH) -> ControlHTTPServer:
+                  token: str | None = None, dashboard_path: Path = DASHBOARD_PATH,
+                  allowed_host: str | None = None) -> ControlHTTPServer:
     """Create an unstarted local HTTP server; useful with an offline fake controller."""
-    return ControlHTTPServer(controller, host, port, token, dashboard_path)
+    return ControlHTTPServer(controller, host, port, token, dashboard_path, allowed_host)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -288,6 +292,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent)
     parser.add_argument("--token-file", type=Path)
     parser.add_argument("--public-origin-file", type=Path)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--allowed-host")
     args = parser.parse_args(argv)
     if not 1 <= args.port <= 65535:
         parser.error("--port must be between 1 and 65535")
@@ -306,7 +312,7 @@ def main(argv: list[str] | None = None) -> int:
                 with os.fdopen(fd, "w") as f:
                     f.write(secrets.token_urlsafe(32))
             token = args.token_file.read_text().strip()
-        server = create_server(controller, port=args.port, token=token)
+        server = create_server(controller, host=args.host, port=args.port, token=token, allowed_host=args.allowed_host)
         server.public_origin_file = args.public_origin_file
         signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
         controller.start_worker()
