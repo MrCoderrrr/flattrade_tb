@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.cookies import SimpleCookie
 import hmac
 import json
 import math
@@ -18,6 +19,8 @@ import secrets
 import socket
 import os
 import signal
+import time
+import threading
 from urllib.parse import urlparse
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -57,7 +60,8 @@ class ControlHTTPServer(ThreadingHTTPServer):
 
     def __init__(self, controller: Any, host: str = "127.0.0.1", port: int = 8080,
                  token: str | None = None, dashboard_path: Path = DASHBOARD_PATH,
-                 allowed_host: str | None = None):
+                 allowed_host: str | None = None, pin: str | None = None,
+                 chain: Any = None):
         if host not in {"127.0.0.1", "localhost"} and not allowed_host:
             raise ValueError("Public binding requires an explicit allowed host.")
         if token is not None and (not isinstance(token, str) or len(token) < 32
@@ -65,6 +69,13 @@ class ControlHTTPServer(ThreadingHTTPServer):
             raise ValueError("The control token must contain at least 32 ASCII characters without spaces.")
         self.controller = controller
         self.control_token = token or secrets.token_urlsafe(32)
+        if pin is not None and (not isinstance(pin,str) or len(pin) != 4 or not pin.isascii() or not pin.isdigit()):
+            raise ValueError("Dashboard PIN must contain exactly four digits")
+        self.pin = pin
+        self.sessions: dict[str, tuple[float,str]] = {}
+        self.login_failures: dict[str, list[float]] = {}
+        self.auth_lock = threading.RLock()
+        self.chain = chain
         # Resolve no user-controlled hostname, including hosts-file entries.
         self.dashboard_html = Path(dashboard_path).read_bytes()
         bind_host = "0.0.0.0" if host == "0.0.0.0" else "127.0.0.1"
@@ -97,7 +108,7 @@ class ControlHandler(BaseHTTPRequestHandler):
         return
 
     def _send(self, status: int, body: bytes, content_type: str,
-              head_only: bool = False) -> None:
+              head_only: bool = False, cookie: str | None = None) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
@@ -105,6 +116,8 @@ class ControlHandler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Frame-Options", "DENY")
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
         self.send_header("Cross-Origin-Resource-Policy", "same-origin")
         self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; "
                          "style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; "
@@ -113,13 +126,14 @@ class ControlHandler(BaseHTTPRequestHandler):
         if not head_only:
             self.wfile.write(body)
 
-    def _json(self, status: int, value: Any, head_only: bool = False) -> None:
+    def _json(self, status: int, value: Any, head_only: bool = False,
+              cookie: str | None = None) -> None:
         try:
             body = json.dumps(value, allow_nan=False, separators=(",", ":")).encode("utf-8")
         except (TypeError, ValueError):
             status = 500
             body = b'{"error":"Controller returned an invalid response."}'
-        self._send(status, body, "application/json; charset=utf-8", head_only)
+        self._send(status, body, "application/json; charset=utf-8", head_only, cookie)
 
     def _validate_source(self) -> None:
         hosts = self.headers.get_all("Host", [])
@@ -147,8 +161,44 @@ class ControlHandler(BaseHTTPRequestHandler):
         values = self.headers.get_all("Authorization", [])
         expected = f"Bearer {self.server.control_token}".encode("ascii")
         supplied = values[0].encode("utf-8") if len(values) == 1 else b""
-        if len(supplied) > 512 or not hmac.compare_digest(supplied, expected):
-            raise RequestError("Enter the current dashboard control token.", 401)
+        if len(supplied) <= 512 and hmac.compare_digest(supplied, expected):
+            return
+        cookie = SimpleCookie()
+        try:
+            cookie.load(self.headers.get("Cookie", "")[:512])
+            session = cookie.get("desk_session")
+            supplied = session.value if session else ""
+        except Exception:
+            supplied = ""
+        now = time.monotonic()
+        with self.server.auth_lock:
+            valid = self.server.sessions.get(supplied)
+            if valid and valid[0] > now and valid[1] == self.client_address[0]:
+                return
+        raise RequestError("Enter the dashboard PIN to unlock.", 401)
+
+    def _login(self, data: dict[str, Any]) -> None:
+        if self.server.pin is None:
+            raise RequestError("PIN login is not configured.", 503)
+        if set(data) != {"pin"} or not isinstance(data['pin'],str) or len(data['pin']) != 4:
+            raise RequestError("Enter the four-digit dashboard PIN.")
+        address = self.client_address[0]
+        now = time.monotonic()
+        with self.server.auth_lock:
+            failures = [when for when in self.server.login_failures.get(address,[]) if now-when < 900]
+            if len(failures) >= 5:
+                raise RequestError("Too many attempts. Try again in 15 minutes.", 429)
+            if not hmac.compare_digest(data['pin'],self.server.pin):
+                failures.append(now)
+                self.server.login_failures[address] = failures
+                raise RequestError("Incorrect dashboard PIN.", 401)
+            self.server.login_failures.pop(address,None)
+            token = secrets.token_urlsafe(32)
+            self.server.sessions[token] = (now+8*3600,address)
+            for old,(expiry,_) in list(self.server.sessions.items()):
+                if expiry <= now:
+                    self.server.sessions.pop(old,None)
+        self._json(200,{"authenticated":True},cookie=f"desk_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800")
 
     def _body(self) -> dict[str, Any]:
         if self.headers.get_all("Transfer-Encoding"):
@@ -223,15 +273,18 @@ class ControlHandler(BaseHTTPRequestHandler):
                 self._send(200, self.server.dashboard_html, "text/html; charset=utf-8", head_only)
                 return
             self._authenticate()
-            if self.path != "/api/status":
+            if self.path == "/api/status":
+                status = self.server.controller.status()
+                if not isinstance(status, dict):
+                    raise RuntimeError("Invalid status")
+                status = dict(status)
+                status["today"] = datetime.now(IST).date().isoformat()
+                self._json(200, status, head_only)
+            elif self.path == "/api/chain":
+                self._json(200, self.server.chain.snapshot() if self.server.chain else
+                           {"ready":False,"reason":"Read-only option-chain stream is unavailable","rows":[]}, head_only)
+            else:
                 raise RequestError("Not found.", 404)
-            status = self.server.controller.status()
-            if not isinstance(status, dict):
-                raise RuntimeError("Invalid status")
-            # The confirmation date is always the server's current IST date.
-            status = dict(status)
-            status["today"] = datetime.now(IST).date().isoformat()
-            self._json(200, status, head_only)
         except RequestError as exc:
             self._json(exc.status, {"error": str(exc)}, head_only)
         except Exception:
@@ -246,7 +299,19 @@ class ControlHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         try:
             self._validate_source()
+            if self.path == "/api/login":
+                self._login(self._body())
+                return
             self._authenticate()
+            if self.path == "/api/logout":
+                cookie = SimpleCookie()
+                cookie.load(self.headers.get("Cookie", "")[:512])
+                supplied = cookie.get("desk_session")
+                if supplied:
+                    with self.server.auth_lock:
+                        self.server.sessions.pop(supplied.value,None)
+                self._json(200,{"authenticated":False},cookie="desk_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
+                return
             if self.path not in {"/api/start", "/api/stop", "/api/kill", "/api/pause"}:
                 raise RequestError("Not found.", 404)
             data = self._body()
@@ -286,9 +351,10 @@ class ControlHandler(BaseHTTPRequestHandler):
 
 def create_server(controller: Any, host: str = "127.0.0.1", port: int = 8080,
                   token: str | None = None, dashboard_path: Path = DASHBOARD_PATH,
-                  allowed_host: str | None = None) -> ControlHTTPServer:
+                  allowed_host: str | None = None, pin: str | None = None,
+                  chain: Any = None) -> ControlHTTPServer:
     """Create an unstarted local HTTP server; useful with an offline fake controller."""
-    return ControlHTTPServer(controller, host, port, token, dashboard_path, allowed_host)
+    return ControlHTTPServer(controller, host, port, token, dashboard_path, allowed_host, pin, chain)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -296,6 +362,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent)
     parser.add_argument("--token-file", type=Path)
+    parser.add_argument("--pin-file", type=Path,
+                        default=Path(os.environ['DASHBOARD_PIN_FILE']) if os.environ.get('DASHBOARD_PIN_FILE') else None)
     parser.add_argument("--public-origin-file", type=Path)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--allowed-host")
@@ -307,6 +375,7 @@ def main(argv: list[str] | None = None) -> int:
     from strategy_lab.runtime import Controller
 
     controller = Controller(args.root.resolve())
+    chain = None
     server = None
     try:
         token = None
@@ -317,7 +386,12 @@ def main(argv: list[str] | None = None) -> int:
                 with os.fdopen(fd, "w") as f:
                     f.write(secrets.token_urlsafe(32))
             token = args.token_file.read_text().strip()
-        server = create_server(controller, host=args.host, port=args.port, token=token, allowed_host=args.allowed_host)
+        pin = args.pin_file.read_text().strip() if args.pin_file else None
+        from strategy_lab.option_chain import OptionChainView
+        chain = OptionChainView(args.root.resolve())
+        chain.start()
+        server = create_server(controller, host=args.host, port=args.port, token=token,
+                               allowed_host=args.allowed_host, pin=pin, chain=chain)
         server.public_origin_file = args.public_origin_file
         signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
         controller.start_worker()
@@ -330,6 +404,8 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         if server is not None:
             server.server_close()
+        if chain is not None:
+            chain.stop()
         controller.shutdown()
     return 0
 

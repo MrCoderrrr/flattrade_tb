@@ -43,7 +43,7 @@ class DashboardHTTPTests(unittest.TestCase):
     def setUpClass(cls):
         cls.controller = FakeController()
         cls.token = "test-local-control-token-" + "x" * 32
-        cls.server = create_server(cls.controller, port=0, token=cls.token)
+        cls.server = create_server(cls.controller, port=0, token=cls.token, pin="7000")
         cls.port = cls.server.server_address[1]
         cls.worker = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.worker.start()
@@ -57,6 +57,7 @@ class DashboardHTTPTests(unittest.TestCase):
     def setUp(self):
         self.controller.calls.clear()
         self.controller.fail = False
+        self.server.login_failures.clear()
 
     def request(self, method, path, payload=None, authorized=True, headers=None, raw=None):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=3)
@@ -91,6 +92,23 @@ class DashboardHTTPTests(unittest.TestCase):
                 status, _, _ = self.request(method, path, payload, authorized=False)
                 self.assertEqual(status, 401)
         self.assertEqual(self.controller.calls, [])
+
+    def test_pin_login_cookie_controls_and_logout(self):
+        self.assertEqual(self.request("POST", "/api/login", {"pin":"1111"}, authorized=False)[0], 401)
+        status, headers, body = self.request("POST", "/api/login", {"pin":"7000"}, authorized=False)
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)['authenticated'])
+        cookie = headers['Set-Cookie'].split(';',1)[0]
+        self.assertIn('HttpOnly',headers['Set-Cookie'])
+        self.assertEqual(self.request("GET", "/api/status", authorized=False, headers={"Cookie":cookie})[0], 200)
+        self.assertEqual(self.request("POST", "/api/stop", {"market":"NIFTY"}, authorized=False, headers={"Cookie":cookie})[0], 200)
+        self.assertEqual(self.request("POST", "/api/logout", {}, authorized=False, headers={"Cookie":cookie})[0], 200)
+        self.assertEqual(self.request("GET", "/api/status", authorized=False, headers={"Cookie":cookie})[0], 401)
+
+    def test_pin_attempts_are_rate_limited(self):
+        for _ in range(5):
+            self.assertEqual(self.request("POST", "/api/login", {"pin":"0000"}, authorized=False)[0], 401)
+        self.assertEqual(self.request("POST", "/api/login", {"pin":"7000"}, authorized=False)[0], 429)
 
     def test_bad_token_and_query_token_cannot_authorize(self):
         self.assertEqual(self.request("GET", "/api/status", headers={"Authorization": "Bearer wrong"})[0], 401)

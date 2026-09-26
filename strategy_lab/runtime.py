@@ -81,6 +81,8 @@ class Controller:
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("CREATE TABLE IF NOT EXISTS state (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)")
         self.db.execute("CREATE TABLE IF NOT EXISTS journal (id INTEGER PRIMARY KEY, timestamp TEXT NOT NULL, payload TEXT NOT NULL)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS strategy_daily (day TEXT NOT NULL, strategy_id TEXT NOT NULL, market TEXT NOT NULL, mode TEXT NOT NULL, net_pnl REAL NOT NULL, capital REAL NOT NULL, entries INTEGER NOT NULL, PRIMARY KEY(day,strategy_id))")
+        self.db.execute("CREATE TABLE IF NOT EXISTS market_snapshots (id INTEGER PRIMARY KEY, timestamp TEXT NOT NULL, market TEXT NOT NULL, payload TEXT NOT NULL)")
         stored = self.db.execute("SELECT payload FROM state WHERE id=1").fetchone()
         self.data = json.loads(stored[0]) if stored else {
             "sessions": {m: blank_session() for m in MARKETS}, "events": [],
@@ -130,9 +132,9 @@ class Controller:
                 raise TypeError("Unsupported snapshot value")
             record = {"timestamp": self.clock().isoformat(), "market": market,
                       "bars": [asdict(b) for b in bars], "quotes": [asdict(q) for q in quotes]}
-            path = self.directory / f"quotes_{now.date().isoformat()}.jsonl"
-            with path.open("a") as handle:
-                handle.write(json.dumps(record, default=encode, allow_nan=False)+"\n")
+            with self.db:
+                self.db.execute("INSERT INTO market_snapshots(timestamp,market,payload) VALUES (?,?,?)",
+                                (record['timestamp'], market, json.dumps(record, default=encode, allow_nan=False)))
         return bars, quotes
 
     def _roll_day(self, now):
@@ -142,6 +144,12 @@ class Controller:
         if any(s["positions"] for s in self.data["sessions"].values()):
             return  # Never abandon yesterday's exposure.
         if account["date"]:
+            for market, session in self.data["sessions"].items():
+                if session.get('date') == account['date']:
+                    self.db.execute("INSERT OR REPLACE INTO strategy_daily VALUES (?,?,?,?,?,?,?)",
+                                    (account['date'], session.get('strategy_id') or resolve(market).id,
+                                     market, session.get('mode') or 'paper', float(session['net_pnl']),
+                                     float(session['capital']), int(session['entries'])))
             self.data["history"].append({"date": account["date"], "net_pnl": account["daily_pnl"],
                                           "capital": account["capital"]})
             account["lifetime_pnl"] += account["daily_pnl"]
@@ -235,6 +243,16 @@ class Controller:
                           strategies=catalog(),
                           live_enabled=False, live_reason=LIVE_REASON,
                           execution="PAPER ONLY — simulated book fills, unvalidated candidates")
+            history = [dict(date=day, strategy_id=sid, market=market, mode=mode,
+                            net_pnl=pnl, capital=capital, entries=entries)
+                       for day,sid,market,mode,pnl,capital,entries in self.db.execute(
+                           "SELECT day,strategy_id,market,mode,net_pnl,capital,entries FROM strategy_daily ORDER BY day DESC LIMIT 400")]
+            for market, session in self.data['sessions'].items():
+                if session.get('date') == now.date().isoformat():
+                    history.append(dict(date=session['date'], strategy_id=session.get('strategy_id') or resolve(market).id,
+                                        market=market, mode=session.get('mode') or 'paper',
+                                        net_pnl=session['net_pnl'], capital=session['capital'], entries=session['entries']))
+            result['strategy_history'] = history
             for market, s in result["sessions"].items():
                 spec = resolve(market, s.get('strategy_id'))
                 s.update(strategy_id=spec.id, max_entries=spec.max_entries, flatten=spec.flatten)

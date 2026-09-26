@@ -184,6 +184,18 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(a["lifetime_pnl"], expected)
         self.c.tick()
         self.assertEqual(self.c.status()["account"]["lifetime_pnl"], expected)
+        rows = self.c.status()['strategy_history']
+        self.assertEqual(len(rows),1)
+        self.assertEqual(rows[0]['strategy_id'],'nfv2')
+        self.assertEqual(rows[0]['date'],'2026-09-22')
+        self.assertAlmostEqual(rows[0]['net_pnl'],expected)
+
+    def test_current_day_appears_in_strategy_history(self):
+        self.start()
+        rows=self.c.status()['strategy_history']
+        self.assertEqual(len(rows),1)
+        self.assertEqual(rows[0]['strategy_id'],'nfv2')
+        self.assertEqual(rows[0]['entries'],1)
 
 
 class DataTests(unittest.TestCase):
