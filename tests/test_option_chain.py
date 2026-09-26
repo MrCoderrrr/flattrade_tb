@@ -1,4 +1,5 @@
 import io
+import time
 import unittest
 import zipfile
 from datetime import date, datetime
@@ -19,6 +20,17 @@ class OptionChainTests(unittest.TestCase):
         view.refresh()
         self.assertFalse(stream.started)
         self.assertIn('outside',view.reason)
+
+    def test_missing_current_master_never_reuses_old_tokens(self):
+        class Stream:
+            thread = None
+            def start(self): pass
+            def latest(self, now): raise AssertionError('Stale token map must not be used')
+        view = OptionChainView(Path('.'),clock=lambda:datetime(2026,9,28,9,20,tzinfo=IST),stream=Stream())
+        view.catalog_day = date(2026,9,25)
+        view.last_master_attempt = time.monotonic()
+        view.refresh()
+        self.assertIn('current nfo contract master',view.reason.lower())
 
     def test_nearest_future_expiry_and_nifty_only(self):
         content = ('Symbol,OptionType,Expiry,StrikePrice,Token,TradingSymbol\n'

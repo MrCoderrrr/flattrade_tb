@@ -103,6 +103,10 @@ class OptionChainView:
             with self.lock:
                 self.reason = 'Current NFO contract master is unavailable'
             return
+        with self.lock:
+            if self.catalog_day != now.date():
+                self.reason = 'Current NFO contract master is unavailable'
+                return
         snap = self.stream.latest(now)
         if not snap['ready']:
             with self.lock:
