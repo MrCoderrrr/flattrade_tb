@@ -93,7 +93,10 @@ class OptionChainView:
         if now.weekday() >= 5 or not '09:15' <= now.strftime('%H:%M') < '15:40':
             with self.lock:
                 self.reason = 'NIFTY option market is outside its live session'
+            if self.stream.thread and self.stream.thread.is_alive():
+                self.stream.stop()
             return
+        self.stream.start()
         try:
             self._load_master(now)
         except Exception:
@@ -148,7 +151,6 @@ class OptionChainView:
         if self.thread and self.thread.is_alive():
             return
         self.stop_event.clear()
-        self.stream.start()
         def run():
             while not self.stop_event.is_set():
                 self.refresh()

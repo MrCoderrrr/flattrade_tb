@@ -1,12 +1,25 @@
 import io
 import unittest
 import zipfile
-from datetime import date
+from datetime import date, datetime
+from pathlib import Path
 
-from strategy_lab.option_chain import parse_master
+from strategy_lab.models import IST
+from strategy_lab.option_chain import OptionChainView, parse_master
 
 
 class OptionChainTests(unittest.TestCase):
+    def test_off_hours_does_not_open_broker_stream(self):
+        class Stream:
+            thread = None
+            started = False
+            def start(self): self.started = True
+        stream = Stream()
+        view = OptionChainView(Path('.'), clock=lambda:datetime(2026,9,26,12,tzinfo=IST), stream=stream)
+        view.refresh()
+        self.assertFalse(stream.started)
+        self.assertIn('outside',view.reason)
+
     def test_nearest_future_expiry_and_nifty_only(self):
         content = ('Symbol,OptionType,Expiry,StrikePrice,Token,TradingSymbol\n'
                    'NIFTY,CE,01-Oct-2026,25000,123,NIFTYCE1\n'
