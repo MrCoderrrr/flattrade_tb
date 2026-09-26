@@ -23,7 +23,7 @@ from .catalog import resolve, catalog
 from . import active_v3
 
 MARKETS = ("NIFTY", "MCX")
-LIVE_REASON = "Live is locked: these candidates have no verified out-of-sample or forward-paper record, and live order reconciliation has not been commissioned."
+LIVE_REASON = "Real orders are unavailable: this controller has no commissioned broker executor or partial-fill reconciliation."
 
 
 def fresh(quote, now):
@@ -89,6 +89,8 @@ class Controller:
             "account": {"date": None, "capital": 200000, "daily_pnl": 0., "drawdown": 0.,
                         "halted": False, "lifetime_pnl": 0., "peak_pnl": 0.},
             "history": []}
+        self.data['account'].setdefault('configured_capital',float(self.data['account']['capital']))
+        self.data['account'].setdefault('live_permission',False)
         for session in self.data["sessions"].values():
             if session["positions"]:
                 session.update(state="RECOVERY_REQUIRED", exit_requested=True, stop_requested=True,
@@ -163,6 +165,8 @@ class Controller:
             if market not in MARKETS or mode not in ("paper", "live"):
                 raise ValueError("Choose NIFTY/MCX and paper/live explicitly")
             if mode == "live":
+                if not self.data['account']['live_permission']:
+                    raise ValueError('Enable account-wide live permission in Settings first')
                 raise ValueError(LIVE_REASON)
             spec = resolve(market, strategy_id)
             if not spec.enabled:
@@ -171,6 +175,8 @@ class Controller:
                 raise ValueError("Multiplier must be an integer from 1 to 100")
             if isinstance(capital, bool) or not isinstance(capital, (int, float)) or not math.isfinite(capital) or capital < 200000 * multiplier:
                 raise ValueError("Each multiplier requires at least ₹200,000 of declared capital")
+            if float(capital) != float(self.data['account']['configured_capital']):
+                raise ValueError('Use the shared account capital saved in Settings')
             self._roll_day(now)
             s = self.data["sessions"][market]
             if s['date'] and resolve(market, s.get('strategy_id')).id != spec.id:
@@ -194,6 +200,34 @@ class Controller:
                      date=now.date().isoformat(), reason="Paper session armed; waiting for valid market data and signal",
                      stop_requested=False, exit_requested=False, paused=False)
             self._event(f"{market}: PAPER session authorized at {multiplier}×; shared capital ₹{capital:,.0f}")
+            self._save()
+            return self.status()
+
+    def configure(self, *, capital=None, live_permission=None):
+        with self.lock:
+            if (capital is None) == (live_permission is None):
+                raise ValueError('Change either account capital or live permission')
+            account = self.data['account']
+            if capital is not None:
+                if (type(capital) not in (int,float) or not math.isfinite(capital)
+                        or capital < 200000):
+                    raise ValueError('Account capital must be at least ₹200,000')
+                now = self.clock().astimezone(IST).date().isoformat()
+                if any(s.get('date') == now or s['positions'] for s in self.data['sessions'].values()):
+                    raise ValueError('Account capital is fixed after a strategy starts for the day')
+                account['configured_capital'] = float(capital)
+                account['capital'] = float(capital)
+                self._event(f"Account capital set to ₹{capital:,.0f}")
+            else:
+                if type(live_permission) is not bool:
+                    raise ValueError('Live permission must be true or false')
+                account['live_permission'] = live_permission
+                if not live_permission:
+                    for market,session in self.data['sessions'].items():
+                        if session.get('mode') == 'live' and session.get('state') not in ('STOPPED','SESSION_COMPLETE'):
+                            self.stop(market)
+                self._event('Account live permission '+('enabled' if live_permission else 'disabled'))
+            self._revision += 1
             self._save()
             return self.status()
 
@@ -242,6 +276,7 @@ class Controller:
             result.update(today=now.date().isoformat(), server_time=now.isoformat(),
                           strategies=catalog(),
                           live_enabled=False, live_reason=LIVE_REASON,
+                          live_permission=bool(self.data['account']['live_permission']),
                           execution="PAPER ONLY — simulated book fills, unvalidated candidates")
             history = [dict(date=day, strategy_id=sid, market=market, mode=mode,
                             net_pnl=pnl, capital=capital, entries=entries)

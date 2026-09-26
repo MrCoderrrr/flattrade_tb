@@ -37,6 +37,10 @@ class FakeController:
         self.calls.append(("kill",))
         return {"halted": True}
 
+    def configure(self, *, capital=None, live_permission=None):
+        self.calls.append(('configure',capital,live_permission))
+        return {'capital':capital,'live_permission':live_permission}
+
 
 class DashboardHTTPTests(unittest.TestCase):
     @classmethod
@@ -173,16 +177,23 @@ class DashboardHTTPTests(unittest.TestCase):
                 self.assertEqual(self.request("POST", "/api/start", payload)[0], 400)
         self.assertEqual(self.controller.calls, [])
 
-    def test_live_requires_exact_market_and_current_date(self):
+    def test_live_start_requires_pin_and_dispatches_explicit_mode(self):
         today = datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
-        for confirmation in ["", "yes", "LIVE NIFTY 2000-01-01", f"LIVE MCX {today}", f"LIVE NIFTY {today} "]:
-            with self.subTest(confirmation=confirmation):
-                self.assertEqual(self.request("POST", "/api/start", self.start_payload(mode="live", confirmation=confirmation))[0], 400)
+        for pin in ['', '1234', None]:
+            with self.subTest(pin=pin):
+                self.assertEqual(self.request("POST", "/api/start", self.start_payload(mode="live", pin=pin))[0], 403)
         self.assertEqual(self.controller.calls, [])
-        status, _, _ = self.request("POST", "/api/start", self.start_payload(mode="live", confirmation=f"LIVE NIFTY {today}"))
+        status, _, _ = self.request("POST", "/api/start", self.start_payload(mode="live", pin='7000'))
         self.assertEqual(status, 200)
-        # Validation and the live-eligibility gate remain the controller's job.
+        # PIN authorization cannot bypass the controller's live-executor gate.
         self.assertEqual(self.controller.calls[-1], ("start", "NIFTY", "live", 1, 200000, f"LIVE NIFTY {today}"))
+
+    def test_settings_change_requires_valid_fields_and_pin_for_live_permission(self):
+        self.assertEqual(self.request('POST','/api/settings',{'capital':400000})[0],200)
+        self.assertEqual(self.request('POST','/api/settings',{'live_permission':True})[0],403)
+        self.assertEqual(self.request('POST','/api/settings',{'live_permission':True,'pin':'7000'})[0],200)
+        self.assertEqual(self.request('POST','/api/settings',{'live_permission':False})[0],200)
+        self.assertEqual(self.controller.calls,[('configure',400000,None),('configure',None,True),('configure',None,False)])
 
     def test_stop_and_shared_emergency_stop_dispatch(self):
         self.assertEqual(self.request("POST", "/api/stop", {"market": "MCX"})[0], 200)

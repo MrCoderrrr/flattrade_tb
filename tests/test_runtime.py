@@ -35,6 +35,8 @@ class RuntimeTests(unittest.TestCase):
         self.temp.cleanup()
 
     def start(self, multiplier=1, capital=200000):
+        if capital != self.c.status()['account']['configured_capital']:
+            self.c.configure(capital=capital)
         self.c.start("NIFTY", "paper", multiplier, capital)
         self.c.tick()
         return self.c.status()["sessions"]["NIFTY"]
@@ -42,7 +44,10 @@ class RuntimeTests(unittest.TestCase):
     def test_paper_never_places_orders_and_requires_explicit_mode(self):
         with self.assertRaises(ValueError):
             self.c.start("NIFTY", None, 1, 200000)
-        with self.assertRaisesRegex(ValueError, "Live is locked"):
+        with self.assertRaisesRegex(ValueError, "live permission"):
+            self.c.start("NIFTY", "live", 1, 200000)
+        self.c.configure(live_permission=True)
+        with self.assertRaisesRegex(ValueError, "no commissioned broker executor"):
             self.c.start("NIFTY", "live", 1, 200000)
         self.assertFalse(self.c.status()["live_enabled"])
         self.assertEqual(len(self.start()["positions"]), 4)
@@ -115,8 +120,27 @@ class RuntimeTests(unittest.TestCase):
         self.start()
         self.c.stop("NIFTY")
         self.c.tick()
-        with self.assertRaisesRegex(ValueError, "capital is fixed"):
+        with self.assertRaisesRegex(ValueError, "shared account capital saved"):
             self.c.start("NIFTY", "paper", 2, 400000)
+
+    def test_shared_capital_is_saved_in_settings_and_enforced(self):
+        self.c.configure(capital=400000)
+        self.assertEqual(self.c.status()['account']['configured_capital'],400000)
+        with self.assertRaisesRegex(ValueError,'shared account capital saved'):
+            self.c.start('NIFTY','paper',1,200000)
+        self.assertEqual(self.start(2,400000)['multiplier'],2)
+        with self.assertRaisesRegex(ValueError,'capital is fixed'):
+            self.c.configure(capital=600000)
+
+    def test_live_permission_is_user_controlled_and_persistent(self):
+        self.c.configure(live_permission=True)
+        self.assertTrue(self.c.status()['live_permission'])
+        self.assertFalse(self.c.status()['live_enabled'])
+        self.c.shutdown()
+        self.c=Controller(Path(self.temp.name),feed=self.feed,clock=lambda:self.now)
+        self.assertTrue(self.c.status()['live_permission'])
+        self.c.configure(live_permission=False)
+        self.assertFalse(self.c.status()['live_permission'])
 
     def test_shared_capital_cannot_back_two_open_sessions(self):
         self.start()

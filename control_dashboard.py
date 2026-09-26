@@ -235,7 +235,7 @@ class ControlHandler(BaseHTTPRequestHandler):
         return market
 
     def _start(self, data: dict[str, Any]) -> Any:
-        fields = {"market", "mode", "multiplier", "capital", "confirmation", "strategy_id"}
+        fields = {"market", "mode", "multiplier", "capital", "confirmation", "strategy_id", "pin"}
         if set(data) - fields:
             raise RequestError("Unexpected start fields.")
         market = self._market(data)
@@ -257,14 +257,34 @@ class ControlHandler(BaseHTTPRequestHandler):
         if not isinstance(confirmation, str) or len(confirmation) > 80:
             raise RequestError("Invalid live confirmation.")
         if mode == "live":
-            today = datetime.now(IST).date().isoformat()
-            if confirmation != f"LIVE {market} {today}":
-                raise RequestError("Type the exact market and today's IST date to request a live session.")
+            pin = data.get('pin')
+            if (self.server.pin is None or not isinstance(pin,str)
+                    or not hmac.compare_digest(pin,self.server.pin)):
+                raise RequestError('Enter the four-digit dashboard PIN for a live request.',403)
+            confirmation = f"LIVE {market} {datetime.now(IST).date().isoformat()}"
         kwargs = {}
         if 'strategy_id' in data:
             from strategy_lab.catalog import resolve
             kwargs['strategy_id'] = resolve(market, data['strategy_id']).id
         return self.server.controller.start(market, mode, multiplier, capital, confirmation=confirmation, **kwargs)
+
+    def _settings(self, data: dict[str, Any]) -> Any:
+        if set(data) == {'capital'}:
+            capital = data['capital']
+            if type(capital) not in (int,float) or not math.isfinite(capital) or capital < 200000:
+                raise RequestError('Account capital must be at least ₹200,000.')
+            return self.server.controller.configure(capital=capital)
+        if set(data) in ({'live_permission'}, {'live_permission','pin'}):
+            value = data['live_permission']
+            if type(value) is not bool:
+                raise RequestError('Live permission must be true or false.')
+            if value:
+                pin = data.get('pin')
+                if (self.server.pin is None or not isinstance(pin,str)
+                        or not hmac.compare_digest(pin,self.server.pin)):
+                    raise RequestError('Enter the four-digit dashboard PIN to enable live permission.',403)
+            return self.server.controller.configure(live_permission=value)
+        raise RequestError('Settings accepts account capital or live permission.')
 
     def _get(self, head_only: bool = False) -> None:
         try:
@@ -312,11 +332,13 @@ class ControlHandler(BaseHTTPRequestHandler):
                         self.server.sessions.pop(supplied.value,None)
                 self._json(200,{"authenticated":False},cookie="desk_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
                 return
-            if self.path not in {"/api/start", "/api/stop", "/api/kill", "/api/pause"}:
+            if self.path not in {"/api/start", "/api/stop", "/api/kill", "/api/pause", "/api/settings"}:
                 raise RequestError("Not found.", 404)
             data = self._body()
             if self.path == "/api/start":
                 result = self._start(data)
+            elif self.path == "/api/settings":
+                result = self._settings(data)
             elif self.path == "/api/pause":
                 if set(data) != {"market", "paused"} or type(data["paused"]) is not bool:
                     raise RequestError("Pause requires market and a boolean paused field")
