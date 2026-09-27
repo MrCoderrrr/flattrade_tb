@@ -11,7 +11,8 @@ import math
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import quote_plus
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from .models import Bar, Contract, Quote, IST
@@ -70,12 +71,19 @@ class FlattradeReadOnly:
         token = token_path.read_text().strip() if token_path.is_file() else ""
         if not user or not token:
             raise FeedError("Set FLATTRADE_USER_ID and a valid FLATTRADE_TOKEN_FILE for market data")
-        body = urlencode({"jData": json.dumps({"uid": user, **fields}), "jKey": token}).encode()
+        # PiConnect expects literal JSON after ``jData=``. Encoding that JSON
+        # with urlencode causes HTTP 400 "jData is not valid json object".
+        body = ("jData=" + json.dumps({"uid": user, **fields}, separators=(",", ":")) +
+                "&jKey=" + quote_plus(token)).encode()
         request = Request(self.BASE + endpoint, data=body,
                           headers={"Content-Type": "application/x-www-form-urlencoded"})
         try:
             with urlopen(request, timeout=8) as response:
                 result = json.load(response)
+        except HTTPError as exc:
+            if exc.code == 401:
+                raise FeedError("Flattrade session expired; refresh the broker login token") from None
+            raise FeedError(f"Flattrade market data returned HTTP {exc.code}") from None
         except Exception:
             raise FeedError("Flattrade market data request failed; check connectivity/session") from None
         if isinstance(result, dict) and result.get("stat") != "Ok":

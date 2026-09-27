@@ -1,6 +1,9 @@
 import tempfile
 import threading
 import unittest
+import io
+import json
+import os
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
@@ -270,6 +273,24 @@ class DataTests(unittest.TestCase):
         feed = FlattradeReadOnly(Path("."))
         with self.assertRaisesRegex(FeedError,"read-only"):
             feed._call("PlaceOrder")
+
+    def test_flattrade_form_keeps_jdata_as_literal_json(self):
+        with tempfile.TemporaryDirectory() as root:
+            token_file=Path(root,'token.txt')
+            token_file.write_text('test-token')
+            captured=[]
+            def respond(request,timeout):
+                captured.append(request)
+                return io.BytesIO(b'[]')
+            with (patch.dict(os.environ,{'FLATTRADE_USER_ID':'TEST',
+                                         'FLATTRADE_TOKEN_FILE':str(token_file)}),
+                  patch('strategy_lab.market_data.urlopen',side_effect=respond)):
+                result=FlattradeReadOnly(Path(root))._call('TPSeries',exch='NSE',token='26000',intrv='1')
+            self.assertEqual(result,[])
+            body=captured[0].data
+            self.assertTrue(body.startswith(b'jData={'))
+            self.assertEqual(json.loads(body.split(b'&jKey=')[0][6:])['token'],'26000')
+            self.assertIn(b'&jKey=test-token',body)
 
     def test_missing_exchange_timestamp_is_not_replaced_by_receive_time(self):
         _, quotes, now = nifty_fixture()
