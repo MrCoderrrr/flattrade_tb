@@ -189,5 +189,15 @@ class FlattradeReadOnly:
         expiry = min(c.expiry for c in contracts)
         contracts = [c for c in contracts if c.expiry == expiry]
         strikes = sorted({c.strike for c in contracts}, key=lambda k: abs(k-spot))[:14]
+        if strategy_id == "nfv1":
+            # The v1 paper basket uses wings at least 1000 points from ATM.
+            # Request only the closest eligible wings, not the whole chain.
+            strikes = strikes[:3]
+            atm = strikes[0]
+            for predicate in (lambda strike: strike >= atm+1000,
+                              lambda strike: strike <= atm-1000):
+                wings = [c.strike for c in contracts if predicate(c.strike)]
+                if wings:
+                    strikes.append(min(wings, key=lambda strike: abs(abs(strike-atm)-1000)))
         selected = [c for c in contracts if c.strike in strikes]
         return bars, self.quotes(selected, now)

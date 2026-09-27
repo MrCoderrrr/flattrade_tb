@@ -20,7 +20,7 @@ from .models import Contract, IST
 from .market_data import FlattradeReadOnly, FeedError
 from .strategies import build_plan, explain_signal, _option_type
 from .catalog import resolve, catalog
-from . import active_v3
+from . import active_v3, legacy_v1
 
 MARKETS = ("NIFTY", "MCX")
 LIVE_REASON = "Real orders are unavailable: this controller has no commissioned broker executor or partial-fill reconciliation."
@@ -181,7 +181,7 @@ class Controller:
                 raise ValueError(LIVE_REASON)
             spec = resolve(market, strategy_id)
             if not spec.enabled:
-                raise ValueError('Original v1 is archived; its legacy engine is not connected to this paper controller')
+                raise ValueError('This strategy is unavailable in the paper controller')
             if type(multiplier) is not int or not 1 <= multiplier <= 100:
                 raise ValueError("Multiplier must be an integer from 1 to 100")
             if isinstance(capital, bool) or not isinstance(capital, (int, float)) or not math.isfinite(capital) or capital < 200000 * multiplier:
@@ -359,11 +359,11 @@ class Controller:
 
     def _enter(self, market, s, plan, now):
         spec = resolve(market, s.get('strategy_id'))
-        naked = spec.id == 'mcxv3' and plan.strategy == 'mcxv3' and plan.max_loss is None and all(l.side == 'SELL' for l in plan.legs)
+        naked = spec.id in ('mcxv1', 'mcxv3') and plan.strategy == spec.id and plan.max_loss is None and all(l.side == 'SELL' for l in plan.legs)
         limit = (spec.trade_risk_per_unit or 0)*s['multiplier']
         if s["positions"] or (not naked and (plan.max_loss is None or plan.max_loss > limit)):
             raise ValueError("Invalid portfolio risk")
-        if not naked and plan.max_loss + self.data["account"]["drawdown"] >= .05*self.data["account"]["capital"]:
+        if not naked and spec.version != 1 and plan.max_loss + self.data["account"]["drawdown"] >= .05*self.data["account"]["capital"]:
             s["reason"] = "Trade would exceed remaining portfolio drawdown budget"
             return
         positions, fills, costs = [], [], 0.
@@ -407,6 +407,10 @@ class Controller:
                  take_profit=plan.take_profit, trade_costs=costs, max_loss=actual_risk,
                  entries=s["entries"]+1, entered_at=now.isoformat(), direction=plan.direction,
                  reversal_count=0, reversal_bar=None)
+        if spec.version == 1:
+            for p in positions:
+                if p["side"] == "SELL":
+                    p.update(best_mark=p["entry_price"], leg_stop=None, trail_armed=False)
         if spec.id == "mcxv3":
             s.update(cycle_start_net=s["net_pnl"], trend_count=0, trend_bar=None,
                      reentry_count=0, reentry_bar=None, leg_reentries=s.get("leg_reentries", 0))
@@ -434,6 +438,102 @@ class Controller:
         else:
             s["missing_armed"] = False
         self._event(f"MCX: simulated {position['contract']['option_type']} leg exit — {reason}")
+
+    def _manage_v1(self, market, s, signal, quotes, now):
+        """Manage the dashboard v1 paper port without invoking legacy broker code."""
+        shorts = [p for p in s['positions'] if p['side'] == 'SELL']
+        if not shorts:
+            return
+        slope = signal.get('indicators', {}).get('kama_slope', 0.) if signal.get('eligible') else 0.
+        direction = signal.get('direction', 0) if signal.get('eligible') else 0
+        initial = .15 if market == 'NIFTY' else .10
+        solo_trail = .09 if market == 'NIFTY' else .05
+        for p in list(shorts):
+            entry, mark = p['entry_price'], p['mark_price']
+            p['best_mark'] = min(p.get('best_mark', entry), mark)
+            solo = len([x for x in s['positions'] if x['side'] == 'SELL']) == 1
+            stop = min(entry*(1+initial), p['best_mark']*(1+solo_trail) if solo else entry*(1+initial))
+            p['leg_stop'] = min(p.get('leg_stop') or stop, stop)
+            p['trail_armed'] = solo
+            option = _option_type(contract_from(p['contract']))
+            impulse = (direction > 0 and option == 'CE' or direction < 0 and option == 'PE')
+            if mark < p['leg_stop'] and not (impulse and abs(slope) >= (.5 if market == 'NIFTY' else .05)):
+                continue
+            fee = cost(mark, p['quantity'])
+            s['costs'] += fee
+            s['realized_pnl'] += p['unrealized_pnl']
+            s['trades'].append({'timestamp': now.isoformat(), 'symbol': p['symbol'],
+                                'side': 'BUY', 'quantity': p['quantity'], 'price': mark,
+                                'cost': fee, 'mode': 'paper', 'simulated': True,
+                                'reason': 'V1 KAMA impulse' if impulse and mark < p['leg_stop'] else 'V1 premium stop'})
+            s['positions'].remove(p)
+            s['last_leg_exit'] = now.isoformat()
+            s['reason'] = 'V1 paper leg exited on KAMA impulse or premium stop'
+            self._mark(s, quotes, now)
+            self._event(f"{market}: simulated v1 {option} short exit")
+        shorts = [p for p in s['positions'] if p['side'] == 'SELL']
+        if not shorts:
+            # Original NIFTY keeps only wings after both shorts are gone. This
+            # controlled adaptation exits them too, so the dashboard is flat.
+            if market == 'NIFTY':
+                s.update(locked=True, exit_requested=True,
+                         reason='Both v1 shorts exited; closing protective wings')
+            else:
+                s.update(state='COOLDOWN', last_exit=now.isoformat())
+            return
+        if (len(shorts) != 1 or s.get('paused') or not signal.get('eligible') or
+                now.strftime('%H:%M') >= resolve(market, s['strategy_id']).entry_end or
+                s['entries'] >= resolve(market, s['strategy_id']).max_entries or
+                s['net_pnl'] <= -resolve(market, s['strategy_id']).session_loss_per_unit*s['multiplier'] or
+                not s.get('last_leg_exit') or
+                (now-datetime.fromisoformat(s['last_leg_exit'])).total_seconds() < 60):
+            return
+        held = shorts[0]
+        missing = 'CE' if _option_type(contract_from(held['contract'])) == 'PE' else 'PE'
+        if direction != (-1 if missing == 'CE' else 1):
+            return
+        try:
+            _, chain = self._snapshot(market, now)
+        except FeedError:
+            s['reason'] = 'KAMA reversal; waiting for fresh option-chain depth'
+            return
+        if s['exit_requested'] or s['stop_requested']:
+            return
+        spot = signal['indicators']['close']
+        candidates = [q for q in chain if _option_type(q.contract) == missing
+                      and q.contract.expiry.isoformat() == held['contract']['expiry']
+                      and q.contract.lot_size == held['contract']['lot_size']
+                      and q.bid_size >= held['quantity'] and fresh(q, now)]
+        if market == 'NIFTY':
+            wing = next((p for p in s['positions'] if p['side'] == 'BUY'
+                         and _option_type(contract_from(p['contract'])) == missing), None)
+            if wing is None:
+                return
+            strike = wing['contract']['strike']
+            candidates = [q for q in candidates if
+                          (q.contract.strike <= strike-1000 if missing == 'CE' else
+                           q.contract.strike >= strike+1000)]
+        if not candidates:
+            s['reason'] = 'V1 reversal confirmed; suitable ATM option or protection unavailable'
+            return
+        q = min(candidates, key=lambda item: abs(item.contract.strike-spot))
+        price = q.bid-q.contract.tick_size
+        if price <= 0:
+            return
+        fee = cost(price, held['quantity'])
+        s['positions'].append({'symbol': q.contract.symbol, 'contract': contract_dict(q.contract),
+                               'side': 'SELL', 'quantity': held['quantity'], 'entry_price': price,
+                               'mark_price': price, 'unrealized_pnl': 0., 'best_mark': price,
+                               'leg_stop': None, 'trail_armed': False})
+        s['costs'] += fee
+        s['trades'].append({'timestamp': now.isoformat(), 'symbol': q.contract.symbol,
+                            'side': 'SELL', 'quantity': held['quantity'], 'price': price,
+                            'cost': fee, 'mode': 'paper', 'reason': 'V1 KAMA reversal re-entry',
+                            'simulated': True})
+        s['entries'] += 1
+        s['reason'] = 'V1 KAMA reversal; paper strangle restored'
+        self._mark(s, quotes+[q], now)
+        self._event(f"{market}: simulated v1 {missing} re-entry")
 
     def _manage_mcx_v3(self, s, signal, quotes, now):
         if s["exit_requested"] or s["stop_requested"]:
@@ -600,8 +700,10 @@ class Controller:
                 if s["state"] in ("STOPPED", "SESSION_COMPLETE") and not s["positions"]:
                     continue
                 spec = resolve(market, s.get('strategy_id'))
-                signal_fn = active_v3.explain_signal if spec.version == 3 else explain_signal
-                plan_fn = active_v3.build_plan if spec.version == 3 else build_plan
+                signal_fn = (legacy_v1.explain_signal if spec.version == 1 else
+                             active_v3.explain_signal if spec.version == 3 else explain_signal)
+                plan_fn = (legacy_v1.build_plan if spec.version == 1 else
+                           active_v3.build_plan if spec.version == 3 else build_plan)
                 deadline = spec.flatten
                 ended = s["date"] != now.date().isoformat() or now.strftime("%H:%M") >= deadline or now.weekday() >= 5
                 if ended:
@@ -616,10 +718,10 @@ class Controller:
                         self._mark(s, quotes, self.clock().astimezone(IST))
                         trade_net = (s["net_pnl"] - s.get("cycle_start_net", 0.)) if spec.id == "mcxv3" else s["unrealized_pnl"] - s["trade_costs"] - s["estimated_exit_costs"]
                         signal = {}
-                        if spec.version == 3 and bars and not s['exit_requested']:
+                        if spec.version in (1, 3) and bars and not s['exit_requested']:
                             signal = signal_fn(market, bars, self.clock().astimezone(IST))
                             s['signal'] = signal
-                            if spec.id != "mcxv3":
+                            if spec.version == 3 and spec.id != "mcxv3":
                                 stamp = bars[-1].timestamp.isoformat()
                                 if signal.get('eligible') and stamp != s.get('reversal_bar'):
                                     s['reversal_bar'] = stamp
@@ -628,13 +730,16 @@ class Controller:
                                         s.update(exit_requested=True, reason='Indicator regime changed for two completed bars')
                         if s["net_pnl"] <= -spec.session_loss_per_unit*s["multiplier"]:
                             s.update(locked=True, exit_requested=True, reason="Session loss limit reached")
-                        elif trade_net <= -s["stop_loss"] or (spec.id != "mcxv3" and trade_net >= s["take_profit"]):
+                        elif spec.version != 1 and (trade_net <= -s["stop_loss"] or (spec.id != "mcxv3" and trade_net >= s["take_profit"])):
                             s.update(exit_requested=True, reason="Portfolio stop" if trade_net < 0 else "Portfolio take profit")
                         self._account()
                         if spec.id == "mcxv3" and not s["exit_requested"]:
                             self._manage_mcx_v3(s, signal, quotes, self.clock().astimezone(IST))
                             if s["net_pnl"] <= -spec.session_loss_per_unit*s["multiplier"]:
                                 s.update(locked=True, exit_requested=bool(s["positions"]), reason="Session loss limit reached")
+                            self._account()
+                        if spec.version == 1 and not s["exit_requested"]:
+                            self._manage_v1(market, s, signal, quotes, self.clock().astimezone(IST))
                             self._account()
                         if s["exit_requested"]:
                             self._exit(market, s, quotes, self.clock().astimezone(IST))
@@ -664,7 +769,7 @@ class Controller:
                         continue
                     bars, quotes = self._snapshot(market, now)
                     fresh_now = self.clock().astimezone(IST)
-                    if not bars or (fresh_now-(bars[-1].timestamp+timedelta(minutes=spec.bar_minutes))).total_seconds() > (90 if spec.version == 3 else 360):
+                    if not bars or (fresh_now-(bars[-1].timestamp+timedelta(minutes=spec.bar_minutes))).total_seconds() > (90 if spec.version in (1, 3) else 360):
                         raise FeedError("Completed underlying bars are missing or stale")
                     if quotes:
                         s["feed_timestamp"] = min(q.timestamp for q in quotes).isoformat()

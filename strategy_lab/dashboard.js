@@ -1,6 +1,6 @@
 (()=>{'use strict';
 const ids=['nfv1','nfv2','nfv3','mcxv1','mcxv2','mcxv3'];
-const labels={nfv1:'Original NIFTY · KAMA / ADX',nfv2:'Selective NIFTY range spreads',nfv3:'Active NIFTY indicators · hedged',mcxv1:'Original MCX · KAMA / EMA',mcxv2:'Selective MCX trend spreads',mcxv3:'ATM straddle · KAMA / EMA · leg stops'};
+const labels={nfv1:'V1 paper port · ATM shorts · 1000-point wings',nfv2:'Selective NIFTY range spreads',nfv3:'Active NIFTY indicators · hedged',mcxv1:'V1 paper port · ATM shorts · KAMA stops',mcxv2:'Selective MCX trend spreads',mcxv3:'ATM straddle · KAMA / EMA · leg stops'};
 const $=id=>document.getElementById(id), money=n=>Number.isFinite(Number(n))?'₹'+Number(n).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2}):'—';
 const signed=n=>{const v=Number(n)||0;return (v>0?'+':'')+money(v)};
 const percent=(n,capital)=>Number(capital)>0?((Number(n)||0)/Number(capital)*100).toFixed(2)+'%':'—';

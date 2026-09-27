@@ -2,7 +2,7 @@
 
 Research and paper trading dashboard. **No live order submission is enabled.** None of the versions has demonstrated or can guarantee the requested 4–5% monthly return.
 
-The dashboard lists all six version names. `nfv1` and `mcxv1` are aliases for the original engines and appear as archived because their execution and risk state cannot safely be managed by this controller. `nfv2` and `mcxv2` remain the selective, five-minute paper candidates. `nfv3` uses one-minute EMA 9/21, RSI 14, ATR 14 and the NIFTY session price mean, beginning at 09:20 and flattening at 15:34 IST. It sells an at-the-money put in a bullish regime, call in a bearish regime, or both when balanced, with farther-strike protective options. `mcxv3` uses the same indicator votes and a volume-weighted session price, beginning at 16:05 and flattening at 23:24 IST. Its short options have **no hedge**; a stop trigger cannot cap the realized loss. V3 permits more entries with a 60-second cooldown, but data, depth, stops and session limits can leave it flat. Prior-session one-minute bars are needed to warm up indicators for the earliest entry.
+The dashboard lists all six version names. `nfv1` and `mcxv1` can now be switched on in **paper mode**. They are controller-managed adaptations of the original standalone engines, not byte-for-byte executions of the old scripts: `nfv1` sells ATM CE/PE with approximately 1000-point protective wings; `mcxv1` sells an unhedged ATM CE/PE pair. Both use KAMA-led paper management, premium stops, and simulated re-entry. The old launchers are never imported by the dashboard. Paper fills and P&L use the same read-only bid/ask feed and ledger as v2/v3. `nfv2` and `mcxv2` remain the selective, five-minute paper candidates. `nfv3` uses one-minute EMA 9/21, RSI 14, ATR 14 and the NIFTY session price mean, beginning at 09:20 and flattening at 15:34 IST. It sells an at-the-money put in a bullish regime, call in a bearish regime, or both when balanced, with farther-strike protective options. `mcxv3` uses the same indicator votes and a volume-weighted session price, beginning at 16:05 and flattening at 23:24 IST. Its short options have **no hedge**; a stop trigger cannot cap the realized loss. V3 permits more entries with a 60-second cooldown, but data, depth, stops and session limits can leave it flat. Prior-session one-minute bars are needed to warm up indicators for the earliest entry.
 
 ## Start the dashboard
 
@@ -14,7 +14,7 @@ python3 control_dashboard.py --port 8080
 
 Open `http://127.0.0.1:8080` and enter the **dashboard control token** printed in that terminal. This token only unlocks local controls; it is not your Flattrade token. The server starts idle. Each session's Start dialog asks for mode, multiplier and declared shared account capital. One multiplier requires ₹200,000. Stop requests flattening; emergency stop locks new entries for the rest of the day. A restart requires new session authorization. Live mode is visibly locked pending strategy and execution validation.
 
-The dashboard controls the v2/v3 paper controller. The original v1 launchers have separate execution and state, so their dashboard rows are informational.
+The dashboard controls all six paper versions. A v1 toggle starts the safe paper adaptation, while the original standalone launchers keep their separate code and state. Live broker execution remains unavailable from the dashboard.
 
 ## Connect market data for paper trading
 
