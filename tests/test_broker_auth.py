@@ -14,6 +14,13 @@ from strategy_lab.broker_auth import BrokerAuthError, BrokerTokenSync, extract_r
 
 
 class BrokerAuthTests(unittest.TestCase):
+    def test_login_url_uses_private_creds_module_key(self):
+        with TemporaryDirectory() as folder:
+            sync = BrokerTokenSync(Path(folder))
+            with patch("strategy_lab.broker_auth._credentials", return_value=("key from creds", "secret")):
+                self.assertEqual(sync.status()["auth_url"],
+                                 "https://auth.flattrade.in/?app_key=key%20from%20creds")
+
     def test_extracts_redirect_code_without_fetching_redirect_url(self):
         self.assertEqual(extract_request_code("https://example.test/callback?request_code=ABC123&state=1"), "ABC123")
         self.assertEqual(extract_request_code("code=ABC123"), "ABC123")

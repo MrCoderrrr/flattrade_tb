@@ -97,6 +97,7 @@ class DashboardHTTPTests(unittest.TestCase):
         for method, path, payload in [("GET", "/api/status", None),
                                       ("GET", "/api/ml", None),
                                       ("GET", "/api/auth/status", None),
+                                      ("GET", "/api/auth/authorize", None),
                                       ("POST", "/api/auth/token", {"url_or_code":"ABC123"}),
                                       ("POST", "/api/start", self.start_payload()),
                                       ("POST", "/api/stop", {"market": "NIFTY"}),
@@ -131,6 +132,11 @@ class DashboardHTTPTests(unittest.TestCase):
             status, _, body = self.request("GET", "/api/auth/status")
             self.assertEqual(status, 200)
             self.assertTrue(json.loads(body)["saved_today"])
+            status, headers, body = self.request("GET", "/api/auth/authorize")
+            self.assertEqual(status, 302)
+            self.assertEqual(headers["Location"],
+                             "https://auth.flattrade.in/?app_key=public")
+            self.assertEqual(body, b"")
             payload = {"url_or_code":"ABC123","pin":"0000"}
             self.assertEqual(self.request("POST", "/api/auth/token", payload)[0], 400)
             self.assertEqual(fake.calls, [])
@@ -138,6 +144,11 @@ class DashboardHTTPTests(unittest.TestCase):
             login, headers, _ = self.request("POST", "/api/login", {"pin":"7000"}, authorized=False)
             self.assertEqual(login, 200)
             cookie = headers["Set-Cookie"].split(";", 1)[0]
+            status, headers, _ = self.request("GET", "/api/auth/authorize",
+                                               authorized=False, headers={"Cookie":cookie})
+            self.assertEqual(status, 302)
+            self.assertEqual(headers["Location"],
+                             "https://auth.flattrade.in/?app_key=public")
             status, _, body = self.request("POST", "/api/auth/token", payload,
                                            authorized=False, headers={"Cookie":cookie})
             self.assertEqual(status, 200)

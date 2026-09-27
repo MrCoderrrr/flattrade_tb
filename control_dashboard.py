@@ -21,7 +21,7 @@ import os
 import signal
 import time
 import threading
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -300,6 +300,22 @@ class ControlHandler(BaseHTTPRequestHandler):
                 self._send(200, self.server.dashboard_js, "text/javascript; charset=utf-8", head_only)
                 return
             self._authenticate()
+            if self.path == "/api/auth/authorize":
+                if self.server.broker_auth is None:
+                    raise RequestError("Flattrade login is unavailable.", 503)
+                auth_url = self.server.broker_auth.status().get("auth_url")
+                parsed = urlparse(auth_url) if isinstance(auth_url, str) else None
+                if (parsed is None or parsed.scheme != "https"
+                        or parsed.netloc != "auth.flattrade.in" or parsed.path != "/"
+                        or not parse_qs(parsed.query).get("app_key") or parsed.fragment):
+                    raise RequestError("Flattrade login is unavailable.", 503)
+                self.send_response(302)
+                self.send_header("Location", auth_url)
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             if self.path == "/api/status":
                 status = self.server.controller.status()
                 if not isinstance(status, dict):
