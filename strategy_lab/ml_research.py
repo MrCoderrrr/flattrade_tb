@@ -67,6 +67,8 @@ def _expiry(value):
 class MLResearch:
     def __init__(self, root: Path, chain=None, clock=None):
         self.path = Path(root) / "data" / "strategy_lab" / "ml.sqlite3"
+        self.spot_report_path = (Path(root) / "data" / "market_history" /
+                                 "nifty_1y" / "spot_ml_report.json")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.path, check_same_thread=False, timeout=15)
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -249,10 +251,15 @@ class MLResearch:
             trade_rows = [dict(file=file, day=day, rows=count, reported_pnl=pnl)
                           for file, day, count, pnl in self.db.execute(
                               "SELECT file,day,rows,reported_pnl FROM trade_audit ORDER BY day DESC,file")]
+        try:
+            spot_report = json.loads(self.spot_report_path.read_text())
+        except (OSError, ValueError):
+            spot_report = None
         return {"report": json.loads(row[0]) if row else None, "data_days": counts,
                 "legacy_trade_files": trade_rows, "collector_error": self.last_error,
                 "collector_running": bool(self.thread and self.thread.is_alive()),
-                "collector_interval_seconds": 1, "model_controls_orders": False}
+                "collector_interval_seconds": 1, "model_controls_orders": False,
+                "spot_model": spot_report}
 
     def _minutes(self):
         with self.lock:

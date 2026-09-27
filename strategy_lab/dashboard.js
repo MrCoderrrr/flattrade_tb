@@ -120,6 +120,29 @@ function renderML(){
   const days=$('ml-days');days.replaceChildren();if(!data.data_days?.length)days.append(node('div','empty','No captured market days yet.'));for(const day of (data.data_days||[])){const row=node('div','mlrow');row.append(node('span','',day.day+' · '+day.quality.replaceAll('_',' ')),node('strong','',day.snapshots.toLocaleString('en-IN')));days.append(row)}
   const features=$('ml-features');features.replaceChildren();for(const name of (report.feature_names||[]))features.append(node('span','',name.replaceAll('_',' ')));
   const tradeFiles=data.legacy_trade_files||[];text($('ml-trades'),tradeFiles.length+' historical trade-log files indexed for audit; their P&L is not used as training labels.');
+  renderSpotML(data.spot_model);
+}
+function renderSpotML(report){
+  const test=report?.test||{},range=report?.test_range||{};
+  text($('spot-model-state'),report?'Research only':'No model yet');
+  text($('spot-model-accuracy'),test.accuracy==null?'—':(100*test.accuracy).toFixed(1)+'%');
+  text($('spot-model-baseline'),test.majority_baseline_accuracy==null?'Majority baseline —':'Majority baseline '+(100*test.majority_baseline_accuracy).toFixed(1)+'%');
+  color($('spot-model-accuracy'),(test.accuracy||0)-(test.majority_baseline_accuracy||0));
+  text($('spot-model-signals'),test.directional_signals==null?'—':String(test.directional_signals));
+  text($('spot-model-range'),range.mae_bps==null?'—':range.mae_bps.toFixed(2)+' bps');
+  text($('spot-model-range-baseline'),range.train_atr_baseline_mae_bps==null?'ATR baseline —':'ATR baseline '+range.train_atr_baseline_mae_bps.toFixed(2)+' bps');
+  color($('spot-model-range'),(range.train_atr_baseline_mae_bps||0)-(range.mae_bps||0));
+  text($('spot-model-cutoff'),report?.model_trained_through||'—');
+  text($('spot-model-warning'),report?('Held-out '+test.days+' sessions, '+Number(test.samples||0).toLocaleString('en-IN')+' labels. Direction signals and range prediction did not pass a trading-use gate. This spot-only model cannot place orders or establish option P&L.'):'Train the historical spot/VIX model to see its held-out results.');
+  const box=$('spot-model-option-days');box.replaceChildren();
+  const audits=report?.option_day_audit||{};
+  if(!Object.keys(audits).length)box.append(node('div','empty','No option-chain comparison yet.'));
+  for(const [day,item] of Object.entries(audits)){
+    const row=node('div','mlrow');
+    row.append(node('span','',day+' · '+(item.forecast_minutes_on_option_quotes||0)+' aligned quote minutes'),
+               node('strong','',item.accuracy==null?'Unavailable':(100*item.accuracy).toFixed(1)+'% direction · '+(item.directional_signals||0)+' high-confidence signals'));
+    box.append(row);
+  }
 }
 $('emergency').onclick=async()=>{if(!confirm('Emergency stop all strategies? Open positions may need fresh quotes to exit.'))return;await change('/api/kill',{},'Emergency stop requested. Verify every position reaches zero.')};$('logout').onclick=async()=>{try{await api('/api/logout',{})}catch{}status=null;$('login').hidden=false;$('pin').focus()};
 $('save-capital').onclick=async()=>{const capital=Number($('capital').value);if(!Number.isFinite(capital)||capital<200000){notify('Enter account capital of at least ₹2,00,000.',true);return}await change('/api/settings',{capital},'Shared account capital saved.')};

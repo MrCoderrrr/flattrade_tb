@@ -23,6 +23,15 @@ class MLResearchTests(unittest.TestCase):
         self.research.close()
         self.temp.cleanup()
 
+    def test_status_exposes_spot_report_without_enabling_orders(self):
+        path = self.research.spot_report_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"paper_only": True, "test": {"accuracy": 0.33}}))
+        status = self.research.status()
+        self.assertTrue(status["spot_model"]["paper_only"])
+        self.assertEqual(status["spot_model"]["test"]["accuracy"], 0.33)
+        self.assertFalse(status["model_controls_orders"])
+
     def test_capture_preserves_stale_quote_status_and_second_timestamp(self):
         stamp = "2026-09-28T10:01:02.345678+05:30"
         rows = [{"strike": 24000, "ce": {"bid": 100, "ask": 101, "bid_size": 65,
