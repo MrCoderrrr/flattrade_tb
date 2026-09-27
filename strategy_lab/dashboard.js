@@ -1,6 +1,4 @@
 (()=>{'use strict';
-const ids=['nfv1','nfv2','nfv3','nfv4','mcxv1','mcxv2','mcxv3'];
-const labels={nfv1:'V1 paper port · ATM shorts · 1000-point wings',nfv2:'Selective NIFTY range spreads',nfv3:'Active NIFTY indicators · hedged',nfv4:'Candle structures · breakout/retest/rejection · hedged',mcxv1:'V1 paper port · ATM shorts · KAMA stops',mcxv2:'Selective MCX trend spreads',mcxv3:'ATM straddle · KAMA / EMA · leg stops'};
 const $=id=>document.getElementById(id), money=n=>Number.isFinite(Number(n))?'₹'+Number(n).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2}):'—';
 const signed=n=>{const v=Number(n)||0;return (v>0?'+':'')+money(v)};
 const percent=(n,capital)=>Number(capital)>0?((Number(n)||0)/Number(capital)*100).toFixed(2)+'%':'—';
@@ -22,7 +20,9 @@ $('theme').onclick=()=>applyTheme(document.documentElement.dataset.theme==='ligh
 async function submitLogin(){const pin=$('pin').value;if(!/^\d{4}$/.test(pin)){text($('login-error'),'Enter exactly four digits.');return}try{await api('/api/login',{pin});$('pin').value='';$('login-error').textContent='';$('login').hidden=true;await loadStatus();if($('login').hidden===false)text($('login-error'),'PIN accepted, but the browser session did not persist. Refresh and try again.')}catch(err){text($('login-error'),err.message)}}$('login-submit').onclick=submitLogin;$('pin').onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();submitLogin()}};
 async function loadStatus(){try{const data=await api('/api/status');status=data;$('login').hidden=true;$('connection-dot').classList.add('on');text($('connection'),'Connected');render()}catch(err){$('connection-dot').classList.remove('on');text($('connection'),'Offline');if(err.status===401){$('login').hidden=false;status=null}else notify(err.message,true)}}
 async function change(path,payload,success){if(busy)return false;busy=true;try{await api(path,payload);notify(success);await loadStatus();return true}catch(err){notify(err.message,true);await loadStatus();return false}finally{busy=false}}
-function market(id){return id.startsWith('nf')?'NIFTY':'MCX'}
+function strategy(id){return(status?.strategies||[]).find(spec=>spec.id===id)}
+function market(id){return strategy(id)?.market}
+function strategyIds(){return(status?.strategies||[]).map(spec=>spec.id)}
 function dateIST(value){if(!value)return'—';const d=new Date(value);return Number.isNaN(d.getTime())?'—':new Intl.DateTimeFormat('en-IN',{timeZone:'Asia/Kolkata',day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit',hour12:false}).format(d)}
 function node(tag,cls,value){const e=document.createElement(tag);if(cls)e.className=cls;if(value!==undefined)e.textContent=String(value);return e}
 function render(){const a=status.account||{}, sessions=status.sessions||{},capital=a.configured_capital||a.capital; text($('asof'),'Updated '+dateIST(status.server_time));text($('today-pnl'),signed(a.daily_pnl));color($('today-pnl'),a.daily_pnl);text($('today-return'),percent(a.daily_pnl,capital));color($('today-return'),a.daily_pnl);text($('account-capital'),money(capital));
@@ -34,12 +34,14 @@ text($('live-reason'),status.live_permission?'Permission is ON. '+(status.live_r
 if(document.activeElement!==$('capital'))$('capital').value=String(capital||200000);
 renderStrategies();renderHistory();}
 function renderStrategies(){
-  const list=$('strategy-list'),sessions=status.sessions||{},schedules=status.schedules||{},specs=new Map((status.strategies||[]).map(x=>[x.id,x]));
-  for(const id of ids){
+  const list=$('strategy-list'),sessions=status.sessions||{},schedules=status.schedules||{},specs=status.strategies||[];
+  for(const card of list.querySelectorAll('.strategy'))if(!specs.some(spec=>card.id==='card-'+spec.id))card.remove();
+  for(const spec of specs){
+    const id=spec.id;
     let card=$('card-'+id);
     if(!card){
       card=node('article','card strategy');card.id='card-'+id;
-      const name=node('div','namecol');name.append(node('div','name',id.toUpperCase()),node('div','desc',labels[id]));
+      const name=node('div','namecol');name.append(node('div','name',id.toUpperCase()),node('div','desc',spec.description||''));
       const size=node('div','sizecol');size.append(node('div','metriclabel','Multiplier'));
       const inp=node('input');inp.type='number';inp.min='1';inp.max='100';inp.step='1';inp.value='1';inp.id='mult-'+id;inp.setAttribute('aria-label',id+' multiplier');size.append(inp);
       const pnlcol=node('div','pnlcol');pnlcol.append(node('div','metriclabel','Today P&L / return'),node('div','metricval'));
@@ -48,26 +50,28 @@ function renderStrategies(){
       const sw=node('div','switchcol');const label=node('label','switch'),input=node('input');input.type='checkbox';input.id='toggle-'+id;input.setAttribute('aria-label','Start or stop '+id);label.append(input,node('span'));sw.append(label,node('small','',''));
       card.append(name,size,pnlcol,feed,mode,sw);list.append(card);input.onchange=()=>toggleStrategy(id,input.checked);
     }
-    const spec=specs.get(id)||{},s=sessions[market(id)]||{},planned=schedules[market(id)],scheduled=planned?.strategy_id===id,owns=s.strategy_id===id&&!!s.date;
-    if(id==='nfv4')text(card.querySelector('.namecol .desc'),owns&&s.pattern?labels[id]+' · '+s.pattern+' · rank '+Number(s.pattern_score).toFixed(2)+' · stop '+Number(s.underlying_stop).toFixed(1)+' · target '+Number(s.underlying_target).toFixed(1):labels[id]);
+    const s=sessions[spec.market]||{},planned=schedules[spec.market],scheduled=planned?.strategy_id===id,owns=s.strategy_id===id&&!!s.date;
+    const patternDetails=owns&&s.pattern?' · '+s.pattern+' · rank '+Number(s.pattern_score).toFixed(2)+' · stop '+Number(s.underlying_stop).toFixed(1)+' · target '+Number(s.underlying_target).toFixed(1):'';
+    text(card.querySelector('.namecol .desc'),(spec.description||'')+patternDetails);
     const working=scheduled||(owns&&!['STOPPED','SESSION_COMPLETE'].includes(s.state)&&!s.stop_requested),archived=spec.enabled===false,competing=(planned&&!scheduled)||(!owns&&s.state&&!['STOPPED','SESSION_COMPLETE'].includes(s.state));
     const sw=$('toggle-'+id),inp=$('mult-'+id),paper=$('paper-'+id);sw.checked=working;sw.disabled=archived||busy||competing||(owns&&s.state==='EXIT_PENDING');inp.disabled=archived||working||busy||competing;paper.disabled=archived||working||busy||competing;
     if(working)paper.checked=(scheduled?planned.mode:s.mode)!=='live';
-    const badge=card.querySelector('.name span');if(!badge)card.querySelector('.name').append(node('span','',archived?'ARCHIVED':id.endsWith('v3')?'ACTIVE':'PAPER'));else text(badge,archived?'ARCHIVED':id.endsWith('v3')?'ACTIVE':'PAPER');
+    const badge=card.querySelector('.name span');if(!badge)card.querySelector('.name').append(node('span','',archived?'ARCHIVED':'PAPER'));else text(badge,archived?'ARCHIVED':'PAPER');
     if((owns||scheduled)&&document.activeElement!==inp)inp.value=String(scheduled?planned.multiplier:s.multiplier||1);
     const pnl=card.querySelector('.pnlcol .metricval'),capital=s.capital||status.account?.configured_capital;
     text(pnl,owns?signed(s.net_pnl)+' · '+percent(s.net_pnl,capital):'—');color(pnl,owns?s.net_pnl:0);
-    text(card.querySelector('.feedcol .metricval'),scheduled?'Scheduled '+planned.scheduled_for:owns?(s.state||'—')+(id==='nfv4'&&s.pattern?' · '+s.pattern:''):'Idle');
+    text(card.querySelector('.feedcol .metricval'),scheduled?'Scheduled '+planned.scheduled_for:owns?(s.state||'—')+(s.pattern?' · '+s.pattern:''):'Idle');
     text(card.querySelector('.switchcol small'),archived?'Legacy':scheduled?'Scheduled':owns?(s.stop_requested?'Exit pending':s.state||'Idle'):'Off');
-    card.title=scheduled?'Starts '+planned.scheduled_for+' at '+spec.entry_start+' IST':owns?(id==='nfv4'&&s.pattern?'Pattern '+s.pattern+' · score '+s.pattern_score+' · stop '+s.underlying_stop+' · target '+s.underlying_target+' · '+(s.reason||''):(s.reason||'')):archived?'Original version is archived in the current controller':'';
+    card.title=scheduled?'Starts '+planned.scheduled_for+' at '+spec.entry_start+' IST':owns?(s.pattern?'Pattern '+s.pattern+' · score '+s.pattern_score+' · stop '+s.underlying_stop+' · target '+s.underlying_target+' · '+(s.reason||''):(s.reason||'')):archived?'This version is archived in the current controller':'';
   }
 }
 async function toggleStrategy(id,on){
   const input=$('toggle-'+id);if(!status){input.checked=false;return}
-  if(!on){const ok=await change('/api/stop',{market:market(id)},id+' switched off; any pending exit remains visible.');if(!ok)input.checked=true;return}
+  const selectedMarket=market(id);if(!selectedMarket){notify('Strategy is no longer available.',true);input.checked=false;return}
+  if(!on){const ok=await change('/api/stop',{market:selectedMarket},id+' switched off; any pending exit remains visible.');if(!ok)input.checked=true;return}
   const multiplier=Number($('mult-'+id).value),capital=Number(status.account?.configured_capital||0);
   if(!Number.isInteger(multiplier)||multiplier<1||multiplier>100||!Number.isFinite(capital)||capital<multiplier*200000){notify('Save account capital in Settings; each multiplier needs at least ₹2,00,000.',true);input.checked=false;return}
-  const mode=$('paper-'+id).checked?'paper':'live',payload={market:market(id),strategy_id:id,mode,multiplier,capital};
+  const mode=$('paper-'+id).checked?'paper':'live',payload={market:selectedMarket,strategy_id:id,mode,multiplier,capital};
   if(mode==='live'){
     if(!status.live_permission){notify('Enable account-wide live permission in Settings first.',true);input.checked=false;return}
     const pin=await requestPin('Confirm live request',id.toUpperCase()+' · '+multiplier+'× · real orders would be placed if a live executor is available.');
@@ -77,7 +81,7 @@ async function toggleStrategy(id,on){
 }
 function monthKey(offset){const now=new Date(),ist=new Date(now.toLocaleString('en-US',{timeZone:'Asia/Kolkata'}));ist.setDate(1);ist.setMonth(ist.getMonth()+offset);return ist.getFullYear()+'-'+String(ist.getMonth()+1).padStart(2,'0')}
 function selectedRows(id){const key=monthKey(monthOffset);return(status?.strategy_history||[]).filter(x=>x.strategy_id===id&&String(x.date||'').startsWith(key)).sort((a,b)=>a.date.localeCompare(b.date))}
-function renderHistory(){const box=$('history-cards');box.replaceChildren();for(const id of ids){const rows=selectedRows(id),total=rows.reduce((sum,r)=>sum+(Number(r.net_pnl)||0),0),capital=Math.max(0,...rows.map(r=>Number(r.capital)||0)),card=node('button','card historycard');card.type='button';card.append(node('h3','',id.toUpperCase()),node('div','value',signed(total)));color(card.querySelector('.value'),total);const foot=node('div','foot');foot.append(node('span','',rows.length+' recorded day'+(rows.length===1?'':'s')),node('span','',capital?(total/capital*100).toFixed(2)+'% return':'—'));card.append(foot);card.onclick=()=>openHistory(id);box.append(card)}}
+function renderHistory(){const box=$('history-cards');box.replaceChildren();const ids=[...new Set([...strategyIds(),...(status?.strategy_history||[]).map(row=>row.strategy_id).filter(Boolean)])];for(const id of ids){const rows=selectedRows(id),total=rows.reduce((sum,r)=>sum+(Number(r.net_pnl)||0),0),capital=Math.max(0,...rows.map(r=>Number(r.capital)||0)),card=node('button','card historycard');card.type='button';card.append(node('h3','',id.toUpperCase()),node('div','value',signed(total)));color(card.querySelector('.value'),total);const foot=node('div','foot');foot.append(node('span','',rows.length+' recorded day'+(rows.length===1?'':'s')),node('span','',capital?(total/capital*100).toFixed(2)+'% return':'—'));card.append(foot);card.onclick=()=>openHistory(id);box.append(card)}}
 function openHistory(id){const rows=selectedRows(id),box=$('dialog-days');text($('dialog-title'),id.toUpperCase()+' · '+(monthOffset===0?'This month':'Last month'));box.replaceChildren();if(!rows.length)box.append(node('div','empty','No strategy-specific records for this month.'));for(const r of rows){const line=node('div','dailyrow');line.append(node('span','',r.date+' · '+(r.mode||'paper').toUpperCase()+' · '+r.entries+' entr'+(r.entries===1?'y':'ies')),node('strong','',signed(r.net_pnl)+' · '+percent(r.net_pnl,r.capital)));color(line.lastChild,r.net_pnl);box.append(line)}const total=rows.reduce((n,r)=>n+(Number(r.net_pnl)||0),0),capital=Math.max(0,...rows.map(r=>Number(r.capital)||0));text($('dialog-total'),signed(total));color($('dialog-total'),total);text($('dialog-return'),capital?(total/capital*100).toFixed(2)+'% of highest configured capital':'No return calculated');$('history-dialog').showModal()}
 $('dialog-x').onclick=$('dialog-close').onclick=()=>$('history-dialog').close();$('month-current').onclick=()=>setMonth(0);$('month-previous').onclick=()=>setMonth(-1);function setMonth(value){monthOffset=value;$('month-current').classList.toggle('active',value===0);$('month-previous').classList.toggle('active',value===-1);if(status)renderHistory()}
 async function loadChain(){if(activeTab!=='chain'||!status)return;try{chain=await api('/api/chain');renderChain()}catch(err){text($('chain-state'),'Unavailable');text($('chain-note'),err.message)}}
