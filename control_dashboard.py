@@ -349,12 +349,8 @@ class ControlHandler(BaseHTTPRequestHandler):
                 raise RequestError("Not found.", 404)
             data = self._body()
             if self.path == "/api/auth/token":
-                if set(data) != {"url_or_code", "pin"}:
-                    raise RequestError("Provide a request code and dashboard PIN.")
-                pin = data["pin"]
-                if (self.server.pin is None or not isinstance(pin, str)
-                        or not hmac.compare_digest(pin, self.server.pin)):
-                    raise RequestError("Enter the dashboard PIN to renew the broker token.", 403)
+                if set(data) != {"url_or_code"}:
+                    raise RequestError("Paste the Flattrade redirect URL or request code.")
                 if self.server.broker_auth is None:
                     raise RequestError("Flattrade token sync is unavailable.", 503)
                 from strategy_lab.broker_auth import BrokerAuthError

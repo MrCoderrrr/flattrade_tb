@@ -97,7 +97,7 @@ class DashboardHTTPTests(unittest.TestCase):
         for method, path, payload in [("GET", "/api/status", None),
                                       ("GET", "/api/ml", None),
                                       ("GET", "/api/auth/status", None),
-                                      ("POST", "/api/auth/token", {"url_or_code":"ABC123","pin":"7000"}),
+                                      ("POST", "/api/auth/token", {"url_or_code":"ABC123"}),
                                       ("POST", "/api/start", self.start_payload()),
                                       ("POST", "/api/stop", {"market": "NIFTY"}),
                                       ("POST", "/api/kill", {})]:
@@ -112,7 +112,7 @@ class DashboardHTTPTests(unittest.TestCase):
         self.assertFalse(json.loads(body)["available"])
         self.assertEqual(self.controller.calls, [])
 
-    def test_broker_token_sync_requires_pin_and_never_dispatches_orders(self):
+    def test_broker_token_sync_uses_dashboard_session_and_never_dispatches_orders(self):
         class FakeBrokerAuth:
             calls = []
 
@@ -132,10 +132,14 @@ class DashboardHTTPTests(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertTrue(json.loads(body)["saved_today"])
             payload = {"url_or_code":"ABC123","pin":"0000"}
-            self.assertEqual(self.request("POST", "/api/auth/token", payload)[0], 403)
+            self.assertEqual(self.request("POST", "/api/auth/token", payload)[0], 400)
             self.assertEqual(fake.calls, [])
-            payload["pin"] = "7000"
-            status, _, body = self.request("POST", "/api/auth/token", payload)
+            del payload["pin"]
+            login, headers, _ = self.request("POST", "/api/login", {"pin":"7000"}, authorized=False)
+            self.assertEqual(login, 200)
+            cookie = headers["Set-Cookie"].split(";", 1)[0]
+            status, _, body = self.request("POST", "/api/auth/token", payload,
+                                           authorized=False, headers={"Cookie":cookie})
             self.assertEqual(status, 200)
             self.assertEqual(fake.calls, ["ABC123"])
             self.assertNotIn(b"token-value", body)
