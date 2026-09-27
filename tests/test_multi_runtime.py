@@ -15,6 +15,7 @@ class MultiRuntimeTests(unittest.TestCase):
         bars, quotes, self.now = nifty_fixture()
         self.controller = MultiController(Path(self.temp.name), feed=Feed(bars, quotes),
                                           clock=lambda: self.now)
+        self.assertIs(self.controller.feed, self.controller.children['nfv5'].feed)
 
     def tearDown(self):
         self.controller.shutdown()

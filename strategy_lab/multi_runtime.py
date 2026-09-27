@@ -24,6 +24,7 @@ class MultiController:
                             storage_directory=base / sid)
             for sid in SPECS
         }
+        self.feed = self.children['nfv5'].feed
         for child in [self.legacy, *self.children.values()]:
             # Idle instances have no worker yet. Archive yesterday's result now
             # so an idle strategy cannot inflate today's aggregate P&L.
