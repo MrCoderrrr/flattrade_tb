@@ -293,13 +293,40 @@ class ControlHandler(BaseHTTPRequestHandler):
     def _get(self, head_only: bool = False) -> None:
         try:
             self._validate_source()
+            parsed_path = urlparse(self.path)
             if self.path == "/":
                 self._send(200, self.server.dashboard_html, "text/html; charset=utf-8", head_only)
                 return
+            if parsed_path.path.startswith('/strategy/') and not parsed_path.query:
+                from strategy_lab.catalog import SPECS
+                if parsed_path.path.removeprefix('/strategy/') in SPECS:
+                    self._send(200, self.server.dashboard_html, "text/html; charset=utf-8", head_only)
+                    return
             if self.path == "/dashboard.js":
                 self._send(200, self.server.dashboard_js, "text/javascript; charset=utf-8", head_only)
                 return
             self._authenticate()
+            if self.path == '/api/analytics/summary':
+                analytics = getattr(self.server.controller, 'analytics', None)
+                if analytics is None:
+                    raise RequestError('Strategy analytics unavailable.', 503)
+                self._json(200, analytics.summary(), head_only)
+                return
+            if parsed_path.path.startswith('/api/analytics/strategy/'):
+                from strategy_lab.catalog import SPECS
+                strategy_id = parsed_path.path.removeprefix('/api/analytics/strategy/')
+                if strategy_id not in SPECS:
+                    raise RequestError('Unknown strategy.', 404)
+                query = parse_qs(parsed_path.query, keep_blank_values=True)
+                if set(query) - {'month','day'} or any(len(value) != 1 for value in query.values()):
+                    raise RequestError('Invalid analytics filter.')
+                analytics = getattr(self.server.controller, 'analytics', None)
+                if analytics is None:
+                    raise RequestError('Strategy analytics unavailable.', 503)
+                self._json(200, analytics.detail(strategy_id,
+                            month=query.get('month',[None])[0],
+                            day=query.get('day',[None])[0]), head_only)
+                return
             if self.path == "/api/auth/authorize":
                 if self.server.broker_auth is None:
                     raise RequestError("Flattrade login is unavailable.", 503)
@@ -336,6 +363,8 @@ class ControlHandler(BaseHTTPRequestHandler):
                 raise RequestError("Not found.", 404)
         except RequestError as exc:
             self._json(exc.status, {"error": str(exc)}, head_only)
+        except ValueError as exc:
+            self._json(400, {"error": str(exc)}, head_only)
         except Exception:
             self._json(500, {"error": "Unable to read controller status."}, head_only)
 

@@ -39,6 +39,8 @@ class MultiController:
                     not state['schedules'] and
                     not any(s.get('date') or s['positions'] for s in state['sessions'].values())):
                 child.configure(capital=capital)
+        from .analytics import AnalyticsStore
+        self.analytics = AnalyticsStore(self.root, self, clock=clock)
 
     def _legacy_owner(self, strategy_id):
         state = self.legacy.status()
@@ -188,6 +190,7 @@ class MultiController:
         return self.children['nfv5'].nifty_position_expiry() or self.legacy.nifty_position_expiry()
 
     def start_worker(self):
+        self.analytics.start()
         old = self.legacy.status()
         if old['schedules'] or any(s['positions'] or s['state'] not in ('STOPPED', 'SESSION_COMPLETE')
                                    for s in old['sessions'].values()):
@@ -200,6 +203,7 @@ class MultiController:
                 child.start_worker()
 
     def shutdown(self):
+        self.analytics.close()
         for child in self.children.values():
             child.shutdown()
         self.legacy.shutdown()

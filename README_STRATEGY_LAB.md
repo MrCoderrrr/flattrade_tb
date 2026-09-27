@@ -36,6 +36,14 @@ The new interface does not collect your broker password or automatically renew b
 
 SQLite state, journal and simulated fills: `data/strategy_lab/ledger.sqlite3` for the prior controller, and `data/strategy_lab/instances/<strategy-id>/ledger.sqlite3` for each independent paper strategy. Bid/ask recordings: `data/strategy_lab/quotes_YYYY-MM-DD.jsonl`. They remain under Git-ignored `data/`. Closing the browser does not stop a strategy; switch it off on its card to request a paper exit. If an exit cannot be priced, the position remains recorded for recovery; closing the program does not erase it.
 
+The Analytics tab and `/strategy/<strategy-id>` pages read `data/strategy_lab/analytics.sqlite3`. While the dashboard runs, it records compact paper P&L/position samples every 10 seconds and completed underlying one-minute bars for NIFTY and MCX. NIFTY also attempts a read-only India VIX bar. Daily summaries retain each version's net return, fills, intraday drawdown, and the completed day's market condition. "Steady", "choppy", and "trending" are descriptive labels based on efficiency and realized volatility relative to the **previous** 60 complete sessions of that market. A condition leader is shown only when at least two paper strategies share ten observed days in the same market condition; this comparison is not a forecast or a live account return. Broker token or symbol-master gaps appear as missing data rather than fabricated bars. MCX needs its own history before condition labels become available.
+
+Import the already downloaded NIFTY spot/VIX minute CSVs once, without inferring strategy returns from them:
+
+```sh
+python3 -m strategy_lab.analytics --root .
+```
+
 ```sh
 python3 -m unittest discover -s tests -v
 python3 -m strategy_lab.replay data/strategy_lab/quotes_YYYY-MM-DD.jsonl --output data/research/report.json

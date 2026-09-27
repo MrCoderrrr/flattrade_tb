@@ -17,6 +17,13 @@ class FakeController:
     def __init__(self):
         self.calls = []
         self.fail = False
+        class FakeAnalytics:
+            def summary(self):
+                return {"coverage": [], "leaders": {}}
+
+            def detail(self, strategy_id, month=None, day=None):
+                return {"strategy_id": strategy_id, "month": month, "day": day}
+        self.analytics = FakeAnalytics()
 
     def status(self):
         return {"today": "2000-01-01", "live_enabled": False,
@@ -112,6 +119,17 @@ class DashboardHTTPTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertFalse(json.loads(body)["available"])
         self.assertEqual(self.controller.calls, [])
+
+    def test_strategy_pages_and_analytics_are_authenticated(self):
+        self.assertEqual(self.request('GET','/strategy/nfv3',authorized=False)[0],200)
+        self.assertEqual(self.request('GET','/api/analytics/summary',authorized=False)[0],401)
+        status,_,body=self.request('GET','/api/analytics/summary')
+        self.assertEqual(status,200)
+        self.assertEqual(json.loads(body)['leaders'],{})
+        status,_,body=self.request('GET','/api/analytics/strategy/nfv3?month=2026-09')
+        self.assertEqual(status,200)
+        self.assertEqual(json.loads(body)['strategy_id'],'nfv3')
+        self.assertEqual(self.request('GET','/api/analytics/strategy/unknown')[0],404)
 
     def test_broker_token_sync_uses_dashboard_session_and_never_dispatches_orders(self):
         class FakeBrokerAuth:
