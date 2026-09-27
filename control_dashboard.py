@@ -62,7 +62,7 @@ class ControlHTTPServer(ThreadingHTTPServer):
     def __init__(self, controller: Any, host: str = "127.0.0.1", port: int = 8080,
                  token: str | None = None, dashboard_path: Path = DASHBOARD_PATH,
                  allowed_host: str | None = None, pin: str | None = None,
-                 chain: Any = None):
+                 chain: Any = None, ml: Any = None):
         if host not in {"127.0.0.1", "localhost"} and not allowed_host:
             raise ValueError("Public binding requires an explicit allowed host.")
         if token is not None and (not isinstance(token, str) or len(token) < 32
@@ -77,6 +77,7 @@ class ControlHTTPServer(ThreadingHTTPServer):
         self.login_failures: dict[str, list[float]] = {}
         self.auth_lock = threading.RLock()
         self.chain = chain
+        self.ml = ml
         # Resolve no user-controlled hostname, including hosts-file entries.
         self.dashboard_html = Path(dashboard_path).read_bytes()
         self.dashboard_js = DASHBOARD_JS_PATH.read_bytes()
@@ -308,6 +309,9 @@ class ControlHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/chain":
                 self._json(200, self.server.chain.snapshot() if self.server.chain else
                            {"ready":False,"reason":"Read-only option-chain stream is unavailable","rows":[]}, head_only)
+            elif self.path == "/api/ml":
+                self._json(200, self.server.ml.status() if self.server.ml else
+                           {"available":False,"reason":"ML research service is unavailable"}, head_only)
             else:
                 raise RequestError("Not found.", 404)
         except RequestError as exc:
@@ -379,9 +383,9 @@ class ControlHandler(BaseHTTPRequestHandler):
 def create_server(controller: Any, host: str = "127.0.0.1", port: int = 8080,
                   token: str | None = None, dashboard_path: Path = DASHBOARD_PATH,
                   allowed_host: str | None = None, pin: str | None = None,
-                  chain: Any = None) -> ControlHTTPServer:
+                  chain: Any = None, ml: Any = None) -> ControlHTTPServer:
     """Create an unstarted local HTTP server; useful with an offline fake controller."""
-    return ControlHTTPServer(controller, host, port, token, dashboard_path, allowed_host, pin, chain)
+    return ControlHTTPServer(controller, host, port, token, dashboard_path, allowed_host, pin, chain, ml)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -403,6 +407,7 @@ def main(argv: list[str] | None = None) -> int:
 
     controller = Controller(args.root.resolve())
     chain = None
+    ml = None
     server = None
     try:
         token = None
@@ -417,8 +422,15 @@ def main(argv: list[str] | None = None) -> int:
         from strategy_lab.option_chain import OptionChainView
         chain = OptionChainView(args.root.resolve())
         chain.start()
+        try:
+            from strategy_lab.ml_research import MLResearch
+            ml = MLResearch(args.root.resolve(), chain=chain)
+            ml.start()
+        except Exception as exc:
+            print(f"ML research unavailable: {type(exc).__name__}", flush=True)
+            ml = None
         server = create_server(controller, host=args.host, port=args.port, token=token,
-                               allowed_host=args.allowed_host, pin=pin, chain=chain)
+                               allowed_host=args.allowed_host, pin=pin, chain=chain, ml=ml)
         server.public_origin_file = args.public_origin_file
         signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
         controller.start_worker()
@@ -431,6 +443,8 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         if server is not None:
             server.server_close()
+        if ml is not None:
+            ml.close()
         if chain is not None:
             chain.stop()
         controller.shutdown()

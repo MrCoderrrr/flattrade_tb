@@ -10,6 +10,15 @@ from strategy_lab.option_chain import OptionChainView, parse_master
 
 
 class OptionChainTests(unittest.TestCase):
+    def test_watched_strikes_include_near_atm_and_both_wings(self):
+        contracts = {(float(strike), kind): (str(strike), kind)
+                     for strike in range(23000, 25001, 50) for kind in ('CE', 'PE')}
+        strikes = OptionChainView._watched_strikes(contracts, 24000)
+        self.assertIn(23000, strikes)
+        self.assertIn(25000, strikes)
+        self.assertIn(24000, strikes)
+        self.assertLessEqual(len(strikes), 13)
+
     def test_off_hours_does_not_open_broker_stream(self):
         class Stream:
             thread = None
@@ -44,4 +53,16 @@ class OptionChainTests(unittest.TestCase):
         expiry,contracts=parse_master(stream.getvalue(),date(2026,9,26))
         self.assertEqual(expiry,date(2026,10,1))
         self.assertEqual(contracts[(25000.,'CE')],('123','NIFTYCE1'))
+        self.assertEqual(len(contracts),2)
+
+    def test_expiry_day_contracts_remain_observable_for_research(self):
+        content = ('Symbol,OptionType,Expiry,StrikePrice,Token,TradingSymbol\n'
+                   'NIFTY,CE,29-Sep-2026,24000,123,NIFTYCE0\n'
+                   'NIFTY,PE,29-Sep-2026,24000,124,NIFTYPE0\n'
+                   'NIFTY,CE,06-Oct-2026,24000,125,NIFTYCE1\n')
+        stream=io.BytesIO()
+        with zipfile.ZipFile(stream,'w') as archive:
+            archive.writestr('NFO_symbols.txt',content)
+        expiry,contracts=parse_master(stream.getvalue(),date(2026,9,29))
+        self.assertEqual(expiry,date(2026,9,29))
         self.assertEqual(len(contracts),2)

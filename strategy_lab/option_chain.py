@@ -43,7 +43,7 @@ def parse_master(raw: bytes, today):
             expiry = datetime.strptime(row['Expiry'],'%d-%b-%Y').date()
             strike = float(row['StrikePrice'])
             token = str(row['Token'])
-            if expiry > today and strike > 0 and token.isdigit():
+            if expiry >= today and strike > 0 and token.isdigit():
                 eligible.append((expiry,strike,row['OptionType'],token,row['TradingSymbol']))
         except (KeyError,ValueError):
             continue
@@ -88,6 +88,17 @@ class OptionChainView:
             self.contracts = contracts
             self.reason = ''
 
+    @staticmethod
+    def _watched_strikes(contracts, spot):
+        strikes = sorted({strike for strike, _ in contracts})
+        near = sorted(strikes, key=lambda strike: abs(strike - spot))[:11]
+        # Keep far protective wings observable for research replay without
+        # subscribing to an entire (much larger) option chain.
+        for target in (spot - 1000, spot + 1000):
+            if strikes:
+                near.append(min(strikes, key=lambda strike: abs(strike - target)))
+        return sorted(set(near))
+
     def refresh(self):
         now = self.clock().astimezone(IST)
         if now.weekday() >= 5 or not '09:15' <= now.strftime('%H:%M') < '15:40':
@@ -114,7 +125,7 @@ class OptionChainView:
             return
         spot = snap['ticks'][-1].price
         with self.lock:
-            strikes = sorted({strike for strike,_ in self.contracts},key=lambda x:abs(x-spot))[:11]
+            strikes = self._watched_strikes(self.contracts, spot)
             selected = {f"NFO|{self.contracts[(strike,kind)][0]}" for strike in strikes
                         for kind in ('CE','PE') if (strike,kind) in self.contracts}
             if selected != self.selected:
@@ -130,7 +141,7 @@ class OptionChainView:
             contracts = dict(self.contracts)
             reason = self.reason
         spot = snap['ticks'][-1].price if snap['ticks'] else None
-        strikes = sorted({strike for strike,_ in contracts},key=lambda x:abs(x-(spot or 0)))[:11] if spot else []
+        strikes = self._watched_strikes(contracts, spot) if spot else []
         rows = []
         for strike in sorted(strikes):
             row = {'strike':strike}

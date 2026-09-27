@@ -4,7 +4,7 @@ const signed=n=>{const v=Number(n)||0;return (v>0?'+':'')+money(v)};
 const percent=(n,capital)=>Number(capital)>0?((Number(n)||0)/Number(capital)*100).toFixed(2)+'%':'—';
 const color=(el,n)=>{el.classList.toggle('positive',Number(n)>0);el.classList.toggle('negative',Number(n)<0);el.classList.toggle('neutral',Number(n)===0)};
 const text=(el,value)=>{const s=String(value??'—');if(el.textContent!==s)el.textContent=s};
-let status=null,chain=null,monthOffset=0,busy=false,activeTab='dashboard',toastTimer;
+let status=null,chain=null,mlData=null,monthOffset=0,busy=false,activeTab='dashboard',toastTimer;
 let pinResolver=null;
 function requestPin(title,explanation){if(pinResolver)return Promise.resolve(null);text($('pin-title'),title);text($('pin-explanation'),explanation);$('action-pin').value='';$('pin-dialog').showModal();$('action-pin').focus();return new Promise(resolve=>pinResolver=resolve)}
 function closePin(value){$('pin-dialog').close();if(pinResolver){const resolve=pinResolver;pinResolver=null;resolve(value)}}
@@ -14,7 +14,7 @@ async function api(path,payload){const options={credentials:'same-origin',cache:
 function themePreference(){try{return window.localStorage.getItem('desk-theme')}catch{return null}}
 function applyTheme(name){document.documentElement.dataset.theme=name;try{window.localStorage.setItem('desk-theme',name)}catch{}$('light-toggle').checked=name==='light'}
 applyTheme(themePreference()==='light'?'light':'dark');
-function tab(name){activeTab=name;document.querySelectorAll('.nav button').forEach(b=>b.setAttribute('aria-selected',String(b.dataset.tab===name)));document.querySelectorAll('.page').forEach(p=>p.classList.toggle('active',p.id==='page-'+name));if(name==='chain')loadChain()}
+function tab(name){activeTab=name;document.querySelectorAll('.nav button').forEach(b=>b.setAttribute('aria-selected',String(b.dataset.tab===name)));document.querySelectorAll('.page').forEach(p=>p.classList.toggle('active',p.id==='page-'+name));if(name==='chain')loadChain();if(name==='ml')loadML()}
 document.querySelectorAll('.nav button').forEach(b=>b.addEventListener('click',()=>tab(b.dataset.tab)));
 $('theme').onclick=()=>applyTheme(document.documentElement.dataset.theme==='light'?'dark':'light');$('light-toggle').onchange=e=>applyTheme(e.target.checked?'light':'dark');
 async function submitLogin(){const pin=$('pin').value;if(!/^\d{4}$/.test(pin)){text($('login-error'),'Enter exactly four digits.');return}try{await api('/api/login',{pin});$('pin').value='';$('login-error').textContent='';$('login').hidden=true;await loadStatus();if($('login').hidden===false)text($('login-error'),'PIN accepted, but the browser session did not persist. Refresh and try again.')}catch(err){text($('login-error'),err.message)}}$('login-submit').onclick=submitLogin;$('pin').onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();submitLogin()}};
@@ -97,9 +97,31 @@ $('dialog-x').onclick=$('dialog-close').onclick=()=>$('history-dialog').close();
 async function loadChain(){if(activeTab!=='chain'||!status)return;try{chain=await api('/api/chain');renderChain()}catch(err){text($('chain-state'),'Unavailable');text($('chain-note'),err.message)}}
 function fmt(n){return n!==null&&n!==undefined&&n!==''&&Number.isFinite(Number(n))?Number(n).toFixed(2):'—'}
 function renderChain(){text($('chain-spot'),fmt(chain.spot));text($('chain-expiry'),chain.expiry||'—');text($('chain-state'),chain.ready?'Streaming':'Waiting');text($('chain-note'),(chain.reason||chain.source||'Broker feed pending')+' · Rows show actual quote age; blank prices mean unavailable.');const box=$('chain-rows');box.replaceChildren();if(!chain.rows?.length){const tr=node('tr');const td=node('td','empty',chain.reason||'No fresh contracts');td.colSpan=9;tr.append(td);box.append(tr);return}const closest=chain.rows.reduce((a,b)=>Math.abs(a.strike-chain.spot)<Math.abs(b.strike-chain.spot)?a:b).strike;for(const r of chain.rows){const tr=node('tr',r.strike===closest?'atm':'');const ce=r.ce||{},pe=r.pe||{};for(const [value,cls] of [[fmt(ce.bid),ce.stale?'stale':''],[fmt(ce.ask),ce.stale?'stale':''],[fmt(ce.last),ce.stale?'stale':''],[ce.age_seconds==null?'—':ce.age_seconds+'s',ce.stale?'stale':''],[r.strike,'strike'],[pe.age_seconds==null?'—':pe.age_seconds+'s',pe.stale?'stale':''],[fmt(pe.last),pe.stale?'stale':''],[fmt(pe.bid),pe.stale?'stale':''],[fmt(pe.ask),pe.stale?'stale':'']])tr.append(node('td',cls,value));box.append(tr)}}
+async function loadML(){if(activeTab!=='ml'||!status)return;try{mlData=await api('/api/ml');renderML()}catch(err){text($('ml-state'),'Unavailable');text($('ml-warning'),err.message)}}
+function renderML(){
+  const data=mlData||{},report=data.report||{},test=report.test||{},replay=report.replay||{};
+  text($('ml-state'),data.available===false?'Unavailable':report.status==='paper_validation'?'Paper validation':report.status==='exploratory'?'Exploratory':'Collecting');
+  text($('ml-accuracy'),test.accuracy==null?'—':(100*test.accuracy).toFixed(1)+'%');
+  text($('ml-baseline'),test.baseline_accuracy==null?'—':(100*test.baseline_accuracy).toFixed(1)+'%');
+  color($('ml-accuracy'),test.accuracy==null?0:test.accuracy-test.baseline_accuracy);
+  text($('ml-accuracy-note'),test.samples?test.samples+' labels · balanced '+(100*test.balanced_accuracy).toFixed(1)+'% · '+report.test_day:'No held-out test yet');
+  text($('ml-points'),replay.pnl_points==null?'—':(replay.pnl_points>=0?'+':'')+replay.pnl_points.toFixed(2));
+  color($('ml-points'),replay.pnl_points||0);
+  text($('ml-collector'),data.collector_running?'Running':'Offline');
+  text($('ml-collector-note'),data.collector_error||'Captures every second during the NIFTY session');
+  text($('ml-warning'),report.promotion_reason||report.message||data.reason||'Research model only; it cannot place orders.');
+  text($('ml-replay-caption'),report.test_day?(report.test_day+' · trained on '+(report.train_days||[]).join(', ')+' · '+(replay.complete?'complete quoted-price replay':'replay incomplete; P&L withheld')+' · hold baseline '+fmt(report.hold_baseline_pnl_points)+' points'):'A completed held-out day is needed.');
+  const points=replay.equity||[],line=$('ml-line');
+  if(points.length>1){const values=points.map(p=>Number(p.points)),low=Math.min(...values),high=Math.max(...values),span=Math.max(high-low,1);line.setAttribute('points',points.map((p,i)=>(10+i*880/(points.length-1)).toFixed(1)+','+(205-(Number(p.points)-low)*190/span).toFixed(1)).join(' '))}else line.setAttribute('points','');
+  const events=$('ml-events');events.replaceChildren();if(!replay.events?.length)events.append(node('div','empty','No complete trade replay yet.'));for(const event of (replay.events||[])){const row=node('div','mlrow');row.append(node('span','',dateIST(event.time)+' · '+event.action),node('strong','',(event.leg||'')+(event.price==null?'':' · '+fmt(event.price))));events.append(row)}
+  const days=$('ml-days');days.replaceChildren();if(!data.data_days?.length)days.append(node('div','empty','No captured market days yet.'));for(const day of (data.data_days||[])){const row=node('div','mlrow');row.append(node('span','',day.day+' · '+day.quality.replaceAll('_',' ')),node('strong','',day.snapshots.toLocaleString('en-IN')));days.append(row)}
+  const features=$('ml-features');features.replaceChildren();for(const name of (report.feature_names||[]))features.append(node('span','',name.replaceAll('_',' ')));
+  const tradeFiles=data.legacy_trade_files||[];text($('ml-trades'),tradeFiles.length+' historical trade-log files indexed for audit; their P&L is not used as training labels.');
+}
 $('emergency').onclick=async()=>{if(!confirm('Emergency stop all strategies? Open positions may need fresh quotes to exit.'))return;await change('/api/kill',{},'Emergency stop requested. Verify every position reaches zero.')};$('logout').onclick=async()=>{try{await api('/api/logout',{})}catch{}status=null;$('login').hidden=false;$('pin').focus()};
 $('save-capital').onclick=async()=>{const capital=Number($('capital').value);if(!Number.isFinite(capital)||capital<200000){notify('Enter account capital of at least ₹2,00,000.',true);return}await change('/api/settings',{capital},'Shared account capital saved.')};
 $('live-toggle').onchange=async e=>{const enabled=e.target.checked;let pin;if(enabled){pin=await requestPin('Allow live requests','Enter your dashboard PIN to enable account-wide live permission. This does not itself place orders.');if(!pin){e.target.checked=false;return}}const payload={live_permission:enabled};if(enabled)payload.pin=pin;const ok=await change('/api/settings',payload,'Live request permission '+(enabled?'enabled.':'disabled.'));if(!ok)e.target.checked=!enabled};
 async function poll(){if(!document.hidden)await loadStatus();setTimeout(poll,document.hidden?15000:2000)}async function pollChain(){if(!document.hidden)await loadChain();setTimeout(pollChain,document.hidden?10000:1000)}
-poll();pollChain();
+async function pollML(){if(!document.hidden)await loadML();setTimeout(pollML,document.hidden?30000:10000)}
+poll();pollChain();pollML();
 })();

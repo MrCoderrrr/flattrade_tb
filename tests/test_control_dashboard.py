@@ -95,12 +95,19 @@ class DashboardHTTPTests(unittest.TestCase):
 
     def test_status_and_all_mutations_require_authentication(self):
         for method, path, payload in [("GET", "/api/status", None),
+                                      ("GET", "/api/ml", None),
                                       ("POST", "/api/start", self.start_payload()),
                                       ("POST", "/api/stop", {"market": "NIFTY"}),
                                       ("POST", "/api/kill", {})]:
             with self.subTest(path=path):
                 status, _, _ = self.request(method, path, payload, authorized=False)
                 self.assertEqual(status, 401)
+        self.assertEqual(self.controller.calls, [])
+
+    def test_ml_endpoint_is_authenticated_and_read_only(self):
+        status, _, body = self.request("GET", "/api/ml")
+        self.assertEqual(status, 200)
+        self.assertFalse(json.loads(body)["available"])
         self.assertEqual(self.controller.calls, [])
 
     def test_pin_login_cookie_controls_and_logout(self):
