@@ -60,6 +60,16 @@ def blank_session():
             "locked": False, "last_signal_bar": None}
 
 
+def next_session_date(now, spec):
+    """Next weekday with an entry window still ahead, in exchange local time."""
+    day = now.date()
+    if now.weekday() >= 5 or now.strftime("%H:%M") >= spec.entry_end:
+        day += timedelta(days=1)
+    while day.weekday() >= 5:
+        day += timedelta(days=1)
+    return day
+
+
 class Controller:
     def __init__(self, root: Path, feed=None, clock=None):
         self.root = Path(root)
@@ -91,6 +101,7 @@ class Controller:
             "history": []}
         self.data['account'].setdefault('configured_capital',float(self.data['account']['capital']))
         self.data['account'].setdefault('live_permission',False)
+        self.data.setdefault('schedules', {})
         for session in self.data["sessions"].values():
             if session["positions"]:
                 session.update(state="RECOVERY_REQUIRED", exit_requested=True, stop_requested=True,
@@ -179,27 +190,34 @@ class Controller:
                 raise ValueError('Use the shared account capital saved in Settings')
             self._roll_day(now)
             s = self.data["sessions"][market]
-            if s['date'] and resolve(market, s.get('strategy_id')).id != spec.id:
+            target = next_session_date(now, spec)
+            immediate = target == now.date() and now.strftime("%H:%M") >= spec.entry_start
+            if market in self.data['schedules']:
+                raise ValueError('Strategy already scheduled; switch it off before changing settings')
+            if (target == now.date() and s.get('date') == now.date().isoformat() and
+                    resolve(market, s.get('strategy_id')).id != spec.id):
                 raise ValueError('Strategy version is fixed for this trading day to preserve its risk ledger')
             if s["positions"] or s["state"] not in ("STOPPED", "SESSION_COMPLETE"):
                 raise ValueError("Stop and flatten the existing session before starting")
-            if s["locked"] or self.data["account"]["halted"]:
+            if (immediate and (s["locked"] or self.data["account"]["halted"]) or
+                    self.data["account"]["drawdown"] >= .05*capital):
                 raise ValueError("Risk limit reached; restarting cannot clear the lock")
             if any(x["date"] for x in self.data["sessions"].values()) and capital != self.data["account"]["capital"]:
                 raise ValueError("Both sessions share one account; capital is fixed for the trading day")
-            if now.weekday() >= 5:
-                raise ValueError("Regular trading sessions are closed on weekends")
-            if now.strftime("%H:%M") >= spec.flatten:
-                raise ValueError("The session's flatten deadline has passed")
             other = self.data["sessions"]["MCX" if market == "NIFTY" else "NIFTY"]
-            if other["positions"]:
+            if immediate and other["positions"]:
                 raise ValueError("Flatten the other session before reusing account capital")
             self.data["account"]["capital"] = float(capital)
             self._revision += 1
-            s.update(state="ARMED", mode=mode, multiplier=multiplier, capital=float(capital), strategy_id=spec.id,
-                     date=now.date().isoformat(), reason="Paper session armed; waiting for valid market data and signal",
-                     stop_requested=False, exit_requested=False, paused=False)
-            self._event(f"{market}: PAPER session authorized at {multiplier}×; shared capital ₹{capital:,.0f}")
+            if immediate:
+                s.update(state="ARMED", mode=mode, multiplier=multiplier, capital=float(capital), strategy_id=spec.id,
+                         date=now.date().isoformat(), reason="Paper session armed; waiting for valid market data and signal",
+                         stop_requested=False, exit_requested=False, paused=False)
+                self._event(f"{market}: PAPER session authorized at {multiplier}×; shared capital ₹{capital:,.0f}")
+            else:
+                self.data['schedules'][market] = {"strategy_id":spec.id, "mode":mode,
+                    "multiplier":multiplier, "capital":float(capital), "scheduled_for":target.isoformat()}
+                self._event(f"{market}: PAPER {spec.id} scheduled for {target.isoformat()} {spec.entry_start} IST at {multiplier}×")
             self._save()
             return self.status()
 
@@ -215,6 +233,8 @@ class Controller:
                 now = self.clock().astimezone(IST).date().isoformat()
                 if any(s.get('date') == now or s['positions'] for s in self.data['sessions'].values()):
                     raise ValueError('Account capital is fixed after a strategy starts for the day')
+                if self.data['schedules']:
+                    raise ValueError('Stop scheduled strategies before changing account capital')
                 account['configured_capital'] = float(capital)
                 account['capital'] = float(capital)
                 self._event(f"Account capital set to ₹{capital:,.0f}")
@@ -235,12 +255,16 @@ class Controller:
         with self.lock:
             if market not in MARKETS:
                 raise ValueError("Unknown market")
+            scheduled = self.data['schedules'].pop(market, None)
             s = self.data["sessions"][market]
             self._revision += 1
-            s.update(exit_requested=bool(s["positions"]), stop_requested=True,
-                     state="EXIT_PENDING" if s["positions"] else "STOPPED",
-                     reason="Stop requested; flattening on fresh executable quotes" if s["positions"] else "Stopped; no open positions")
-            self._event(f"{market}: stop requested")
+            if s["positions"] or s["state"] not in ("STOPPED", "SESSION_COMPLETE"):
+                s.update(exit_requested=bool(s["positions"]), stop_requested=True,
+                         state="EXIT_PENDING" if s["positions"] else "STOPPED",
+                         reason="Stop requested; flattening on fresh executable quotes" if s["positions"] else "Stopped; no open positions")
+            elif scheduled:
+                s["reason"] = "Scheduled start canceled"
+            self._event(f"{market}: {'scheduled start canceled' if scheduled else 'stop requested'}")
             self._save()
             return self.status()
 
@@ -531,10 +555,46 @@ class Controller:
         s["net_pnl"] = round(s["realized_pnl"]-s["costs"], 4)
         self._event(f"{market}: paper positions flat; session net ₹{s['net_pnl']:.2f}")
 
+    def _activate_schedules(self, now):
+        for market, planned in list(self.data['schedules'].items()):
+            spec = resolve(market, planned['strategy_id'])
+            if now.date().isoformat() < planned['scheduled_for'] or now.weekday() >= 5:
+                continue
+            minute = now.strftime("%H:%M")
+            if minute < spec.entry_start:
+                continue
+            if minute >= spec.entry_end:
+                planned['scheduled_for'] = next_session_date(now, spec).isoformat()
+                continue
+            s = self.data['sessions'][market]
+            if s['positions'] or s['state'] not in ('STOPPED', 'SESSION_COMPLETE'):
+                continue
+            if ((s.get('date') == now.date().isoformat() and s['entries']) or
+                    self.data['account']['halted'] or s['locked']):
+                planned['scheduled_for'] = next_session_date(
+                    now.replace(hour=23, minute=59), spec).isoformat()
+                continue
+            if any(other['positions'] for name, other in self.data['sessions'].items() if name != market):
+                continue
+            if (planned['capital'] != self.data['account']['configured_capital'] or
+                    planned['capital'] < 200000*planned['multiplier']):
+                del self.data['schedules'][market]
+                self._event(f"{market}: scheduled start canceled; account capital changed")
+                continue
+            s.update(state='ARMED', mode=planned['mode'], multiplier=planned['multiplier'],
+                     capital=planned['capital'], strategy_id=spec.id,
+                     date=now.date().isoformat(),
+                     reason='Scheduled paper session armed; waiting for valid market data and signal',
+                     stop_requested=False, exit_requested=False, paused=False)
+            del self.data['schedules'][market]
+            self._revision += 1
+            self._event(f"{market}: scheduled PAPER {spec.id} activated at {planned['multiplier']}×")
+
     def tick(self):
         with self.lock:
             now = self.clock().astimezone(IST)
             self._roll_day(now)
+            self._activate_schedules(now)
             for market in MARKETS:
                 s = self.data["sessions"][market]
                 if s["state"] in ("STOPPED", "SESSION_COMPLETE") and not s["positions"]:

@@ -142,10 +142,11 @@ class RuntimeTests(unittest.TestCase):
         self.c.configure(live_permission=False)
         self.assertFalse(self.c.status()['live_permission'])
 
-    def test_shared_capital_cannot_back_two_open_sessions(self):
+    def test_other_market_can_be_scheduled_while_first_has_positions(self):
         self.start()
-        with self.assertRaisesRegex(ValueError, "Flatten the other"):
-            self.c.start("MCX", "paper", 1, 200000)
+        result = self.c.start("MCX", "paper", 1, 200000)
+        self.assertIn('MCX', result['schedules'])
+        self.assertFalse(result['sessions']['MCX']['positions'])
 
     def test_daily_cutoff_flattens_and_does_not_reenter(self):
         self.start()
@@ -153,16 +154,16 @@ class RuntimeTests(unittest.TestCase):
         self.feed.quotes = [replace(q, timestamp=self.now) for q in self.quotes]
         self.c.tick()
         self.assertFalse(self.c.status()["sessions"]["NIFTY"]["positions"])
-        with self.assertRaisesRegex(ValueError, "deadline"):
-            self.c.start("NIFTY", "paper", 1, 200000)
+        result = self.c.start("NIFTY", "paper", 1, 200000)
+        self.assertEqual(result['schedules']['NIFTY']['scheduled_for'],'2026-09-23')
 
-    def test_weekends_and_invalid_allocations_are_rejected(self):
+    def test_weekends_schedule_monday_and_invalid_allocations_are_rejected(self):
         for multiplier, capital in [(0,200000),(True,200000),(2,200000),(1,float("nan")),(1,float("inf"))]:
             with self.subTest(multiplier=multiplier,capital=capital), self.assertRaises(ValueError):
                 self.c.start("NIFTY", "paper", multiplier, capital)
         self.now = self.now.replace(day=26)
-        with self.assertRaisesRegex(ValueError, "weekends"):
-            self.c.start("NIFTY", "paper", 1, 200000)
+        result = self.c.start("NIFTY", "paper", 1, 200000)
+        self.assertEqual(result['schedules']['NIFTY']['scheduled_for'],'2026-09-28')
 
     def test_second_controller_cannot_manage_same_ledger(self):
         with self.assertRaisesRegex(RuntimeError, "already running"):
@@ -220,6 +221,48 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(len(rows),1)
         self.assertEqual(rows[0]['strategy_id'],'nfv2')
         self.assertEqual(rows[0]['entries'],1)
+
+    def test_night_before_schedule_survives_restart_and_activates(self):
+        session_time = self.now
+        self.now = session_time-timedelta(days=1)
+        self.now = self.now.replace(hour=22, minute=0)
+        result = self.c.start('NIFTY','paper',1,200000,strategy_id='nfv2')
+        self.assertEqual(result['schedules']['NIFTY']['scheduled_for'], session_time.date().isoformat())
+        self.assertEqual(result['sessions']['NIFTY']['state'], 'STOPPED')
+        with self.assertRaisesRegex(ValueError,'Stop scheduled strategies'):
+            self.c.configure(capital=400000)
+        self.c.shutdown()
+        self.c = Controller(Path(self.temp.name), feed=self.feed, clock=lambda:self.now)
+        self.assertIn('NIFTY',self.c.status()['schedules'])
+        self.now = session_time
+        self.c.tick()
+        session = self.c.status()['sessions']['NIFTY']
+        self.assertNotIn('NIFTY',self.c.status()['schedules'])
+        self.assertEqual(session['date'],session_time.date().isoformat())
+        self.assertTrue(session['positions'])
+
+    def test_late_and_weekend_start_schedule_next_weekday(self):
+        self.now = self.now.replace(hour=15, minute=35)
+        result = self.c.start('NIFTY','paper',1,200000,strategy_id='nfv3')
+        self.assertEqual(result['schedules']['NIFTY']['scheduled_for'],'2026-09-23')
+        self.c.stop('NIFTY')
+        self.now = self.now+timedelta(days=4)
+        result = self.c.start('NIFTY','paper',1,200000,strategy_id='nfv2')
+        self.assertEqual(result['schedules']['NIFTY']['scheduled_for'],'2026-09-28')
+
+    def test_scheduled_stop_preserves_today_pnl_and_capital_is_fixed(self):
+        self.start()
+        self.c.stop('NIFTY')
+        self.c.tick()
+        pnl = self.c.status()['account']['daily_pnl']
+        self.now = self.now.replace(hour=21,minute=0)
+        self.c.start('NIFTY','paper',1,200000,strategy_id='nfv2')
+        with self.assertRaisesRegex(ValueError,'capital is fixed'):
+            self.c.configure(capital=400000)
+        self.assertAlmostEqual(self.c.status()['account']['daily_pnl'],pnl)
+        self.c.stop('NIFTY')
+        self.assertNotIn('NIFTY',self.c.status()['schedules'])
+        self.assertAlmostEqual(self.c.status()['account']['daily_pnl'],pnl)
 
 
 class DataTests(unittest.TestCase):
