@@ -14,6 +14,7 @@ async function api(path,payload){const options={credentials:'same-origin',cache:
 function themePreference(){try{return window.localStorage.getItem('desk-theme')}catch{return null}}
 function applyTheme(name){document.documentElement.dataset.theme=name;try{window.localStorage.setItem('desk-theme',name)}catch{}$('light-toggle').checked=name==='light'}
 applyTheme(themePreference()==='light'?'light':'dark');
+$('broker-auth-transport-note').hidden=location.protocol!=='http:'||['localhost','127.0.0.1'].includes(location.hostname);
 function tab(name){activeTab=name;document.querySelectorAll('.nav button').forEach(b=>b.setAttribute('aria-selected',String(b.dataset.tab===name)));document.querySelectorAll('.page').forEach(p=>p.classList.toggle('active',p.id==='page-'+name));if(name==='chain')loadChain();if(name==='ml')loadML();if(name==='settings')loadBrokerAuth()}
 document.querySelectorAll('.nav button').forEach(b=>b.addEventListener('click',()=>tab(b.dataset.tab)));
 $('theme').onclick=()=>applyTheme(document.documentElement.dataset.theme==='light'?'dark':'light');$('light-toggle').onchange=e=>applyTheme(e.target.checked?'light':'dark');
