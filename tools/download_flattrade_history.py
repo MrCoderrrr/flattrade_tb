@@ -180,6 +180,34 @@ def save_summary(output: Path, start: date, end: date):
     return manifest
 
 
+def save_joined_minutes(output: Path) -> int:
+    """Inner-join spot and VIX on identical broker timestamps; never forward-fill."""
+    columns = ("Timestamp", "Spot_Open", "Spot_High", "Spot_Low", "Spot_Close",
+               "VIX_Open", "VIX_High", "VIX_Low", "VIX_Close")
+    target = output / "nifty_spot_vix_1m.csv"
+    temporary = target.with_suffix(".tmp")
+    count = 0
+    with temporary.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        for spot_path in sorted((output / "nifty_spot_1m").glob("*.csv")):
+            day = date.fromisoformat(spot_path.stem[-10:])
+            vix_path = output / "india_vix_1m" / f"india_vix_1m_{day}.csv"
+            if not vix_path.is_file():
+                continue
+            spot = {row["Timestamp"]: row for row in read_day(spot_path, day)}
+            for vix in read_day(vix_path, day):
+                stamp = vix["Timestamp"]
+                if stamp not in spot:
+                    continue
+                writer.writerow({"Timestamp": stamp, **{
+                    f"Spot_{field}": spot[stamp][field] for field in FIELDS[1:5]},
+                    **{f"VIX_{field}": vix[field] for field in FIELDS[1:5]}})
+                count += 1
+    temporary.replace(target)
+    return count
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     today = datetime.now(IST).date()
@@ -234,8 +262,10 @@ def main():
         if day.day in (1, 15) or day == args.end:
             print(f"Progress through {day}: {calls} requests, {no_data} no-data responses", flush=True)
     manifest = save_summary(args.output, args.start, args.end)
+    manifest["joined_minute_rows"] = save_joined_minutes(args.output)
+    (args.output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print("DONE " + json.dumps({key: manifest[key] for key in
-          ("spot_days", "vix_days", "spot_bars", "vix_bars", "weekdays")}), flush=True)
+          ("spot_days", "vix_days", "spot_bars", "vix_bars", "joined_minute_rows", "weekdays")}), flush=True)
 
 
 if __name__ == "__main__":
