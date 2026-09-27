@@ -86,6 +86,12 @@ class DashboardHTTPTests(unittest.TestCase):
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertEqual(headers["X-Frame-Options"], "DENY")
         self.assertIn("frame-ancestors 'none'", headers["Content-Security-Policy"])
+        self.assertIn("script-src 'self'", headers["Content-Security-Policy"])
+        self.assertIn(b'<script src="/dashboard.js" defer></script>', body)
+        status, headers, body = self.request("GET", "/dashboard.js", authorized=False)
+        self.assertEqual(status, 200)
+        self.assertIn("text/javascript", headers["Content-Type"])
+        self.assertIn(b"submitLogin", body)
 
     def test_status_and_all_mutations_require_authentication(self):
         for method, path, payload in [("GET", "/api/status", None),

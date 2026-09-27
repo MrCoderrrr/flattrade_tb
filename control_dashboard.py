@@ -29,6 +29,7 @@ from zoneinfo import ZoneInfo
 MAX_BODY_BYTES = 4096
 IST = ZoneInfo("Asia/Kolkata")
 DASHBOARD_PATH = Path(__file__).resolve().parent / "strategy_lab" / "dashboard.html"
+DASHBOARD_JS_PATH = Path(__file__).resolve().parent / "strategy_lab" / "dashboard.js"
 
 
 class RequestError(Exception):
@@ -78,6 +79,7 @@ class ControlHTTPServer(ThreadingHTTPServer):
         self.chain = chain
         # Resolve no user-controlled hostname, including hosts-file entries.
         self.dashboard_html = Path(dashboard_path).read_bytes()
+        self.dashboard_js = DASHBOARD_JS_PATH.read_bytes()
         bind_host = "0.0.0.0" if host == "0.0.0.0" else "127.0.0.1"
         super().__init__((bind_host, port), ControlHandler)
         actual_port = self.server_address[1]
@@ -119,7 +121,7 @@ class ControlHandler(BaseHTTPRequestHandler):
         if cookie:
             self.send_header("Set-Cookie", cookie)
         self.send_header("Cross-Origin-Resource-Policy", "same-origin")
-        self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; "
+        self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'self'; "
                          "style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; "
                          "base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
         self.end_headers()
@@ -291,6 +293,9 @@ class ControlHandler(BaseHTTPRequestHandler):
             self._validate_source()
             if self.path == "/":
                 self._send(200, self.server.dashboard_html, "text/html; charset=utf-8", head_only)
+                return
+            if self.path == "/dashboard.js":
+                self._send(200, self.server.dashboard_js, "text/javascript; charset=utf-8", head_only)
                 return
             self._authenticate()
             if self.path == "/api/status":
