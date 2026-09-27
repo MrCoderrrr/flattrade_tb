@@ -182,6 +182,28 @@ class FlattradeReadOnly:
         if not bars:
             return bars, []
         spot = bars[-1].close
+        if strategy_id == "nfv4":
+            from .pattern_v4 import explain_signal
+            from .strategies import _option_type
+            signal = explain_signal(market, bars, now)
+            if not signal['eligible']:
+                return bars, []
+            option = 'PE' if signal['direction'] > 0 else 'CE'
+            contracts = [c for c in self.contracts(market, now)
+                         if _option_type(c) == option and (c.expiry-now.date()).days >= 2]
+            if not contracts:
+                return bars, []
+            expiry = min(c.expiry for c in contracts)
+            contracts = [c for c in contracts if c.expiry == expiry]
+            near = sorted({c.strike for c in contracts}, key=lambda k: abs(k-spot))[:3]
+            selected_strikes = set(near)
+            for short in near:
+                wings = sorted({c.strike for c in contracts if 100 <=
+                    (short-c.strike if option == 'PE' else c.strike-short) <= 200},
+                    key=lambda strike: abs(abs(short-strike)-100))
+                selected_strikes.update(wings[:2])
+            selected = [c for c in contracts if c.strike in selected_strikes]
+            return bars, self.quotes(selected, now)
         contracts = [c for c in self.contracts(market, now) if c.option_type in {"CE", "PE"}
                      and (c.expiry-now.date()).days >= 2]
         if not contracts:

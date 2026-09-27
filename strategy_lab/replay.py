@@ -11,8 +11,9 @@ import argparse
 import hashlib
 import json
 import math
+import sqlite3
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import date, datetime, time, timedelta
 from itertools import groupby
 from pathlib import Path
@@ -21,6 +22,7 @@ from tempfile import TemporaryDirectory
 from .market_data import FeedError
 from .models import Bar, Contract, IST, Quote
 from .runtime import Controller
+from .catalog import SPECS
 
 
 ENTRY = {"NIFTY": time(9, 45), "MCX": time(16, 30)}
@@ -148,8 +150,21 @@ def _invalid_constant(value):
 
 def load_snapshots(path: str | Path) -> list[Snapshot]:
     snapshots, seen, metadata = [], set(), {}
-    with Path(path).open(encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, 1):
+    source = Path(path)
+    def rows():
+        if source.suffix == '.sqlite3':
+            connection = sqlite3.connect(source.resolve().as_uri()+'?mode=ro', uri=True)
+            try:
+                for number, (payload,) in enumerate(connection.execute(
+                        'SELECT payload FROM market_snapshots ORDER BY timestamp, id'), 1):
+                    yield number, payload
+            finally:
+                connection.close()
+        else:
+            with source.open(encoding='utf-8') as handle:
+                yield from enumerate(handle, 1)
+    try:
+        for line_number, line in rows():
             try:
                 if not line.strip():
                     raise DataError("Blank lines are not snapshots")
@@ -169,6 +184,8 @@ def load_snapshots(path: str | Path) -> list[Snapshot]:
                 snapshots.append(snapshot)
             except (DataError, json.JSONDecodeError, OverflowError) as exc:
                 raise DataError(f"Line {line_number}: {exc}") from None
+    except sqlite3.Error as exc:
+        raise DataError(f"Cannot read market_snapshots from SQLite: {exc}") from None
     if not snapshots:
         raise DataError("No historical snapshots supplied")
     return snapshots
@@ -207,7 +224,8 @@ def _issue(record, issue):
         record["issues"].append(issue)
 
 
-def run_replay(snapshots: list[Snapshot], *, capital=200_000, multiplier=1) -> dict:
+def run_replay(snapshots: list[Snapshot], *, capital=200_000, multiplier=1,
+               strategy_id=None) -> dict:
     """Run one fixed-parameter sample with a fresh, isolated controller ledger."""
     if not snapshots:
         raise DataError("Cannot replay an empty sample")
@@ -216,6 +234,18 @@ def run_replay(snapshots: list[Snapshot], *, capital=200_000, multiplier=1) -> d
     _number(capital, "capital")
     if capital < 200_000 * multiplier:
         raise DataError("Each multiplier requires at least INR 200,000 of shared capital")
+    if strategy_id is not None:
+        if strategy_id not in SPECS:
+            raise DataError("Unknown strategy id")
+        spec = SPECS[strategy_id]
+        active_markets = (spec.market,)
+        entry = {spec.market: time.fromisoformat(spec.entry_start)}
+        deadline = {spec.market: time.fromisoformat(spec.flatten)}
+        snapshots = [row for row in snapshots if row.market == spec.market]
+        if not snapshots:
+            raise DataError(f"No {spec.market} snapshots for {strategy_id}")
+    else:
+        active_markets, entry, deadline = tuple(ENTRY), ENTRY, DEADLINE
     # Programmatic callers get the same ordering guarantees as the JSONL loader.
     keys = [(row.timestamp, row.market) for row in snapshots]
     if any(right[0] < left[0] for left, right in zip(keys, keys[1:])) or len(keys) != len(set(keys)):
@@ -239,17 +269,18 @@ def run_replay(snapshots: list[Snapshot], *, capital=200_000, multiplier=1) -> d
                     gap = (now - previous_time).total_seconds() if record["snapshot_count"] else 0.
                     record["max_snapshot_gap_seconds"] = max(record["max_snapshot_gap_seconds"], gap)
                     # Sparse entry observations can miss different trades even if flat.
-                    if gap > 10 and previous_time.time() < DEADLINE[snapshot.market] and now.time() >= ENTRY[snapshot.market]:
+                    if gap > 10 and previous_time.time() < deadline[snapshot.market] and now.time() >= entry[snapshot.market]:
                         _issue(record, "snapshot_gap_exceeds_10_seconds")
                     record["last_snapshot"] = now.isoformat()
                     record["snapshot_count"] += 1
                 feed.update(rows)
                 for snapshot in rows:
                     key = (now.date().isoformat(), snapshot.market)
-                    if key not in attempted and now.weekday() < 5 and ENTRY[snapshot.market] <= now.time() < DEADLINE[snapshot.market]:
+                    if key not in attempted and now.weekday() < 5 and entry[snapshot.market] <= now.time() < deadline[snapshot.market]:
                         attempted.add(key)
                         try:
-                            controller.start(snapshot.market, "paper", multiplier, capital)
+                            controller.start(snapshot.market, "paper", multiplier, capital,
+                                             strategy_id=strategy_id)
                             coverage[key]["authorized"] = True
                         except ValueError as exc:
                             _issue(coverage[key], f"authorization_rejected: {exc}")
@@ -292,9 +323,9 @@ def run_replay(snapshots: list[Snapshot], *, capital=200_000, multiplier=1) -> d
     days = sorted({snapshot.timestamp.date().isoformat() for snapshot in snapshots})
     for key, record in coverage.items():
         first, last = (_time(record[field], field) for field in ("first_snapshot", "last_snapshot"))
-        if first.time() > ENTRY[record["market"]]:
+        if first.time() > entry[record["market"]]:
             _issue(record, "entry_window_start_not_observed")
-        if last.time() < DEADLINE[record["market"]]:
+        if last.time() < deadline[record["market"]]:
             _issue(record, "flatten_deadline_not_observed")
         if not record["authorized"]:
             _issue(record, "session_not_authorized")
@@ -304,8 +335,8 @@ def run_replay(snapshots: list[Snapshot], *, capital=200_000, multiplier=1) -> d
         record["booked_net_pnl"] = round(record["realized_gross_pnl"] - record["estimated_costs"], 4)
     daily = []
     for day in days:
-        records = [coverage.get((day, market)) for market in ENTRY]
-        missing = [market for market in ENTRY if (day, market) not in coverage]
+        records = [coverage.get((day, market)) for market in active_markets]
+        missing = [market for market in active_markets if (day, market) not in coverage]
         present = [record for record in records if record is not None]
         complete = not missing and all(record["complete"] for record in present)
         observed = sum(record["observed_net_pnl"] for record in present)
@@ -332,6 +363,7 @@ def run_replay(snapshots: list[Snapshot], *, capital=200_000, multiplier=1) -> d
                    "last_known_net_pnl": session["net_pnl"], "valuation_stale": session.get("valuation_stale", False)}
                   for market, session in final["sessions"].items() if session["positions"]]
     return {"mode": "offline_paper_replay", "performance_status": "UNVALIDATED",
+            "strategy_id": strategy_id,
             "capital": capital, "multiplier": multiplier, "return_denominator_shared_allocation": allocation,
             "coverage": {"first_timestamp": snapshots[0].timestamp.isoformat(), "last_timestamp": snapshots[-1].timestamp.isoformat(),
                          "dates": days, "snapshots": len(snapshots), "missing_calendar_days_not_filled": True},
@@ -356,16 +388,30 @@ def run_replay(snapshots: list[Snapshot], *, capital=200_000, multiplier=1) -> d
                             "Observed drawdown cannot capture excursions between recorded quotes."]}
 
 
-def evaluate(path: str | Path, *, capital=200_000, multiplier=1) -> dict:
+def evaluate(path: str | Path, *, capital=200_000, multiplier=1,
+             strategy_id=None) -> dict:
     """Evaluate the full record and a chronological 70/30 split by whole dates."""
     snapshots = load_snapshots(path)
+    if strategy_id is not None:
+        if strategy_id not in SPECS:
+            raise DataError("Unknown strategy id")
+        snapshots = [row for row in snapshots if row.market == SPECS[strategy_id].market]
+        if not snapshots:
+            raise DataError("No snapshots for selected strategy market")
     days = sorted({snapshot.timestamp.date() for snapshot in snapshots})
-    source_hash = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    for snapshot in snapshots:
+        digest.update(json.dumps(asdict(snapshot), default=str, sort_keys=True,
+                                 separators=(',', ':')).encode()+b'\n')
+    source_hash = digest.hexdigest()
     code_hash = hashlib.sha256(b"".join((Path(__file__).parent / filename).read_bytes()
-                                       for filename in ("models.py", "strategies.py", "runtime.py", "replay.py"))).hexdigest()
+                                       for filename in ("models.py", "strategies.py", "market_data.py",
+                                                        "runtime.py", "replay.py",
+                                                        "catalog.py", "active_v3.py", "legacy_v1.py", "pattern_v4.py"))).hexdigest()
     report = {"input_sha256": source_hash, "implementation_sha256": code_hash,
               "parameter_selection": "Fixed implementation; no fitting or optimization performed.",
-              "all_data": run_replay(snapshots, capital=capital, multiplier=multiplier)}
+              "all_data": run_replay(snapshots, capital=capital, multiplier=multiplier,
+                                     strategy_id=strategy_id)}
     if len(days) < 2:
         report["split"] = {"available": False, "reason": "At least two distinct session dates are required; one date cannot be held out honestly."}
         return report
@@ -377,8 +423,10 @@ def evaluate(path: str | Path, *, capital=200_000, multiplier=1) -> dict:
                        "held_out_start": test_start.isoformat(), "training_dates": split_index,
                        "held_out_dates": len(days) - split_index,
                        "caveat": "A held-out label does not prove unseen data provenance, adequate sample size or profitability.",
-                       "training": run_replay(training, capital=capital, multiplier=multiplier),
-                       "held_out": run_replay(held_out, capital=capital, multiplier=multiplier)}
+                       "training": run_replay(training, capital=capital, multiplier=multiplier,
+                                              strategy_id=strategy_id),
+                       "held_out": run_replay(held_out, capital=capital, multiplier=multiplier,
+                                              strategy_id=strategy_id)}
     return report
 
 
@@ -387,10 +435,13 @@ def main(argv=None):
     parser.add_argument("path", type=Path, help="Chronologically merged JSONL historical snapshots")
     parser.add_argument("--capital", type=float, default=200_000)
     parser.add_argument("--multiplier", type=int, default=1)
+    parser.add_argument("--strategy", choices=sorted(SPECS),
+                        help="Replay one named strategy in its own market; default is both v2 markets")
     parser.add_argument("--output", type=Path, help="Write the full JSON research report here")
     args = parser.parse_args(argv)
     try:
-        report = evaluate(args.path, capital=args.capital, multiplier=args.multiplier)
+        report = evaluate(args.path, capital=args.capital, multiplier=args.multiplier,
+                          strategy_id=args.strategy)
     except (DataError, OSError) as exc:
         parser.error(str(exc))
     serialized = json.dumps(report, indent=2, allow_nan=False)

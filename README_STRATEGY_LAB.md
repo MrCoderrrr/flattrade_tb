@@ -2,7 +2,7 @@
 
 Research and paper trading dashboard. **No live order submission is enabled.** None of the versions has demonstrated or can guarantee the requested 4–5% monthly return.
 
-The dashboard lists all six version names. `nfv1` and `mcxv1` can now be switched on in **paper mode**. They are controller-managed adaptations of the original standalone engines, not byte-for-byte executions of the old scripts: `nfv1` sells ATM CE/PE with approximately 1000-point protective wings; `mcxv1` sells an unhedged ATM CE/PE pair. Both use KAMA-led paper management, premium stops, and simulated re-entry. The old launchers are never imported by the dashboard. Paper fills and P&L use the same read-only bid/ask feed and ledger as v2/v3. `nfv2` and `mcxv2` remain the selective, five-minute paper candidates. `nfv3` uses one-minute EMA 9/21, RSI 14, ATR 14 and the NIFTY session price mean, beginning at 09:20 and flattening at 15:34 IST. It sells an at-the-money put in a bullish regime, call in a bearish regime, or both when balanced, with farther-strike protective options. `mcxv3` uses the same indicator votes and a volume-weighted session price, beginning at 16:05 and flattening at 23:24 IST. Its short options have **no hedge**; a stop trigger cannot cap the realized loss. V3 permits more entries with a 60-second cooldown, but data, depth, stops and session limits can leave it flat. Prior-session one-minute bars are needed to warm up indicators for the earliest entry.
+The dashboard lists all seven version names. `nfv1` and `mcxv1` can now be switched on in **paper mode**. They are controller-managed adaptations of the original standalone engines, not byte-for-byte executions of the old scripts: `nfv1` sells ATM CE/PE with approximately 1000-point protective wings; `mcxv1` sells an unhedged ATM CE/PE pair. Both use KAMA-led paper management, premium stops, and simulated re-entry. The old launchers are never imported by the dashboard. Paper fills and P&L use the same read-only bid/ask feed and ledger as v2/v3. `nfv2` and `mcxv2` remain the selective, five-minute paper candidates. `nfv3` uses one-minute EMA 9/21, RSI 14, ATR 14 and the NIFTY session price mean, beginning at 09:20 and flattening at 15:34 IST. It sells an at-the-money put in a bullish regime, call in a bearish regime, or both when balanced, with farther-strike protective options. `mcxv3` uses the same indicator votes and a volume-weighted session price, beginning at 16:05 and flattening at 23:24 IST. Its short options have **no hedge**; a stop trigger cannot cap the realized loss. V3 permits more entries with a 60-second cooldown, but data, depth, stops and session limits can leave it flat. Prior-session one-minute bars are needed to warm up indicators for the earliest entry.
 
 ## Start the dashboard
 
@@ -14,7 +14,9 @@ python3 control_dashboard.py --port 8080
 
 Open `http://127.0.0.1:8080` and enter the **dashboard control token** printed in that terminal. This token only unlocks local controls; it is not your Flattrade token. The server starts idle. Each session's Start dialog asks for mode, multiplier and declared shared account capital. One multiplier requires ₹200,000. Stop requests flattening; emergency stop locks new entries for the rest of the day. A restart requires new session authorization. Live mode is visibly locked pending strategy and execution validation.
 
-The dashboard controls all six paper versions. A v1 toggle starts the safe paper adaptation, while the original standalone launchers keep their separate code and state. Live broker execution remains unavailable from the dashboard.
+The dashboard controls all seven paper versions. A v1 toggle starts the safe paper adaptation, while the original standalone launchers keep their separate code and state. Live broker execution remains unavailable from the dashboard.
+
+`nfv4` is an additional NIFTY-only paper candidate based on completed one-minute candles and levels built from the opening range and recent price structure. It ranks opening/range/compression breaks, breakout retests, failed breaks, and support/resistance rejection or engulfing. The highest qualified pattern drives a direction, underlying invalidation, and target; a 100–200-point long wing caps the option spread payoff. The displayed score is a heuristic ranking, **not** a win probability. No historical market snapshots were present on the server when v4 was built, so its return, drawdown, and pattern ranking are unvalidated. See `docs/nifty_v4_pattern_spec.md`.
 
 ## Connect market data for paper trading
 
@@ -37,6 +39,7 @@ SQLite state, journal and simulated fills: `data/strategy_lab/ledger.sqlite3`. B
 ```sh
 python3 -m unittest discover -s tests -v
 python3 -m strategy_lab.replay data/strategy_lab/quotes_YYYY-MM-DD.jsonl --output data/research/report.json
+python3 -m strategy_lab.replay data/strategy_lab/quotes_YYYY-MM-DD.jsonl --strategy nfv4 --output data/research/nfv4.json
 ```
 
 The HTTP tests need permission to bind a loopback socket. All tests use synthetic data; none places broker orders. A replay report from synthetic fixtures is not a trading-performance result.

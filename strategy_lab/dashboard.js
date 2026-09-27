@@ -1,6 +1,6 @@
 (()=>{'use strict';
-const ids=['nfv1','nfv2','nfv3','mcxv1','mcxv2','mcxv3'];
-const labels={nfv1:'V1 paper port · ATM shorts · 1000-point wings',nfv2:'Selective NIFTY range spreads',nfv3:'Active NIFTY indicators · hedged',mcxv1:'V1 paper port · ATM shorts · KAMA stops',mcxv2:'Selective MCX trend spreads',mcxv3:'ATM straddle · KAMA / EMA · leg stops'};
+const ids=['nfv1','nfv2','nfv3','nfv4','mcxv1','mcxv2','mcxv3'];
+const labels={nfv1:'V1 paper port · ATM shorts · 1000-point wings',nfv2:'Selective NIFTY range spreads',nfv3:'Active NIFTY indicators · hedged',nfv4:'Candle structures · breakout/retest/rejection · hedged',mcxv1:'V1 paper port · ATM shorts · KAMA stops',mcxv2:'Selective MCX trend spreads',mcxv3:'ATM straddle · KAMA / EMA · leg stops'};
 const $=id=>document.getElementById(id), money=n=>Number.isFinite(Number(n))?'₹'+Number(n).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2}):'—';
 const signed=n=>{const v=Number(n)||0;return (v>0?'+':'')+money(v)};
 const percent=(n,capital)=>Number(capital)>0?((Number(n)||0)/Number(capital)*100).toFixed(2)+'%':'—';
@@ -49,6 +49,7 @@ function renderStrategies(){
       card.append(name,size,pnlcol,feed,mode,sw);list.append(card);input.onchange=()=>toggleStrategy(id,input.checked);
     }
     const spec=specs.get(id)||{},s=sessions[market(id)]||{},planned=schedules[market(id)],scheduled=planned?.strategy_id===id,owns=s.strategy_id===id&&!!s.date;
+    if(id==='nfv4')text(card.querySelector('.namecol .desc'),owns&&s.pattern?labels[id]+' · '+s.pattern+' · rank '+Number(s.pattern_score).toFixed(2)+' · stop '+Number(s.underlying_stop).toFixed(1)+' · target '+Number(s.underlying_target).toFixed(1):labels[id]);
     const working=scheduled||(owns&&!['STOPPED','SESSION_COMPLETE'].includes(s.state)&&!s.stop_requested),archived=spec.enabled===false,competing=(planned&&!scheduled)||(!owns&&s.state&&!['STOPPED','SESSION_COMPLETE'].includes(s.state));
     const sw=$('toggle-'+id),inp=$('mult-'+id),paper=$('paper-'+id);sw.checked=working;sw.disabled=archived||busy||competing||(owns&&s.state==='EXIT_PENDING');inp.disabled=archived||working||busy||competing;paper.disabled=archived||working||busy||competing;
     if(working)paper.checked=(scheduled?planned.mode:s.mode)!=='live';
@@ -56,9 +57,9 @@ function renderStrategies(){
     if((owns||scheduled)&&document.activeElement!==inp)inp.value=String(scheduled?planned.multiplier:s.multiplier||1);
     const pnl=card.querySelector('.pnlcol .metricval'),capital=s.capital||status.account?.configured_capital;
     text(pnl,owns?signed(s.net_pnl)+' · '+percent(s.net_pnl,capital):'—');color(pnl,owns?s.net_pnl:0);
-    text(card.querySelector('.feedcol .metricval'),scheduled?'Scheduled '+planned.scheduled_for:owns?(s.state||'—'):'Idle');
+    text(card.querySelector('.feedcol .metricval'),scheduled?'Scheduled '+planned.scheduled_for:owns?(s.state||'—')+(id==='nfv4'&&s.pattern?' · '+s.pattern:''):'Idle');
     text(card.querySelector('.switchcol small'),archived?'Legacy':scheduled?'Scheduled':owns?(s.stop_requested?'Exit pending':s.state||'Idle'):'Off');
-    card.title=scheduled?'Starts '+planned.scheduled_for+' at '+spec.entry_start+' IST':owns?(s.reason||''):archived?'Original version is archived in the current controller':'';
+    card.title=scheduled?'Starts '+planned.scheduled_for+' at '+spec.entry_start+' IST':owns?(id==='nfv4'&&s.pattern?'Pattern '+s.pattern+' · score '+s.pattern_score+' · stop '+s.underlying_stop+' · target '+s.underlying_target+' · '+(s.reason||''):(s.reason||'')):archived?'Original version is archived in the current controller':'';
   }
 }
 async function toggleStrategy(id,on){

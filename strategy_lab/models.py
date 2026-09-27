@@ -64,3 +64,7 @@ class Plan:
     take_profit: float
     max_loss: float | None
     direction: int = 0
+    underlying_stop: float | None = None
+    underlying_target: float | None = None
+    pattern: str | None = None
+    pattern_score: float | None = None
