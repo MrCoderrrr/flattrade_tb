@@ -24,6 +24,14 @@ IST = ZoneInfo("Asia/Kolkata")
 URL = "https://piconnect.flattrade.in/PiConnectAPI/TPSeries"
 INSTRUMENTS = {"nifty_spot_1m": "26000", "india_vix_1m": "26017"}
 FIELDS = ("Timestamp", "Open", "High", "Low", "Close", "Volume")
+# NSE circular NSE/CMTR/70319: Diwali Muhurat trading, 13:45-14:45 IST.
+SHORT_SESSIONS = {date(2025, 10, 21): 50}
+# NSE circular NSE/CMTR/72349: live Sunday session for the Union Budget.
+TRADING_WEEKENDS = {date(2026, 2, 1)}
+
+
+def minimum_bars(day: date) -> int:
+    return SHORT_SESSIONS.get(day, 300)
 
 
 def fetch(uid: str, token: str, instrument: str, day: date):
@@ -77,7 +85,7 @@ def normalize(raw, day: date):
             raise RuntimeError(f"Conflicting duplicate candle on {day}")
         found[stamp] = row
     rows = [found[stamp] for stamp in sorted(found)]
-    if len(rows) < 300:
+    if len(rows) < minimum_bars(day):
         raise RuntimeError(f"Incomplete session on {day}: {len(rows)} candles")
     return rows
 
@@ -95,7 +103,8 @@ def write_csv(path: Path, rows: list[dict]):
 def read_day(path: Path, day: date):
     with path.open(newline="") as handle:
         rows = list(csv.DictReader(handle))
-    if len(rows) < 300 or any(not row["Timestamp"].startswith(day.isoformat()) for row in rows):
+    if (len(rows) < minimum_bars(day)
+            or any(not row["Timestamp"].startswith(day.isoformat()) for row in rows)):
         raise RuntimeError(f"Saved file failed validation: {path.name}")
     stamps = [row["Timestamp"] for row in rows]
     if stamps != sorted(set(stamps)):
@@ -111,7 +120,9 @@ def daily_features(day: date, spot: list[dict], vix: list[dict] | None):
     returns = [math.log(closes[i] / closes[i-1]) for i in range(1, len(closes))]
     # Sum of intraday one-minute squared returns approximates one day's variance.
     realized = 100 * math.sqrt(252 * sum(value * value for value in returns))
-    result = {"Date": day.isoformat(), "Spot_Bars": len(spot),
+    result = {"Date": day.isoformat(),
+              "Session_Type": "muhurat_short" if day in SHORT_SESSIONS else "regular",
+              "Spot_Bars": len(spot),
               "Spot_Open": opens[0], "Spot_High": max(highs),
               "Spot_Low": min(lows), "Spot_Close": closes[-1],
               "Spot_Return_Pct": 100 * (closes[-1] / opens[0] - 1),
@@ -129,7 +140,7 @@ def daily_features(day: date, spot: list[dict], vix: list[dict] | None):
 
 def save_summary(output: Path, start: date, end: date):
     days = [start + timedelta(days=offset) for offset in range((end-start).days + 1)]
-    candidates = [day for day in days if day.weekday() < 5]
+    candidates = [day for day in days if day.weekday() < 5 or day in TRADING_WEEKENDS]
     daily = []
     spot_missing = []
     vix_missing = []
@@ -160,6 +171,10 @@ def save_summary(output: Path, start: date, end: date):
                 "spot_bars": sum(int(row["Spot_Bars"]) for row in daily),
                 "vix_bars": sum(int(row["VIX_Bars"]) for row in daily),
                 "spot_missing_weekdays": spot_missing,
+                "short_session_dates": [str(day) for day in SHORT_SESSIONS
+                                        if start <= day <= end],
+                "trading_weekends": [str(day) for day in TRADING_WEEKENDS
+                                     if start <= day <= end],
                 "vix_missing_on_spot_days": vix_missing}
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return manifest
@@ -190,7 +205,7 @@ def main():
     calls = 0
     dates = [args.start + timedelta(days=i) for i in range((args.end-args.start).days+1)]
     for day in dates:
-        if day.weekday() >= 5:
+        if day.weekday() >= 5 and day not in TRADING_WEEKENDS:
             continue
         for name, instrument in INSTRUMENTS.items():
             target = args.output / name / f"{name}_{day}.csv"
