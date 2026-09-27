@@ -62,7 +62,8 @@ function renderStrategies(){
     if(card.parentElement!==section.lastElementChild)section.lastElementChild.append(card);
     const s=sessions[spec.market]||{},planned=schedules[spec.market],scheduled=planned?.strategy_id===id,owns=s.strategy_id===id&&!!s.date;
     const patternDetails=owns&&s.pattern?' · '+s.pattern+' · rank '+Number(s.pattern_score).toFixed(2)+' · stop '+Number(s.underlying_stop).toFixed(1)+' · target '+Number(s.underlying_target).toFixed(1):'';
-    text(card.querySelector('.namecol .desc'),(spec.description||'')+patternDetails);
+    const flowDetails=owns&&id==='nfv5'?' · '+(s.v5_state||'WAITING')+' · flow '+(s.signal?.eligible?Number(s.signal.score).toFixed(1):'waiting'):'';
+    text(card.querySelector('.namecol .desc'),(spec.description||'')+patternDetails+flowDetails);
     const working=scheduled||(owns&&!['STOPPED','SESSION_COMPLETE'].includes(s.state)&&!s.stop_requested),archived=spec.enabled===false,competing=(planned&&!scheduled)||(!owns&&s.state&&!['STOPPED','SESSION_COMPLETE'].includes(s.state));
     const sw=$('toggle-'+id),inp=$('mult-'+id),paper=$('paper-'+id);sw.checked=working;sw.disabled=archived||busy||competing||(owns&&s.state==='EXIT_PENDING');inp.disabled=archived||working||busy||competing;paper.disabled=archived||working||busy||competing;
     if(working)paper.checked=(scheduled?planned.mode:s.mode)!=='live';
@@ -70,7 +71,7 @@ function renderStrategies(){
     if((owns||scheduled)&&document.activeElement!==inp)inp.value=String(scheduled?planned.multiplier:s.multiplier||1);
     const pnl=card.querySelector('.pnlcol .metricval'),capital=s.capital||status.account?.configured_capital;
     text(pnl,owns?signed(s.net_pnl)+' · '+percent(s.net_pnl,capital):'—');color(pnl,owns?s.net_pnl:0);
-    text(card.querySelector('.feedcol .metricval'),scheduled?'Scheduled '+planned.scheduled_for:owns?(s.state||'—')+(s.pattern?' · '+s.pattern:''):'Idle');
+    text(card.querySelector('.feedcol .metricval'),scheduled?'Scheduled '+planned.scheduled_for:owns?(s.state||'—')+(s.pattern?' · '+s.pattern:'')+(id==='nfv5'&&s.v5_state?' · '+s.v5_state:''):'Idle');
     text(card.querySelector('.switchcol small'),archived?'Legacy':scheduled?'Scheduled':owns?(s.stop_requested?'Exit pending':s.state||'Idle'):'Off');
     card.title=scheduled?'Starts '+planned.scheduled_for+' at '+spec.entry_start+' IST':owns?(s.pattern?'Pattern '+s.pattern+' · score '+s.pattern_score+' · stop '+s.underlying_stop+' · target '+s.underlying_target+' · '+(s.reason||''):(s.reason||'')):archived?'This version is archived in the current controller':'';
     }
@@ -110,7 +111,8 @@ function renderML(){
   color($('ml-points'),replay.pnl_points||0);
   text($('ml-collector'),data.collector_running?'Running':'Offline');
   text($('ml-collector-note'),data.collector_error||'Captures every second during the NIFTY session');
-  text($('ml-warning'),report.promotion_reason||report.message||data.reason||'Research model only; it cannot place orders.');
+  const action=report.action_model||{},actionNote=action.test_samples?' Action-value test: '+(100*action.sign_accuracy).toFixed(1)+'% sign accuracy vs '+(100*action.baseline_sign_accuracy).toFixed(1)+'% baseline on '+action.test_samples+' quoted paths; research only.':'';
+  text($('ml-warning'),(report.promotion_reason||report.message||data.reason||'Research model only; it cannot place orders.')+actionNote);
   text($('ml-replay-caption'),report.test_day?(report.test_day+' · trained on '+(report.train_days||[]).join(', ')+' · '+(replay.complete?'complete quoted-price replay':'replay incomplete; P&L withheld')+' · hold baseline '+fmt(report.hold_baseline_pnl_points)+' points'):'A completed held-out day is needed.');
   const points=replay.equity||[],line=$('ml-line');
   if(points.length>1){const values=points.map(p=>Number(p.points)),low=Math.min(...values),high=Math.max(...values),span=Math.max(high-low,1);line.setAttribute('points',points.map((p,i)=>(10+i*880/(points.length-1)).toFixed(1)+','+(205-(Number(p.points)-low)*190/span).toFixed(1)).join(' '))}else line.setAttribute('points','');

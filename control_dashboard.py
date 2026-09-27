@@ -427,6 +427,7 @@ def main(argv: list[str] | None = None) -> int:
 
     controller = Controller(args.root.resolve())
     chain = None
+    observer = None
     ml = None
     server = None
     try:
@@ -441,8 +442,13 @@ def main(argv: list[str] | None = None) -> int:
         pin = args.pin_file.read_text().strip() if args.pin_file else None
         from strategy_lab.option_chain import OptionChainView
         from strategy_lab.broker_auth import BrokerTokenSync
-        chain = OptionChainView(args.root.resolve())
+        chain = OptionChainView(args.root.resolve(), pinned_strikes=controller.nifty_pin_strikes)
+        controller.attach_nifty_stream(chain.stream)
         chain.start()
+        from strategy_lab.nifty_v5 import FlowObserver
+        observer = FlowObserver(controller.feed, chain.stream)
+        controller.attach_nifty_observer(observer)
+        observer.start()
         broker_auth = BrokerTokenSync(args.root.resolve())
         try:
             from strategy_lab.ml_research import MLResearch
@@ -468,6 +474,8 @@ def main(argv: list[str] | None = None) -> int:
             server.server_close()
         if ml is not None:
             ml.close()
+        if observer is not None:
+            observer.stop()
         if chain is not None:
             chain.stop()
         controller.shutdown()

@@ -168,7 +168,7 @@ class FlattradeReadOnly:
                 raise FeedError("Broker returned incomplete depth data") from None
         return result
 
-    def snapshot(self, market, now, held=(), strategy_id=None):
+    def snapshot(self, market, now, held=(), strategy_id=None, spot_override=None):
         from .catalog import resolve
         interval = resolve(market, strategy_id).bar_minutes
         if held:
@@ -181,7 +181,8 @@ class FlattradeReadOnly:
         bars = self.bars(market, now, interval)
         if not bars:
             return bars, []
-        spot = bars[-1].close
+        spot = spot_override if (strategy_id == 'nfv5' and isinstance(spot_override,(int,float))
+                                 and math.isfinite(spot_override) and spot_override > 0) else bars[-1].close
         if strategy_id == "nfv4":
             from .pattern_v4 import explain_signal
             from .strategies import _option_type
@@ -210,16 +211,19 @@ class FlattradeReadOnly:
             return bars, []
         expiry = min(c.expiry for c in contracts)
         contracts = [c for c in contracts if c.expiry == expiry]
-        strikes = sorted({c.strike for c in contracts}, key=lambda k: abs(k-spot))[:14]
-        if strategy_id == "nfv1":
-            # The v1 paper basket uses wings at least 1000 points from ATM.
+        strikes = sorted({c.strike for c in contracts}, key=lambda k: abs(k-spot))[:(1 if strategy_id == "nfv5" else 14)]
+        if strategy_id in ("nfv1", "nfv5"):
+            # These paper baskets use wings at least 1000 points from ATM.
             # Request only the closest eligible wings, not the whole chain.
-            strikes = strikes[:3]
+            strikes = strikes[:(1 if strategy_id == "nfv5" else 3)]
             atm = strikes[0]
             for predicate in (lambda strike: strike >= atm+1000,
                               lambda strike: strike <= atm-1000):
                 wings = [c.strike for c in contracts if predicate(c.strike)]
                 if wings:
                     strikes.append(min(wings, key=lambda strike: abs(abs(strike-atm)-1000)))
-        selected = [c for c in contracts if c.strike in strikes]
+        selected = [c for c in contracts if c.strike in strikes and
+                    (strategy_id != "nfv5" or c.strike == atm or
+                     (c.strike > atm and c.option_type == 'CE') or
+                     (c.strike < atm and c.option_type == 'PE'))]
         return bars, self.quotes(selected, now)

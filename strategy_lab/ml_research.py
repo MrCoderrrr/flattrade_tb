@@ -119,7 +119,7 @@ class MLResearch:
             item = {"strike": row.get("strike")}
             for kind in ("ce", "pe"):
                 item[kind] = {field: (row.get(kind) or {}).get(field)
-                              for field in ("bid", "ask", "oi", "iv", "age_seconds")}
+                              for field in ("bid", "ask", "bid_size", "ask_size", "oi", "iv", "age_seconds")}
             compact.append(item)
         payload = {"rows": compact, "dte": max(0, (datetime.fromisoformat(snapshot["expiry"]).date()
                     - now.date()).days) if snapshot.get("expiry") else 0}
@@ -497,6 +497,100 @@ def _evaluation(model, frames):
                            for j in range(3)] for i in range(3)]}
 
 
+def _action_examples(frames):
+    """Five-minute, original-strike premium outcomes with no missing quote path.
+
+    These are independent action-value labels, not a full portfolio backtest.
+    Minute data can miss intraminute stop crossings; live one-second records
+    improve that resolution as they accumulate.
+    """
+    from .nifty_v5 import stop_parameters
+    examples = []
+    for index in range(len(frames)-HORIZON):
+        path = frames[index:index+HORIZON+1]
+        if any((b['sample']['time']-a['sample']['time']).total_seconds() != 60
+               for a,b in zip(path,path[1:])):
+            continue
+        current = path[0]
+        strike = current['atm_strike']
+        for kind in ('ce','pe'):
+            books = [_book_at(item['sample'],strike,kind) for item in path]
+            if any(book is None for book in books):
+                continue
+            first = books[0]
+            stop_pct,trail_pct = stop_parameters(
+                {'quality':current['features'][7],'volatility_ratio':1.},True)
+            spot = current['sample']['spot']
+            spread = (_num(first['ask'])-_num(first['bid']))/max(_num(first['ask']),.01)
+            for action in ('hold','reenter'):
+                opening = _num(first['ask']) if action == 'hold' else _num(first['bid'])
+                if opening <= 0:
+                    continue
+                best = opening
+                exit_ask = None
+                for book in books[1:]:
+                    ask = _num(book['ask'])
+                    best = min(best,ask)
+                    exit_ask = ask
+                    if ask >= min(opening*(1+stop_pct),best*(1+trail_pct)):
+                        break
+                feature = current['features'] + [1. if kind=='ce' else -1.,
+                           1. if action=='reenter' else 0.,spread,opening/spot]
+                # Hold advantage compares closing now with closing on the
+                # observed path; re-entry includes the bid/ask crossing.
+                advantage = opening-exit_ask
+                examples.append({'day':current['sample']['time'].date().isoformat(),
+                                 'time':current['sample']['time'].isoformat(),
+                                 'features':feature,'advantage':advantage,
+                                 'kind':kind,'action':action})
+    return examples
+
+
+def _fit_action_model(examples, training_days):
+    selected = [item for item in examples if item['day'] in training_days]
+    if len(selected) < 100:
+        return None
+    x = np.asarray([item['features'] for item in selected],dtype=float)
+    y = np.asarray([item['advantage'] for item in selected],dtype=float)
+    z,center,scale = _standardize(x)
+    latest = max(training_days)
+    counts = Counter(item['day'] for item in selected)
+    day_weight = {day:1+.5*(1-min(60,(datetime.fromisoformat(latest)-
+                    datetime.fromisoformat(day)).days)/60) for day in training_days}
+    weight = np.asarray([day_weight[item['day']]/counts[item['day']]
+                         for item in selected],dtype=float)
+    weight /= weight.sum()
+    ridge = np.diag(np.r_[.001,np.repeat(.2,z.shape[1]-1)])
+    coef = np.linalg.solve((z.T*weight)@z+ridge,(z.T*weight)@y)
+    return {'center':center.tolist(),'scale':scale.tolist(),'coef':coef.tolist(),
+            'trained_days':training_days,'samples':len(selected),
+            'max_day_weight_share':round(max(day_weight.values())/sum(day_weight.values()),4)}
+
+
+def _action_research(frames, eligible, prior, test_day):
+    examples = [item for day in eligible for item in _action_examples(frames[day])]
+    model = _fit_action_model(examples,prior)
+    test = [item for item in examples if item['day']==test_day]
+    if model is None or not test:
+        return {'status':'insufficient_quote_paths','training_days':prior,
+                'test_day':test_day,'test_samples':len(test)},None
+    x = np.asarray([item['features'] for item in test],dtype=float)
+    z,_,_ = _standardize(x,np.asarray(model['center']),np.asarray(model['scale']))
+    predicted = z@np.asarray(model['coef'])
+    actual = np.asarray([item['advantage'] for item in test],dtype=float)
+    baseline = np.median([item['advantage'] for item in examples if item['day'] in prior])
+    report = {'status':'exploratory' if len(prior)<MIN_TRAIN_DAYS else 'paper_validation',
+              'training_days':prior,'test_day':test_day,'train_samples':model['samples'],
+              'test_samples':len(test),'sign_accuracy':round(float(np.mean((predicted>0)==(actual>0))),4),
+              'baseline_sign_accuracy':round(float(np.mean((baseline>0)==(actual>0))),4),
+              'mae_points':round(float(np.mean(np.abs(predicted-actual))),4),
+              'baseline_mae_points':round(float(np.mean(np.abs(baseline-actual))),4),
+              'max_training_day_weight':model['max_day_weight_share'],
+              'horizon_minutes':HORIZON,'paper_only':True,
+              'limitation':'Quote-path action labels omit brokerage, margin, portfolio interaction, and intraminute stops on historical CSV days.'}
+    return report,_fit_action_model(examples,[day for day in eligible if day >= prior[0]])
+
+
 def _book_at(sample, strike, kind):
     row = next((row for row in sample["rows"] if _num(row["strike"]) == strike), None)
     book = row.get(kind) if row else None
@@ -678,6 +772,7 @@ def train_research(research: MLResearch):
         evaluation = _evaluation(model, frames[test_day])
         replay = _replay(model, frames[test_day], managed=True)
         baseline = _replay(model, frames[test_day], managed=False)
+        action_report, action_candidate = _action_research(frames,eligible,prior,test_day)
         future_model = _fit(frames, [day for day in eligible if day >= cutoff])
         rolling = []
         for day in eligible[-MIN_TEST_DAYS:]:
@@ -694,6 +789,7 @@ def train_research(research: MLResearch):
                   or len(rolling) < MIN_TEST_DAYS else "paper_validation",
                   "train_days": prior, "test_day": test_day, "train_rows": model["rows"],
                   "test": evaluation, "rolling_out_of_sample": rolling, "replay": replay,
+                  "action_model": action_report,
                   "hold_baseline_pnl_points": baseline["pnl_points"],
                   "candidate_trained_through": future_model["trained_days"][-1]
                   if future_model else None,
@@ -707,6 +803,9 @@ def train_research(research: MLResearch):
         with research.lock, research.db:
             research.db.execute("INSERT OR REPLACE INTO artifacts VALUES ('candidate',?)",
                                 (json.dumps(future_model),))
+            if action_candidate:
+                research.db.execute("INSERT OR REPLACE INTO artifacts VALUES ('action_candidate',?)",
+                                    (json.dumps(action_candidate),))
     with research.lock, research.db:
         research.db.execute("INSERT OR REPLACE INTO artifacts VALUES ('report',?)",
                             (json.dumps(report),))

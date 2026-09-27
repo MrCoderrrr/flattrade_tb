@@ -174,4 +174,4 @@ class ActiveTests(unittest.TestCase):
             finally:c.shutdown()
 
     def test_six_unique_catalog_names(self):
-        self.assertEqual({s['id'] for s in catalog()},{'nfv1','nfv2','nfv3','nfv4','mcxv1','mcxv2','mcxv3'})
+        self.assertEqual({s['id'] for s in catalog()},{'nfv1','nfv2','nfv3','nfv4','nfv5','mcxv1','mcxv2','mcxv3'})

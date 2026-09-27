@@ -56,11 +56,12 @@ def parse_master(raw: bytes, today):
 class OptionChainView:
     MASTER_URL = 'https://api.shoonya.com/NFO_symbols.txt.zip'
 
-    def __init__(self, root: Path, clock=None, stream=None):
+    def __init__(self, root: Path, clock=None, stream=None, pinned_strikes=None):
         self.root = Path(root)
         self.clock = clock or (lambda: datetime.now(IST))
         token_path = Path(os.environ.get('FLATTRADE_TOKEN_FILE',str(self.root/'token.txt')))
         self.stream = stream or NiftyStream(token_path,os.environ.get('FLATTRADE_USER_ID',''))
+        self.pinned_strikes = pinned_strikes or (lambda: ())
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
         self.thread = None
@@ -89,7 +90,7 @@ class OptionChainView:
             self.reason = ''
 
     @staticmethod
-    def _watched_strikes(contracts, spot):
+    def _watched_strikes(contracts, spot, pinned=()):
         strikes = sorted({strike for strike, _ in contracts})
         near = sorted(strikes, key=lambda strike: abs(strike - spot))[:11]
         # Keep far protective wings observable for research replay without
@@ -97,6 +98,9 @@ class OptionChainView:
         for target in (spot - 1000, spot + 1000):
             if strikes:
                 near.append(min(strikes, key=lambda strike: abs(strike - target)))
+        for strike in pinned:
+            if strike in strikes:
+                near.append(strike)
         return sorted(set(near))
 
     def refresh(self):
@@ -125,7 +129,7 @@ class OptionChainView:
             return
         spot = snap['ticks'][-1].price
         with self.lock:
-            strikes = self._watched_strikes(self.contracts, spot)
+            strikes = self._watched_strikes(self.contracts, spot, self.pinned_strikes())
             selected = {f"NFO|{self.contracts[(strike,kind)][0]}" for strike in strikes
                         for kind in ('CE','PE') if (strike,kind) in self.contracts}
             if selected != self.selected:
@@ -141,7 +145,7 @@ class OptionChainView:
             contracts = dict(self.contracts)
             reason = self.reason
         spot = snap['ticks'][-1].price if snap['ticks'] else None
-        strikes = self._watched_strikes(contracts, spot) if spot else []
+        strikes = self._watched_strikes(contracts, spot, self.pinned_strikes()) if spot else []
         rows = []
         for strike in sorted(strikes):
             row = {'strike':strike}

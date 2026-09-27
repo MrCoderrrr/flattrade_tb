@@ -19,6 +19,13 @@ class OptionChainTests(unittest.TestCase):
         self.assertIn(24000, strikes)
         self.assertLessEqual(len(strikes), 13)
 
+    def test_original_held_strike_stays_subscribed_after_spot_moves(self):
+        contracts = {(float(strike), kind):(str(strike),kind)
+                     for strike in range(23000,27001,50) for kind in ('CE','PE')}
+        strikes = OptionChainView._watched_strikes(contracts,26000,[24000,25000])
+        self.assertIn(24000,strikes)
+        self.assertIn(25000,strikes)
+
     def test_off_hours_does_not_open_broker_stream(self):
         class Stream:
             thread = None

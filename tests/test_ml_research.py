@@ -25,7 +25,8 @@ class MLResearchTests(unittest.TestCase):
 
     def test_capture_preserves_stale_quote_status_and_second_timestamp(self):
         stamp = "2026-09-28T10:01:02.345678+05:30"
-        rows = [{"strike": 24000, "ce": {"bid": 100, "ask": 101, "age_seconds": 2},
+        rows = [{"strike": 24000, "ce": {"bid": 100, "ask": 101, "bid_size": 65,
+                                            "ask_size": 130, "age_seconds": 2},
                  "pe": {"bid": 99, "ask": 100, "age_seconds": 2}}]
         self.research.capture({"as_of": stamp, "ready": True, "spot": 24001,
                                "expiry": "2026-09-29", "rows": rows})
@@ -37,6 +38,10 @@ class MLResearchTests(unittest.TestCase):
             "SELECT timestamp,quality FROM snapshots ORDER BY timestamp").fetchall()
         self.assertEqual(stored[0], ("2026-09-28T10:01:02+05:30", "live_observed"))
         self.assertEqual(stored[1][1], "live_stale")
+        payload = self.research.db.execute(
+            "SELECT payload FROM snapshots ORDER BY timestamp LIMIT 1").fetchone()[0]
+        import zlib
+        self.assertEqual(json.loads(zlib.decompress(payload))['rows'][0]['ce']['bid_size'],65)
         self.assertEqual(len(self.research._minutes()["2026-09-28"]), 1)
 
     def test_constant_legacy_fields_are_quarantined(self):
@@ -87,6 +92,10 @@ class MLResearchTests(unittest.TestCase):
         self.assertEqual(report["test_day"], "2026-08-27")
         self.assertGreater(report["test"]["samples"], 100)
         self.assertFalse(report["promotion_ready"])
+        self.assertEqual(report['action_model']['training_days'],['2026-08-25','2026-08-26'])
+        self.assertEqual(report['action_model']['test_day'],'2026-08-27')
+        self.assertGreater(report['action_model']['test_samples'],100)
+        self.assertTrue(report['action_model']['paper_only'])
         candidate = json.loads(self.research.db.execute(
             "SELECT value FROM artifacts WHERE key='candidate'").fetchone()[0])
         self.assertEqual(candidate["trained_days"][-1], "2026-08-27")

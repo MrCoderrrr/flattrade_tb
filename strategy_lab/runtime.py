@@ -20,7 +20,8 @@ from .models import Contract, IST
 from .market_data import FlattradeReadOnly, FeedError
 from .strategies import build_plan, explain_signal, _option_type
 from .catalog import resolve, catalog
-from . import active_v3, legacy_v1, pattern_v4
+from . import active_v3, legacy_v1, pattern_v4, nifty_v5
+from .nifty_flow import decision as flow_decision
 
 MARKETS = ("NIFTY", "MCX")
 LIVE_REASON = "Real orders are unavailable: this controller has no commissioned broker executor or partial-fill reconciliation."
@@ -84,6 +85,8 @@ class Controller:
         self.lock = threading.RLock()
         self.clock = clock or (lambda: datetime.now(IST))
         self.feed = feed or FlattradeReadOnly(self.root)
+        self.nifty_stream = None
+        self.nifty_observer = None
         self.record_market_data = feed is None
         self._revision = 0
         self.db = sqlite3.connect(self.directory / "ledger.sqlite3", check_same_thread=False)
@@ -125,13 +128,49 @@ class Controller:
             self.db.execute("INSERT INTO journal(timestamp,payload) VALUES (?,?)",
                             (row["timestamp"], json.dumps(row)))
 
+    def attach_nifty_stream(self, stream):
+        """Share the dashboard's read-only index stream; never grants order access."""
+        with self.lock:
+            self.nifty_stream = stream
+
+    def attach_nifty_observer(self, observer):
+        with self.lock:
+            self.nifty_observer = observer
+
+    def nifty_pin_strikes(self):
+        """Keep held wings and original short strikes in the research stream."""
+        with self.lock:
+            s = self.data['sessions']['NIFTY']
+            return ([p['contract']['strike'] for p in s['positions']] + [
+                c['strike'] for c in s.get('v5_anchor',{}).values()]) if s['positions'] else []
+
+    def _v5_observation(self, s, bars, now):
+        if self.nifty_observer:
+            observation,history = self.nifty_observer.snapshot(now)
+            s['flow_history'] = history
+            s['signal'] = observation
+            return observation
+        ticks = self.nifty_stream.latest(now)['ticks'] if self.nifty_stream else []
+        observation = nifty_v5.flow(bars, ticks, now)
+        if observation.get('eligible'):
+            history = s.setdefault('flow_history', [])
+            stamp = observation['timestamp']
+            if not history or history[-1]['timestamp'] != stamp:
+                history.append(observation)
+                s['flow_history'] = history[-90:]
+        s['signal'] = observation
+        return observation
+
     def _snapshot(self, market, now, held=()):
         # Broker I/O must never hold the control lock: Stop/Kill remain responsive.
         revision = self._revision
+        strategy_id = self.data['sessions'][market].get('strategy_id')
+        spot_override = (self.data['sessions'][market].get('signal') or {}).get('spot') if strategy_id == 'nfv5' and not held else None
         self.lock.release()
         try:
             if isinstance(self.feed, FlattradeReadOnly):
-                bars, quotes = self.feed.snapshot(market, now, held, strategy_id=self.data['sessions'][market].get('strategy_id'))
+                bars, quotes = self.feed.snapshot(market, now, held, strategy_id=strategy_id,
+                                                   spot_override=spot_override)
             else:
                 bars, quotes = self.feed.snapshot(market, now, held)
         finally:
@@ -149,6 +188,21 @@ class Controller:
                 self.db.execute("INSERT INTO market_snapshots(timestamp,market,payload) VALUES (?,?,?)",
                                 (record['timestamp'], market, json.dumps(record, default=encode, allow_nan=False)))
         return bars, quotes
+
+    def _v5_bars(self, now):
+        # In the flat state, do not request an entire option basket every
+        # second. The broker's completed-minute bar cache costs one read/minute.
+        if not isinstance(self.feed, FlattradeReadOnly):
+            return self._snapshot('NIFTY', now)[0]
+        revision = self._revision
+        self.lock.release()
+        try:
+            bars = self.feed.bars('NIFTY', now, 1)
+        finally:
+            self.lock.acquire()
+        if revision != self._revision:
+            raise FeedError('Control changed during NIFTY flow read')
+        return bars
 
     def _roll_day(self, now):
         account = self.data["account"]
@@ -363,7 +417,7 @@ class Controller:
         limit = (spec.trade_risk_per_unit or 0)*s['multiplier']
         if s["positions"] or (not naked and (plan.max_loss is None or plan.max_loss > limit)):
             raise ValueError("Invalid portfolio risk")
-        if not naked and spec.version != 1 and plan.max_loss + self.data["account"]["drawdown"] >= .05*self.data["account"]["capital"]:
+        if not naked and spec.version not in (1, 5) and plan.max_loss + self.data["account"]["drawdown"] >= .05*self.data["account"]["capital"]:
             s["reason"] = "Trade would exceed remaining portfolio drawdown budget"
             return
         positions, fills, costs = [], [], 0.
@@ -421,6 +475,13 @@ class Controller:
                      reentry_count=0, reentry_bar=None, leg_reentries=s.get("leg_reentries", 0))
             for p in positions:
                 p.update(best_mark=p["entry_price"], leg_stop=None, trail_armed=False)
+        if spec.id == "nfv5":
+            s['v5_anchor'] = { _option_type(contract_from(p['contract'])): p['contract']
+                               for p in positions if p['side'] == 'SELL' }
+            s['v5_state'] = 'DUAL'
+            for p in positions:
+                if p['side'] == 'SELL':
+                    p.update(best_mark=p['entry_price'], leg_stop=None, trail_armed=False)
         s["costs"] += costs
         s["trades"].extend(fills)
         self._mark(s, [leg.quote for leg in plan.legs], now)
@@ -643,6 +704,119 @@ class Controller:
         self._mark(s, quotes+[q], now)
         self._event(f"MCX: simulated ATM {missing} re-entry after confirmed KAMA/EMA reversal")
 
+    def _close_v5_leg(self, s, position, quotes, now, reason):
+        fee = cost(position['mark_price'], position['quantity'])
+        s['costs'] += fee
+        s['realized_pnl'] += position['unrealized_pnl']
+        s['trades'].append({'timestamp':now.isoformat(), 'symbol':position['symbol'],
+                            'side':'BUY', 'quantity':position['quantity'],
+                            'price':position['mark_price'], 'cost':fee,
+                            'mode':'paper', 'reason':reason, 'simulated':True})
+        s['positions'].remove(position)
+        s['last_leg_exit'] = now.isoformat()
+        s['reason'] = reason
+        self._mark(s, quotes, now)
+        self._event(f"NIFTY v5: simulated {_option_type(contract_from(position['contract']))} short exit — {reason}")
+
+    def _reenter_v5(self, s, missing, quotes, now):
+        spec = resolve('NIFTY','nfv5')
+        if (s.get('paused') or s.get('exit_requested') or s.get('stop_requested') or
+                s['entries'] >= spec.max_entries or now.strftime('%H:%M') >= spec.entry_end or
+                s['net_pnl'] <= -spec.session_loss_per_unit*s['multiplier'] or
+                not s.get('last_leg_exit') or
+                (now-datetime.fromisoformat(s['last_leg_exit'])).total_seconds() < 5):
+            return False
+        anchor = s.get('v5_anchor',{}).get(missing)
+        if not anchor:
+            return False
+        wing = next((p for p in s['positions'] if p['side'] == 'BUY' and
+                     _option_type(contract_from(p['contract'])) == missing),None)
+        if (wing is None or wing['quantity'] != s['multiplier']*anchor['lot_size'] or
+                (wing['contract']['strike']-anchor['strike'] if missing == 'CE' else
+                 anchor['strike']-wing['contract']['strike']) < 1000):
+            return False
+        try:
+            _, candidate = self._snapshot('NIFTY',now,[contract_from(anchor)])
+        except FeedError:
+            s['reason'] = 'V5 re-entry waiting for fresh original-strike depth'
+            return False
+        if s.get('exit_requested') or s.get('stop_requested'):
+            return False
+        q = next((q for q in candidate if q.contract.symbol == anchor['symbol']),None)
+        quantity = s['multiplier']*anchor['lot_size']
+        if q is None or not fresh(q,now) or q.bid_size < quantity:
+            s['reason'] = 'V5 re-entry waiting for executable original-strike bid'
+            return False
+        price = q.bid-q.contract.tick_size
+        if price <= 0:
+            return False
+        fee = cost(price,quantity)
+        s['positions'].append({'symbol':q.contract.symbol,'contract':anchor,'side':'SELL',
+                               'quantity':quantity,'entry_price':price,'mark_price':price,
+                               'unrealized_pnl':0.,'best_mark':price,'leg_stop':None,
+                               'trail_armed':False})
+        s['costs'] += fee
+        s['entries'] += 1
+        s['v5_state'] = 'DUAL'
+        s['trades'].append({'timestamp':now.isoformat(),'symbol':q.contract.symbol,
+                            'side':'SELL','quantity':quantity,'price':price,'cost':fee,
+                            'mode':'paper','reason':'V5 flow re-entry at protected anchor',
+                            'simulated':True})
+        self._mark(s,quotes+candidate,now)
+        s['reason'] = 'V5 protected ATM straddle restored at original strike'
+        self._event(f'NIFTY v5: simulated {missing} short re-entry')
+        return True
+
+    def _manage_nifty_v5(self, s, observation, quotes, now):
+        shorts = [p for p in s['positions'] if p['side'] == 'SELL']
+        if not shorts or s.get('exit_requested') or s.get('stop_requested'):
+            if not shorts:
+                s.update(exit_requested=True,reason='V5 no short remains; release protective wings')
+            return
+        state = ('DUAL' if len(shorts) == 2 else
+                 'SOLO_PE' if _option_type(contract_from(shorts[0]['contract'])) == 'PE' else 'SOLO_CE')
+        s['v5_state'] = state
+        action = flow_decision(s.get('flow_history',[]),state) if observation.get('eligible') else None
+        stop_pct,trail_pct = nifty_v5.stop_parameters(observation,len(shorts)==1)
+        for p in list(shorts):
+            mark,entry = p['mark_price'],p['entry_price']
+            p['best_mark'] = min(p.get('best_mark',entry),mark)
+            p['trail_armed'] = len(shorts)==1 or p.get('trail_armed',False) or mark <= .90*entry
+            stop = entry*(1+stop_pct)
+            if p['trail_armed']:
+                stop = min(stop,p['best_mark']*(1+trail_pct))
+            p['leg_stop'] = round(min(p.get('leg_stop') or stop,stop),4)
+            p['stop_pct_cap'] = .30
+            kind = _option_type(contract_from(p['contract']))
+            signal_exit = action == 'EXIT_'+kind
+            stop_hit = mark >= p['leg_stop']
+            if not (signal_exit or stop_hit):
+                continue
+            # If a profitable solo leg trails out just as the trend stalls,
+            # restore the protected straddle and reset its trail once. A hard
+            # premium stop still takes precedence over this optimization.
+            if (len(shorts)==1 and stop_hit and mark < entry*(1+stop_pct) and
+                    action == 'REENTER_'+('CE' if kind=='PE' else 'PE')):
+                missing = 'CE' if kind=='PE' else 'PE'
+                if self._reenter_v5(s,missing,quotes,now):
+                    p['best_mark'] = mark
+                    p['leg_stop'] = round(entry*(1+stop_pct),4)
+                    p['trail_armed'] = False
+                    return
+            self._close_v5_leg(s,p,quotes,now,'V5 flow exit' if signal_exit else 'V5 premium stop/trail')
+            shorts = [x for x in s['positions'] if x['side']=='SELL']
+            if not shorts:
+                s.update(exit_requested=True,reason='V5 shorts exited; closing wings')
+                return
+            break  # One directional change per observed second.
+        shorts = [p for p in s['positions'] if p['side']=='SELL']
+        if len(shorts)==1 and observation.get('eligible'):
+            kind = _option_type(contract_from(shorts[0]['contract']))
+            s['v5_state'] = 'SOLO_'+kind
+            missing = 'CE' if kind=='PE' else 'PE'
+            if action == 'REENTER_'+missing:
+                self._reenter_v5(s,missing,quotes,now)
+
     def _exit(self, market, s, quotes, now):
         self._mark(s, quotes, now)
         # In a live executor shorts MUST close before protective longs. Paper
@@ -725,6 +899,8 @@ class Controller:
                         self._mark(s, quotes, self.clock().astimezone(IST))
                         trade_net = (s["net_pnl"] - s.get("cycle_start_net", 0.)) if spec.id == "mcxv3" else s["unrealized_pnl"] - s["trade_costs"] - s["estimated_exit_costs"]
                         signal = {}
+                        if spec.id == 'nfv5':
+                            signal = self._v5_observation(s,bars,self.clock().astimezone(IST))
                         if spec.version in (1, 3, 4) and bars and not s['exit_requested']:
                             signal = signal_fn(market, bars, self.clock().astimezone(IST))
                             s['signal'] = signal
@@ -756,6 +932,9 @@ class Controller:
                             if s["net_pnl"] <= -spec.session_loss_per_unit*s["multiplier"]:
                                 s.update(locked=True, exit_requested=bool(s["positions"]), reason="Session loss limit reached")
                             self._account()
+                        if spec.id == 'nfv5' and not s['exit_requested']:
+                            self._manage_nifty_v5(s,signal,quotes,self.clock().astimezone(IST))
+                            self._account()
                         if spec.version == 1 and not s["exit_requested"]:
                             self._manage_v1(market, s, signal, quotes, self.clock().astimezone(IST))
                             self._account()
@@ -784,6 +963,25 @@ class Controller:
                         continue
                     if any(other["positions"] for name, other in self.data["sessions"].items() if name != market):
                         s["reason"] = "Shared account is allocated to another open session"
+                        continue
+                    if spec.id == 'nfv5':
+                        bars = [] if self.nifty_observer else self._v5_bars(now)
+                        observation = self._v5_observation(s,bars,self.clock().astimezone(IST))
+                        s['reason'] = observation.get('reason','Waiting for NIFTY flow')
+                        if (not observation.get('eligible') or
+                                flow_decision(s.get('flow_history',[]),'FLAT') != 'OPEN_BOTH'):
+                            continue
+                        bars,quotes = self._snapshot(market,self.clock().astimezone(IST))
+                        fresh_now = self.clock().astimezone(IST)
+                        observation = self._v5_observation(s,bars,fresh_now)
+                        if (not bars or not quotes or not observation.get('eligible') or
+                                flow_decision(s.get('flow_history',[]),'FLAT') != 'OPEN_BOTH'):
+                            raise FeedError('NIFTY flow or option-chain depth stale before entry')
+                        plan = nifty_v5.build_plan(bars,quotes,fresh_now,s['multiplier'],s['capital'],observation)
+                        if plan:
+                            self._enter(market,s,plan,fresh_now)
+                        else:
+                            s['reason'] = 'Flow is balanced; protected ATM basket lacks fresh depth or risk capacity'
                         continue
                     bars, quotes = self._snapshot(market, now)
                     fresh_now = self.clock().astimezone(IST)
@@ -829,7 +1027,8 @@ class Controller:
                         self.data["account"]["halted"] = True
                         self._event("Controller fault; new entries halted")
                         self._save()
-                self._stop.wait(3)
+                active_v5 = self.data['sessions']['NIFTY'].get('strategy_id') == 'nfv5' and self.data['sessions']['NIFTY']['state'] not in ('STOPPED','SESSION_COMPLETE')
+                self._stop.wait(1 if active_v5 else 3)
         self.worker = threading.Thread(target=work, name="paper-controller", daemon=True)
         self.worker.start()
 

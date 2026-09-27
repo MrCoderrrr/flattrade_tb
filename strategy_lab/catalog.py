@@ -26,6 +26,7 @@ SPECS = {
     "mcxv2": StrategySpec("mcxv2", "MCX", 2, "Selective trend credit spread", "16:30", "22:30", "23:15", 5, 2, 1800, 1000, 2000),
     "nfv3": StrategySpec("nfv3", "NIFTY", 3, "Active EMA / RSI / session mean · hedged", "09:20", "15:33", "15:34", 1, 20, 60, 4000, 10000),
     "nfv4": StrategySpec("nfv4", "NIFTY", 4, "Closed-candle structure · breakout/retest/rejection · hedged paper", "09:31", "15:15", "15:34", 1, 12, 60, 4000, 8000),
+    "nfv5": StrategySpec("nfv5", "NIFTY", 5, "One-second flow · ATM straddle · 1000-point wings · adaptive leg stops · paper", "09:20", "15:33", "15:34", 1, 60, 30, 4000, 100000),
     "mcxv3": StrategySpec("mcxv3", "MCX", 3, "ATM straddle · KAMA(10,3,30) / EMA trend · leg stops", "16:05", "23:22", "23:24", 1, 24, 60, 6000, None),
 }
 
