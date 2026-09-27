@@ -62,7 +62,7 @@ class ControlHTTPServer(ThreadingHTTPServer):
     def __init__(self, controller: Any, host: str = "127.0.0.1", port: int = 8080,
                  token: str | None = None, dashboard_path: Path = DASHBOARD_PATH,
                  allowed_host: str | None = None, pin: str | None = None,
-                 chain: Any = None, ml: Any = None):
+                 chain: Any = None, ml: Any = None, broker_auth: Any = None):
         if host not in {"127.0.0.1", "localhost"} and not allowed_host:
             raise ValueError("Public binding requires an explicit allowed host.")
         if token is not None and (not isinstance(token, str) or len(token) < 32
@@ -78,6 +78,7 @@ class ControlHTTPServer(ThreadingHTTPServer):
         self.auth_lock = threading.RLock()
         self.chain = chain
         self.ml = ml
+        self.broker_auth = broker_auth
         # Resolve no user-controlled hostname, including hosts-file entries.
         self.dashboard_html = Path(dashboard_path).read_bytes()
         self.dashboard_js = DASHBOARD_JS_PATH.read_bytes()
@@ -312,6 +313,9 @@ class ControlHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/ml":
                 self._json(200, self.server.ml.status() if self.server.ml else
                            {"available":False,"reason":"ML research service is unavailable"}, head_only)
+            elif self.path == "/api/auth/status":
+                self._json(200, self.server.broker_auth.status() if self.server.broker_auth else
+                           {"configured":False,"token_present":False,"saved_today":False}, head_only)
             else:
                 raise RequestError("Not found.", 404)
         except RequestError as exc:
@@ -341,9 +345,27 @@ class ControlHandler(BaseHTTPRequestHandler):
                         self.server.sessions.pop(supplied.value,None)
                 self._json(200,{"authenticated":False},cookie="desk_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
                 return
-            if self.path not in {"/api/start", "/api/stop", "/api/kill", "/api/pause", "/api/settings"}:
+            if self.path not in {"/api/start", "/api/stop", "/api/kill", "/api/pause", "/api/settings", "/api/auth/token"}:
                 raise RequestError("Not found.", 404)
             data = self._body()
+            if self.path == "/api/auth/token":
+                if set(data) != {"url_or_code", "pin"}:
+                    raise RequestError("Provide a request code and dashboard PIN.")
+                pin = data["pin"]
+                if (self.server.pin is None or not isinstance(pin, str)
+                        or not hmac.compare_digest(pin, self.server.pin)):
+                    raise RequestError("Enter the dashboard PIN to renew the broker token.", 403)
+                if self.server.broker_auth is None:
+                    raise RequestError("Flattrade token sync is unavailable.", 503)
+                from strategy_lab.broker_auth import BrokerAuthError
+                try:
+                    result = self.server.broker_auth.exchange(data["url_or_code"])
+                except BrokerAuthError as exc:
+                    raise RequestError(str(exc)) from None
+                if self.server.chain is not None:
+                    self.server.chain.stream.stop()
+                self._json(200, result)
+                return
             if self.path == "/api/start":
                 result = self._start(data)
             elif self.path == "/api/settings":
@@ -383,9 +405,11 @@ class ControlHandler(BaseHTTPRequestHandler):
 def create_server(controller: Any, host: str = "127.0.0.1", port: int = 8080,
                   token: str | None = None, dashboard_path: Path = DASHBOARD_PATH,
                   allowed_host: str | None = None, pin: str | None = None,
-                  chain: Any = None, ml: Any = None) -> ControlHTTPServer:
+                  chain: Any = None, ml: Any = None,
+                  broker_auth: Any = None) -> ControlHTTPServer:
     """Create an unstarted local HTTP server; useful with an offline fake controller."""
-    return ControlHTTPServer(controller, host, port, token, dashboard_path, allowed_host, pin, chain, ml)
+    return ControlHTTPServer(controller, host, port, token, dashboard_path,
+                             allowed_host, pin, chain, ml, broker_auth)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -420,8 +444,10 @@ def main(argv: list[str] | None = None) -> int:
             token = args.token_file.read_text().strip()
         pin = args.pin_file.read_text().strip() if args.pin_file else None
         from strategy_lab.option_chain import OptionChainView
+        from strategy_lab.broker_auth import BrokerTokenSync
         chain = OptionChainView(args.root.resolve())
         chain.start()
+        broker_auth = BrokerTokenSync(args.root.resolve())
         try:
             from strategy_lab.ml_research import MLResearch
             ml = MLResearch(args.root.resolve(), chain=chain)
@@ -430,7 +456,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"ML research unavailable: {type(exc).__name__}", flush=True)
             ml = None
         server = create_server(controller, host=args.host, port=args.port, token=token,
-                               allowed_host=args.allowed_host, pin=pin, chain=chain, ml=ml)
+                               allowed_host=args.allowed_host, pin=pin, chain=chain, ml=ml,
+                               broker_auth=broker_auth)
         server.public_origin_file = args.public_origin_file
         signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
         controller.start_worker()

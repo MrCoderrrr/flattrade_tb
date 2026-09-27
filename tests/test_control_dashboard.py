@@ -96,6 +96,8 @@ class DashboardHTTPTests(unittest.TestCase):
     def test_status_and_all_mutations_require_authentication(self):
         for method, path, payload in [("GET", "/api/status", None),
                                       ("GET", "/api/ml", None),
+                                      ("GET", "/api/auth/status", None),
+                                      ("POST", "/api/auth/token", {"url_or_code":"ABC123","pin":"7000"}),
                                       ("POST", "/api/start", self.start_payload()),
                                       ("POST", "/api/stop", {"market": "NIFTY"}),
                                       ("POST", "/api/kill", {})]:
@@ -109,6 +111,37 @@ class DashboardHTTPTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertFalse(json.loads(body)["available"])
         self.assertEqual(self.controller.calls, [])
+
+    def test_broker_token_sync_requires_pin_and_never_dispatches_orders(self):
+        class FakeBrokerAuth:
+            calls = []
+
+            def status(self):
+                return {"configured":True,"token_present":True,"saved_today":True,
+                        "last_updated":"2026-09-27T10:00:00+05:30",
+                        "auth_url":"https://auth.flattrade.in/?app_key=public"}
+
+            def exchange(self, code):
+                self.calls.append(code)
+                return self.status()
+
+        fake = FakeBrokerAuth()
+        self.server.broker_auth = fake
+        try:
+            status, _, body = self.request("GET", "/api/auth/status")
+            self.assertEqual(status, 200)
+            self.assertTrue(json.loads(body)["saved_today"])
+            payload = {"url_or_code":"ABC123","pin":"0000"}
+            self.assertEqual(self.request("POST", "/api/auth/token", payload)[0], 403)
+            self.assertEqual(fake.calls, [])
+            payload["pin"] = "7000"
+            status, _, body = self.request("POST", "/api/auth/token", payload)
+            self.assertEqual(status, 200)
+            self.assertEqual(fake.calls, ["ABC123"])
+            self.assertNotIn(b"token-value", body)
+            self.assertEqual(self.controller.calls, [])
+        finally:
+            self.server.broker_auth = None
 
     def test_pin_login_cookie_controls_and_logout(self):
         self.assertEqual(self.request("POST", "/api/login", {"pin":"1111"}, authorized=False)[0], 401)
