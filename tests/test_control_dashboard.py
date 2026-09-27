@@ -29,8 +29,8 @@ class FakeController:
         self.calls.append(("start", market, mode, multiplier, capital, confirmation))
         return {"state": "waiting", "mode": mode}
 
-    def stop(self, market):
-        self.calls.append(("stop", market))
+    def stop(self, market, strategy_id=None):
+        self.calls.append(("stop", market) if strategy_id is None else ("stop", market, strategy_id))
         return {"state": "stopped"}
 
     def kill(self):
@@ -220,6 +220,16 @@ class DashboardHTTPTests(unittest.TestCase):
         status, _, _ = self.request("POST", "/api/start", self.start_payload())
         self.assertEqual(status, 200)
         self.assertEqual(self.controller.calls, [("start", "NIFTY", "paper", 1, 200000, "")])
+
+    def test_stop_targets_one_strategy(self):
+        status, _, _ = self.request("POST", "/api/stop",
+                                    {"market": "NIFTY", "strategy_id": "nfv3"})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.controller.calls, [("stop", "NIFTY", "nfv3")])
+        status, _, _ = self.request("POST", "/api/stop",
+                                    {"market": "MCX", "strategy_id": "nfv3"})
+        self.assertEqual(status, 409)
+        self.assertEqual(self.controller.calls, [("stop", "NIFTY", "nfv3")])
 
     def test_invalid_start_never_reaches_runtime(self):
         payloads = [self.start_payload(mode=None), self.start_payload(mode="LIVE"),

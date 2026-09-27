@@ -383,13 +383,26 @@ class ControlHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/settings":
                 result = self._settings(data)
             elif self.path == "/api/pause":
-                if set(data) != {"market", "paused"} or type(data["paused"]) is not bool:
+                if (set(data) not in ({"market", "paused"}, {"market", "paused", "strategy_id"})
+                        or type(data["paused"]) is not bool):
                     raise RequestError("Pause requires market and a boolean paused field")
-                result = self.server.controller.pause(self._market(data), data["paused"])
+                market = self._market(data)
+                if 'strategy_id' in data:
+                    from strategy_lab.catalog import resolve
+                    strategy_id = resolve(market, data['strategy_id']).id
+                    result = self.server.controller.pause(market, data['paused'], strategy_id=strategy_id)
+                else:
+                    result = self.server.controller.pause(market, data['paused'])
             elif self.path == "/api/stop":
-                if set(data) != {"market"}:
-                    raise RequestError("Stop requires only the market field.")
-                result = self.server.controller.stop(self._market(data))
+                if set(data) not in ({"market"}, {"market", "strategy_id"}):
+                    raise RequestError("Stop requires a market and optional strategy_id.")
+                market = self._market(data)
+                if 'strategy_id' in data:
+                    from strategy_lab.catalog import resolve
+                    strategy_id = resolve(market, data['strategy_id']).id
+                    result = self.server.controller.stop(market, strategy_id=strategy_id)
+                else:
+                    result = self.server.controller.stop(market)
             else:
                 if data:
                     raise RequestError("Emergency stop takes an empty JSON object.")
@@ -439,9 +452,9 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--port must be between 1 and 65535")
     # Runtime owns process locking. Importing the HTTP module alone has no trading
     # side effects, and every actual session still needs an authenticated start.
-    from strategy_lab.runtime import Controller
+    from strategy_lab.multi_runtime import MultiController
 
-    controller = Controller(args.root.resolve())
+    controller = MultiController(args.root.resolve())
     chain = None
     observer = None
     ml = None

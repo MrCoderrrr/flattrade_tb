@@ -72,9 +72,9 @@ def next_session_date(now, spec):
 
 
 class Controller:
-    def __init__(self, root: Path, feed=None, clock=None):
+    def __init__(self, root: Path, feed=None, clock=None, storage_directory: Path | None = None):
         self.root = Path(root)
-        self.directory = self.root / "data" / "strategy_lab"
+        self.directory = Path(storage_directory) if storage_directory is not None else self.root / "data" / "strategy_lab"
         self.directory.mkdir(parents=True, exist_ok=True)
         self._file = (self.directory / "controller.lock").open("a+")
         try:
