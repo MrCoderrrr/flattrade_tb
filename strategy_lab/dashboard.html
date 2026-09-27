@@ -44,8 +44,9 @@ function closePin(value){$('pin-dialog').close();if(pinResolver){const resolve=p
 $('pin-form').onsubmit=e=>{e.preventDefault();closePin($('action-pin').value)};$('pin-cancel').onclick=$('pin-cancel-x').onclick=()=>closePin(null);$('pin-dialog').oncancel=e=>{e.preventDefault();closePin(null)};
 function notify(message,error=false){const el=$('toast');text(el,message);el.classList.toggle('error',error);el.hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.hidden=true,5000)}
 async function api(path,payload){const options={credentials:'same-origin',cache:'no-store',headers:{}};if(payload!==undefined){options.method='POST';options.headers['Content-Type']='application/json';options.body=JSON.stringify(payload)}const response=await fetch(path,options);let data={};try{data=await response.json()}catch{}if(!response.ok){const e=new Error(data.error||'Server request failed');e.status=response.status;throw e}return data}
-function applyTheme(name){document.documentElement.dataset.theme=name;localStorage.setItem('desk-theme',name);$('light-toggle').checked=name==='light'}
-applyTheme(localStorage.getItem('desk-theme')==='light'?'light':'dark');
+function themePreference(){try{return window.localStorage.getItem('desk-theme')}catch{return null}}
+function applyTheme(name){document.documentElement.dataset.theme=name;try{window.localStorage.setItem('desk-theme',name)}catch{}$('light-toggle').checked=name==='light'}
+applyTheme(themePreference()==='light'?'light':'dark');
 function tab(name){activeTab=name;document.querySelectorAll('.nav button').forEach(b=>b.setAttribute('aria-selected',String(b.dataset.tab===name)));document.querySelectorAll('.page').forEach(p=>p.classList.toggle('active',p.id==='page-'+name));if(name==='chain')loadChain()}
 document.querySelectorAll('.nav button').forEach(b=>b.addEventListener('click',()=>tab(b.dataset.tab)));
 $('theme').onclick=()=>applyTheme(document.documentElement.dataset.theme==='light'?'dark':'light');$('light-toggle').onchange=e=>applyTheme(e.target.checked?'light':'dark');
