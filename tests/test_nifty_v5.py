@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from strategy_lab.models import Bar, IST
-from strategy_lab.nifty_v5 import build_plan, five_minute_bars, stop_parameters
+from strategy_lab.nifty_v5 import build_plan, five_minute_bars, ready_to_open, stop_parameters
 from strategy_lab.runtime import Controller
 from test_runtime import Feed
 from test_strategies import quote
@@ -46,6 +46,14 @@ class V5Tests(unittest.TestCase):
         self.assertGreater(choppy[0],calm[0])
         self.assertGreater(choppy[1],calm[1])
         self.assertLessEqual(choppy[0],.30)
+
+    def test_trending_observed_seconds_can_open_initial_straddle(self):
+        now,_,_ = fixture()
+        rows = [{'eligible':True,'score':80.,'timestamp':(now+timedelta(seconds=i)).isoformat()}
+                for i in range(3)]
+        self.assertTrue(ready_to_open(rows))
+        rows[-1]['timestamp'] = (now+timedelta(seconds=5)).isoformat()
+        self.assertFalse(ready_to_open(rows))
 
     def test_balanced_to_solo_to_reentry_keeps_original_wings(self):
         now,bars,quotes = fixture()

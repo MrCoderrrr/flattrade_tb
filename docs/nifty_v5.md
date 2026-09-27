@@ -19,7 +19,8 @@ missing seconds. The strategy controller may act later if the broker quote
 requests are slow, but it rejects stale entry signals and never fabricates a
 fill.
 
-Three observed neutral seconds open the balanced basket. In a balanced basket,
+Three observed fresh seconds open the balanced basket, including on a trend
+day. In a balanced basket,
 a sustained bullish score closes the CE short; a bearish score closes the PE
 short. An urgent score can close the losing leg immediately. An individual
 premium stop can also close either short. The opposite short and both wings

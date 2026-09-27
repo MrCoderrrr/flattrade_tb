@@ -979,13 +979,13 @@ class Controller:
                         observation = self._v5_observation(s,bars,self.clock().astimezone(IST))
                         s['reason'] = observation.get('reason','Waiting for NIFTY flow')
                         if (not observation.get('eligible') or
-                                flow_decision(self.v5_flow_history,'FLAT') != 'OPEN_BOTH'):
+                                not nifty_v5.ready_to_open(self.v5_flow_history)):
                             continue
                         bars,quotes = self._snapshot(market,self.clock().astimezone(IST))
                         fresh_now = self.clock().astimezone(IST)
                         observation = self._v5_observation(s,bars,fresh_now)
                         if (not bars or not quotes or not observation.get('eligible') or
-                                flow_decision(self.v5_flow_history,'FLAT') != 'OPEN_BOTH'):
+                                not nifty_v5.ready_to_open(self.v5_flow_history)):
                             raise FeedError('NIFTY flow or option-chain depth stale before entry')
                         plan = nifty_v5.build_plan(bars,quotes,fresh_now,s['multiplier'],s['capital'],observation)
                         if plan:

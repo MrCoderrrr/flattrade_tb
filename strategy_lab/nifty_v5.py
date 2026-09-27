@@ -97,6 +97,20 @@ def flow(bars, ticks, now):
     return evaluate(bars, five_minute_bars(bars, now), ticks, now)
 
 
+def ready_to_open(history: list[dict]) -> bool:
+    """Start an ATM basket after three real flow seconds, including trend days."""
+    rows = history[-3:]
+    if len(rows) != 3 or any(not item.get('eligible') for item in rows):
+        return False
+    try:
+        times = [datetime.fromisoformat(item['timestamp']) for item in rows]
+        return all(stamp.tzinfo is not None for stamp in times) and all(
+            0 < (right-left).total_seconds() <= 1.5
+            for left,right in zip(times,times[1:]))
+    except (KeyError,TypeError,ValueError):
+        return False
+
+
 def stop_parameters(observation: dict, solo: bool) -> tuple[float, float]:
     """Premium stop/trail percentages, bounded even for noisy observations."""
     quality = max(0., min(1., float(observation.get('quality', .5))))
