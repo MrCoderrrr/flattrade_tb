@@ -23,6 +23,8 @@ async function change(path,payload,success){if(busy)return false;busy=true;try{a
 function strategy(id){return(status?.strategies||[]).find(spec=>spec.id===id)}
 function market(id){return strategy(id)?.market}
 function strategyIds(){return(status?.strategies||[]).map(spec=>spec.id)}
+function marketOrder(markets){return [...new Set(markets)].sort((a,b)=>{const order={NIFTY:0,MCX:1};return(order[a]??2)-(order[b]??2)||a.localeCompare(b)})}
+function marketSection(parent,market,count,listClass){const section=node('section','market-section'),head=node('div','market-head'),heading=node('h2','',market),badge=node('span','badge',count+' strateg'+(count===1?'y':'ies')),cards=node('div',listClass);head.append(heading,badge);section.append(head,cards);parent.append(section);return cards}
 function dateIST(value){if(!value)return'—';const d=new Date(value);return Number.isNaN(d.getTime())?'—':new Intl.DateTimeFormat('en-IN',{timeZone:'Asia/Kolkata',day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit',hour12:false}).format(d)}
 function node(tag,cls,value){const e=document.createElement(tag);if(cls)e.className=cls;if(value!==undefined)e.textContent=String(value);return e}
 function render(){const a=status.account||{}, sessions=status.sessions||{},capital=a.configured_capital||a.capital; text($('asof'),'Updated '+dateIST(status.server_time));text($('today-pnl'),signed(a.daily_pnl));color($('today-pnl'),a.daily_pnl);text($('today-return'),percent(a.daily_pnl,capital));color($('today-return'),a.daily_pnl);text($('account-capital'),money(capital));
@@ -36,7 +38,13 @@ renderStrategies();renderHistory();}
 function renderStrategies(){
   const list=$('strategy-list'),sessions=status.sessions||{},schedules=status.schedules||{},specs=status.strategies||[];
   for(const card of list.querySelectorAll('.strategy'))if(!specs.some(spec=>card.id==='card-'+spec.id))card.remove();
-  for(const spec of specs){
+  for(const section of list.querySelectorAll('.market-section'))if(!specs.some(spec=>spec.market===section.dataset.market))section.remove();
+  for(const group of marketOrder(specs.map(spec=>spec.market))){
+    let section=[...list.querySelectorAll('.market-section')].find(item=>item.dataset.market===group);
+    if(!section){marketSection(list,group,specs.filter(spec=>spec.market===group).length,'strategylist');section=list.lastElementChild;section.dataset.market=group}
+    const groupCount=specs.filter(spec=>spec.market===group).length;
+    text(section.querySelector('.badge'),groupCount+' strateg'+(groupCount===1?'y':'ies'));
+    for(const spec of specs.filter(spec=>spec.market===group)){
     const id=spec.id;
     let card=$('card-'+id);
     if(!card){
@@ -48,8 +56,9 @@ function renderStrategies(){
       const feed=node('div','feedcol');feed.append(node('div','metriclabel','Session'),node('div','metricval'));
       const mode=node('div','modecol');const paperLabel=node('label');const paper=node('input');paper.type='checkbox';paper.checked=true;paper.id='paper-'+id;paper.setAttribute('aria-label',id+' paper trading');paperLabel.append(paper,node('span','','Paper'));mode.append(paperLabel,node('small','','Uncheck for live'));
       const sw=node('div','switchcol');const label=node('label','switch'),input=node('input');input.type='checkbox';input.id='toggle-'+id;input.setAttribute('aria-label','Start or stop '+id);label.append(input,node('span'));sw.append(label,node('small','',''));
-      card.append(name,size,pnlcol,feed,mode,sw);list.append(card);input.onchange=()=>toggleStrategy(id,input.checked);
+      card.append(name,size,pnlcol,feed,mode,sw);section.lastElementChild.append(card);input.onchange=()=>toggleStrategy(id,input.checked);
     }
+    if(card.parentElement!==section.lastElementChild)section.lastElementChild.append(card);
     const s=sessions[spec.market]||{},planned=schedules[spec.market],scheduled=planned?.strategy_id===id,owns=s.strategy_id===id&&!!s.date;
     const patternDetails=owns&&s.pattern?' · '+s.pattern+' · rank '+Number(s.pattern_score).toFixed(2)+' · stop '+Number(s.underlying_stop).toFixed(1)+' · target '+Number(s.underlying_target).toFixed(1):'';
     text(card.querySelector('.namecol .desc'),(spec.description||'')+patternDetails);
@@ -63,6 +72,7 @@ function renderStrategies(){
     text(card.querySelector('.feedcol .metricval'),scheduled?'Scheduled '+planned.scheduled_for:owns?(s.state||'—')+(s.pattern?' · '+s.pattern:''):'Idle');
     text(card.querySelector('.switchcol small'),archived?'Legacy':scheduled?'Scheduled':owns?(s.stop_requested?'Exit pending':s.state||'Idle'):'Off');
     card.title=scheduled?'Starts '+planned.scheduled_for+' at '+spec.entry_start+' IST':owns?(s.pattern?'Pattern '+s.pattern+' · score '+s.pattern_score+' · stop '+s.underlying_stop+' · target '+s.underlying_target+' · '+(s.reason||''):(s.reason||'')):archived?'This version is archived in the current controller':'';
+    }
   }
 }
 async function toggleStrategy(id,on){
@@ -81,7 +91,7 @@ async function toggleStrategy(id,on){
 }
 function monthKey(offset){const now=new Date(),ist=new Date(now.toLocaleString('en-US',{timeZone:'Asia/Kolkata'}));ist.setDate(1);ist.setMonth(ist.getMonth()+offset);return ist.getFullYear()+'-'+String(ist.getMonth()+1).padStart(2,'0')}
 function selectedRows(id){const key=monthKey(monthOffset);return(status?.strategy_history||[]).filter(x=>x.strategy_id===id&&String(x.date||'').startsWith(key)).sort((a,b)=>a.date.localeCompare(b.date))}
-function renderHistory(){const box=$('history-cards');box.replaceChildren();const ids=[...new Set([...strategyIds(),...(status?.strategy_history||[]).map(row=>row.strategy_id).filter(Boolean)])];for(const id of ids){const rows=selectedRows(id),total=rows.reduce((sum,r)=>sum+(Number(r.net_pnl)||0),0),capital=Math.max(0,...rows.map(r=>Number(r.capital)||0)),card=node('button','card historycard');card.type='button';card.append(node('h3','',id.toUpperCase()),node('div','value',signed(total)));color(card.querySelector('.value'),total);const foot=node('div','foot');foot.append(node('span','',rows.length+' recorded day'+(rows.length===1?'':'s')),node('span','',capital?(total/capital*100).toFixed(2)+'% return':'—'));card.append(foot);card.onclick=()=>openHistory(id);box.append(card)}}
+function renderHistory(){const box=$('history-cards');box.replaceChildren();const records=status?.strategy_history||[],ids=[...new Set([...strategyIds(),...records.map(row=>row.strategy_id).filter(Boolean)])],marketOf=id=>strategy(id)?.market||records.find(row=>row.strategy_id===id)?.market||'OTHER';for(const group of marketOrder(ids.map(marketOf))){const groupIds=ids.filter(id=>marketOf(id)===group),cards=marketSection(box,group,groupIds.length,'historygrid');for(const id of groupIds){const rows=selectedRows(id),total=rows.reduce((sum,r)=>sum+(Number(r.net_pnl)||0),0),capital=Math.max(0,...rows.map(r=>Number(r.capital)||0)),card=node('button','card historycard');card.type='button';card.append(node('h3','',id.toUpperCase()),node('div','value',signed(total)));color(card.querySelector('.value'),total);const foot=node('div','foot');foot.append(node('span','',rows.length+' recorded day'+(rows.length===1?'':'s')),node('span','',capital?(total/capital*100).toFixed(2)+'% return':'—'));card.append(foot);card.onclick=()=>openHistory(id);cards.append(card)}}}
 function openHistory(id){const rows=selectedRows(id),box=$('dialog-days');text($('dialog-title'),id.toUpperCase()+' · '+(monthOffset===0?'This month':'Last month'));box.replaceChildren();if(!rows.length)box.append(node('div','empty','No strategy-specific records for this month.'));for(const r of rows){const line=node('div','dailyrow');line.append(node('span','',r.date+' · '+(r.mode||'paper').toUpperCase()+' · '+r.entries+' entr'+(r.entries===1?'y':'ies')),node('strong','',signed(r.net_pnl)+' · '+percent(r.net_pnl,r.capital)));color(line.lastChild,r.net_pnl);box.append(line)}const total=rows.reduce((n,r)=>n+(Number(r.net_pnl)||0),0),capital=Math.max(0,...rows.map(r=>Number(r.capital)||0));text($('dialog-total'),signed(total));color($('dialog-total'),total);text($('dialog-return'),capital?(total/capital*100).toFixed(2)+'% of highest configured capital':'No return calculated');$('history-dialog').showModal()}
 $('dialog-x').onclick=$('dialog-close').onclick=()=>$('history-dialog').close();$('month-current').onclick=()=>setMonth(0);$('month-previous').onclick=()=>setMonth(-1);function setMonth(value){monthOffset=value;$('month-current').classList.toggle('active',value===0);$('month-previous').classList.toggle('active',value===-1);if(status)renderHistory()}
 async function loadChain(){if(activeTab!=='chain'||!status)return;try{chain=await api('/api/chain');renderChain()}catch(err){text($('chain-state'),'Unavailable');text($('chain-note'),err.message)}}
