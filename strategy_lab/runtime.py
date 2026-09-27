@@ -87,6 +87,7 @@ class Controller:
         self.feed = feed or FlattradeReadOnly(self.root)
         self.nifty_stream = None
         self.nifty_observer = None
+        self.v5_flow_history = []
         self.record_market_data = feed is None
         self._revision = 0
         self.db = sqlite3.connect(self.directory / "ledger.sqlite3", check_same_thread=False)
@@ -106,6 +107,7 @@ class Controller:
         self.data['account'].setdefault('live_permission',False)
         self.data.setdefault('schedules', {})
         for session in self.data["sessions"].values():
+            session.pop('flow_history',None)  # Prior releases stored oversized per-second histories.
             if session["positions"]:
                 session.update(state="RECOVERY_REQUIRED", exit_requested=True, stop_requested=True,
                                reason="Recovered paper positions; fresh quotes required to flatten")
@@ -144,20 +146,25 @@ class Controller:
             return ([p['contract']['strike'] for p in s['positions']] + [
                 c['strike'] for c in s.get('v5_anchor',{}).values()]) if s['positions'] else []
 
+    def nifty_position_expiry(self):
+        with self.lock:
+            positions = self.data['sessions']['NIFTY']['positions']
+            return positions[0]['contract']['expiry'] if positions else None
+
     def _v5_observation(self, s, bars, now):
         if self.nifty_observer:
             observation,history = self.nifty_observer.snapshot(now)
-            s['flow_history'] = history
+            self.v5_flow_history = history
             s['signal'] = observation
             return observation
         ticks = self.nifty_stream.latest(now)['ticks'] if self.nifty_stream else []
         observation = nifty_v5.flow(bars, ticks, now)
         if observation.get('eligible'):
-            history = s.setdefault('flow_history', [])
+            history = self.v5_flow_history
             stamp = observation['timestamp']
             if not history or history[-1]['timestamp'] != stamp:
                 history.append(observation)
-                s['flow_history'] = history[-90:]
+                self.v5_flow_history = history[-90:]
         s['signal'] = observation
         return observation
 
@@ -177,7 +184,10 @@ class Controller:
             self.lock.acquire()
         if revision != self._revision and not held:
             raise FeedError("Control request changed during data fetch; pending entry discarded")
-        if self.record_market_data:
+        # The one-second ML collector already stores NIFTY v5's spot and
+        # pinned option books; duplicating full seven-day bar arrays on every
+        # valuation would grow this uncompressed ledger by gigabytes.
+        if self.record_market_data and strategy_id != 'nfv5':
             def encode(value):
                 if isinstance(value, (datetime, date)):
                     return value.isoformat()
@@ -776,7 +786,7 @@ class Controller:
         state = ('DUAL' if len(shorts) == 2 else
                  'SOLO_PE' if _option_type(contract_from(shorts[0]['contract'])) == 'PE' else 'SOLO_CE')
         s['v5_state'] = state
-        action = flow_decision(s.get('flow_history',[]),state) if observation.get('eligible') else None
+        action = flow_decision(self.v5_flow_history,state) if observation.get('eligible') else None
         stop_pct,trail_pct = nifty_v5.stop_parameters(observation,len(shorts)==1)
         for p in list(shorts):
             mark,entry = p['mark_price'],p['entry_price']
@@ -969,13 +979,13 @@ class Controller:
                         observation = self._v5_observation(s,bars,self.clock().astimezone(IST))
                         s['reason'] = observation.get('reason','Waiting for NIFTY flow')
                         if (not observation.get('eligible') or
-                                flow_decision(s.get('flow_history',[]),'FLAT') != 'OPEN_BOTH'):
+                                flow_decision(self.v5_flow_history,'FLAT') != 'OPEN_BOTH'):
                             continue
                         bars,quotes = self._snapshot(market,self.clock().astimezone(IST))
                         fresh_now = self.clock().astimezone(IST)
                         observation = self._v5_observation(s,bars,fresh_now)
                         if (not bars or not quotes or not observation.get('eligible') or
-                                flow_decision(s.get('flow_history',[]),'FLAT') != 'OPEN_BOTH'):
+                                flow_decision(self.v5_flow_history,'FLAT') != 'OPEN_BOTH'):
                             raise FeedError('NIFTY flow or option-chain depth stale before entry')
                         plan = nifty_v5.build_plan(bars,quotes,fresh_now,s['multiplier'],s['capital'],observation)
                         if plan:

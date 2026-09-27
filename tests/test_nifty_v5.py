@@ -68,6 +68,8 @@ class V5Tests(unittest.TestCase):
                     session = controller.status()['sessions']['NIFTY']
                     self.assertEqual(session['v5_state'],'DUAL')
                     self.assertEqual(len(session['positions']),4)
+                    self.assertNotIn('flow_history',session)
+                    self.assertGreaterEqual(len(controller.v5_flow_history),3)
                     self.assertEqual(controller.nifty_pin_strikes(),[26000,24000,25000,25000,25000,25000])
                     score[0] = 80.
                     for _ in range(3):

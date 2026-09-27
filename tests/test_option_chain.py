@@ -6,7 +6,8 @@ from datetime import date, datetime
 from pathlib import Path
 
 from strategy_lab.models import IST
-from strategy_lab.option_chain import OptionChainView, parse_master
+from strategy_lab.option_chain import OptionChainView, parse_master, parse_master_all
+from strategy_lab.nifty_flow import IndexTick
 
 
 class OptionChainTests(unittest.TestCase):
@@ -61,6 +62,29 @@ class OptionChainTests(unittest.TestCase):
         self.assertEqual(expiry,date(2026,10,1))
         self.assertEqual(contracts[(25000.,'CE')],('123','NIFTYCE1'))
         self.assertEqual(len(contracts),2)
+        self.assertEqual(len(parse_master_all(stream.getvalue(),date(2026,9,26))),2)
+
+    def test_held_later_expiry_switches_subscriptions(self):
+        now=datetime(2026,9,28,9,30,tzinfo=IST)
+        class Stream:
+            thread=None
+            def start(self): pass
+            def latest(self,_now):
+                return {'ready':True,'reason':'','ticks':[IndexTick(now,25000)],'books':{}}
+            def set_contracts(self,selected): self.selected=selected
+        stream=Stream()
+        view=OptionChainView(Path('.'),clock=lambda:now,stream=stream,
+                             preferred_expiry=lambda:'2026-10-06',
+                             pinned_strikes=lambda:[25000.])
+        view.catalog_day=now.date()
+        view.expiry=date(2026,9,29)
+        view.all_expiries={date(2026,9,29):{(25000.,'CE'):('101','NIFTY1')},
+                           date(2026,10,6):{(25000.,'CE'):('201','NIFTY2')}}
+        view.contracts=view.all_expiries[view.expiry]
+        view.refresh()
+        self.assertEqual(view.expiry,date(2026,10,6))
+        self.assertIn('NFO|201',stream.selected)
+        self.assertNotIn('NFO|101',stream.selected)
 
     def test_expiry_day_contracts_remain_observable_for_research(self):
         content = ('Symbol,OptionType,Expiry,StrikePrice,Token,TradingSymbol\n'

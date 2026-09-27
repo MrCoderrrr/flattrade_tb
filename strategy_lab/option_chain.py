@@ -27,8 +27,8 @@ def _number(value):
         return None
 
 
-def parse_master(raw: bytes, today):
-    """Nearest live expiry's NIFTY CE/PE tokens, keyed by strike and type."""
+def parse_master_all(raw: bytes, today):
+    """All live NIFTY expiries, preserving tokens for a held later expiry."""
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
         name = next((n for n in archive.namelist() if n.endswith('NFO_symbols.txt')), None)
         if name is None:
@@ -49,25 +49,37 @@ def parse_master(raw: bytes, today):
             continue
     if not eligible:
         raise ValueError('No future NIFTY options in contract master')
-    expiry = min(row[0] for row in eligible)
-    return expiry,{(strike,kind):(token,symbol) for day,strike,kind,token,symbol in eligible if day==expiry}
+    expiries = {}
+    for day,strike,kind,token,symbol in eligible:
+        expiries.setdefault(day,{})[(strike,kind)] = (token,symbol)
+    return expiries
+
+
+def parse_master(raw: bytes, today):
+    """Nearest live expiry's NIFTY CE/PE tokens, keyed by strike and type."""
+    expiries = parse_master_all(raw,today)
+    expiry = min(expiries)
+    return expiry,expiries[expiry]
 
 
 class OptionChainView:
     MASTER_URL = 'https://api.shoonya.com/NFO_symbols.txt.zip'
 
-    def __init__(self, root: Path, clock=None, stream=None, pinned_strikes=None):
+    def __init__(self, root: Path, clock=None, stream=None, pinned_strikes=None,
+                 preferred_expiry=None):
         self.root = Path(root)
         self.clock = clock or (lambda: datetime.now(IST))
         token_path = Path(os.environ.get('FLATTRADE_TOKEN_FILE',str(self.root/'token.txt')))
         self.stream = stream or NiftyStream(token_path,os.environ.get('FLATTRADE_USER_ID',''))
         self.pinned_strikes = pinned_strikes or (lambda: ())
+        self.preferred_expiry = preferred_expiry or (lambda: None)
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
         self.thread = None
         self.catalog_day = None
         self.expiry = None
         self.contracts = {}
+        self.all_expiries = {}
         self.reason = 'Waiting for current contract master and broker stream'
         self.selected = set()
         self.last_master_attempt = 0.
@@ -82,11 +94,13 @@ class OptionChainView:
             raw = response.read(20_000_001)
         if len(raw) > 20_000_000:
             raise ValueError('Contract master exceeded download limit')
-        expiry,contracts = parse_master(raw,now.date())
+        expiries = parse_master_all(raw,now.date())
+        expiry = min(expiries)
         with self.lock:
             self.catalog_day = now.date()
             self.expiry = expiry
-            self.contracts = contracts
+            self.contracts = expiries[expiry]
+            self.all_expiries = expiries
             self.reason = ''
 
     @staticmethod
@@ -122,6 +136,12 @@ class OptionChainView:
             if self.catalog_day != now.date():
                 self.reason = 'Current NFO contract master is unavailable'
                 return
+            requested = self.preferred_expiry()
+            chosen = next((day for day in self.all_expiries if day.isoformat()==requested),
+                          min(self.all_expiries))
+            if chosen != self.expiry:
+                self.expiry = chosen
+                self.contracts = self.all_expiries[chosen]
         snap = self.stream.latest(now)
         if not snap['ready']:
             with self.lock:

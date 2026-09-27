@@ -27,6 +27,8 @@ remain. Five seconds of trend cooling, or three seconds of reversal, can
 restore the missing short at its **original strike** while its long wing is
 still held. The original strike and all held wings remain subscribed in the
 one-second option-chain collector after spot moves.
+If the held basket uses a later expiry than the nearest listed expiry, the
+collector switches to that exact expiry while the position remains open.
 
 Each short has an adaptive premium stop, hard-capped at 30% above its entry
 premium, and a trailing stop on a solo or sufficiently profitable leg. Higher
