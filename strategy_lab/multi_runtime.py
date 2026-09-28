@@ -11,12 +11,15 @@ from pathlib import Path
 
 from .catalog import SPECS, resolve
 from .models import IST
+from .market_data import FlattradeReadOnly
 from .runtime import Controller, LIVE_REASON, MARKETS
 
 
 class MultiController:
     def __init__(self, root: Path, feed=None, clock=None):
         self.root = Path(root)
+        # All paper workers share one read-only quote cache and broker budget.
+        feed = feed or FlattradeReadOnly(self.root, auto_refresh=True)
         self.legacy = Controller(self.root, feed=feed, clock=clock)
         base = self.root / "data" / "strategy_lab" / "instances"
         self.children = {

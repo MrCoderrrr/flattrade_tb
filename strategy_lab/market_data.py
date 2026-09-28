@@ -12,6 +12,7 @@ import math
 import os
 import tempfile
 import threading
+import time
 import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -89,6 +90,8 @@ class FlattradeReadOnly:
         self.auto_refresh = auto_refresh
         self._bars_cache = {}
         self._contracts_cache = {}
+        self._quote_cache = {}
+        self._quote_lock = threading.Lock()
 
     def _refresh_master(self, exchange, underlying, now):
         target = self.root / f"{exchange}_symbols_{now.date().isoformat()}.csv"
@@ -243,7 +246,17 @@ class FlattradeReadOnly:
         last_error = None
         for contract in contracts:
             try:
-                data = self._call("GetQuotes", exch=contract.exchange, token=contract.token)
+                key = (contract.exchange, contract.token)
+                with self._quote_lock:
+                    cached = self._quote_cache.get(key)
+                    if cached is not None and time.monotonic() - cached[0] < 1.0:
+                        data = cached[1]
+                    else:
+                        data = self._call("GetQuotes", exch=contract.exchange, token=contract.token)
+                        self._quote_cache[key] = (time.monotonic(), data)
+                    if len(self._quote_cache) > 64:
+                        self._quote_cache = {k: v for k, v in self._quote_cache.items()
+                                             if time.monotonic() - v[0] < 2.0}
                 if data.get("tsym") != contract.symbol or int(number(data.get("ls", 0))) != contract.lot_size:
                     raise FeedError("Broker contract metadata differs from symbol master")
                 result.append(parse_quote(contract, data))

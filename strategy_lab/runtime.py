@@ -952,6 +952,16 @@ class Controller:
                     if not s["positions"]:
                         s["state"] = "SESSION_COMPLETE"
                         continue
+                if market == "NIFTY" and (now.weekday() >= 5 or
+                        now.strftime("%H:%M") < "09:15" or
+                        now.strftime("%H:%M") >= "15:35"):
+                    # A closed exchange cannot provide executable NIFTY depth.
+                    # Repeated reads here can exhaust the broker quote budget
+                    # needed to manage the still-open MCX paper positions.
+                    if s["positions"]:
+                        s.update(state="EXIT_PENDING",
+                                 reason="NIFTY market closed; paper exit awaits fresh session quotes")
+                    continue
                 try:
                     release_due = (any(p["side"] == "BUY" for p in s["positions"])
                                    and hedge_release_reached(market, s.get("date"), now))

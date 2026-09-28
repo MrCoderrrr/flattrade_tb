@@ -8,6 +8,22 @@ from strategy_lab.models import Bar, Contract, IST
 
 
 class MarketDataRecoveryTests(unittest.TestCase):
+    def test_repeat_quote_reads_share_a_short_cache(self):
+        with tempfile.TemporaryDirectory() as root:
+            feed = FlattradeReadOnly(Path(root))
+            contract = Contract('NATURALGAS23OCT26CE300', 'cache-test', 'MCX',
+                                date(2026, 10, 23), 300, 'CE', 1250, .05)
+            now = datetime(2026, 9, 28, 17, 0, tzinfo=IST)
+            calls = []
+            def broker(*_args, **_kwargs):
+                calls.append(1)
+                return {'tsym': contract.symbol, 'ls': '1250', 'bp1': '17.00',
+                        'sp1': '17.05', 'lp': '17.00', 'bq1': '2', 'sq1': '3',
+                        'ft': str(int(now.timestamp()))}
+            feed._call = broker
+            self.assertEqual(feed.quotes([contract], now), feed.quotes([contract], now))
+            self.assertEqual(len(calls), 1)
+
     def test_mcx_depth_lots_are_converted_to_trading_units(self):
         contract = Contract('NATURALGAS23OCT26CE300', '1', 'MCX',
                             date(2026, 10, 23), 300, 'CE', 1250, .05)
