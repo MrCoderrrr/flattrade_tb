@@ -7,8 +7,8 @@ from pathlib import Path
 from strategy_lab.analytics import AnalyticsStore, regime_from_bars
 from strategy_lab.models import IST
 from strategy_lab.multi_runtime import MultiController
-from test_runtime import Feed
-from test_strategies import nifty_fixture
+from test_fixtures import Feed
+from test_fixtures import nifty_fixture
 
 
 class RegimeTests(unittest.TestCase):
@@ -45,7 +45,7 @@ class RegimeTests(unittest.TestCase):
                 self.assertEqual(store.summary()['coverage'][0]['days'],1)
                 self.assertEqual(store.summary()['leaders'],{})
                 self.assertEqual(store.summary()['daily'],[])
-                self.assertEqual(store.detail('nfv2','2026-09')['daily'],[])
+                self.assertEqual(store.detail('nfv1','2026-09')['daily'],[])
             finally:
                 store.close()
 
@@ -56,51 +56,20 @@ class RegimeTests(unittest.TestCase):
             try:
                 for i in range(10):
                     day=f'2026-09-{i+1:02d}'
-                    for sid,pct in [('nfv2',.4),('nfv3',.2)]:
+                    for sid,pct in [('nfv1',.4),('nfv3',.2)]:
                         store.db.execute('''INSERT INTO strategy_days VALUES
                             (?,?,?,?,?,?,?,?,?,?,?,?)''',
                             (sid,day,'NIFTY','paper',pct*2000,200000,pct,1,50,10,
                              'choppy','complete'))
                 store.db.commit()
                 summary=store.summary()
-                self.assertEqual(summary['leaders']['NIFTY:choppy'],'nfv2')
+                self.assertEqual(summary['leaders']['NIFTY:choppy'],'nfv1')
                 self.assertEqual(summary['comparison_days']['NIFTY:choppy'],10)
                 store.db.execute("DELETE FROM strategy_days WHERE strategy_id='nfv3' AND day='2026-09-10'")
                 store.db.commit()
                 self.assertNotIn('NIFTY:choppy',store.summary()['leaders'])
             finally:
                 store.close()
-
-
-class PaperAuditTests(unittest.TestCase):
-    def test_strategy_curve_and_daily_ledger_are_kept_separately(self):
-        with tempfile.TemporaryDirectory() as temp:
-            bars,quotes,now=nifty_fixture()
-            current=[now]
-            controller=MultiController(Path(temp),feed=Feed(bars,quotes),clock=lambda:current[0])
-            try:
-                controller.children['nfv2'].start_worker=lambda:None
-                controller.start('NIFTY','paper',1,200000,strategy_id='nfv2')
-                controller.children['nfv2'].tick()
-                controller.analytics.capture_strategies(current[0])
-                current[0] += timedelta(seconds=1)
-                controller.stop('NIFTY',strategy_id='nfv2')
-                controller.children['nfv2'].tick()
-                controller.analytics.capture_strategies(current[0])
-                controller.analytics.update_strategy_days()
-                detail=controller.analytics.detail('nfv2',current[0].strftime('%Y-%m'))
-                self.assertEqual(len(detail['curve']),2)
-                stored=controller.analytics.db.execute(
-                    'SELECT spot,vix,signal,positions FROM strategy_ticks WHERE strategy_id=? LIMIT 1',
-                    ('nfv2',)).fetchone()
-                self.assertEqual(stored,(None,None,None,None))
-                self.assertEqual(len(detail['daily']),1)
-                self.assertEqual(detail['daily'][0]['entries'],1)
-                self.assertEqual(len(detail['trades']),6)
-                self.assertEqual([p['side'] for p in controller.children['nfv2'].status()['sessions']['NIFTY']['positions']], ['BUY','BUY'])
-                self.assertEqual(controller.analytics.summary()['leaders'],{})
-            finally:
-                controller.shutdown()
 
 
 if __name__ == '__main__':

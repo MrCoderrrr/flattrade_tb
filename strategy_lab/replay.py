@@ -25,7 +25,7 @@ from .runtime import Controller, HEDGE_RELEASE
 from .catalog import SPECS
 
 
-ENTRY = {"NIFTY": time(9, 45), "MCX": time(16, 30)}
+ENTRY = {"NIFTY": time(9, 20), "MCX": time(16, 5)}
 DEADLINE = {"NIFTY": time.fromisoformat(HEDGE_RELEASE["NIFTY"]),
             "MCX": time.fromisoformat(HEDGE_RELEASE["MCX"])}
 
@@ -410,7 +410,7 @@ def evaluate(path: str | Path, *, capital=200_000, multiplier=1,
     code_hash = hashlib.sha256(b"".join((Path(__file__).parent / filename).read_bytes()
                                        for filename in ("models.py", "strategies.py", "market_data.py",
                                                         "runtime.py", "replay.py",
-                                                        "catalog.py", "active_v3.py", "legacy_v1.py", "pattern_v4.py", "nifty_v5.py", "nifty_flow.py"))).hexdigest()
+                                                        "catalog.py", "active_v3.py", "legacy_v1.py", "nifty_v5.py", "nifty_flow.py"))).hexdigest()
     report = {"input_sha256": source_hash, "implementation_sha256": code_hash,
               "parameter_selection": "Fixed implementation; no fitting or optimization performed.",
               "all_data": run_replay(snapshots, capital=capital, multiplier=multiplier,

@@ -189,7 +189,7 @@ class MultiController:
     def nifty_position_expiry(self):
         # The option-chain recorder must follow any active NIFTY strategy,
         # including v1/v3 when v5 has not opened a position yet.
-        for sid in ('nfv5', 'nfv1', 'nfv2', 'nfv3', 'nfv4'):
+        for sid in ('nfv5', 'nfv1', 'nfv3'):
             expiry = self.children[sid].nifty_position_expiry()
             if expiry:
                 return expiry

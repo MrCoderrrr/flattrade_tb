@@ -27,15 +27,6 @@ class MarketDataRecoveryTests(unittest.TestCase):
             with self.assertRaises(FeedError):
                 feed.quotes([bad,good],now,strict=True)
 
-    def test_ineligible_v2_signal_does_not_request_option_quotes(self):
-        with tempfile.TemporaryDirectory() as root:
-            feed = FlattradeReadOnly(Path(root))
-            now = datetime(2026,9,28,9,20,tzinfo=IST)
-            feed.bars = lambda *args: [Bar(now,23000,23001,22999,23000,100,5)]
-            feed.contracts = lambda *args: self.fail('ineligible signal fetched option chain')
-            bars, quotes = feed.snapshot('NIFTY',now,strategy_id='nfv2')
-            self.assertEqual(len(bars),1)
-            self.assertEqual(quotes,[])
 
 
 if __name__ == '__main__':

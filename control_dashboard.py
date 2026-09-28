@@ -265,11 +265,9 @@ class ControlHandler(BaseHTTPRequestHandler):
                     or not hmac.compare_digest(pin,self.server.pin)):
                 raise RequestError('Enter the four-digit dashboard PIN for a live request.',403)
             confirmation = f"LIVE {market} {datetime.now(IST).date().isoformat()}"
-        from strategy_lab.catalog import ARCHIVED_IDS, resolve
+        from strategy_lab.catalog import resolve
         selected = data.get('strategy_id') or ('nfv3' if market == 'NIFTY' else 'mcxv3')
         kwargs = {'strategy_id': resolve(market, selected).id}
-        if selected in ARCHIVED_IDS:
-            raise RequestError('This strategy is retired; choose an available version.')
         return self.server.controller.start(market, mode, multiplier, capital, confirmation=confirmation, **kwargs)
 
     def _settings(self, data: dict[str, Any]) -> Any:

@@ -18,9 +18,9 @@ from pathlib import Path
 
 from .models import Contract, IST
 from .market_data import FlattradeReadOnly, FeedError
-from .strategies import build_plan, explain_signal, _option_type
+from .strategies import _option_type
 from .catalog import resolve, catalog
-from . import active_v3, legacy_v1, pattern_v4, nifty_v5
+from . import active_v3, legacy_v1, nifty_v5
 from .nifty_flow import decision as flow_decision
 
 MARKETS = ("NIFTY", "MCX")
@@ -69,7 +69,7 @@ def blank_session():
             "positions": [], "trades": [], "feed_timestamp": None,
             "entries": 0, "last_exit": None, "stop_loss": 0., "take_profit": 0.,
             "trade_costs": 0., "exit_requested": False, "stop_requested": False,
-            "locked": False, "last_signal_bar": None,
+            "locked": False,
             "feed_error_count": 0, "last_feed_error_at": None}
 
 
@@ -513,11 +513,6 @@ class Controller:
                  take_profit=plan.take_profit, trade_costs=costs, max_loss=actual_risk,
                  entries=s["entries"]+1, entered_at=now.isoformat(), direction=plan.direction,
                  reversal_count=0, reversal_bar=None)
-        if spec.version == 4:
-            s.update(underlying_stop=plan.underlying_stop,
-                     underlying_target=plan.underlying_target,
-                     pattern=plan.pattern, pattern_score=plan.pattern_score,
-                     last_signal_bar=s.get('signal', {}).get('indicators', {}).get('last_bar_open'))
         if spec.version == 1:
             for p in positions:
                 if p["side"] == "SELL":
@@ -947,12 +942,8 @@ class Controller:
                 if s["state"] in ("STOPPED", "SESSION_COMPLETE") and not s["positions"]:
                     continue
                 spec = resolve(market, s.get('strategy_id'))
-                signal_fn = (legacy_v1.explain_signal if spec.version == 1 else
-                             active_v3.explain_signal if spec.version == 3 else
-                             pattern_v4.explain_signal if spec.version == 4 else explain_signal)
-                plan_fn = (legacy_v1.build_plan if spec.version == 1 else
-                           active_v3.build_plan if spec.version == 3 else
-                           pattern_v4.build_plan if spec.version == 4 else build_plan)
+                signal_fn = legacy_v1.explain_signal if spec.version == 1 else active_v3.explain_signal
+                plan_fn = legacy_v1.build_plan if spec.version == 1 else active_v3.build_plan
                 deadline = spec.flatten
                 ended = s["date"] != now.date().isoformat() or now.strftime("%H:%M") >= deadline or now.weekday() >= 5
                 if ended:
@@ -979,7 +970,7 @@ class Controller:
                         signal = {}
                         if spec.id == 'nfv5':
                             signal = self._v5_observation(s,bars,self.clock().astimezone(IST))
-                        if spec.version in (1, 3, 4) and bars and not s['exit_requested']:
+                        if spec.version in (1, 3) and bars and not s['exit_requested']:
                             signal = signal_fn(market, bars, self.clock().astimezone(IST))
                             s['signal'] = signal
                             if spec.version == 3 and spec.id != "mcxv3":
@@ -993,17 +984,6 @@ class Controller:
                             s.update(locked=True, exit_requested=True, reason="Session loss limit reached")
                         elif spec.version != 1 and (trade_net <= -s["stop_loss"] or (spec.id != "mcxv3" and trade_net >= s["take_profit"])):
                             s.update(exit_requested=True, reason="Portfolio stop" if trade_net < 0 else "Portfolio take profit")
-                        if spec.version == 4 and bars and not s['exit_requested']:
-                            bar = bars[-1]
-                            entered = datetime.fromisoformat(s['entered_at'])
-                            if (bar.interval_minutes == 1 and bar.timestamp.astimezone(IST).date() == now.date()
-                                    and entered < bar.timestamp+timedelta(minutes=1) <= now):
-                                stop, target = s['underlying_stop'], s['underlying_target']
-                                hit_stop = bar.low <= stop if s['direction'] > 0 else bar.high >= stop
-                                hit_target = bar.high >= target if s['direction'] > 0 else bar.low <= target
-                                if hit_stop or hit_target:
-                                    s.update(exit_requested=True,
-                                             reason='V4 underlying invalidation' if hit_stop else 'V4 underlying target')
                         self._account()
                         if spec.id == "mcxv3" and not s["exit_requested"]:
                             self._manage_mcx_v3(s, signal, quotes, self.clock().astimezone(IST))
@@ -1077,17 +1057,13 @@ class Controller:
                         # session; it never consumes a fresh authorization.
                         s["state"] = "ARMED"
                     fresh_now = self.clock().astimezone(IST)
-                    if not bars or (fresh_now-(bars[-1].timestamp+timedelta(minutes=spec.bar_minutes))).total_seconds() > (90 if spec.version in (1, 3, 4) else 360):
+                    if not bars or (fresh_now-(bars[-1].timestamp+timedelta(minutes=spec.bar_minutes))).total_seconds() > (90 if spec.version in (1, 3) else 360):
                         raise FeedError("Completed underlying bars are missing or stale")
                     if quotes:
                         s["feed_timestamp"] = min(q.timestamp for q in quotes).isoformat()
                     signal = signal_fn(market, bars, fresh_now)
                     s["signal"] = signal
                     s["reason"] = signal.get("reason", "Waiting for a qualifying signal")
-                    if (spec.version == 4 and signal.get('indicators', {}).get('last_bar_open')
-                            == s.get('last_signal_bar')):
-                        s['reason'] = 'V4 waits for a new completed candle after its last entry'
-                        continue
                     plan = plan_fn(market, bars, quotes, fresh_now, s["multiplier"], s["capital"])
                     if plan:
                         self._enter(market, s, plan, fresh_now)

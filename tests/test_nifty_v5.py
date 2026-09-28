@@ -9,8 +9,8 @@ from unittest.mock import patch
 from strategy_lab.models import Bar, IST
 from strategy_lab.nifty_v5 import build_plan, five_minute_bars, ready_to_open, stop_parameters
 from strategy_lab.runtime import Controller
-from test_runtime import Feed
-from test_strategies import quote
+from test_fixtures import Feed
+from test_fixtures import quote
 
 
 def fixture():

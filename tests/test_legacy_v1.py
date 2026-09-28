@@ -8,8 +8,8 @@ from strategy_lab.catalog import catalog
 from strategy_lab.legacy_v1 import build_plan, explain_signal
 from strategy_lab.runtime import Controller
 from test_active_v3 import fixture
-from test_runtime import Feed
-from test_strategies import quote
+from test_fixtures import Feed
+from test_fixtures import quote
 
 
 class LegacyV1PaperTests(unittest.TestCase):

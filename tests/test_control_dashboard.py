@@ -243,15 +243,6 @@ class DashboardHTTPTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(self.controller.calls, [("start", "NIFTY", "paper", 1, 200000, "", "nfv3")])
 
-    def test_retired_versions_cannot_start_from_dashboard_api(self):
-        for market, strategy_id in (("NIFTY", "nfv2"), ("NIFTY", "nfv4"), ("MCX", "mcxv2")):
-            with self.subTest(strategy_id=strategy_id):
-                status, _, body = self.request("POST", "/api/start",
-                                               self.start_payload(market=market, strategy_id=strategy_id))
-                self.assertEqual(status, 400)
-                self.assertIn(b"retired", body)
-        self.assertEqual(self.controller.calls, [])
-
     def test_stop_targets_one_strategy(self):
         status, _, _ = self.request("POST", "/api/stop",
                                     {"market": "NIFTY", "strategy_id": "nfv3"})

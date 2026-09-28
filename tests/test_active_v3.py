@@ -8,8 +8,8 @@ from strategy_lab.models import Bar, IST
 from strategy_lab.active_v3 import build_plan, explain_signal
 from strategy_lab.catalog import catalog
 from strategy_lab.runtime import Controller
-from test_runtime import Feed
-from test_strategies import quote
+from test_fixtures import Feed
+from test_fixtures import quote
 
 
 def fixture(market='NIFTY', direction=1):
@@ -76,7 +76,7 @@ class ActiveTests(unittest.TestCase):
                 c.stop('MCX'); c.tick()
                 self.assertFalse(c.status()['sessions']['MCX']['positions'])
                 with self.assertRaisesRegex(ValueError,'fixed'):
-                    c.start('MCX','paper',1,200000,strategy_id='mcxv2')
+                    c.start('MCX','paper',1,200000,strategy_id='mcxv1')
             finally:c.shutdown()
 
     def test_bearish_call_spread_survives_temporary_quote_failure(self):
@@ -203,4 +203,4 @@ class ActiveTests(unittest.TestCase):
             finally:c.shutdown()
 
     def test_six_unique_catalog_names(self):
-        self.assertEqual({s['id'] for s in catalog()},{'nfv1','nfv2','nfv3','nfv4','nfv5','mcxv1','mcxv2','mcxv3'})
+        self.assertEqual({s['id'] for s in catalog()},{'nfv1','nfv3','nfv5','mcxv1','mcxv3'})
