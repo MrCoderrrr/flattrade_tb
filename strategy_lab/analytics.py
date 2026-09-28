@@ -224,25 +224,17 @@ class AnalyticsStore:
                 strategy_id = session.get('strategy_id') or (sid if sid != 'legacy' else None)
                 if strategy_id not in SPECS:
                     continue
-                signal = session.get('signal') or {}
-                compact_signal = {k: signal.get(k) for k in ('direction','score','confidence','reason','eligible')
-                                  if k in signal}
-                positions = [{k: p.get(k) for k in ('symbol','side','quantity','entry_price','mark_price','unrealized_pnl')}
-                             for p in session.get('positions', [])]
-                with self.lock:
-                    market_row = self.db.execute('''SELECT close,vix FROM market_minutes
-                        WHERE market=? AND day=? AND ts<=? ORDER BY ts DESC LIMIT 1''',
-                        (market, day, now.isoformat())).fetchone()
-                spot, vix = market_row if market_row else (None, None)
+                # The intraday chart needs only P&L and leg count. Repeating
+                # every leg's option premiums on each tick wastes disk space.
+                leg_count = len(session.get('positions', []))
                 with self.lock, self.db:
                     self.db.execute('''INSERT OR REPLACE INTO strategy_ticks VALUES
                         (?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                         (strategy_id, now.isoformat(), day, session['state'],
                          float(session['net_pnl']), float(session['realized_pnl']),
                          float(session['unrealized_pnl']), float(session['capital']),
-                         int(session['multiplier']), len(positions), spot, vix,
-                         json.dumps(compact_signal, separators=(',',':'), default=str),
-                         json.dumps(positions, separators=(',',':'), default=str)))
+                         int(session['multiplier']), leg_count, None, None,
+                         None, None))
                     for trade in session.get('trades', []):
                         ts = str(trade.get('timestamp') or now.isoformat())
                         payload = json.dumps([strategy_id, ts, trade.get('symbol'),

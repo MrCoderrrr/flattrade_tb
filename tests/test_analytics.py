@@ -90,6 +90,10 @@ class PaperAuditTests(unittest.TestCase):
                 controller.analytics.update_strategy_days()
                 detail=controller.analytics.detail('nfv2',current[0].strftime('%Y-%m'))
                 self.assertEqual(len(detail['curve']),2)
+                stored=controller.analytics.db.execute(
+                    'SELECT spot,vix,signal,positions FROM strategy_ticks WHERE strategy_id=? LIMIT 1',
+                    ('nfv2',)).fetchone()
+                self.assertEqual(stored,(None,None,None,None))
                 self.assertEqual(len(detail['daily']),1)
                 self.assertEqual(detail['daily'][0]['entries'],1)
                 self.assertEqual(len(detail['trades']),6)
