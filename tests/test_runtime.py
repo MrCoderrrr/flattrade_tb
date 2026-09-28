@@ -12,7 +12,8 @@ from unittest.mock import patch
 
 from strategy_lab.market_data import FeedError, FlattradeReadOnly, parse_quote
 from strategy_lab.runtime import Controller
-from test_strategies import nifty_fixture
+from strategy_lab.strategies import build_plan
+from test_strategies import nifty_fixture, mcx_fixture
 
 
 class Feed:
@@ -65,17 +66,24 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(s["realized_pnl"], 0)
         self.assertLessEqual(s["max_loss"], 2000)
 
-    def test_multiplier_exit_closes_all_units_and_accounts_roundtrip_costs(self):
+    def test_multiplier_stop_closes_shorts_then_releases_hedges_at_cutoff(self):
         s = self.start(2, 400000)
         self.assertEqual({p["quantity"] for p in s["positions"]}, {130})
         entry_cost = s["costs"]
         self.c.stop("NIFTY")
         self.c.tick()
         s = self.c.status()["sessions"]["NIFTY"]
-        self.assertFalse(s["positions"])
+        self.assertEqual([p["side"] for p in s["positions"]], ["BUY", "BUY"])
+        self.assertEqual(s["state"], "HEDGE_HOLD")
         self.assertEqual({t["quantity"] for t in s["trades"]}, {130})
-        self.assertEqual([t["side"] for t in s["trades"][4:]], ["BUY", "BUY", "SELL", "SELL"])
+        self.assertEqual([t["side"] for t in s["trades"][4:]], ["BUY", "BUY"])
         self.assertGreater(s["costs"], entry_cost)
+        self.now = self.now.replace(hour=15, minute=33)
+        self.feed.quotes = [replace(q, timestamp=self.now) for q in self.quotes]
+        self.c.tick()
+        s = self.c.status()["sessions"]["NIFTY"]
+        self.assertFalse(s["positions"])
+        self.assertEqual([t["side"] for t in s["trades"][6:]], ["SELL", "SELL"])
         self.assertAlmostEqual(s["net_pnl"], s["realized_pnl"]-s["costs"], places=3)
 
     def test_stale_stop_keeps_exposure_and_then_flattens_on_fresh_data(self):
@@ -89,7 +97,40 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(s["valuation_stale"])
         self.feed.quotes = [replace(q, timestamp=self.now) for q in self.quotes]
         self.c.tick()
-        self.assertFalse(self.c.status()["sessions"]["NIFTY"]["positions"])
+        self.assertEqual([p['side'] for p in self.c.status()["sessions"]["NIFTY"]["positions"]], ['BUY','BUY'])
+
+    def test_held_hedges_are_reused_without_duplicate_buy_fills(self):
+        self.start()
+        s = self.c.data['sessions']['NIFTY']
+        s.update(exit_requested=True, reason='Test signal exit')
+        self.c.tick()
+        self.assertEqual([p['side'] for p in s['positions']], ['BUY','BUY'])
+        original_buys = sum(t['side'] == 'BUY' and t['reason'] == 'ENTRY' for t in s['trades'])
+        plan = build_plan('NIFTY', self.bars, self.quotes, self.now, 1, 200000)
+        self.assertIsNotNone(plan)
+        with self.c.lock:
+            self.c._enter('NIFTY', s, plan, self.now)
+        self.assertEqual(s['entries'], 2)
+        self.assertEqual([p['side'] for p in s['positions']], ['BUY','BUY','SELL','SELL'])
+        self.assertEqual(sum(t['side'] == 'BUY' and t['reason'] == 'ENTRY' for t in s['trades']), original_buys)
+
+    def test_mcx_v2_early_flatten_retains_hedge_until_2323(self):
+        self.feed.bars, self.feed.quotes, self.now = mcx_fixture()
+        self.c.start('MCX', 'paper', 1, 200000, strategy_id='mcxv2')
+        self.c.tick()
+        s = self.c.status()['sessions']['MCX']
+        self.assertEqual([p['side'] for p in s['positions']], ['BUY','SELL'])
+        self.now = self.now.replace(hour=23, minute=15)
+        self.feed.quotes = [replace(q, timestamp=self.now) for q in self.feed.quotes]
+        self.c.tick()
+        s = self.c.status()['sessions']['MCX']
+        self.assertEqual([p['side'] for p in s['positions']], ['BUY'])
+        self.assertEqual(s['state'], 'HEDGE_HOLD')
+        self.assertFalse(any(t['side'] == 'SELL' and t['reason'] != 'ENTRY' for t in s['trades']))
+        self.now = self.now.replace(hour=23, minute=23)
+        self.feed.quotes = [replace(q, timestamp=self.now) for q in self.feed.quotes]
+        self.c.tick()
+        self.assertFalse(self.c.status()['sessions']['MCX']['positions'])
 
     def test_insufficient_exit_depth_does_not_fabricate_a_fill(self):
         self.start()
@@ -109,7 +150,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(s["entries"], 1)
         self.assertEqual(len(s["positions"]), 4)
         self.c.tick()
-        self.assertFalse(self.c.status()["sessions"]["NIFTY"]["positions"])
+        self.assertEqual([p['side'] for p in self.c.status()["sessions"]["NIFTY"]["positions"]], ['BUY','BUY'])
 
     def test_emergency_stop_lock_survives_restart(self):
         self.start()
@@ -117,7 +158,7 @@ class RuntimeTests(unittest.TestCase):
         self.c.tick()
         self.c.shutdown()
         self.c = Controller(Path(self.temp.name), feed=self.feed, clock=lambda: self.now)
-        with self.assertRaisesRegex(ValueError, "Risk limit"):
+        with self.assertRaisesRegex(ValueError, "Stop and flatten"):
             self.c.start("NIFTY", "paper", 1, 200000)
 
     def test_capital_cannot_be_changed_to_reset_limits(self):
@@ -154,7 +195,7 @@ class RuntimeTests(unittest.TestCase):
 
     def test_daily_cutoff_flattens_and_does_not_reenter(self):
         self.start()
-        self.now = self.now.replace(hour=15, minute=30)
+        self.now = self.now.replace(hour=15, minute=33)
         self.feed.quotes = [replace(q, timestamp=self.now) for q in self.quotes]
         self.c.tick()
         self.assertFalse(self.c.status()["sessions"]["NIFTY"]["positions"])
@@ -204,6 +245,9 @@ class RuntimeTests(unittest.TestCase):
     def test_completed_day_rollup_does_not_double_count_pnl(self):
         self.start()
         self.c.stop("NIFTY")
+        self.c.tick()
+        self.now = self.now.replace(hour=15, minute=33)
+        self.feed.quotes = [replace(q, timestamp=self.now) for q in self.quotes]
         self.c.tick()
         expected = self.c.status()["account"]["daily_pnl"]
         self.now += timedelta(days=1)
@@ -257,6 +301,9 @@ class RuntimeTests(unittest.TestCase):
     def test_scheduled_stop_preserves_today_pnl_and_capital_is_fixed(self):
         self.start()
         self.c.stop('NIFTY')
+        self.c.tick()
+        self.now = self.now.replace(hour=15, minute=33)
+        self.feed.quotes = [replace(q, timestamp=self.now) for q in self.quotes]
         self.c.tick()
         pnl = self.c.status()['account']['daily_pnl']
         self.now = self.now.replace(hour=21,minute=0)
@@ -354,6 +401,10 @@ class PauseTests(unittest.TestCase):
         self.start()
         self.c.pause('NIFTY',True)
         self.now=self.now.replace(hour=15,minute=30)
+        self.feed.quotes=[replace(q,timestamp=self.now) for q in self.quotes]
+        self.c.tick()
+        self.assertEqual([p['side'] for p in self.c.status()['sessions']['NIFTY']['positions']], ['BUY','BUY'])
+        self.now=self.now.replace(hour=15,minute=33)
         self.feed.quotes=[replace(q,timestamp=self.now) for q in self.quotes]
         self.c.tick()
         self.assertFalse(self.c.status()['sessions']['NIFTY']['positions'])

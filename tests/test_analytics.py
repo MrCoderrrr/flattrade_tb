@@ -92,7 +92,8 @@ class PaperAuditTests(unittest.TestCase):
                 self.assertEqual(len(detail['curve']),2)
                 self.assertEqual(len(detail['daily']),1)
                 self.assertEqual(detail['daily'][0]['entries'],1)
-                self.assertGreaterEqual(len(detail['trades']),8)
+                self.assertEqual(len(detail['trades']),6)
+                self.assertEqual([p['side'] for p in controller.children['nfv2'].status()['sessions']['NIFTY']['positions']], ['BUY','BUY'])
                 self.assertEqual(controller.analytics.summary()['leaders'],{})
             finally:
                 controller.shutdown()

@@ -117,9 +117,9 @@ class PatternV4Tests(unittest.TestCase):
                 feed.quotes = [replace(q, timestamp=clock[0]) for q in quotes]
                 c.tick()
                 session = c.status()['sessions']['NIFTY']
-                self.assertEqual(session['reason'], 'V4 underlying target')
-                self.assertFalse(session['positions'])
-                self.assertEqual(len(session['trades']), 4)
+                self.assertEqual(session['trades'][-1]['reason'], 'V4 underlying target')
+                self.assertEqual([p['side'] for p in session['positions']], ['BUY'])
+                self.assertEqual(len(session['trades']), 3)
             finally:
                 c.shutdown()
 
@@ -138,7 +138,7 @@ class PatternV4Tests(unittest.TestCase):
                                      session['underlying_stop']-1, 25010, 0, 1))
                 feed.quotes = [replace(q, timestamp=clock[0]) for q in quotes]
                 c.tick()
-                self.assertEqual(c.status()['sessions']['NIFTY']['reason'],
+                self.assertEqual(c.status()['sessions']['NIFTY']['trades'][-1]['reason'],
                                  'V4 underlying invalidation')
             finally:
                 c.shutdown()
@@ -156,7 +156,7 @@ class PatternV4Tests(unittest.TestCase):
                 feed.quotes = [replace(quotes[0], bid=92, ask=93, timestamp=clock[0]),
                                replace(quotes[1], timestamp=clock[0])]
                 c.tick()
-                self.assertFalse(c.status()['sessions']['NIFTY']['positions'])
+                self.assertEqual([p['side'] for p in c.status()['sessions']['NIFTY']['positions']], ['BUY'])
                 clock[0] = now+timedelta(seconds=64)
                 feed.quotes = [replace(q, timestamp=clock[0]) for q in quotes]
                 c.tick()

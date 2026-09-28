@@ -71,6 +71,6 @@ class LegacyV1PaperTests(unittest.TestCase):
                 self.assertTrue(all(row['simulated'] for row in session['trades']))
                 c.stop('NIFTY')
                 c.tick()
-                self.assertFalse(c.status()['sessions']['NIFTY']['positions'])
+                self.assertEqual([p['side'] for p in c.status()['sessions']['NIFTY']['positions']], ['BUY','BUY'])
             finally:
                 c.shutdown()

@@ -27,7 +27,7 @@ class ReplayTests(unittest.TestCase):
 
     def test_deadline_exits_and_missing_data_are_not_hidden(self):
         bars,quotes,now=nifty_fixture()
-        end=now.replace(hour=15,minute=30)
+        end=now.replace(hour=15,minute=33)
         result=run_replay([Snapshot(now,"NIFTY",bars,quotes),
                            Snapshot(end,"NIFTY",bars,[replace(q,timestamp=end) for q in quotes])])
         self.assertEqual(result["closed_trades"],1)
@@ -37,7 +37,7 @@ class ReplayTests(unittest.TestCase):
 
     def test_stale_quote_cannot_close_position_at_end(self):
         bars,quotes,now=nifty_fixture()
-        end=now.replace(hour=15,minute=30)
+        end=now.replace(hour=15,minute=33)
         result=run_replay([Snapshot(now,"NIFTY",bars,quotes),Snapshot(end,"NIFTY",bars,quotes)])
         self.assertEqual(result["fill_count"],4)
         self.assertTrue(result["unresolved_positions"])

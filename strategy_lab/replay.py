@@ -21,12 +21,13 @@ from tempfile import TemporaryDirectory
 
 from .market_data import FeedError
 from .models import Bar, Contract, IST, Quote
-from .runtime import Controller
+from .runtime import Controller, HEDGE_RELEASE
 from .catalog import SPECS
 
 
 ENTRY = {"NIFTY": time(9, 45), "MCX": time(16, 30)}
-DEADLINE = {"NIFTY": time(15, 30), "MCX": time(23, 15)}
+DEADLINE = {"NIFTY": time.fromisoformat(HEDGE_RELEASE["NIFTY"]),
+            "MCX": time.fromisoformat(HEDGE_RELEASE["MCX"])}
 
 
 class DataError(ValueError):
@@ -240,7 +241,9 @@ def run_replay(snapshots: list[Snapshot], *, capital=200_000, multiplier=1,
         spec = SPECS[strategy_id]
         active_markets = (spec.market,)
         entry = {spec.market: time.fromisoformat(spec.entry_start)}
-        deadline = {spec.market: time.fromisoformat(spec.flatten)}
+        deadline = {spec.market: max(time.fromisoformat(spec.flatten),
+                                    time.fromisoformat(HEDGE_RELEASE[spec.market]))
+                    if spec.id not in ('mcxv1', 'mcxv3') else time.fromisoformat(spec.flatten)}
         snapshots = [row for row in snapshots if row.market == spec.market]
         if not snapshots:
             raise DataError(f"No {spec.market} snapshots for {strategy_id}")

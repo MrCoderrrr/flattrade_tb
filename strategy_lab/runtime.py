@@ -51,6 +51,17 @@ def cost(price, quantity):
     return round(20 + price * quantity * 0.002, 4)
 
 
+# The configured paper sessions finish at 15:34 (NIFTY) and 23:24 (MCX).
+# Bought protection is retained through the preceding minute, including
+# manual stops, portfolio stops, and early version-specific flatten times.
+HEDGE_RELEASE = {"NIFTY": "15:33", "MCX": "23:23"}
+
+
+def hedge_release_reached(market, session_day, now):
+    return (not session_day or session_day != now.date().isoformat()
+            or now.weekday() >= 5 or now.strftime("%H:%M") >= HEDGE_RELEASE[market])
+
+
 def blank_session():
     return {"state": "STOPPED", "mode": None, "multiplier": 1, "capital": 200000,
             "date": None, "reason": "Choose a mode and start this session",
@@ -425,12 +436,23 @@ class Controller:
         spec = resolve(market, s.get('strategy_id'))
         naked = spec.id in ('mcxv1', 'mcxv3') and plan.strategy == spec.id and plan.max_loss is None and all(l.side == 'SELL' for l in plan.legs)
         limit = (spec.trade_risk_per_unit or 0)*s['multiplier']
-        if s["positions"] or (not naked and (plan.max_loss is None or plan.max_loss > limit)):
+        if any(p['side'] != 'BUY' for p in s['positions']) or (not naked and (plan.max_loss is None or plan.max_loss > limit)):
             raise ValueError("Invalid portfolio risk")
         if not naked and spec.version not in (1, 5) and plan.max_loss + self.data["account"]["drawdown"] >= .05*self.data["account"]["capital"]:
             s["reason"] = "Trade would exceed remaining portfolio drawdown budget"
             return
-        positions, fills, costs = [], [], 0.
+        held = list(s['positions'])
+        held_quotes = []
+        if held:
+            revision = self._revision
+            _, held_quotes = self._snapshot(market, now, [contract_from(p['contract']) for p in held])
+            now = self.clock().astimezone(IST)
+            if revision != self._revision or s['stop_requested'] or s['exit_requested'] or s['locked']:
+                raise FeedError('Control request changed during hedge refresh; entry discarded')
+            self._mark(s, held_quotes, now)
+        positions, risk_positions, fills, costs = list(held), [], [], 0.
+        reused = set()
+        reused_exit_cost = 0.
         # Validate entire synthetic basket before recording any fill.
         for leg in sorted(plan.legs, key=lambda leg: leg.side != "BUY"):
             q = leg.quote
@@ -442,26 +464,41 @@ class Controller:
             price = q.ask + q.contract.tick_size if leg.side == "BUY" else q.bid-q.contract.tick_size
             if price <= 0:
                 raise FeedError("Option premium cannot cover slippage")
+            existing = next((p for p in held if leg.side == 'BUY' and p['symbol'] == q.contract.symbol
+                             and p['quantity'] == qty and p['symbol'] not in reused), None)
+            if existing is not None:
+                reused.add(existing['symbol'])
+                risk_positions.append({**existing, 'entry_price': price})
+                reused_exit_cost += cost(existing['mark_price'], qty)
+                continue
             fee = cost(price, qty)
             costs += fee
-            positions.append({"symbol": q.contract.symbol, "contract": contract_dict(q.contract),
-                              "side": leg.side, "quantity": qty, "entry_price": price,
-                              "mark_price": price, "unrealized_pnl": 0.})
+            position = {"symbol": q.contract.symbol, "contract": contract_dict(q.contract),
+                        "side": leg.side, "quantity": qty, "entry_price": price,
+                        "mark_price": price, "unrealized_pnl": 0.}
+            positions.append(position)
+            risk_positions.append(position)
             fills.append({"timestamp": now.isoformat(), "symbol": q.contract.symbol,
                           "side": leg.side, "quantity": qty, "price": price, "cost": fee,
                           "mode": "paper", "reason": "ENTRY", "simulated": True})
+        held_by_symbol = {q.contract.symbol: q for q in held_quotes}
+        for existing in held:
+            if existing['symbol'] not in reused:
+                q = held_by_symbol[existing['symbol']]
+                risk_positions.append({**existing, 'entry_price': q.ask + q.contract.tick_size})
+                reused_exit_cost += cost(existing['mark_price'], existing['quantity'])
         # Recompute expiration payoff using executable fills, including one-tick
         # slippage and a reserve for both sides of the round trip.
-        strikes = sorted({p["contract"]["strike"] for p in positions})
+        strikes = sorted({p["contract"]["strike"] for p in risk_positions})
         payoffs = []
         for spot in [0.] + strikes + [max(strikes)*2]:
             payoff = 0.
-            for p in positions:
+            for p in risk_positions:
                 c = p["contract"]
                 intrinsic = max(0., spot-c["strike"]) if c["option_type"] in ("C", "CE", "CALL") else max(0., c["strike"]-spot)
                 payoff += (intrinsic-p["entry_price"])*p["quantity"]*(1 if p["side"] == "BUY" else -1)
             payoffs.append(payoff)
-        actual_risk = max(0., -min(payoffs)) + costs*2
+        actual_risk = max(0., -min(payoffs)) + costs*2 + reused_exit_cost
         if naked:
             actual_risk = None  # A stop trigger does not cap naked-option loss.
         if not naked and actual_risk > limit:
@@ -494,7 +531,7 @@ class Controller:
                     p.update(best_mark=p['entry_price'], leg_stop=None, trail_armed=False)
         s["costs"] += costs
         s["trades"].extend(fills)
-        self._mark(s, [leg.quote for leg in plan.legs], now)
+        self._mark(s, [leg.quote for leg in plan.legs] + held_quotes, now)
         self._event(f"{market}: simulated {plan.strategy} entry; {len(positions)} legs")
 
     def _close_mcx_leg(self, s, position, quotes, now, reason):
@@ -829,9 +866,11 @@ class Controller:
 
     def _exit(self, market, s, quotes, now):
         self._mark(s, quotes, now)
-        # In a live executor shorts MUST close before protective longs. Paper
-        # preserves that ledger ordering; it does not claim real basket fills.
-        for p in sorted(s["positions"], key=lambda p: p["side"] != "SELL"):
+        release_hedges = hedge_release_reached(market, s.get("date"), now)
+        # A risk, stop, or signal exit may close shorts now. Bought protection
+        # stays in the paper ledger until the market's penultimate minute.
+        closing = [p for p in s["positions"] if p["side"] == "SELL" or release_hedges]
+        for p in sorted(closing, key=lambda p: p["side"] != "SELL"):
             fee = cost(p["mark_price"], p["quantity"])
             s["costs"] += fee
             s["realized_pnl"] += p["unrealized_pnl"]
@@ -839,10 +878,24 @@ class Controller:
                                 "side": "BUY" if p["side"] == "SELL" else "SELL",
                                 "quantity": p["quantity"], "price": p["mark_price"], "cost": fee,
                                 "mode": "paper", "reason": s["reason"], "simulated": True})
-        s.update(positions=[], unrealized_pnl=0., estimated_exit_costs=0., exit_requested=False,
-                 last_exit=now.isoformat(), state="STOPPED" if s["stop_requested"] or s["locked"] else "COOLDOWN")
-        s["net_pnl"] = round(s["realized_pnl"]-s["costs"], 4)
-        self._event(f"{market}: paper positions flat; session net ₹{s['net_pnl']:.2f}")
+        s["positions"] = [p for p in s["positions"] if p not in closing]
+        s["exit_requested"] = False
+        if closing:
+            s["last_exit"] = now.isoformat()
+        if s["positions"]:
+            self._mark(s, quotes, now)
+            s["state"] = ("HEDGE_HOLD" if s["stop_requested"] or s["locked"] or
+                          now.strftime("%H:%M") >= resolve(market, s.get("strategy_id")).flatten
+                          else "COOLDOWN")
+            s["reason"] = (f"Protective buys held until {HEDGE_RELEASE[market]} IST; "
+                           "short exposure closed")
+            if closing:
+                self._event(f"{market}: paper shorts flat; protective buys retained")
+        else:
+            s.update(unrealized_pnl=0., estimated_exit_costs=0.,
+                     state="STOPPED" if s["stop_requested"] or s["locked"] else "COOLDOWN")
+            s["net_pnl"] = round(s["realized_pnl"]-s["costs"], 4)
+            self._event(f"{market}: paper positions flat; session net ₹{s['net_pnl']:.2f}")
 
     def _activate_schedules(self, now):
         for market, planned in list(self.data['schedules'].items()):
@@ -904,7 +957,15 @@ class Controller:
                         s["state"] = "SESSION_COMPLETE"
                         continue
                 try:
-                    if s["positions"]:
+                    release_due = (any(p["side"] == "BUY" for p in s["positions"])
+                                   and hedge_release_reached(market, s.get("date"), now))
+                    if release_due and not ended:
+                        s.update(stop_requested=True, exit_requested=True,
+                                 reason="Protective hedge release cutoff reached")
+                    shorts_open = any(p["side"] == "SELL" for p in s["positions"])
+                    if (s["positions"] and (shorts_open or ended or release_due or
+                                             s["stop_requested"] or s["exit_requested"] or
+                                             s["locked"] or s["state"] == "RECOVERY_REQUIRED")):
                         bars, quotes = self._snapshot(market, now, [contract_from(p["contract"]) for p in s["positions"]])
                         self._mark(s, quotes, self.clock().astimezone(IST))
                         trade_net = (s["net_pnl"] - s.get("cycle_start_net", 0.)) if spec.id == "mcxv3" else s["unrealized_pnl"] - s["trade_costs"] - s["estimated_exit_costs"]
@@ -951,9 +1012,17 @@ class Controller:
                         if s["exit_requested"]:
                             self._exit(market, s, quotes, self.clock().astimezone(IST))
                         continue
+                    if s["positions"]:
+                        # Long-only protection survives a prior short exit. Keep
+                        # marking it while allowing the next paper short cycle.
+                        _, held_quotes = self._snapshot(
+                            market, now, [contract_from(p["contract"]) for p in s["positions"]])
+                        self._mark(s, held_quotes, self.clock().astimezone(IST))
                     self._account()
                     if s["locked"] or self.data["account"]["halted"]:
-                        s.update(state="STOPPED", reason="Risk lock active")
+                        s.update(state="HEDGE_HOLD" if s["positions"] else "STOPPED",
+                                 reason="Risk lock active; protective buys held until cutoff"
+                                 if s["positions"] else "Risk lock active")
                         continue
                     if s.get("paused"):
                         s["reason"] = "New entries paused; open positions remain managed"

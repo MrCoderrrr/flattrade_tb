@@ -66,14 +66,14 @@ function renderStrategies(){
     const flowDetails=owns&&id==='nfv5'?' · '+(s.v5_state||'WAITING')+' · flow '+(s.signal?.eligible?Number(s.signal.score).toFixed(1):'waiting'):'';
     text(card.querySelector('.namecol .desc'),(spec.description||'')+patternDetails+flowDetails);
     const working=scheduled||(owns&&!['STOPPED','SESSION_COMPLETE'].includes(s.state)&&!s.stop_requested),archived=spec.enabled===false;
-    const sw=$('toggle-'+id),inp=$('mult-'+id),paper=$('paper-'+id);sw.checked=working;sw.disabled=archived||busy||(owns&&s.state==='EXIT_PENDING');inp.disabled=archived||working||busy;paper.disabled=archived||working||busy;
+    const sw=$('toggle-'+id),inp=$('mult-'+id),paper=$('paper-'+id);sw.checked=working;sw.disabled=archived||busy||(owns&&['EXIT_PENDING','HEDGE_HOLD'].includes(s.state));inp.disabled=archived||working||busy;paper.disabled=archived||working||busy;
     if(working)paper.checked=(scheduled?planned.mode:s.mode)!=='live';
     const badge=card.querySelector('.name span');if(!badge)card.querySelector('.name').append(node('span','',archived?'ARCHIVED':'PAPER'));else text(badge,archived?'ARCHIVED':'PAPER');
     if((owns||scheduled)&&document.activeElement!==inp)inp.value=String(scheduled?planned.multiplier:s.multiplier||1);
     const pnl=card.querySelector('.pnlcol .metricval'),capital=s.capital||status.account?.configured_capital;
     text(pnl,owns?signed(s.net_pnl)+' · '+percent(s.net_pnl,capital):'—');color(pnl,owns?s.net_pnl:0);
     text(card.querySelector('.feedcol .metricval'),scheduled?'Scheduled '+planned.scheduled_for:owns?(s.state||'—')+(s.pattern?' · '+s.pattern:'')+(id==='nfv5'&&s.v5_state?' · '+s.v5_state:''):'Idle');
-    text(card.querySelector('.switchcol small'),archived?'Legacy':scheduled?'Scheduled':owns?(s.stop_requested?'Exit pending':s.state||'Idle'):'Off');
+    text(card.querySelector('.switchcol small'),archived?'Legacy':scheduled?'Scheduled':owns?(s.state==='HEDGE_HOLD'?'Hedge held':s.stop_requested?'Exit pending':s.state||'Idle'):'Off');
     card.title=scheduled?'Starts '+planned.scheduled_for+' at '+spec.entry_start+' IST':owns?(s.pattern?'Pattern '+s.pattern+' · score '+s.pattern_score+' · stop '+s.underlying_stop+' · target '+s.underlying_target+' · '+(s.reason||''):(s.reason||'')):archived?'This version is archived in the current controller':'';
     }
   }
