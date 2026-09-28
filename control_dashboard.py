@@ -353,9 +353,6 @@ class ControlHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/chain":
                 self._json(200, self.server.chain.snapshot() if self.server.chain else
                            {"ready":False,"reason":"Read-only option-chain stream is unavailable","rows":[]}, head_only)
-            elif self.path == "/api/ml":
-                self._json(200, self.server.ml.status() if self.server.ml else
-                           {"available":False,"reason":"ML research service is unavailable"}, head_only)
             elif self.path == "/api/auth/status":
                 self._json(200, self.server.broker_auth.status() if self.server.broker_auth else
                            {"configured":False,"token_present":False,"saved_today":False}, head_only)
@@ -509,13 +506,6 @@ def main(argv: list[str] | None = None) -> int:
         controller.attach_nifty_observer(observer)
         observer.start()
         broker_auth = BrokerTokenSync(args.root.resolve())
-        try:
-            from strategy_lab.ml_research import MLResearch
-            ml = MLResearch(args.root.resolve(), chain=chain)
-            ml.start()
-        except Exception as exc:
-            print(f"ML research unavailable: {type(exc).__name__}", flush=True)
-            ml = None
         server = create_server(controller, host=args.host, port=args.port, token=token,
                                allowed_host=args.allowed_host, pin=pin, chain=chain, ml=ml,
                                broker_auth=broker_auth)

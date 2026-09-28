@@ -100,7 +100,7 @@ class Controller:
         self.nifty_stream = None
         self.nifty_observer = None
         self.v5_flow_history = []
-        self.record_market_data = feed is None
+        self.record_market_data = False  # Keep trade ledgers, not raw option-book snapshots.
         self._revision = 0
         self.db = sqlite3.connect(self.directory / "ledger.sqlite3", check_same_thread=False)
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -425,6 +425,10 @@ class Controller:
             price = q.ask + q.contract.tick_size if closing_buy else max(q.contract.tick_size, q.bid-q.contract.tick_size)
             pnl = (price-p["entry_price"]) * p["quantity"] * (1 if p["side"] == "BUY" else -1)
             p.update(mark_price=price, unrealized_pnl=round(pnl, 4))
+            if p["side"] == "BUY":
+                p["best_mark"] = max(p.get("best_mark", p["entry_price"]), price)
+            else:
+                p["best_mark"] = min(p.get("best_mark", p["entry_price"]), price)
             total += pnl
             exit_costs += cost(price, p["quantity"])
         s["unrealized_pnl"] = round(total, 4)
