@@ -37,6 +37,10 @@ class MultiRuntimeTests(unittest.TestCase):
         self.assertFalse(after['sessions']['nfv3']['stop_requested'])
         self.assertEqual(after['paper_capital_basis'], 400000)
 
+    def test_chain_tracks_v1_expiry_when_v5_is_flat(self):
+        self.controller.children['nfv1'].nifty_position_expiry = lambda: '2026-10-06'
+        self.assertEqual(self.controller.nifty_position_expiry(), '2026-10-06')
+
     def test_scheduled_sessions_survive_restart_and_cancel_separately(self):
         self.now += timedelta(hours=13)
         self.controller.start('NIFTY', 'paper', 1, 200000, strategy_id='nfv2')

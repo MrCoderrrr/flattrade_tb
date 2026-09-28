@@ -187,7 +187,13 @@ class MultiController:
         return sorted(set(strikes))
 
     def nifty_position_expiry(self):
-        return self.children['nfv5'].nifty_position_expiry() or self.legacy.nifty_position_expiry()
+        # The option-chain recorder must follow any active NIFTY strategy,
+        # including v1/v3 when v5 has not opened a position yet.
+        for sid in ('nfv5', 'nfv1', 'nfv2', 'nfv3', 'nfv4'):
+            expiry = self.children[sid].nifty_position_expiry()
+            if expiry:
+                return expiry
+        return self.legacy.nifty_position_expiry()
 
     def start_worker(self):
         self.analytics.start()
