@@ -8,6 +8,23 @@ from strategy_lab.models import Bar, Contract, IST
 
 
 class MarketDataRecoveryTests(unittest.TestCase):
+    def test_mcx_atm_versions_request_only_one_pair(self):
+        with tempfile.TemporaryDirectory() as root:
+            feed = FlattradeReadOnly(Path(root))
+            now = datetime(2026, 9, 28, 16, 40, tzinfo=IST)
+            feed.bars = lambda *_: [Bar(now, 300, 301, 299, 300, 100, 1)]
+            contracts = [Contract(f'NATURALGAS23OCT26{kind}{strike}', f'{kind}{strike}',
+                                  'MCX', date(2026, 10, 23), strike, kind, 1250, .05)
+                         for strike in (295, 300, 305) for kind in ('CE', 'PE')]
+            feed.contracts = lambda *_: contracts
+            requested = []
+            feed.quotes = lambda rows, *_args, **_kwargs: requested.extend(rows) or []
+            for strategy_id in ('mcxv1', 'mcxv3'):
+                feed.snapshot('MCX', now, strategy_id=strategy_id)
+                self.assertEqual({c.symbol for c in requested},
+                                 {'NATURALGAS23OCT26CE300', 'NATURALGAS23OCT26PE300'})
+                requested.clear()
+
     def test_bad_entry_contract_does_not_discard_other_fresh_quotes(self):
         with tempfile.TemporaryDirectory() as root:
             feed = FlattradeReadOnly(Path(root))

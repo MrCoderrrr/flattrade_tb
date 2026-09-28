@@ -275,6 +275,18 @@ class FlattradeReadOnly:
             return bars, []
         expiry = min(c.expiry for c in contracts)
         contracts = [c for c in contracts if c.expiry == expiry]
+        if market == "MCX" and strategy_id in ("mcxv1", "mcxv3"):
+            # Both active MCX versions open at one common ATM strike. Fetching
+            # the surrounding 14 strikes issued 28 quote calls per worker and
+            # repeatedly exhausted the broker's quote endpoint.
+            calls = {c.strike for c in contracts if c.option_type == "CE"}
+            puts = {c.strike for c in contracts if c.option_type == "PE"}
+            common = calls & puts
+            if not common:
+                return bars, []
+            atm = min(common, key=lambda strike: abs(strike - spot))
+            selected = [c for c in contracts if c.strike == atm]
+            return bars, self.quotes(selected, now, strict=False)
         strikes = sorted({c.strike for c in contracts}, key=lambda k: abs(k-spot))[:(1 if strategy_id == "nfv5" else 14)]
         if strategy_id in ("nfv1", "nfv5"):
             # These paper baskets use wings at least 1000 points from ATM.
