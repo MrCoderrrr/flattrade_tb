@@ -84,7 +84,7 @@ class Controller:
             raise RuntimeError("Another strategy controller is already running") from None
         self.lock = threading.RLock()
         self.clock = clock or (lambda: datetime.now(IST))
-        self.feed = feed or FlattradeReadOnly(self.root)
+        self.feed = feed or FlattradeReadOnly(self.root, auto_refresh=True)
         self.nifty_stream = None
         self.nifty_observer = None
         self.v5_flow_history = []

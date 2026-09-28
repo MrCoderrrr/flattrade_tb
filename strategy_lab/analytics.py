@@ -76,7 +76,7 @@ class AnalyticsStore:
         self.root = Path(root)
         self.controller = controller
         self.clock = clock or (lambda: datetime.now(IST))
-        self.feed = feed or FlattradeReadOnly(self.root)
+        self.feed = feed or FlattradeReadOnly(self.root, auto_refresh=True)
         directory = self.root / 'data' / 'strategy_lab'
         directory.mkdir(parents=True, exist_ok=True)
         self.path = directory / 'analytics.sqlite3'

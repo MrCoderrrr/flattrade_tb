@@ -4,6 +4,7 @@ import unittest
 import io
 import json
 import os
+import zipfile
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
@@ -299,6 +300,31 @@ class DataTests(unittest.TestCase):
             parse_quote(quotes[0].contract,row)
         row["ft"] = str(int(now.timestamp()))
         self.assertEqual(parse_quote(quotes[0].contract,row).timestamp,now)
+
+    def test_time_only_ltt_uses_broker_date_but_not_broker_time(self):
+        _, quotes, now = nifty_fixture()
+        row = {"bp1":30,"sp1":31,"lp":30.5,"bq1":100,"sq1":100,
+               "ltt":"10:11:02","request_time":"10:11:04 22-09-2026"}
+        parsed = parse_quote(quotes[0].contract,row)
+        self.assertEqual(parsed.timestamp,now.replace(hour=10,minute=11,second=2))
+        row["request_time"] = "bad"
+        with self.assertRaisesRegex(FeedError,"broker date"):
+            parse_quote(quotes[0].contract,row)
+
+    def test_daily_master_auto_refresh_validates_before_atomic_save(self):
+        with tempfile.TemporaryDirectory() as root:
+            _, _, now = nifty_fixture()
+            lines = ["Symbol,Token,TradingSymbol,Expiry,StrikePrice,OptionType,LotSize,TickSize"]
+            for i in range(25):
+                lines.append(f"NIFTY,{1000+i},NIFTYTEST{i},29-Sep-2026,{25000+i*50},CE,65,0.05")
+            archive = io.BytesIO()
+            with zipfile.ZipFile(archive,"w") as zipped:
+                zipped.writestr("NFO_symbols.txt","\n".join(lines)+"\n")
+            feed = FlattradeReadOnly(Path(root), auto_refresh=True)
+            with patch('strategy_lab.market_data.urlopen',return_value=io.BytesIO(archive.getvalue())):
+                contracts = feed.contracts('NIFTY',now)
+            self.assertEqual(len(contracts),25)
+            self.assertTrue(Path(root,f'NFO_symbols_{now.date()}.csv').is_file())
 
     def test_stale_symbol_master_is_rejected(self):
         with tempfile.TemporaryDirectory() as root:

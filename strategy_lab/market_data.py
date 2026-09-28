@@ -6,9 +6,13 @@ LTP for the order book or receipt time for a missing exchange timestamp.
 from __future__ import annotations
 
 import csv
+import io
 import json
 import math
 import os
+import tempfile
+import threading
+import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote_plus
@@ -20,6 +24,10 @@ from .models import Bar, Contract, Quote, IST
 
 class FeedError(RuntimeError):
     pass
+
+
+_master_lock = threading.Lock()
+_master_attempts = {}
 
 
 def number(value):
@@ -46,7 +54,20 @@ def exchange_time(value):
 def parse_quote(contract, row):
     # ft is an exchange feed timestamp. request_time is only a REST response time.
     stamp = row.get("ft") or row.get("ltt")
-    quote = Quote(contract, exchange_time(stamp), number(row["bp1"]),
+    if isinstance(stamp, str) and len(stamp) == 8 and stamp[2] == stamp[5] == ":":
+        # PiConnect often sends ltt as HH:MM:SS. Use the broker response only
+        # for its calendar date, never as a substitute for the trade time.
+        try:
+            received = datetime.strptime(row["request_time"], "%H:%M:%S %d-%m-%Y").replace(tzinfo=IST)
+            traded = datetime.combine(received.date(), datetime.strptime(stamp, "%H:%M:%S").time(), IST)
+        except (KeyError, TypeError, ValueError):
+            raise FeedError("Time-only quote has no broker date") from None
+        if traded > received:
+            traded -= timedelta(days=1)
+        timestamp = traded
+    else:
+        timestamp = exchange_time(stamp)
+    quote = Quote(contract, timestamp, number(row["bp1"]),
                   number(row["sp1"]), number(row["lp"]),
                   int(row.get("bq1", 0)), int(row.get("sq1", 0)))
     if quote.bid <= 0 or quote.ask < quote.bid or quote.last <= 0:
@@ -58,10 +79,55 @@ class FlattradeReadOnly:
     BASE = "https://piconnect.flattrade.in/PiConnectAPI/"
     ALLOWED = {"GetQuotes", "TPSeries", "GetSecurityInfo", "GetOptionChain"}
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, auto_refresh: bool = False):
         self.root = Path(root)
+        self.auto_refresh = auto_refresh
         self._bars_cache = {}
         self._contracts_cache = {}
+
+    def _refresh_master(self, exchange, underlying, now):
+        target = self.root / f"{exchange}_symbols_{now.date().isoformat()}.csv"
+        with _master_lock:
+            if target.is_file():
+                return
+            key = (str(self.root.resolve()), exchange, now.date())
+            last = _master_attempts.get(key)
+            if last is not None and (now-last).total_seconds() < 300:
+                raise FeedError(f"Refresh {exchange} symbol master for {now.date().isoformat()}; stale tokens blocked")
+            _master_attempts[key] = now
+            try:
+                with urlopen(f"https://api.shoonya.com/{exchange}_symbols.txt.zip", timeout=15) as response:
+                    raw = response.read(25_000_001)
+                if len(raw) > 25_000_000:
+                    raise ValueError("Oversized symbol archive")
+                with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                    name = next((name for name in archive.namelist()
+                                 if name.endswith(f"{exchange}_symbols.txt")), None)
+                    if name is None or archive.getinfo(name).file_size > 80_000_000:
+                        raise ValueError("Invalid symbol archive")
+                    body = archive.read(name)
+                rows = csv.DictReader(io.StringIO(body.decode("utf-8-sig")))
+                required = {"Symbol", "Token", "TradingSymbol", "Expiry", "StrikePrice",
+                            "OptionType", "LotSize", "TickSize"}
+                if not required.issubset(rows.fieldnames or []):
+                    raise ValueError("Invalid symbol columns")
+                eligible = sum(1 for row in rows if row.get("Symbol") == underlying
+                               and row.get("OptionType") in {"CE", "PE"}
+                               and str(row.get("Token", "")).isdigit())
+                if eligible < 20:
+                    raise ValueError("Insufficient current contracts")
+                fd, temporary = tempfile.mkstemp(prefix=f".{exchange}-master-", dir=self.root)
+                try:
+                    with os.fdopen(fd, "wb") as handle:
+                        handle.write(body)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(temporary, target)
+                finally:
+                    if os.path.exists(temporary):
+                        os.unlink(temporary)
+            except (OSError, ValueError, UnicodeError, zipfile.BadZipFile):
+                raise FeedError(f"Refresh {exchange} symbol master for {now.date().isoformat()}; stale tokens blocked") from None
 
     def _call(self, endpoint, **fields):
         if endpoint not in self.ALLOWED:
@@ -96,6 +162,9 @@ class FlattradeReadOnly:
         if key in self._contracts_cache:
             return self._contracts_cache[key]
         files = sorted(self.root.glob(f"{exchange}_symbols_*.csv"), reverse=True)
+        if self.auto_refresh and (not files or now.date().isoformat() not in files[0].name):
+            self._refresh_master(exchange, underlying, now)
+            files = sorted(self.root.glob(f"{exchange}_symbols_*.csv"), reverse=True)
         if not files:
             raise FeedError(f"Missing {exchange} symbol master")
         # Token mappings can change. The master must be refreshed for this session.
