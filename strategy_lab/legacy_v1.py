@@ -11,7 +11,8 @@ from math import isfinite
 from .active_v3 import _kama
 from .catalog import resolve
 from .models import Bar, IST, Leg, Plan
-from .strategies import _option_type, _valid_quote
+from .nifty_flow import _adx
+from .strategies import _ema, _option_type, _valid_quote
 
 
 def explain_signal(market, bars, now):
@@ -62,16 +63,22 @@ def explain_signal(market, bars, now):
     slope = kama[-1]-kama[-2]
     threshold = .15 if market == "NIFTY" else .02
     direction = 1 if slope >= threshold else -1 if slope <= -threshold else 0
+    ema8, ema21 = _ema(closes, 8)[-1], _ema(closes, 21)[-1]
+    adx = _adx(today, 7)
+    opening = 0
     if market == "NIFTY":
         from .opening_trend import opening_drive
-        drive = opening_drive(bars, now)
-        if drive and direction == -drive:
-            result["reason"] = "Opening EMA/KAMA/ADX drive opposes this new short leg"
-            return result
+        opening = opening_drive(bars, now)
     result.update(eligible=True, direction=direction,
                   reason=f"V1 paper ATM entry; KAMA({period},3,30) slope {slope:+.3f}",
-                  indicators={"close": closes[-1], "kama_slope": slope,
+                  indicators={"close": closes[-1], "kama": kama[-1],
+                              "kama_slope": slope, "kama_threshold": threshold,
+                              "ema8": ema8, "ema21": ema21, "adx7_1m": adx,
+                              "opening_drive": opening,
                               "last_bar_open": recent[-1].timestamp.isoformat()})
+    if opening and direction == -opening:
+        result.update(eligible=False, direction=0,
+                      reason="Opening EMA/KAMA/ADX drive opposes this new short leg")
     return result
 
 

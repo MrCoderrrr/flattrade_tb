@@ -19,6 +19,9 @@ class LegacyV1PaperTests(unittest.TestCase):
                    quote('NIFTY', 26050, 'CE', 5.5, 6, now)]
         signal = explain_signal('NIFTY', bars, now)
         self.assertTrue(signal['eligible'])
+        self.assertTrue({'kama', 'kama_slope', 'kama_threshold', 'ema8',
+                         'ema21', 'adx7_1m', 'opening_drive', 'close',
+                         'last_bar_open'} <= signal['indicators'].keys())
         plan = build_plan('NIFTY', bars, quotes, now, 1, 200000)
         self.assertEqual(plan.strategy, 'nfv1')
         self.assertEqual([leg.side for leg in plan.legs], ['BUY', 'BUY', 'SELL', 'SELL'])
