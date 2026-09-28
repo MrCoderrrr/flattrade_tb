@@ -6,6 +6,7 @@ are intentionally untouched. Run only with an explicit day and backup path.
 
 import argparse
 import fcntl
+import gzip
 import json
 import sqlite3
 from datetime import date
@@ -14,10 +15,13 @@ from pathlib import Path
 from strategy_lab.runtime import MARKETS, blank_session
 
 
-def backup(db, destination):
+def backup_rows(db, destination, tables, day):
+    """Save exactly the rows this reset may remove; ledgers contain huge books."""
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(destination) as archived:
-        db.backup(archived)
+    with gzip.open(destination, "wt", encoding="utf-8") as archived:
+        for table, query in tables.items():
+            for row in db.execute(query, (day,) if "?" in query else ()):
+                archived.write(json.dumps({"table": table, "row": row}) + "\n")
 
 
 def reset_ledger(path, day, backup_path):
@@ -29,7 +33,11 @@ def reset_ledger(path, day, backup_path):
             raise RuntimeError(f"Controller still owns {path}; stop the service first") from None
         db = sqlite3.connect(path)
         try:
-            backup(db, backup_path)
+            backup_rows(db, backup_path, {
+                "state": "SELECT * FROM state",
+                "journal": "SELECT * FROM journal WHERE substr(timestamp,1,10)=?",
+                "strategy_daily": "SELECT * FROM strategy_daily WHERE day=?",
+            }, day)
             row = db.execute("SELECT payload FROM state WHERE id=1").fetchone()
             if row:
                 state = json.loads(row[0])
@@ -61,7 +69,10 @@ def reset_ledger(path, day, backup_path):
 
 def reset_analytics(path, day, backup_path):
     with sqlite3.connect(path) as db:
-        backup(db, backup_path)
+        backup_rows(db, backup_path, {
+            table: f"SELECT * FROM {table} WHERE day=?"
+            for table in ("strategy_ticks", "strategy_trades", "strategy_days")
+        }, day)
         with db:
             for table in ("strategy_ticks", "strategy_trades", "strategy_days"):
                 db.execute(f"DELETE FROM {table} WHERE day=?", (day,))
@@ -80,11 +91,11 @@ def main():
     for path in ledgers:
         if path.is_file():
             name = "legacy" if path == ledgers[0] else path.parent.name
-            reset_ledger(path, args.day, args.backup_dir / f"{name}-ledger.sqlite3")
+            reset_ledger(path, args.day, args.backup_dir / f"{name}-removed.jsonl.gz")
             print(f"cleared paper strategy day in {name}")
     analytics = data / "analytics.sqlite3"
     if analytics.is_file():
-        reset_analytics(analytics, args.day, args.backup_dir / "analytics.sqlite3")
+        reset_analytics(analytics, args.day, args.backup_dir / "analytics-removed.jsonl.gz")
         print("cleared today's strategy analytics; market data retained")
 
 
