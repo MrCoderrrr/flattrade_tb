@@ -1068,6 +1068,10 @@ class Controller:
                             s['reason'] = 'Flow is balanced; protected ATM basket lacks fresh depth or risk capacity'
                         continue
                     bars, quotes = self._snapshot(market, now)
+                    if s["state"] == "DATA_WAIT":
+                        # A recovered broker read resumes the same paper
+                        # session; it never consumes a fresh authorization.
+                        s["state"] = "ARMED"
                     fresh_now = self.clock().astimezone(IST)
                     if not bars or (fresh_now-(bars[-1].timestamp+timedelta(minutes=spec.bar_minutes))).total_seconds() > (90 if spec.version in (1, 3, 4) else 360):
                         raise FeedError("Completed underlying bars are missing or stale")
@@ -1087,13 +1091,15 @@ class Controller:
                         s["reason"] = "Signal qualifies; no liquid spread meets contract, premium and risk requirements"
                 except FeedError as exc:
                     s["reason"] = str(exc)
+                    s["feed_error_count"] = s.get("feed_error_count", 0) + 1
+                    s["last_feed_error_at"] = self.clock().astimezone(IST).isoformat()
                     if s["positions"]:
-                        s["feed_error_count"] = s.get("feed_error_count", 0) + 1
-                        s["last_feed_error_at"] = self.clock().astimezone(IST).isoformat()
                         # A failed data read is not a trading signal. Preserve
                         # the existing basket and retry; explicit stops and
                         # risk exits remain pending for fresh executable quotes.
                         s["state"] = "EXIT_PENDING" if s["exit_requested"] else "DATA_WAIT"
+                    else:
+                        s["state"] = "DATA_WAIT"
                 except Exception:
                     s.update(reason="Engine validation error; new entries halted, inspect local diagnostics", locked=True)
                     if s["positions"]:

@@ -115,6 +115,11 @@ def explain_signal(market, bars, now):
              (1 if rsi >= 52 else -1 if rsi <= 48 else 0),
              (1 if closes[-1] > anchor+.05*atr else -1 if closes[-1] < anchor-.05*atr else 0)]
     direction = 1 if votes.count(1) >= 2 else -1 if votes.count(-1) >= 2 else 0
+    from .opening_trend import opening_drive
+    drive = opening_drive(bars, now)
+    if drive and direction == -drive:
+        result["reason"] = "Opening EMA/KAMA/ADX drive opposes this new short leg"
+        return result
     return {"eligible": True, "direction": direction,
             "reason": {1:"Bullish indicator vote: sell put premium",-1:"Bearish indicator vote: sell call premium",0:"Balanced indicators: sell both near-ATM sides"}[direction],
             "indicators": {"close":closes[-1],"ema9":ema9,"ema21":ema21,"rsi14":round(rsi,2),"atr14":atr,

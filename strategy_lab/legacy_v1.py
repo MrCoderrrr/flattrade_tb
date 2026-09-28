@@ -62,6 +62,12 @@ def explain_signal(market, bars, now):
     slope = kama[-1]-kama[-2]
     threshold = .15 if market == "NIFTY" else .02
     direction = 1 if slope >= threshold else -1 if slope <= -threshold else 0
+    if market == "NIFTY":
+        from .opening_trend import opening_drive
+        drive = opening_drive(bars, now)
+        if drive and direction == -drive:
+            result["reason"] = "Opening EMA/KAMA/ADX drive opposes this new short leg"
+            return result
     result.update(eligible=True, direction=direction,
                   reason=f"V1 paper ATM entry; KAMA({period},3,30) slope {slope:+.3f}",
                   indicators={"close": closes[-1], "kama_slope": slope,

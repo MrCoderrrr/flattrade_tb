@@ -228,6 +228,10 @@ def explain_signal(market, bars, now):
     if not ranked or ranked[0][0] < .70:
         return _reject("No clear pattern with at least 1.5:1 underlying target-to-stop room", indicators, matches)
     score, best = ranked[0]
+    from .opening_trend import opening_drive
+    drive = opening_drive(bars, now)
+    if drive and best.direction == -drive:
+        return _reject("Opening EMA/KAMA/ADX drive opposes this pattern", indicators, matches)
     if any(c.direction != best.direction and score-other_score <= .08 for other_score, c in ranked[1:]):
         return _reject("Opposing patterns have similar scores", indicators, matches)
     risk = abs(best.entry-best.stop)
