@@ -233,8 +233,9 @@ class FlattradeReadOnly:
         self._bars_cache = {bucket: bars}
         return bars
 
-    def quotes(self, contracts, now):
+    def quotes(self, contracts, now, *, strict=True):
         result = []
+        last_error = None
         for contract in contracts:
             try:
                 data = self._call("GetQuotes", exch=contract.exchange, token=contract.token)
@@ -242,7 +243,15 @@ class FlattradeReadOnly:
                     raise FeedError("Broker contract metadata differs from symbol master")
                 result.append(parse_quote(contract, data))
             except (KeyError, ValueError):
-                raise FeedError("Broker returned incomplete depth data") from None
+                last_error = FeedError("Broker returned incomplete depth data")
+                if strict:
+                    raise last_error from None
+            except FeedError as exc:
+                last_error = exc
+                if strict:
+                    raise
+        if contracts and not result and last_error is not None:
+            raise last_error
         return result
 
     def snapshot(self, market, now, held=(), strategy_id=None, spot_override=None):
@@ -258,6 +267,10 @@ class FlattradeReadOnly:
         bars = self.bars(market, now, interval)
         if not bars:
             return bars, []
+        if strategy_id in ("nfv2", "mcxv2"):
+            from .strategies import explain_signal
+            if not explain_signal(market, bars, now)["eligible"]:
+                return bars, []
         spot = spot_override if (strategy_id == 'nfv5' and isinstance(spot_override,(int,float))
                                  and math.isfinite(spot_override) and spot_override > 0) else bars[-1].close
         if strategy_id == "nfv4":
@@ -281,7 +294,7 @@ class FlattradeReadOnly:
                     key=lambda strike: abs(abs(short-strike)-100))
                 selected_strikes.update(wings[:2])
             selected = [c for c in contracts if c.strike in selected_strikes]
-            return bars, self.quotes(selected, now)
+            return bars, self.quotes(selected, now, strict=False)
         contracts = [c for c in self.contracts(market, now) if c.option_type in {"CE", "PE"}
                      and (c.expiry-now.date()).days >= 2]
         if not contracts:
@@ -303,4 +316,4 @@ class FlattradeReadOnly:
                     (strategy_id != "nfv5" or c.strike == atm or
                      (c.strike > atm and c.option_type == 'CE') or
                      (c.strike < atm and c.option_type == 'PE'))]
-        return bars, self.quotes(selected, now)
+        return bars, self.quotes(selected, now, strict=False)

@@ -68,7 +68,7 @@ class PatternV4Tests(unittest.TestCase):
         feed.bars = lambda market, stamp, interval: bars
         feed.contracts = lambda market, stamp: [q.contract for q in quotes]
         requested = []
-        def read_quotes(contracts, stamp):
+        def read_quotes(contracts, stamp, *, strict=True):
             requested.extend(contracts)
             return [q for q in quotes if q.contract in contracts]
         feed.quotes = read_quotes
