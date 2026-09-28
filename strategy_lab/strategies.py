@@ -202,7 +202,8 @@ def _valid_quote(quote: Quote, market: str, now: datetime) -> bool:
         return False
     if not isinstance(contract.expiry, date) or isinstance(contract.expiry, datetime):
         return False
-    if contract.expiry <= _next_weekday(now.astimezone(IST).date()) or not _option_type(contract):
+    if (contract.expiry < now.astimezone(IST).date() if market == "NIFTY"
+            else contract.expiry <= _next_weekday(now.astimezone(IST).date())) or not _option_type(contract):
         return False
     if not isinstance(contract.symbol, str) or not isinstance(contract.token, str) or not contract.token.strip():
         return False

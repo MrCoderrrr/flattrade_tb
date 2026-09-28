@@ -177,7 +177,7 @@ class FlattradeReadOnly:
                     continue
                 try:
                     expiry = datetime.strptime(row["Expiry"], "%d-%b-%Y").date()
-                    if expiry <= now.date():
+                    if expiry < now.date() or (market != "NIFTY" and expiry == now.date()):
                         continue
                     contract = Contract(row["TradingSymbol"], str(row["Token"]), exchange,
                                         expiry, number(row["StrikePrice"]), row["OptionType"],
@@ -281,7 +281,7 @@ class FlattradeReadOnly:
                 return bars, []
             option = 'PE' if signal['direction'] > 0 else 'CE'
             contracts = [c for c in self.contracts(market, now)
-                         if _option_type(c) == option and (c.expiry-now.date()).days >= 2]
+                         if _option_type(c) == option and c.expiry >= now.date()]
             if not contracts:
                 return bars, []
             expiry = min(c.expiry for c in contracts)
@@ -296,7 +296,7 @@ class FlattradeReadOnly:
             selected = [c for c in contracts if c.strike in selected_strikes]
             return bars, self.quotes(selected, now, strict=False)
         contracts = [c for c in self.contracts(market, now) if c.option_type in {"CE", "PE"}
-                     and (c.expiry-now.date()).days >= 2]
+                     and (c.expiry >= now.date() if market == "NIFTY" else (c.expiry-now.date()).days >= 2)]
         if not contracts:
             return bars, []
         expiry = min(c.expiry for c in contracts)

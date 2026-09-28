@@ -86,7 +86,7 @@ class OptionChainTests(unittest.TestCase):
         self.assertIn('NFO|201',stream.selected)
         self.assertNotIn('NFO|101',stream.selected)
 
-    def test_unheld_chain_defaults_to_strategy_eligible_expiry(self):
+    def test_unheld_chain_defaults_to_nearest_expiry(self):
         now=datetime(2026,9,28,9,20,tzinfo=IST)
         class Stream:
             thread=None
@@ -102,8 +102,9 @@ class OptionChainTests(unittest.TestCase):
                            date(2026,10,6):{(25000.,'CE'):('201','NIFTY2')}}
         view.contracts=view.all_expiries[view.expiry]
         view.refresh()
-        self.assertEqual(view.expiry,date(2026,10,6))
-        self.assertIn('NFO|201',stream.selected)
+        self.assertEqual(view.expiry,date(2026,9,29))
+        self.assertIn('NFO|101',stream.selected)
+        self.assertNotIn('NFO|201',stream.selected)
 
     def test_expiry_day_contracts_remain_observable_for_research(self):
         content = ('Symbol,OptionType,Expiry,StrikePrice,Token,TradingSymbol\n'

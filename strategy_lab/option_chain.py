@@ -137,11 +137,9 @@ class OptionChainView:
                 self.reason = 'Current NFO contract master is unavailable'
                 return
             requested = self.preferred_expiry()
-            # Strategy entries require at least two calendar days to expiry.
-            # Observe that same expiry before any strategy opens, or the
-            # second-by-second archive records the wrong option chain.
-            eligible = [day for day in self.all_expiries if (day-now.date()).days >= 2]
-            default = min(eligible) if eligible else min(self.all_expiries)
+            # Default to the nearest listed expiry; a held contract can pin
+            # the view to its own expiry until it is closed.
+            default = min(self.all_expiries)
             chosen = next((day for day in self.all_expiries if day.isoformat()==requested),
                           default)
             if chosen != self.expiry:

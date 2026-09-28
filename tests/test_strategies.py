@@ -174,11 +174,13 @@ class ConstructionTests(unittest.TestCase):
                          replace(quotes[1].contract, symbol="BANKNIFTY29SEP26P24900")):
             self.assertIsNone(build_plan("NIFTY", bars, [quotes[0], replace(quotes[1], contract=contract)] + quotes[2:], now, 1, 200_000))
 
-    def test_expiry_day_and_expiry_eve_are_excluded(self):
+    def test_nearest_nifty_expiry_is_accepted_and_expired_is_rejected(self):
         bars, quotes, now = nifty_fixture()
         for expiry in (DAY, DAY + timedelta(days=1)):
             near = [replace(q, contract=replace(q.contract, expiry=expiry)) for q in quotes]
-            self.assertIsNone(build_plan("NIFTY", bars, near, now, 1, 200_000))
+            self.assertIsNotNone(build_plan("NIFTY", bars, near, now, 1, 200_000))
+        expired = [replace(q, contract=replace(q.contract, expiry=DAY-timedelta(days=1))) for q in quotes]
+        self.assertIsNone(build_plan("NIFTY", bars, expired, now, 1, 200_000))
 
     def test_quotes_must_be_fresh_liquid_and_well_formed(self):
         bars, quotes, now = nifty_fixture()
