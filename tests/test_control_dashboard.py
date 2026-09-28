@@ -30,10 +30,10 @@ class FakeController:
                 "account": {"daily_pnl": 0, "capital": 200000, "halted": False},
                 "sessions": {}, "events": []}
 
-    def start(self, market, mode, multiplier, capital, confirmation=""):
+    def start(self, market, mode, multiplier, capital, confirmation="", strategy_id=None):
         if self.fail:
             raise RuntimeError("secret-broker-token-must-not-leak")
-        self.calls.append(("start", market, mode, multiplier, capital, confirmation))
+        self.calls.append(("start", market, mode, multiplier, capital, confirmation, strategy_id))
         return {"state": "waiting", "mode": mode}
 
     def stop(self, market, strategy_id=None):
@@ -96,11 +96,14 @@ class DashboardHTTPTests(unittest.TestCase):
         self.assertIn("script-src 'self'", headers["Content-Security-Policy"])
         self.assertIn(b'<script src="/dashboard.js" defer></script>', body)
         self.assertIn(b'id="v1-variables-section"', body)
+        self.assertIn(b'Strategy variables', body)
+        self.assertIn(b'Best premium', body)
         status, headers, body = self.request("GET", "/dashboard.js", authorized=False)
         self.assertEqual(status, 200)
         self.assertIn("text/javascript", headers["Content-Type"])
         self.assertIn(b"submitLogin", body)
         self.assertIn(b"renderV1Variables", body)
+        self.assertIn(b"premiumStop", body)
 
     def test_status_and_all_mutations_require_authentication(self):
         for method, path, payload in [("GET", "/api/status", None),
@@ -238,7 +241,16 @@ class DashboardHTTPTests(unittest.TestCase):
     def test_explicit_paper_start_dispatches_once(self):
         status, _, _ = self.request("POST", "/api/start", self.start_payload())
         self.assertEqual(status, 200)
-        self.assertEqual(self.controller.calls, [("start", "NIFTY", "paper", 1, 200000, "")])
+        self.assertEqual(self.controller.calls, [("start", "NIFTY", "paper", 1, 200000, "", "nfv3")])
+
+    def test_retired_versions_cannot_start_from_dashboard_api(self):
+        for market, strategy_id in (("NIFTY", "nfv2"), ("NIFTY", "nfv4"), ("MCX", "mcxv2")):
+            with self.subTest(strategy_id=strategy_id):
+                status, _, body = self.request("POST", "/api/start",
+                                               self.start_payload(market=market, strategy_id=strategy_id))
+                self.assertEqual(status, 400)
+                self.assertIn(b"retired", body)
+        self.assertEqual(self.controller.calls, [])
 
     def test_stop_targets_one_strategy(self):
         status, _, _ = self.request("POST", "/api/stop",
@@ -276,7 +288,7 @@ class DashboardHTTPTests(unittest.TestCase):
         status, _, _ = self.request("POST", "/api/start", self.start_payload(mode="live", pin='7000'))
         self.assertEqual(status, 200)
         # PIN authorization cannot bypass the controller's live-executor gate.
-        self.assertEqual(self.controller.calls[-1], ("start", "NIFTY", "live", 1, 200000, f"LIVE NIFTY {today}"))
+        self.assertEqual(self.controller.calls[-1], ("start", "NIFTY", "live", 1, 200000, f"LIVE NIFTY {today}", "nfv3"))
 
     def test_settings_change_requires_valid_fields_and_pin_for_live_permission(self):
         self.assertEqual(self.request('POST','/api/settings',{'capital':400000})[0],200)

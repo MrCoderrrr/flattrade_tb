@@ -30,6 +30,10 @@ SPECS = {
     "mcxv3": StrategySpec("mcxv3", "MCX", 3, "ATM straddle · KAMA(10,3,30) / EMA trend · leg stops", "16:05", "23:22", "23:24", 1, 24, 60, 6000, None),
 }
 
+# Retired versions remain addressable for historical journals and replay, but
+# are no longer offered for new dashboard sessions.
+ARCHIVED_IDS = frozenset({"nfv2", "nfv4", "mcxv2"})
+
 
 def resolve(market, strategy_id=None):
     name = strategy_id or ("nfv2" if market == "NIFTY" else "mcxv2")
@@ -39,4 +43,5 @@ def resolve(market, strategy_id=None):
 
 
 def catalog():
-    return [asdict(spec) for spec in SPECS.values()]
+    return [{**asdict(spec), "available": spec.id not in ARCHIVED_IDS}
+            for spec in SPECS.values()]
