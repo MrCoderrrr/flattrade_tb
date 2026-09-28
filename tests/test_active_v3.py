@@ -79,6 +79,35 @@ class ActiveTests(unittest.TestCase):
                     c.start('MCX','paper',1,200000,strategy_id='mcxv2')
             finally:c.shutdown()
 
+    def test_bearish_call_spread_survives_temporary_quote_failure(self):
+        bars, quotes, now = fixture('NIFTY', -1)
+        clock = [now]
+        feed = Feed(bars, quotes)
+        with tempfile.TemporaryDirectory() as root:
+            c = Controller(Path(root), feed=feed, clock=lambda: clock[0])
+            try:
+                c.start('NIFTY', 'paper', 1, 200000, strategy_id='nfv3')
+                c.tick()
+                session = c.status()['sessions']['NIFTY']
+                self.assertEqual([p['contract']['option_type'] for p in session['positions']], ['CE', 'CE'])
+                self.assertEqual(len(session['trades']), 2)
+                clock[0] += timedelta(seconds=2)
+                feed.error = True
+                c.tick()
+                session = c.status()['sessions']['NIFTY']
+                self.assertEqual(session['state'], 'DATA_WAIT')
+                self.assertEqual(len(session['positions']), 2)
+                self.assertEqual(len(session['trades']), 2)
+                feed.error = False
+                feed.quotes = [replace(q, timestamp=clock[0]) for q in quotes]
+                c.tick()
+                session = c.status()['sessions']['NIFTY']
+                self.assertEqual(session['state'], 'RUNNING')
+                self.assertEqual(len(session['positions']), 2)
+                self.assertEqual(len(session['trades']), 2)
+            finally:
+                c.shutdown()
+
     def test_mcx_kama_impulse_closes_one_leg_then_reenters_on_reversal(self):
         bars, quotes, now = fixture('MCX', 1)
         clock = [now]

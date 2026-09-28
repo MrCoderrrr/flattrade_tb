@@ -69,7 +69,8 @@ def blank_session():
             "positions": [], "trades": [], "feed_timestamp": None,
             "entries": 0, "last_exit": None, "stop_loss": 0., "take_profit": 0.,
             "trade_costs": 0., "exit_requested": False, "stop_requested": False,
-            "locked": False, "last_signal_bar": None}
+            "locked": False, "last_signal_bar": None,
+            "feed_error_count": 0, "last_feed_error_at": None}
 
 
 def next_session_date(now, spec):
@@ -968,6 +969,8 @@ class Controller:
                                              s["locked"] or s["state"] == "RECOVERY_REQUIRED")):
                         bars, quotes = self._snapshot(market, now, [contract_from(p["contract"]) for p in s["positions"]])
                         self._mark(s, quotes, self.clock().astimezone(IST))
+                        if s["state"] == "DATA_WAIT" and not s["exit_requested"]:
+                            s.update(state="RUNNING", reason="Market data recovered; managing paper positions")
                         trade_net = (s["net_pnl"] - s.get("cycle_start_net", 0.)) if spec.id == "mcxv3" else s["unrealized_pnl"] - s["trade_costs"] - s["estimated_exit_costs"]
                         signal = {}
                         if spec.id == 'nfv5':
@@ -1018,6 +1021,8 @@ class Controller:
                         _, held_quotes = self._snapshot(
                             market, now, [contract_from(p["contract"]) for p in s["positions"]])
                         self._mark(s, held_quotes, self.clock().astimezone(IST))
+                        if s["state"] == "DATA_WAIT":
+                            s.update(state="COOLDOWN", reason="Market data recovered; protective buys retained")
                     self._account()
                     if s["locked"] or self.data["account"]["halted"]:
                         s.update(state="HEDGE_HOLD" if s["positions"] else "STOPPED",
@@ -1083,8 +1088,12 @@ class Controller:
                 except FeedError as exc:
                     s["reason"] = str(exc)
                     if s["positions"]:
-                        s["exit_requested"] = True
-                        s["state"] = "EXIT_PENDING"
+                        s["feed_error_count"] = s.get("feed_error_count", 0) + 1
+                        s["last_feed_error_at"] = self.clock().astimezone(IST).isoformat()
+                        # A failed data read is not a trading signal. Preserve
+                        # the existing basket and retry; explicit stops and
+                        # risk exits remain pending for fresh executable quotes.
+                        s["state"] = "EXIT_PENDING" if s["exit_requested"] else "DATA_WAIT"
                 except Exception:
                     s.update(reason="Engine validation error; new entries halted, inspect local diagnostics", locked=True)
                     if s["positions"]:

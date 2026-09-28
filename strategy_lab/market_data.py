@@ -149,7 +149,7 @@ class FlattradeReadOnly:
         except HTTPError as exc:
             if exc.code == 401:
                 raise FeedError("Flattrade session expired; refresh the broker login token") from None
-            raise FeedError(f"Flattrade market data returned HTTP {exc.code}") from None
+            raise FeedError(f"Flattrade {endpoint} returned HTTP {exc.code}") from None
         except Exception:
             raise FeedError("Flattrade market data request failed; check connectivity/session") from None
         if isinstance(result, dict) and result.get("stat") != "Ok":

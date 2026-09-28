@@ -99,6 +99,26 @@ class RuntimeTests(unittest.TestCase):
         self.c.tick()
         self.assertEqual([p['side'] for p in self.c.status()["sessions"]["NIFTY"]["positions"]], ['BUY','BUY'])
 
+    def test_transient_feed_failure_does_not_force_a_paper_exit(self):
+        self.start()
+        self.now += timedelta(seconds=2)
+        self.feed.error = True
+        self.c.tick()
+        s = self.c.status()['sessions']['NIFTY']
+        self.assertEqual(s['state'], 'DATA_WAIT')
+        self.assertEqual(s['feed_error_count'], 1)
+        self.assertFalse(s['exit_requested'])
+        self.assertEqual(len(s['positions']), 4)
+        self.assertEqual(len(s['trades']), 4)
+        self.feed.error = False
+        self.feed.quotes = [replace(q, timestamp=self.now) for q in self.quotes]
+        self.c.tick()
+        s = self.c.status()['sessions']['NIFTY']
+        self.assertEqual(s['state'], 'RUNNING')
+        self.assertFalse(s['exit_requested'])
+        self.assertEqual(len(s['positions']), 4)
+        self.assertEqual(len(s['trades']), 4)
+
     def test_held_hedges_are_reused_without_duplicate_buy_fills(self):
         self.start()
         s = self.c.data['sessions']['NIFTY']
