@@ -49,6 +49,11 @@ def explain_signal(market, bars, now):
         if stamp + timedelta(minutes=1) > now:
             continue
         if stamp.second or stamp.microsecond:
+            # PiConnect occasionally includes an off-grid bar from an older
+            # session. It cannot affect the current 60-bar indicator window.
+            if stamp.date() < now.date():
+                continue
+            result["reason"] = "Off-grid one-minute bar in current session"
             return result
         if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and isfinite(v) and v > 0
                    for v in (bar.open, bar.high, bar.low, bar.close)):

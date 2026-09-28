@@ -3,11 +3,20 @@ import unittest
 from datetime import date, datetime
 from pathlib import Path
 
-from strategy_lab.market_data import FeedError, FlattradeReadOnly
+from strategy_lab.market_data import FeedError, FlattradeReadOnly, parse_quote
 from strategy_lab.models import Bar, Contract, IST
 
 
 class MarketDataRecoveryTests(unittest.TestCase):
+    def test_mcx_depth_lots_are_converted_to_trading_units(self):
+        contract = Contract('NATURALGAS23OCT26CE300', '1', 'MCX',
+                            date(2026, 10, 23), 300, 'CE', 1250, .05)
+        now = datetime(2026, 9, 28, 17, 0, tzinfo=IST)
+        row = {'bp1': '17.00', 'sp1': '17.05', 'lp': '17.00',
+               'bq1': '2', 'sq1': '3', 'ft': str(int(now.timestamp()))}
+        quote = parse_quote(contract, row)
+        self.assertEqual((quote.bid_size, quote.ask_size), (2500, 3750))
+
     def test_mcx_atm_versions_request_only_one_pair(self):
         with tempfile.TemporaryDirectory() as root:
             feed = FlattradeReadOnly(Path(root))

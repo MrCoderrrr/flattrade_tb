@@ -67,9 +67,14 @@ def parse_quote(contract, row):
         timestamp = traded
     else:
         timestamp = exchange_time(stamp)
+    # MCX depth is quoted in lots while order quantity and P&L use trading
+    # units. The exchange's Natural Gas option chain labels bid/ask quantity
+    # as lots; convert it before comparing with the symbol-master lot size.
+    depth_unit = contract.lot_size if contract.exchange == "MCX" else 1
     quote = Quote(contract, timestamp, number(row["bp1"]),
                   number(row["sp1"]), number(row["lp"]),
-                  int(row.get("bq1", 0)), int(row.get("sq1", 0)))
+                  int(row.get("bq1", 0)) * depth_unit,
+                  int(row.get("sq1", 0)) * depth_unit)
     if quote.bid <= 0 or quote.ask < quote.bid or quote.last <= 0:
         raise FeedError("Empty or crossed order book")
     return quote

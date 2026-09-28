@@ -28,6 +28,12 @@ def fixture(market='NIFTY', direction=1):
 
 
 class ActiveTests(unittest.TestCase):
+    def test_old_off_grid_broker_bar_does_not_block_current_mcx_signal(self):
+        bars, _, now = fixture('MCX')
+        old = bars[0]
+        bars.insert(0, replace(old, timestamp=old.timestamp-timedelta(days=2, seconds=-3)))
+        self.assertTrue(explain_signal('MCX', bars, now)['eligible'])
+
     def test_early_warmup_and_no_lookahead(self):
         bars, quotes, now = fixture()
         expected = explain_signal('NIFTY', bars, now)
