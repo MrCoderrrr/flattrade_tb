@@ -118,11 +118,18 @@ class Controller:
         self.data['account'].setdefault('configured_capital',float(self.data['account']['capital']))
         self.data['account'].setdefault('live_permission',False)
         self.data.setdefault('schedules', {})
+        today = self.clock().astimezone(IST).date().isoformat()
         for session in self.data["sessions"].values():
             session.pop('flow_history',None)  # Prior releases stored oversized per-second histories.
             if session["positions"]:
-                session.update(state="RECOVERY_REQUIRED", exit_requested=True, stop_requested=True,
-                               reason="Recovered paper positions; fresh quotes required to flatten")
+                if (session.get("mode") == "paper" and session.get("date") == today
+                        and not session.get("stop_requested") and not session.get("exit_requested")
+                        and not session.get("locked")):
+                    session.update(state="DATA_WAIT",
+                                   reason="Recovered paper positions; awaiting fresh quotes")
+                else:
+                    session.update(state="RECOVERY_REQUIRED", exit_requested=True, stop_requested=True,
+                                   reason="Recovered paper positions; fresh quotes required to flatten")
             else:
                 session.update(state="STOPPED", reason="Session authorization expires on restart")
         self._stop = threading.Event()
@@ -1126,8 +1133,14 @@ class Controller:
                 raise RuntimeError("Market-data worker is still finishing; keep controller running")
         with self.lock:
             for s in self.data["sessions"].values():
-                s.update(state="RECOVERY_REQUIRED" if s["positions"] else "STOPPED", stop_requested=True,
-                         exit_requested=bool(s["positions"]))
+                if (s["positions"] and s.get("mode") == "paper"
+                        and s.get("date") == self.clock().astimezone(IST).date().isoformat()
+                        and not s.get("stop_requested") and not s.get("exit_requested")
+                        and not s.get("locked")):
+                    s.update(state="DATA_WAIT", reason="Paper worker restarting; awaiting fresh quotes")
+                else:
+                    s.update(state="RECOVERY_REQUIRED" if s["positions"] else "STOPPED",
+                             stop_requested=True, exit_requested=bool(s["positions"]))
             self._save()
             self.db.close()
             fcntl.flock(self._file, fcntl.LOCK_UN)

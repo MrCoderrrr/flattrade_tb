@@ -28,6 +28,23 @@ def fixture(market='NIFTY', direction=1):
 
 
 class ActiveTests(unittest.TestCase):
+    def test_same_day_paper_positions_resume_after_worker_restart(self):
+        bars, quotes, now = fixture('MCX')
+        with tempfile.TemporaryDirectory() as root:
+            first = Controller(Path(root), feed=Feed(bars, quotes), clock=lambda: now)
+            first.start('MCX', 'paper', 1, 200000, strategy_id='mcxv3')
+            first.tick()
+            self.assertEqual(len(first.status()['sessions']['MCX']['positions']), 2)
+            first.shutdown()
+            second = Controller(Path(root), feed=Feed(bars, quotes), clock=lambda: now)
+            try:
+                self.assertEqual(second.status()['sessions']['MCX']['state'], 'DATA_WAIT')
+                second.tick()
+                self.assertEqual(second.status()['sessions']['MCX']['state'], 'RUNNING')
+                self.assertEqual(len(second.status()['sessions']['MCX']['positions']), 2)
+            finally:
+                second.shutdown()
+
     def test_old_off_grid_broker_bar_does_not_block_current_mcx_signal(self):
         bars, _, now = fixture('MCX')
         old = bars[0]
