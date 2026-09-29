@@ -166,7 +166,11 @@ function renderDetailPositions(){
   text($('detail-open-count'),open.length+' open');
   const scheduled=status.schedules?.[detailStrategy];
   const current=matches.find(session=>session.positions.length)||matches[0];
-  text($('detail-open-state'),open.length?'Current paper session · '+(current?.state||'open'):
+  const entryFills=(current?.trades||[]).filter(fill=>fill.reason==='ENTRY'&&fill.side==='SELL');
+  const lastEntry=entryFills.at(-1)?.timestamp;
+  const entryLegs=lastEntry?entryFills.filter(fill=>fill.timestamp===lastEntry).length:0;
+  const origin=entryLegs===2?'Opened 2-leg ATM straddle at '+dateIST(lastEntry)+' · ':'';
+  text($('detail-open-state'),open.length?origin+open.length+' leg'+(open.length===1?' remains':'s open')+' · '+(current?.state||'open'):
     scheduled?'Paper session scheduled for '+scheduled.scheduled_for:
     current?(current.state||'Idle')+(current.reason?' · '+current.reason:''):'No paper session running');
   if(!open.length){const row=node('tr'),cell=node('td','empty','No open positions for this strategy.');cell.colSpan=8;row.append(cell);table.append(row);text($('detail-open-note'),scheduled?'Positions will appear here when its session starts.':'Open legs appear here as soon as a paper basket enters.')}else{
