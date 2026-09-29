@@ -1228,8 +1228,7 @@ class Controller:
                 spec = resolve(market, s.get('strategy_id'))
                 signal_fn = legacy_v1.explain_signal if spec.version == 1 else active_v3.explain_signal
                 plan_fn = legacy_v1.build_plan if spec.version == 1 else active_v3.build_plan
-                # Close positions before exchange close; NIFTY options close at 15:30.
-                deadline = min(spec.flatten, "15:29" if market == "NIFTY" else "23:24")
+                deadline = spec.flatten
                 ended = s["date"] != now.date().isoformat() or now.strftime("%H:%M") >= deadline or now.weekday() >= 5
                 if ended:
                     s.update(stop_requested=True, exit_requested=bool(s["positions"]),
