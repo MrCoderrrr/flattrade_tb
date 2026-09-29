@@ -28,6 +28,27 @@ def fixture(market='NIFTY', direction=1):
 
 
 class ActiveTests(unittest.TestCase):
+    def test_nifty_v3_restarts_straddle_after_both_shorts_exit(self):
+        bars, quotes, now = fixture('NIFTY', 0)
+        with tempfile.TemporaryDirectory() as root:
+            c = Controller(Path(root), feed=Feed(bars, quotes), clock=lambda: now)
+            try:
+                c.start('NIFTY', 'paper', 1, 200000, strategy_id='nfv3')
+                c.tick()
+                s = c.data['sessions']['NIFTY']
+                with c.lock:
+                    for p in list(s['positions']):
+                        if p['side'] == 'SELL':
+                            c._close_nifty_v3_leg(s, p, quotes, now, 'test stop')
+                self.assertEqual([p['side'] for p in s['positions']], ['BUY', 'BUY'])
+                c.tick()
+                self.assertEqual([p['side'] for p in s['positions']],
+                                 ['BUY', 'BUY', 'SELL', 'SELL'])
+                self.assertEqual(s['entries'], 2)
+                self.assertEqual(len([t for t in s['trades'] if t['side'] == 'BUY']), 4)
+            finally:
+                c.shutdown()
+
     def test_nifty_v3_cumulative_daily_loss_does_not_halt_paper_session(self):
         now = datetime(2026, 9, 29, 14, 30, tzinfo=IST)
         with tempfile.TemporaryDirectory() as root:

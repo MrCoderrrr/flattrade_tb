@@ -1131,6 +1131,7 @@ class Controller:
                         if s["exit_requested"]:
                             self._exit(market, s, quotes, self.clock().astimezone(IST))
                         continue
+                    long_only_v3 = False
                     if s["positions"]:
                         # Long-only protection survives a prior short exit. Keep
                         # marking it while allowing the next paper short cycle.
@@ -1139,11 +1140,13 @@ class Controller:
                         self._mark(s, held_quotes, self.clock().astimezone(IST))
                         if s["state"] == "DATA_WAIT":
                             s.update(state="COOLDOWN", reason="Market data recovered; protective buys retained")
-                        if spec.id == 'nfv3' and all(p['side'] == 'BUY' for p in s['positions']):
-                            # A new ATM strike would accumulate unrelated wings
-                            # and make the displayed basket risk/P&L misleading.
-                            s['reason'] = 'V3 protective wings retained; no new basket before release'
-                            continue
+                        long_only_v3 = (spec.id == 'nfv3' and
+                                        all(p['side'] == 'BUY' for p in s['positions']))
+                        if long_only_v3:
+                            # The previous shorts are gone. Start a fresh ATM
+                            # pair with 1000-point wings; matching wings are
+                            # reused, while older protection remains held.
+                            s['reason'] = 'V3 shorts flat; seeking a new protected ATM straddle'
                     self._account()
                     if s["locked"] or self.data["account"]["halted"]:
                         s.update(state="HEDGE_HOLD" if s["positions"] else "STOPPED",
@@ -1156,7 +1159,8 @@ class Controller:
                     if s["entries"] >= spec.max_entries:
                         s.update(state="STOPPED", reason="Session entry limit reached", locked=True)
                         continue
-                    if s["last_exit"] and (now-datetime.fromisoformat(s["last_exit"])).total_seconds() < spec.cooldown_seconds:
+                    if (not long_only_v3 and s["last_exit"] and
+                            (now-datetime.fromisoformat(s["last_exit"])).total_seconds() < spec.cooldown_seconds):
                         s.update(state="COOLDOWN", reason=f"{spec.cooldown_seconds}-second cooldown after exit")
                         continue
                     if market == "MCX" and spec.version == 2 and now.weekday() == 3:
