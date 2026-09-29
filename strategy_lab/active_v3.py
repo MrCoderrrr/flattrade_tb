@@ -127,7 +127,9 @@ def explain_signal(market, bars, now):
         # the initial protected straddle into a one-sided entry.
         direction = 0
     return {"eligible": True, "direction": direction,
-            "reason": {1:"Bullish indicator vote: sell put premium",-1:"Bearish indicator vote: sell call premium",0:"Balanced indicators: sell both near-ATM sides"}[direction],
+            "reason": {1:"Bullish indicators; protected ATM straddle, monitor call short",
+                       -1:"Bearish indicators; protected ATM straddle, monitor put short",
+                       0:"Balanced indicators; protected ATM straddle"}[direction],
             "indicators": {"close":closes[-1],"ema9":ema9,"ema21":ema21,"rsi14":round(rsi,2),"atr14":atr,
                            "anchor":anchor,"anchor_kind":"vwap" if volume else "mean_typical_price",
                            "votes":votes,"bar_minutes":1,"last_bar_open":recent[-1].timestamp.isoformat()}}
