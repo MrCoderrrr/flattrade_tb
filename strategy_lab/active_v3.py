@@ -139,7 +139,8 @@ def build_plan(market, bars, quotes, now, multiplier, capital):
     signal = explain_signal(market,bars,now)
     if not signal["eligible"]:
         return None
-    available = [q for q in quotes if _valid_quote(q,market,now)]
+    available = [q for q in quotes if _valid_quote(q,market,now) or
+                 (market == 'NIFTY' and _valid_quote(q,market,now,protective_wing=True))]
     if len({(q.contract.exchange,q.contract.token) for q in available}) != len(available):
         return None
     groups = {}
@@ -152,14 +153,17 @@ def build_plan(market, bars, quotes, now, multiplier, capital):
         chain=groups[group]; quantity=group[1]*multiplier
         shorts,hedges=[],[]
         common_strike = None
-        ce = {q.contract.strike for q in chain if _option_type(q.contract) == "CE" and q.bid_size >= quantity}
-        pe = {q.contract.strike for q in chain if _option_type(q.contract) == "PE" and q.bid_size >= quantity}
+        ce = {q.contract.strike for q in chain if _option_type(q.contract) == "CE"
+              and q.bid_size >= quantity and _valid_quote(q,market,now)}
+        pe = {q.contract.strike for q in chain if _option_type(q.contract) == "PE"
+              and q.bid_size >= quantity and _valid_quote(q,market,now)}
         if not ce.intersection(pe):
             continue
         common_strike = min(ce.intersection(pe), key=lambda strike:abs(strike-spot))
         for option in sides:
             candidates=[q for q in chain if _option_type(q.contract)==option and
-                        q.contract.strike == common_strike and q.bid_size >= quantity]
+                        q.contract.strike == common_strike and q.bid_size >= quantity
+                        and _valid_quote(q,market,now)]
             if not candidates:break
             short=min(candidates,key=lambda q:abs(q.contract.strike-spot))
             shorts.append(Leg(short,"SELL",quantity))

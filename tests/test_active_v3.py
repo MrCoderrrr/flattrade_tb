@@ -85,6 +85,15 @@ class ActiveTests(unittest.TestCase):
         self.assertEqual(len(plan.legs),4)
         self.assertIsNone(build_plan('NIFTY',bars,quotes[:2],now,1,200000))
 
+    def test_one_tick_far_wing_spread_is_accepted_only_for_protection(self):
+        bars, quotes, now = fixture('NIFTY', 0)
+        wings = [replace(q, bid=.10, ask=.15, last=.10) if q.contract.strike != quotes[0].contract.strike else q
+                 for q in quotes]
+        self.assertIsNotNone(build_plan('NIFTY', bars, wings, now, 1, 200000))
+        wide_short = [replace(q, bid=10., ask=12., last=10.) if q.contract.strike == quotes[0].contract.strike else q
+                      for q in wings]
+        self.assertIsNone(build_plan('NIFTY', bars, wide_short, now, 1, 200000))
+
     def test_stale_and_missing_history_rejected(self):
         bars,quotes,now=fixture()
         self.assertIsNone(build_plan('NIFTY',bars,[replace(q,timestamp=now-timedelta(seconds=11)) for q in quotes],now,1,200000))

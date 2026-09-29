@@ -39,7 +39,7 @@ def _option_type(contract: Contract) -> str:
         str(contract.option_type).upper(), "")
 
 
-def _valid_quote(quote: Quote, market: str, now: datetime) -> bool:
+def _valid_quote(quote: Quote, market: str, now: datetime, *, protective_wing: bool = False) -> bool:
     if not isinstance(quote, Quote) or not isinstance(quote.contract, Contract):
         return False
     contract = quote.contract
@@ -47,7 +47,10 @@ def _valid_quote(quote: Quote, market: str, now: datetime) -> bool:
         return False
     if not all(_finite_positive(value) for value in (quote.bid, quote.ask, quote.last, contract.strike, contract.tick_size)):
         return False
-    if quote.bid > quote.ask or (quote.ask - quote.bid) / ((quote.ask + quote.bid) / 2) > MAX_SPREAD_FRACTION:
+    spread = quote.ask - quote.bid
+    if quote.bid > quote.ask or (spread / ((quote.ask + quote.bid) / 2) > MAX_SPREAD_FRACTION
+                               and not (protective_wing and market == "NIFTY"
+                                        and spread <= 2*contract.tick_size + 1e-9)):
         return False
     # A stale LTP need not lie inside the current bid/ask; it is never a fill price.
     if not isinstance(contract.lot_size, int) or isinstance(contract.lot_size, bool) or contract.lot_size <= 0:
