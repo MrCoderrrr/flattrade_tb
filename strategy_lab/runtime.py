@@ -465,6 +465,15 @@ class Controller:
     def _enter(self, market, s, plan, now):
         spec = resolve(market, s.get('strategy_id'))
         naked = spec.id in ('mcxv1', 'mcxv3') and plan.strategy == spec.id and plan.max_loss is None and all(l.side == 'SELL' for l in plan.legs)
+        if market == 'MCX':
+            legs = list(plan.legs)
+            if (not naked or len(legs) != 2 or
+                    {_option_type(leg.quote.contract) for leg in legs} != {'CE', 'PE'} or
+                    len({(leg.quote.contract.exchange, leg.quote.contract.expiry,
+                          leg.quote.contract.strike, leg.quote.contract.lot_size,
+                          leg.quote.contract.symbol.upper().startswith('NATGASMINI'))
+                         for leg in legs}) != 1):
+                raise ValueError('MCX entry must sell one call and one put at the same strike, expiry and contract family')
         limit = (spec.trade_risk_per_unit or 0)*s['multiplier']
         if any(p['side'] != 'BUY' for p in s['positions']) or (not naked and (plan.max_loss is None or plan.max_loss > limit)):
             raise ValueError("Invalid portfolio risk")
@@ -584,6 +593,31 @@ class Controller:
             s["missing_armed"] = False
         self._event(f"MCX: simulated {position['contract']['option_type']} leg exit — {reason}")
 
+    def _mcx_reentry_quote(self, held, missing, now):
+        """Fetch only the original straddle strike's missing option contract."""
+        if not hasattr(self.feed, 'contracts'):
+            raise FeedError('MCX contract master is unavailable for same-strike re-entry')
+        anchor = contract_from(held['contract'])
+        if anchor.exchange != 'MCX' or _option_type(anchor) == missing:
+            raise FeedError('MCX held leg is not a valid opposite-side anchor')
+        self.lock.release()
+        try:
+            contracts = self.feed.contracts('MCX', now)
+        finally:
+            self.lock.acquire()
+        mini = anchor.symbol.upper().startswith('NATGASMINI')
+        candidates = [c for c in contracts if c.exchange == 'MCX' and
+                      _option_type(c) == missing and c.expiry == anchor.expiry and
+                      c.strike == anchor.strike and c.lot_size == anchor.lot_size and
+                      c.symbol.upper().startswith('NATGASMINI') == mini]
+        if len(candidates) != 1:
+            raise FeedError('Matching MCX opposite leg is unavailable or ambiguous')
+        _, quotes = self._snapshot('MCX', now, [candidates[0]])
+        quote = next((q for q in quotes if q.contract.token == candidates[0].token), None)
+        if quote is None or not fresh(quote, self.clock().astimezone(IST)) or quote.bid_size < held['quantity']:
+            raise FeedError('Matching MCX opposite leg has no fresh executable bid')
+        return quote
+
     def _manage_v1(self, market, s, signal, quotes, now):
         """Manage the dashboard v1 paper port without invoking legacy broker code."""
         shorts = [p for p in s['positions'] if p['side'] == 'SELL']
@@ -638,9 +672,12 @@ class Controller:
         if direction != (-1 if missing == 'CE' else 1):
             return
         try:
-            _, chain = self._snapshot(market, now)
+            if market == 'MCX':
+                chain = [self._mcx_reentry_quote(held, missing, now)]
+            else:
+                _, chain = self._snapshot(market, now)
         except FeedError:
-            s['reason'] = 'KAMA reversal; waiting for fresh option-chain depth'
+            s['reason'] = 'KAMA reversal; waiting for fresh same-strike option depth'
             return
         if s['exit_requested'] or s['stop_requested']:
             return
@@ -648,7 +685,8 @@ class Controller:
         candidates = [q for q in chain if _option_type(q.contract) == missing
                       and q.contract.expiry.isoformat() == held['contract']['expiry']
                       and q.contract.lot_size == held['contract']['lot_size']
-                      and q.bid_size >= held['quantity'] and fresh(q, now)]
+                      and (market != 'MCX' or q.contract.strike == held['contract']['strike'])
+                      and q.bid_size >= held['quantity'] and fresh(q, self.clock().astimezone(IST))]
         if market == 'NIFTY':
             wing = next((p for p in s['positions'] if p['side'] == 'BUY'
                          and _option_type(contract_from(p['contract'])) == missing), None)
@@ -747,16 +785,17 @@ class Controller:
         if s["locked"] or self.data["account"]["halted"] or s["net_pnl"] <= -6000*s["multiplier"]:
             return
         try:
-            _, chain = self._snapshot("MCX", now)
+            chain = [self._mcx_reentry_quote(held, missing, now)]
         except FeedError:
-            s["reason"] = "KAMA reversal confirmed; waiting for a fresh option chain"
+            s["reason"] = "KAMA reversal confirmed; waiting for the original-strike opposite leg"
             return
         if s["exit_requested"] or s["stop_requested"]:
             return
         candidates = [q for q in chain if _option_type(q.contract) == missing and
                       q.contract.expiry.isoformat() == held["contract"]["expiry"] and
                       q.contract.lot_size == held["contract"]["lot_size"] and
-                      q.bid_size >= held["quantity"] and fresh(q, now)]
+                      q.contract.strike == held["contract"]["strike"] and
+                      q.bid_size >= held["quantity"] and fresh(q, self.clock().astimezone(IST))]
         if not candidates:
             s["reason"] = "KAMA reversal confirmed; waiting for fresh ATM opposite-leg depth"
             return
