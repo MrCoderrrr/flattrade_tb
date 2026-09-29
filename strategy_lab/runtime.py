@@ -254,7 +254,7 @@ class Controller:
             self.data["history"].append({"date": account["date"], "net_pnl": account["daily_pnl"],
                                           "capital": account["capital"]})
             account["lifetime_pnl"] += account["daily_pnl"]
-        uncapped_v3 = any(s.get('date') and s.get('strategy_id') == 'nfv3'
+        uncapped_v3 = any(s.get('date') and s.get('strategy_id') in ('nfv3', 'mcxv1', 'mcxv3')
                           for s in self.data['sessions'].values())
         account.update(date=now.date().isoformat(), daily_pnl=0.,
                        halted=False if uncapped_v3 else account["drawdown"] >= .05 * account["capital"])
@@ -290,7 +290,8 @@ class Controller:
             if s["positions"] or s["state"] not in ("STOPPED", "SESSION_COMPLETE"):
                 raise ValueError("Stop and flatten the existing session before starting")
             if (immediate and (s["locked"] or self.data["account"]["halted"]) or
-                    (spec.id != 'nfv3' and self.data["account"]["drawdown"] >= .05*capital)):
+                    (spec.id not in ('nfv3', 'mcxv1', 'mcxv3') and
+                     self.data["account"]["drawdown"] >= .05*capital)):
                 raise ValueError("Risk limit reached; restarting cannot clear the lock")
             if any(x["date"] for x in self.data["sessions"].values()) and capital != self.data["account"]["capital"]:
                 raise ValueError("Both sessions share one account; capital is fixed for the trading day")
@@ -416,7 +417,7 @@ class Controller:
         equity = a["lifetime_pnl"] + a["daily_pnl"]
         a["peak_pnl"] = max(a["peak_pnl"], equity)
         a["drawdown"] = a["peak_pnl"] - equity
-        uncapped = any(s.get('date') and s.get('strategy_id') in ('nfv3', 'mcxv1')
+        uncapped = any(s.get('date') and s.get('strategy_id') in ('nfv3', 'mcxv1', 'mcxv3')
                        for s in self.data['sessions'].values())
         a['daily_loss_fraction'] = (None if uncapped else .05 if any(
             resolve(m, s.get('strategy_id')).version >= 3 and s['date']
@@ -787,7 +788,7 @@ class Controller:
         if not resolve("MCX", "mcxv3").entry_start <= now.strftime("%H:%M") < resolve("MCX", "mcxv3").entry_end:
             return
         self._account()
-        if s["locked"] or self.data["account"]["halted"] or s["net_pnl"] <= -6000*s["multiplier"]:
+        if s["locked"] or self.data["account"]["halted"]:
             return
         try:
             chain = [self._mcx_reentry_quote(held, missing, now)]
@@ -1215,7 +1216,7 @@ class Controller:
                                     s['reversal_count'] = s.get('reversal_count', 0)+1 if signal.get('direction') != s.get('direction') else 0
                                     if s['reversal_count'] >= 2:
                                         s.update(exit_requested=True, reason='Indicator regime changed for two completed bars')
-                        if (spec.id != 'mcxv1' and spec.session_loss_per_unit is not None and
+                        if (spec.id not in ('mcxv1', 'mcxv3') and spec.session_loss_per_unit is not None and
                                 s["net_pnl"] <= -spec.session_loss_per_unit*s["multiplier"]):
                             s.update(locked=True, exit_requested=True, reason="Session loss limit reached")
                         elif spec.version != 1 and (trade_net <= -s["stop_loss"] or (spec.id != "mcxv3" and trade_net >= s["take_profit"])):
@@ -1223,8 +1224,6 @@ class Controller:
                         self._account()
                         if spec.id == "mcxv3" and not s["exit_requested"]:
                             self._manage_mcx_v3(s, signal, quotes, self.clock().astimezone(IST))
-                            if s["net_pnl"] <= -spec.session_loss_per_unit*s["multiplier"]:
-                                s.update(locked=True, exit_requested=bool(s["positions"]), reason="Session loss limit reached")
                             self._account()
                         if spec.id == 'nfv3' and not s['exit_requested']:
                             self._manage_nifty_v3(s, signal, quotes, self.clock().astimezone(IST))
