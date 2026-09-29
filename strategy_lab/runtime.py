@@ -653,7 +653,11 @@ class Controller:
         direction = signal.get('direction', 0) if signal.get('eligible') else 0
         signal_bar = signal.get('indicators', {}).get('last_bar_open')
         initial = .15 if market == 'NIFTY' else .10
-        solo_trail = .09 if market == 'NIFTY' else .05
+        # MCX premium bounces are larger than NIFTY's; keep the hard 10%
+        # entry stop while allowing the trailing stop room when KAMA is noisy.
+        efficiency = signal.get('indicators', {}).get('efficiency5')
+        efficiency = efficiency if isinstance(efficiency, (int, float)) else .5
+        solo_trail = .09 if market == 'NIFTY' else min(.14, .08 + .06*(1-efficiency))
         for p in list(shorts):
             if market == 'MCX' and not p.get('entry_signal_bar'):
                 p['entry_signal_bar'] = signal_bar
@@ -761,7 +765,11 @@ class Controller:
             p["best_mark"] = min(p.get("best_mark", entry), mark)
             if len(s["positions"]) == 1 or mark <= .92*entry:
                 p["trail_armed"] = True
-            distance = max(p["contract"]["tick_size"], entry*(trail_pct-(.02 if len(s["positions"]) == 1 else 0)))
+            # A lone short remains trailed, but its cushion expands in noisy
+            # MCX moves. The separate adaptive premium stop still caps loss.
+            leg_trail_pct = (min(.18, max(trail_pct, .10 + .08*(1-er)))
+                             if len(s["positions"]) == 1 else trail_pct)
+            distance = max(p["contract"]["tick_size"], entry*leg_trail_pct)
             stop = entry*(1+stop_pct)
             if p["trail_armed"]:
                 stop = min(stop, p["best_mark"]+distance)
@@ -795,14 +803,14 @@ class Controller:
             return
         held = s["positions"][0]
         missing = "CE" if _option_type(contract_from(held["contract"])) == "PE" else "PE"
-        score, slope = indicators["flow_score"], indicators["kama_slope"]
+        score = indicators["flow_score"]
         if not s.get("missing_armed"):
             if (score >= .35 if missing == "CE" else score <= -.35):
                 s["missing_armed"] = True
             return
-        reversal = ((score <= -.15 and slope <= 0 and indicators["ema8"] <= indicators["ema21"])
-                    if missing == "CE" else
-                    (score >= .15 and slope >= 0 and indicators["ema8"] >= indicators["ema21"]))
+        # Re-entry uses the same fully confirmed direction as leg exits.
+        # A weak KAMA turn during a bounce no longer restores the losing side.
+        reversal = signal["direction"] == (-1 if missing == "CE" else 1)
         if bar != s.get("reentry_bar"):
             s["reentry_bar"] = bar
             s["reentry_count"] = s.get("reentry_count", 0)+1 if reversal else 0

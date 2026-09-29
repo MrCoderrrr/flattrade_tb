@@ -100,17 +100,30 @@ def explain_signal(market, bars, now):
         noise = sum(abs(closes[j]-closes[j-1]) for j in range(len(closes)-10,len(closes)))
         efficiency = abs(closes[-1]-closes[-11])/noise if noise else 0.
         ema8, ema21 = _ema(closes, 8)[-1], _ema(closes, 21)[-1]
+        slow_ema = _ema(closes, 34)
+        slow_slope = slow_ema[-1]-slow_ema[-11]
+        prior_swing = recent[-13:-1]
+        breakout_up = closes[-1] > max(b.high for b in prior_swing)+.10*atr
+        breakout_down = closes[-1] < min(b.low for b in prior_swing)-.10*atr
         score = (.55*tanh(slope/max(.06*atr, .001)) +
                  .25*tanh((closes[-1]-kama[-1])/max(.35*atr, .001)) +
                  .20*tanh((ema8-ema21)/max(.25*atr, .001)))
         direction = (1 if score >= .62 and efficiency >= .30 and slope > 0 and ema8 > ema21
                      else -1 if score <= -.62 and efficiency >= .30 and slope < 0 and ema8 < ema21 else 0)
+        # Countertrend KAMA/EMA turns need a swing break. A small bounce can
+        # otherwise close the winning short or restore the losing short.
+        if ((direction > 0 and slow_slope < -.05*atr and not breakout_up) or
+                (direction < 0 and slow_slope > .05*atr and not breakout_down)):
+            direction = 0
         return {"eligible": True, "direction": direction,
                 "reason": "KAMA trend impulse" if direction else "KAMA neutral; keep the ATM straddle",
                 "indicators": {"close":closes[-1], "kama":round(kama[-1],4),
                                "kama_slope":round(slope,4), "ema8":round(ema8,4),
                                "ema21":round(ema21,4), "efficiency":round(efficiency,4),
                                "flow_score":round(score,4), "atr14":round(atr,4),
+                               "slow_ema34_slope10":round(slow_slope,4),
+                               "swing_breakout_up":breakout_up,
+                               "swing_breakout_down":breakout_down,
                                "bar_minutes":1,"last_bar_open":recent[-1].timestamp.isoformat()}}
     volume = sum(b.volume for b in today)
     anchor = sum((b.high+b.low+b.close)/3*(b.volume if volume else 1) for b in today)/(volume or len(today))

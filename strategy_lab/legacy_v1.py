@@ -66,6 +66,8 @@ def explain_signal(market, bars, now):
     ema8, ema21 = _ema(closes, 8)[-1], _ema(closes, 21)[-1]
     efficiency = None
     ema_gap_floor = None
+    slow_slope = None
+    breakout_up = breakout_down = False
     if market == "MCX":
         # KAMA(5) reacts quickly, but a slope alone can reverse inside a noisy
         # minute. Require its efficiency ratio and EMA spread to agree before
@@ -79,6 +81,18 @@ def explain_signal(market, bars, now):
         ema_gap_floor = max(.02, .08*atr14)
         if efficiency < .35 or direction*(ema8-ema21) <= ema_gap_floor:
             direction = 0
+        # A brief countertrend bounce must clear the recent swing before a
+        # fast KAMA turn can remove the short leg that benefits from the
+        # established trend. Premium hard stops remain independent of this.
+        if len(recent) >= 34:
+            slow_ema = _ema(closes, 34)
+            slow_slope = slow_ema[-1]-slow_ema[-11]
+            prior_swing = recent[-13:-1]
+            breakout_up = closes[-1] > max(b.high for b in prior_swing)+.10*atr14
+            breakout_down = closes[-1] < min(b.low for b in prior_swing)-.10*atr14
+            if ((direction > 0 and slow_slope < -.05*atr14 and not breakout_up) or
+                    (direction < 0 and slow_slope > .05*atr14 and not breakout_down)):
+                direction = 0
     adx = _adx(today, 7)
     opening = 0
     if market == "NIFTY":
@@ -90,6 +104,9 @@ def explain_signal(market, bars, now):
                               "kama_slope": slope, "kama_threshold": threshold,
                               "ema8": ema8, "ema21": ema21, "adx7_1m": adx,
                               "efficiency5": efficiency, "ema_gap_floor": ema_gap_floor,
+                              "slow_ema34_slope10": slow_slope,
+                              "swing_breakout_up": breakout_up,
+                              "swing_breakout_down": breakout_down,
                               "opening_drive": opening,
                               "last_bar_open": recent[-1].timestamp.isoformat()})
     if opening and direction == -opening:
