@@ -150,7 +150,8 @@ function renderClosedLegs(){
   const sessions=detailSessions(),today=status?.today,selected=detailDay||(detailMonth===monthKey(0)?today:detailData?.day);
   const live=selected===today;
   const trades=live?sessions.flatMap(session=>session.date===today?(session.trades||[]):[]):detailData?.day===selected?(detailData.trades||[]):[];
-  const legs=closedLegs([...trades].sort((a,b)=>String(a.ts||a.timestamp||'').localeCompare(String(b.ts||b.timestamp||''))));
+  const resetAt=live?Math.max(0,...sessions.filter(session=>session.date===today).map(session=>Date.parse(session.pnl_reset_at||'')||0)):0;
+  const legs=closedLegs([...trades].sort((a,b)=>String(a.ts||a.timestamp||'').localeCompare(String(b.ts||b.timestamp||'')))).filter(leg=>!resetAt||(Date.parse(leg.ts||'')||0)>=resetAt);
   const capital=detailCapital(sessions,detailMonth||monthKey(0)),table=$('detail-closed');table.replaceChildren();
   text($('detail-closed-count'),legs.length+' closed');
   text($('detail-closed-state'),selected?selected+' · '+(live?'updating every second':'recorded fills'):'Select a day below');
@@ -180,7 +181,7 @@ function renderDetailPositions(){
     text($('detail-open-note'),stale?'Some marks are stale; displayed leg P&L is the last known paper valuation.':'Leg P&L is simulated mark-to-market before basket-level costs. Percentages use the strategy allocation.');
   }
   renderClosedLegs();
-  if(detailData)renderDetailMetrics();
+  renderDetailMetrics();
 }
 function renderDetailMetrics(){
   const data=detailData||{},rows=data.daily||[],sessions=detailSessions(),today=status?.today;

@@ -250,11 +250,16 @@ class Controller:
                 if session.get('date') == account['date']:
                     self.db.execute("INSERT OR REPLACE INTO strategy_daily VALUES (?,?,?,?,?,?,?)",
                                     (account['date'], session.get('strategy_id') or resolve(market).id,
-                                     market, session.get('mode') or 'paper', float(session['net_pnl']),
+                                     market, session.get('mode') or 'paper',
+                                     float(session['net_pnl']) - float(session.get('pnl_reset_offset') or 0),
                                      float(session['capital']), int(session['entries'])))
-            self.data["history"].append({"date": account["date"], "net_pnl": account["daily_pnl"],
+            visible_daily_pnl = sum(
+                float(session["net_pnl"]) - float(session.get("pnl_reset_offset") or 0)
+                for session in self.data["sessions"].values()
+                if session.get("date") == account["date"])
+            self.data["history"].append({"date": account["date"], "net_pnl": visible_daily_pnl,
                                           "capital": account["capital"]})
-            account["lifetime_pnl"] += account["daily_pnl"]
+            account["lifetime_pnl"] += visible_daily_pnl
         uncapped_v3 = any(s.get('date') and s.get('strategy_id') in ('nfv3', 'mcxv1', 'mcxv3')
                           for s in self.data['sessions'].values())
         account.update(date=now.date().isoformat(), daily_pnl=0.,
@@ -402,8 +407,14 @@ class Controller:
                 if session.get('date') == now.date().isoformat():
                     history.append(dict(date=session['date'], strategy_id=session.get('strategy_id') or resolve(market).id,
                                         market=market, mode=session.get('mode') or 'paper',
-                                        net_pnl=session['net_pnl'], capital=session['capital'], entries=session['entries']))
+                                        net_pnl=round(float(session['net_pnl']) - float(session.get('pnl_reset_offset') or 0), 4),
+                                        capital=session['capital'], entries=session['entries']))
             result['strategy_history'] = history
+            for market, s in result["sessions"].items():
+                s["net_pnl"] = round(float(s["net_pnl"]) - float(s.get("pnl_reset_offset") or 0), 4)
+            result['account']['daily_pnl'] = round(sum(
+                s['net_pnl'] for s in result['sessions'].values()
+                if s.get('date') == now.date().isoformat()), 4)
             for market, s in result["sessions"].items():
                 spec = resolve(market, s.get('strategy_id'))
                 s.update(strategy_id=spec.id, max_entries=spec.max_entries, flatten=spec.flatten)

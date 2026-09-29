@@ -231,7 +231,7 @@ class AnalyticsStore:
                     self.db.execute('''INSERT OR REPLACE INTO strategy_ticks VALUES
                         (?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                         (strategy_id, now.isoformat(), day, session['state'],
-                         float(session['net_pnl']), float(session['realized_pnl']),
+                         float(session['net_pnl'])-float(session.get('pnl_reset_offset') or 0), float(session['realized_pnl']),
                          float(session['unrealized_pnl']), float(session['capital']),
                          int(session['multiplier']), leg_count, None, None,
                          None, None))
