@@ -442,7 +442,8 @@ class Controller:
                 continue
             price = q.ask + q.contract.tick_size if closing_buy else max(q.contract.tick_size, q.bid-q.contract.tick_size)
             pnl = (price-p["entry_price"]) * p["quantity"] * (1 if p["side"] == "BUY" else -1)
-            p.update(mark_price=price, unrealized_pnl=round(pnl, 4))
+            p.update(mark_price=price, unrealized_pnl=round(pnl, 4),
+                     mark_timestamp=q.timestamp.isoformat())
             if p["side"] == "BUY":
                 p["best_mark"] = max(p.get("best_mark", p["entry_price"]), price)
             else:
@@ -1025,6 +1026,46 @@ class Controller:
             s["net_pnl"] = round(s["realized_pnl"]-s["costs"], 4)
             self._event(f"{market}: paper positions flat; session net ₹{s['net_pnl']:.2f}")
 
+    def _paper_close_at_last_marks(self, market, s, now):
+        """End a paper session from recorded marks when executable depth is gone.
+
+        This is accounting only. It never represents a broker fill or a price
+        that could necessarily have been executed after the session cutoff.
+        """
+        marks = []
+        for p in s["positions"]:
+            try:
+                price = float(p["mark_price"])
+                entry = float(p["entry_price"])
+                quantity = int(p["quantity"])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                price, entry, quantity = 0., 0., 0
+            if not (math.isfinite(price) and price > 0 and math.isfinite(entry)
+                    and entry > 0 and quantity > 0):
+                s.update(state="EXIT_PENDING", reason="Paper EOD close needs a recorded mark for every leg")
+                return
+            marks.append((p, price, entry, quantity))
+        for p, price, entry, quantity in marks:
+            pnl = (price-entry)*quantity*(1 if p["side"] == "BUY" else -1)
+            fee = cost(price, quantity)
+            s["realized_pnl"] += pnl
+            s["costs"] += fee
+            s["trades"].append({"timestamp": now.isoformat(), "symbol": p["symbol"],
+                                "side": "BUY" if p["side"] == "SELL" else "SELL",
+                                "quantity": quantity, "price": price, "cost": fee,
+                                "mode": "paper", "simulated": True,
+                                "last_mark_timestamp": p.get("mark_timestamp") or s.get("feed_timestamp"),
+                                "reason": "EOD paper close at last observed mark; not an executable broker fill"})
+        count = len(marks)
+        s["positions"] = []
+        s.update(unrealized_pnl=0., estimated_exit_costs=0.,
+                 net_pnl=round(s["realized_pnl"]-s["costs"], 4),
+                 state="SESSION_COMPLETE", stop_requested=True, exit_requested=False,
+                 last_exit=now.isoformat(),
+                 reason="Paper session closed at last observed marks; prices may be stale")
+        self._account()
+        self._event(f"{market}: {count} paper legs closed at last observed marks after session cutoff")
+
     def _activate_schedules(self, now):
         for market, planned in list(self.data['schedules'].items()):
             spec = resolve(market, planned['strategy_id'])
@@ -1080,9 +1121,19 @@ class Controller:
                     if not s["positions"]:
                         s["state"] = "SESSION_COMPLETE"
                         continue
+                # Allow one minute for a normal fresh-quote exit. If it still
+                # cannot fill, close paper legs at their last recorded marks.
+                # Never use this accounting fallback for real broker positions.
+                minute_now = now.hour*60+now.minute
+                minute_limit = int(deadline[:2])*60+int(deadline[3:])+1
+                if (ended and s["positions"] and s.get("mode") == "paper" and
+                        (s.get("date") != now.date().isoformat() or
+                         now.weekday() >= 5 or minute_now >= minute_limit)):
+                    self._paper_close_at_last_marks(market, s, now)
+                    continue
                 if market == "NIFTY" and (now.weekday() >= 5 or
                         now.strftime("%H:%M") < "09:15" or
-                        now.strftime("%H:%M") >= "15:35"):
+                        now.strftime("%H:%M") >= "15:40"):
                     # A closed exchange cannot provide executable NIFTY depth.
                     # Repeated reads here can exhaust the broker quote budget
                     # needed to manage the still-open MCX paper positions.
