@@ -131,6 +131,10 @@ class Controller:
                 else:
                     session.update(state="RECOVERY_REQUIRED", exit_requested=True, stop_requested=True,
                                    reason="Recovered paper positions; fresh quotes required to flatten")
+            elif (session.get("mode") == "paper" and session.get("date") == today
+                  and session.get("state") == "ARMED" and not session.get("stop_requested")
+                  and not session.get("locked")):
+                session["reason"] = "Recovered armed paper session; waiting for current market data"
             else:
                 session.update(state="STOPPED", reason="Session authorization expires on restart")
         self._stop = threading.Event()
