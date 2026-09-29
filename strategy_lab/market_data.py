@@ -293,6 +293,20 @@ class FlattradeReadOnly:
             return bars, []
         expiry = min(c.expiry for c in contracts)
         contracts = [c for c in contracts if c.expiry == expiry]
+        if market == "NIFTY" and strategy_id == "nfv3":
+            calls = {c.strike for c in contracts if c.option_type == "CE"}
+            puts = {c.strike for c in contracts if c.option_type == "PE"}
+            common = calls & puts
+            if not common:
+                return bars, []
+            atm = min(common, key=lambda strike: abs(strike - spot))
+            selected = [c for c in contracts if
+                        (c.strike == atm and c.option_type in {"CE", "PE"}) or
+                        (c.strike == atm + 1000 and c.option_type == "CE") or
+                        (c.strike == atm - 1000 and c.option_type == "PE")]
+            if len(selected) != 4:
+                return bars, []
+            return bars, self.quotes(selected, now, strict=False)
         if market == "MCX" and strategy_id in ("mcxv1", "mcxv3"):
             # Both active MCX versions open at one common ATM strike. Fetching
             # the surrounding 14 strikes issued 28 quote calls per worker and

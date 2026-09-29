@@ -15,8 +15,6 @@ from test_fixtures import quote
 class LegacyV1PaperTests(unittest.TestCase):
     def test_nifty_has_far_wings_and_mcx_has_no_hedges(self):
         bars, quotes, now = fixture('NIFTY')
-        quotes += [quote('NIFTY', 24050, 'PE', 5.5, 6, now),
-                   quote('NIFTY', 26050, 'CE', 5.5, 6, now)]
         signal = explain_signal('NIFTY', bars, now)
         self.assertTrue(signal['eligible'])
         self.assertTrue({'kama', 'kama_slope', 'kama_threshold', 'ema8',
@@ -60,8 +58,6 @@ class LegacyV1PaperTests(unittest.TestCase):
 
     def test_nifty_runtime_has_wings_and_stop_flattens_paper_positions(self):
         bars, quotes, now = fixture('NIFTY')
-        quotes += [quote('NIFTY', 24050, 'PE', 5.5, 6, now),
-                   quote('NIFTY', 26050, 'CE', 5.5, 6, now)]
         with tempfile.TemporaryDirectory() as directory:
             c = Controller(Path(directory), feed=Feed(bars, quotes), clock=lambda: now)
             try:

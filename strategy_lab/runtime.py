@@ -450,7 +450,7 @@ class Controller:
         limit = (spec.trade_risk_per_unit or 0)*s['multiplier']
         if any(p['side'] != 'BUY' for p in s['positions']) or (not naked and (plan.max_loss is None or plan.max_loss > limit)):
             raise ValueError("Invalid portfolio risk")
-        if not naked and spec.version not in (1, 5) and plan.max_loss + self.data["account"]["drawdown"] >= .05*self.data["account"]["capital"]:
+        if not naked and spec.id not in ('nfv1', 'nfv3', 'nfv5') and plan.max_loss + self.data["account"]["drawdown"] >= .05*self.data["account"]["capital"]:
             s["reason"] = "Trade would exceed remaining portfolio drawdown budget"
             return
         held = list(s['positions'])
@@ -529,6 +529,13 @@ class Controller:
                      reentry_count=0, reentry_bar=None, leg_reentries=s.get("leg_reentries", 0))
             for p in positions:
                 p.update(best_mark=p["entry_price"], leg_stop=None, trail_armed=False)
+        if spec.id == "nfv3":
+            s['v3_anchor'] = {_option_type(contract_from(p['contract'])):p['contract']
+                              for p in positions if p['side'] == 'SELL'}
+            s.update(v3_trend_bar=None, v3_trend_count=0, v3_trend_direction=0)
+            for p in positions:
+                if p['side'] == 'SELL':
+                    p.update(best_mark=p['entry_price'], leg_stop=None, trail_armed=False)
         if spec.id == "nfv5":
             s['v5_anchor'] = { _option_type(contract_from(p['contract'])): p['contract']
                                for p in positions if p['side'] == 'SELL' }
@@ -757,6 +764,102 @@ class Controller:
         s["reason"] = "KAMA/EMA reversal; ATM straddle restored"
         self._mark(s, quotes+[q], now)
         self._event(f"MCX: simulated ATM {missing} re-entry after confirmed KAMA/EMA reversal")
+
+    def _close_nifty_v3_leg(self, s, position, quotes, now, reason):
+        fee = cost(position['mark_price'], position['quantity'])
+        s['costs'] += fee
+        s['realized_pnl'] += position['unrealized_pnl']
+        s['trades'].append({'timestamp':now.isoformat(), 'symbol':position['symbol'],
+                            'side':'BUY', 'quantity':position['quantity'],
+                            'price':position['mark_price'], 'cost':fee,
+                            'mode':'paper', 'reason':reason, 'simulated':True})
+        s['positions'].remove(position)
+        s['last_leg_exit'] = now.isoformat()
+        s['reason'] = reason
+        self._mark(s, quotes, now)
+        self._event(f'NIFTY v3: simulated {_option_type(contract_from(position["contract"]))} short exit — {reason}')
+
+    def _reenter_nifty_v3_leg(self, s, kind, quotes, now):
+        spec = resolve('NIFTY', 'nfv3')
+        anchor = s.get('v3_anchor', {}).get(kind)
+        wing = next((p for p in s['positions'] if p['side'] == 'BUY' and
+                     _option_type(contract_from(p['contract'])) == kind), None)
+        if (not anchor or not wing or s.get('paused') or s['entries'] >= spec.max_entries or
+                s['stop_requested'] or s['exit_requested'] or s['locked'] or
+                now.strftime('%H:%M') >= spec.entry_end or
+                s['net_pnl'] <= -spec.session_loss_per_unit*s['multiplier']):
+            return False
+        width = (wing['contract']['strike'] - anchor['strike'] if kind == 'CE'
+                 else anchor['strike'] - wing['contract']['strike'])
+        if width != 1000 or wing['quantity'] != anchor['lot_size']*s['multiplier']:
+            return False
+        _, candidates = self._snapshot('NIFTY', now, [contract_from(anchor)])
+        q = next((q for q in candidates if q.contract.symbol == anchor['symbol']), None)
+        quantity = anchor['lot_size']*s['multiplier']
+        if q is None or not fresh(q, now) or q.bid_size < quantity:
+            return False
+        price = q.bid - q.contract.tick_size
+        if price <= 0:
+            return False
+        fee = cost(price, quantity)
+        s['positions'].append({'symbol':q.contract.symbol, 'contract':anchor, 'side':'SELL',
+                               'quantity':quantity, 'entry_price':price, 'mark_price':price,
+                               'unrealized_pnl':0., 'best_mark':price, 'leg_stop':None,
+                               'trail_armed':False})
+        s['costs'] += fee
+        s['entries'] += 1
+        s['leg_reentries'] = s.get('leg_reentries', 0) + 1
+        s['trades'].append({'timestamp':now.isoformat(), 'symbol':q.contract.symbol,
+                            'side':'SELL', 'quantity':quantity, 'price':price, 'cost':fee,
+                            'mode':'paper', 'reason':'V3 trend pause/reversal re-entry',
+                            'simulated':True})
+        self._mark(s, quotes+[q], now)
+        s['reason'] = 'V3 ATM straddle restored at the protected anchor'
+        self._event(f'NIFTY v3: simulated {kind} short re-entry')
+        return True
+
+    def _manage_nifty_v3(self, s, signal, quotes, now):
+        shorts = [p for p in s['positions'] if p['side'] == 'SELL']
+        if not shorts or s['stop_requested'] or s['exit_requested']:
+            return
+        indicators = signal.get('indicators', {}) if signal.get('eligible') else {}
+        direction = signal.get('direction', 0) if indicators else 0
+        bar = indicators.get('last_bar_open')
+        if bar and bar != s.get('v3_trend_bar'):
+            s['v3_trend_count'] = (s.get('v3_trend_count', 0) + 1
+                                   if direction == s.get('v3_trend_direction') else 1)
+            s['v3_trend_bar'] = bar
+            s['v3_trend_direction'] = direction
+        confirmed = s.get('v3_trend_count', 0) >= 2
+        atr = indicators.get('atr14', 0.)
+        spot = indicators.get('close', 0.)
+        volatility = atr/spot if spot and atr else 0.
+        stop_pct = min(.30, max(.15, .18 + 8*volatility))
+        trail_pct = min(.16, max(.05, .07 + 4*volatility))
+        for p in list(shorts):
+            mark, entry = p['mark_price'], p['entry_price']
+            p['best_mark'] = min(p.get('best_mark', entry), mark)
+            solo = len(shorts) == 1
+            p['trail_armed'] = solo and p['best_mark'] <= .85*entry
+            hard_stop = entry*(1+stop_pct)
+            trail = p['best_mark']*(1+trail_pct) if p['trail_armed'] else hard_stop
+            p['leg_stop'] = round(min(hard_stop, trail), 4)
+            kind = _option_type(contract_from(p['contract']))
+            trend_exit = len(shorts) == 2 and confirmed and ((direction == 1 and kind == 'CE') or
+                                        (direction == -1 and kind == 'PE'))
+            if mark >= p['leg_stop'] or trend_exit:
+                self._close_nifty_v3_leg(s, p, quotes, now,
+                                         'V3 premium stop/trail' if mark >= p['leg_stop']
+                                         else 'V3 confirmed trend; close losing short')
+                shorts = [x for x in s['positions'] if x['side'] == 'SELL']
+                if not shorts:
+                    s.update(exit_requested=True, reason='V3 shorts exited; protective wings retained')
+                return
+        if len(shorts) == 1 and confirmed:
+            held_kind = _option_type(contract_from(shorts[0]['contract']))
+            missing = 'CE' if held_kind == 'PE' else 'PE'
+            if direction == 0 or (held_kind == 'PE' and direction == -1) or (held_kind == 'CE' and direction == 1):
+                self._reenter_nifty_v3_leg(s, missing, quotes, now)
 
     def _close_v5_leg(self, s, position, quotes, now, reason):
         fee = cost(position['mark_price'], position['quantity'])
@@ -990,7 +1093,7 @@ class Controller:
                         if spec.version in (1, 3) and bars and not s['exit_requested']:
                             signal = signal_fn(market, bars, self.clock().astimezone(IST))
                             s['signal'] = signal
-                            if spec.version == 3 and spec.id != "mcxv3":
+                            if spec.version == 3 and spec.id not in ("mcxv3", "nfv3"):
                                 stamp = bars[-1].timestamp.isoformat()
                                 if signal.get('eligible') and stamp != s.get('reversal_bar'):
                                     s['reversal_bar'] = stamp
@@ -1006,6 +1109,9 @@ class Controller:
                             self._manage_mcx_v3(s, signal, quotes, self.clock().astimezone(IST))
                             if s["net_pnl"] <= -spec.session_loss_per_unit*s["multiplier"]:
                                 s.update(locked=True, exit_requested=bool(s["positions"]), reason="Session loss limit reached")
+                            self._account()
+                        if spec.id == 'nfv3' and not s['exit_requested']:
+                            self._manage_nifty_v3(s, signal, quotes, self.clock().astimezone(IST))
                             self._account()
                         if spec.id == 'nfv5' and not s['exit_requested']:
                             self._manage_nifty_v5(s,signal,quotes,self.clock().astimezone(IST))
@@ -1024,6 +1130,11 @@ class Controller:
                         self._mark(s, held_quotes, self.clock().astimezone(IST))
                         if s["state"] == "DATA_WAIT":
                             s.update(state="COOLDOWN", reason="Market data recovered; protective buys retained")
+                        if spec.id == 'nfv3' and all(p['side'] == 'BUY' for p in s['positions']):
+                            # A new ATM strike would accumulate unrelated wings
+                            # and make the displayed basket risk/P&L misleading.
+                            s['reason'] = 'V3 protective wings retained; no new basket before release'
+                            continue
                     self._account()
                     if s["locked"] or self.data["account"]["halted"]:
                         s.update(state="HEDGE_HOLD" if s["positions"] else "STOPPED",

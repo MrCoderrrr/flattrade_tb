@@ -23,7 +23,7 @@ def fixture(market='NIFTY', direction=1):
     lot = 65 if market == 'NIFTY' else 250
     quotes = [quote(market, strike, side, 50, 51, now, lot=lot) for side in ('PE','CE')]
     if market == 'NIFTY':
-        quotes += [quote(market, strike-100, 'PE', 19, 20, now), quote(market, strike+100, 'CE', 19, 20, now)]
+        quotes += [quote(market, strike-1000, 'PE', 19, 20, now), quote(market, strike+1000, 'CE', 19, 20, now)]
     return bars, quotes, now
 
 
@@ -67,12 +67,16 @@ class ActiveTests(unittest.TestCase):
                 plan=build_plan(market,bars,quotes,now,2,400000)
                 self.assertIsNotNone(plan)
                 self.assertEqual(plan.direction,direction)
-                self.assertEqual([l.quote.contract.option_type for l in plan.legs if l.side=='SELL'],
-                                 ['PE' if direction==1 else 'CE'] if market=='NIFTY' else ['PE','CE'])
-                self.assertEqual(len(plan.legs),2 if market=='NIFTY' else 2)
+                self.assertEqual([l.quote.contract.option_type for l in plan.legs if l.side=='SELL'], ['PE','CE'])
+                self.assertEqual(len(plan.legs),4 if market=='NIFTY' else 2)
                 self.assertEqual(plan.max_loss is None,market=='MCX')
                 if market == 'MCX':
                     self.assertEqual(len({l.quote.contract.strike for l in plan.legs}),1)
+                else:
+                    shorts = {l.quote.contract.option_type:l.quote.contract.strike for l in plan.legs if l.side=='SELL'}
+                    wings = {l.quote.contract.option_type:l.quote.contract.strike for l in plan.legs if l.side=='BUY'}
+                    self.assertEqual(shorts['CE'], shorts['PE'])
+                    self.assertEqual(wings, {'CE':shorts['CE']+1000,'PE':shorts['PE']-1000})
                 self.assertTrue(all(l.quantity==l.quote.contract.lot_size*2 for l in plan.legs))
 
     def test_neutral_sells_both_and_missing_hedge_rejected(self):
@@ -102,7 +106,7 @@ class ActiveTests(unittest.TestCase):
                     c.start('MCX','paper',1,200000,strategy_id='mcxv1')
             finally:c.shutdown()
 
-    def test_bearish_call_spread_survives_temporary_quote_failure(self):
+    def test_bearish_protected_straddle_survives_temporary_quote_failure(self):
         bars, quotes, now = fixture('NIFTY', -1)
         clock = [now]
         feed = Feed(bars, quotes)
@@ -112,22 +116,57 @@ class ActiveTests(unittest.TestCase):
                 c.start('NIFTY', 'paper', 1, 200000, strategy_id='nfv3')
                 c.tick()
                 session = c.status()['sessions']['NIFTY']
-                self.assertEqual([p['contract']['option_type'] for p in session['positions']], ['CE', 'CE'])
-                self.assertEqual(len(session['trades']), 2)
+                self.assertEqual([p['contract']['option_type'] for p in session['positions']], ['PE', 'CE', 'PE', 'CE'])
+                self.assertEqual(len(session['trades']), 4)
                 clock[0] += timedelta(seconds=2)
                 feed.error = True
                 c.tick()
                 session = c.status()['sessions']['NIFTY']
                 self.assertEqual(session['state'], 'DATA_WAIT')
-                self.assertEqual(len(session['positions']), 2)
-                self.assertEqual(len(session['trades']), 2)
+                self.assertEqual(len(session['positions']), 4)
+                self.assertEqual(len(session['trades']), 4)
                 feed.error = False
                 feed.quotes = [replace(q, timestamp=clock[0]) for q in quotes]
                 c.tick()
                 session = c.status()['sessions']['NIFTY']
                 self.assertEqual(session['state'], 'RUNNING')
-                self.assertEqual(len(session['positions']), 2)
-                self.assertEqual(len(session['trades']), 2)
+                self.assertEqual(len(session['positions']), 4)
+                self.assertEqual(len(session['trades']), 4)
+            finally:
+                c.shutdown()
+
+    def test_nifty_v3_closes_only_losing_short_and_reenters_on_pause(self):
+        bars, quotes, start = fixture('NIFTY', 1)
+        clock = [start]
+        feed = Feed(bars, quotes)
+        with tempfile.TemporaryDirectory() as root:
+            c = Controller(Path(root), feed=feed, clock=lambda: clock[0])
+            try:
+                c.start('NIFTY', 'paper', 1, 200000, strategy_id='nfv3')
+                c.tick()
+                session = c.data['sessions']['NIFTY']
+                for minute in (1, 2):
+                    clock[0] = start + timedelta(minutes=minute)
+                    feed.quotes = [replace(q, timestamp=clock[0]) for q in quotes]
+                    with c.lock:
+                        c._mark(session, feed.quotes, clock[0])
+                        c._manage_nifty_v3(session, {'eligible': True, 'direction': 1,
+                            'indicators': {'close':25000, 'atr14':10,
+                                           'last_bar_open':clock[0].isoformat()}}, feed.quotes, clock[0])
+                self.assertEqual([p['contract']['option_type'] for p in session['positions']
+                                  if p['side'] == 'SELL'], ['PE'])
+                self.assertEqual(len([p for p in session['positions'] if p['side'] == 'BUY']), 2)
+                for minute in (3, 4):
+                    clock[0] = start + timedelta(minutes=minute)
+                    feed.quotes = [replace(q, timestamp=clock[0]) for q in quotes]
+                    with c.lock:
+                        c._mark(session, feed.quotes, clock[0])
+                        c._manage_nifty_v3(session, {'eligible': True, 'direction': 0,
+                            'indicators': {'close':25000, 'atr14':10,
+                                           'last_bar_open':clock[0].isoformat()}}, feed.quotes, clock[0])
+                self.assertEqual({p['contract']['option_type'] for p in session['positions']
+                                  if p['side'] == 'SELL'}, {'PE', 'CE'})
+                self.assertEqual(session['leg_reentries'], 1)
             finally:
                 c.shutdown()
 

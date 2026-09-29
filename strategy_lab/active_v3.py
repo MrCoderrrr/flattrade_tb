@@ -123,8 +123,9 @@ def explain_signal(market, bars, now):
     from .opening_trend import opening_drive
     drive = opening_drive(bars, now)
     if drive and direction == -drive:
-        result["reason"] = "Opening EMA/KAMA/ADX drive opposes this new short leg"
-        return result
+        # Conflicting trend votes may postpone a leg exit, but must not turn
+        # the initial protected straddle into a one-sided entry.
+        direction = 0
     return {"eligible": True, "direction": direction,
             "reason": {1:"Bullish indicator vote: sell put premium",-1:"Bearish indicator vote: sell call premium",0:"Balanced indicators: sell both near-ATM sides"}[direction],
             "indicators": {"close":closes[-1],"ema9":ema9,"ema21":ema21,"rsi14":round(rsi,2),"atr14":atr,
@@ -138,7 +139,7 @@ def build_plan(market, bars, quotes, now, multiplier, capital):
     signal = explain_signal(market,bars,now)
     if not signal["eligible"]:
         return None
-    available = [q for q in quotes if _valid_quote(q,market,now) and q.bid_size >= q.contract.lot_size*multiplier]
+    available = [q for q in quotes if _valid_quote(q,market,now)]
     if len({(q.contract.exchange,q.contract.token) for q in available}) != len(available):
         return None
     groups = {}
@@ -146,27 +147,26 @@ def build_plan(market, bars, quotes, now, multiplier, capital):
         family = "MINI" if q.contract.symbol.startswith("NATGASMINI") else market
         groups.setdefault((q.contract.expiry,q.contract.lot_size,q.contract.tick_size,family),[]).append(q)
     direction, spot, atr = signal["direction"],signal["indicators"]["close"],signal["indicators"]["atr14"]
-    sides = ["PE","CE"] if market == "MCX" or direction == 0 else ["PE"] if direction == 1 else ["CE"]
+    sides = ["PE","CE"]
     for group in sorted(groups):
         chain=groups[group]; quantity=group[1]*multiplier
         shorts,hedges=[],[]
         common_strike = None
-        if market == "MCX":
-            ce = {q.contract.strike for q in chain if _option_type(q.contract) == "CE"}
-            pe = {q.contract.strike for q in chain if _option_type(q.contract) == "PE"}
-            if not ce.intersection(pe):
-                continue
-            common_strike = min(ce.intersection(pe), key=lambda strike:abs(strike-spot))
+        ce = {q.contract.strike for q in chain if _option_type(q.contract) == "CE" and q.bid_size >= quantity}
+        pe = {q.contract.strike for q in chain if _option_type(q.contract) == "PE" and q.bid_size >= quantity}
+        if not ce.intersection(pe):
+            continue
+        common_strike = min(ce.intersection(pe), key=lambda strike:abs(strike-spot))
         for option in sides:
             candidates=[q for q in chain if _option_type(q.contract)==option and
-                        (common_strike is None or q.contract.strike == common_strike)]
+                        q.contract.strike == common_strike and q.bid_size >= quantity]
             if not candidates:break
             short=min(candidates,key=lambda q:abs(q.contract.strike-spot))
             shorts.append(Leg(short,"SELL",quantity))
             if market=="NIFTY":
-                width=max(100.,min(200.,2*atr))
-                wings=[q for q in candidates if q.ask_size>=quantity and
-                       (short.contract.strike-q.contract.strike>=width if option=="PE" else q.contract.strike-short.contract.strike>=width)]
+                wing_strike = common_strike + (1000 if option == "CE" else -1000)
+                wings=[q for q in chain if _option_type(q.contract)==option and
+                       q.contract.strike == wing_strike and q.ask_size>=quantity]
                 if not wings:break
                 hedge=min(wings,key=lambda q:abs(q.contract.strike-short.contract.strike))
                 hedges.append(Leg(hedge,"BUY",quantity))
@@ -180,7 +180,7 @@ def build_plan(market, bars, quotes, now, multiplier, capital):
         if market=="NIFTY":
             width=max(abs(a.quote.contract.strike-b.quote.contract.strike) for a,b in zip(shorts,hedges))
             max_loss=width*quantity-credit+reserve
-            if max_loss<=0 or max_loss>10000*multiplier:continue
+            if max_loss<=0 or max_loss>65000*multiplier:continue
             stop=min(2000*multiplier,max_loss*.6)
             target=max(200*multiplier,credit*.4-reserve)
         else:

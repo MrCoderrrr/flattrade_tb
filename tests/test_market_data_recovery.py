@@ -8,6 +8,23 @@ from strategy_lab.models import Bar, Contract, IST
 
 
 class MarketDataRecoveryTests(unittest.TestCase):
+    def test_nifty_v3_requests_atm_straddle_and_exact_1000_point_wings(self):
+        with tempfile.TemporaryDirectory() as root:
+            feed = FlattradeReadOnly(Path(root))
+            now = datetime(2026, 9, 29, 10, 0, tzinfo=IST)
+            feed.bars = lambda *_: [Bar(now, 22500, 22510, 22490, 22500, 100, 1)]
+            contracts = [Contract(f'NIFTY29SEP26{kind}{strike}', f'{kind}{strike}',
+                                  'NFO', date(2026, 9, 29), strike, kind, 65, .05)
+                         for strike in (21500, 22450, 22500, 22550, 23500)
+                         for kind in ('CE', 'PE')]
+            feed.contracts = lambda *_: contracts
+            selected = []
+            feed.quotes = lambda rows, *_args, **_kwargs: selected.extend(rows) or []
+            feed.snapshot('NIFTY', now, strategy_id='nfv3')
+            self.assertEqual({(c.option_type, c.strike) for c in selected},
+                             {('CE', 22500), ('PE', 22500),
+                              ('CE', 23500), ('PE', 21500)})
+
     def test_repeat_quote_reads_share_a_short_cache(self):
         with tempfile.TemporaryDirectory() as root:
             feed = FlattradeReadOnly(Path(root))
