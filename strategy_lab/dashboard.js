@@ -119,63 +119,101 @@ function plot(values,lineId,zeroId){const line=$(lineId),zero=$(zeroId);if(!valu
 function regimeName(value){return String(value||'unknown').replaceAll('_',' ')}
 async function loadAnalytics(){if(activeTab!=='analytics'||!status)return;try{analyticsSummary=await api('/api/analytics/summary');renderAnalytics()}catch(err){text($('analytics-note'),err.message)}}
 function renderAnalytics(){const data=analyticsSummary||{},daily=(data.daily||[]).filter(row=>row.day.startsWith(monthKey(0))).reverse(),total=daily.reduce((sum,row)=>sum+Number(row.pnl||0),0),days=daily.length;plot(daily.map(row=>daily.slice(0,daily.indexOf(row)+1).reduce((sum,item)=>sum+Number(item.pnl||0),0)),'combined-line','combined-zero');text($('combined-month'),monthKey(0));const metrics=$('combined-metrics');metrics.replaceChildren(metricCard('Month P&L',signed(total),total),metricCard('Recorded days',days),metricCard('Positive days',daily.filter(row=>row.pnl>0).length),metricCard('Average daily return',days?(daily.reduce((sum,row)=>sum+Number(row.return_pct||0),0)/days).toFixed(2)+'%':'—'));text($('combined-note'),days?'Each day divides P&L by the sum of that day’s independent paper allocations. This is simulated performance.':'No paper strategy days recorded this month.');text($('analytics-updated'),data.last_capture?'Captured '+dateIST(data.last_capture):'Collector waiting');text($('analytics-note'),data.note||'Condition labels describe completed sessions.');const coverage=$('market-coverage');coverage.replaceChildren();for(const market of ['NIFTY','MCX']){const item=(data.coverage||[]).find(row=>row.market===market),row=node('div','analytics-row');row.append(node('span','',market),node('strong','',item?item.days+' complete days · '+item.latest:'Collecting'));coverage.append(row)}for(const [market,error] of Object.entries(data.market_errors||{})){const row=node('div','analytics-row');row.append(node('span','',market+' feed'),node('small','',error));coverage.append(row)}const recent=$('recent-regimes');recent.replaceChildren();for(const item of (data.market_days||[]).slice(0,8)){const row=node('div','analytics-row');row.append(node('span','',item.day+' · '+item.market),node('strong','',regimeName(item.regime)));recent.append(row)}if(!recent.children.length)recent.append(node('div','empty','No complete market sessions recorded yet.'));const leaders=$('condition-leaders');leaders.replaceChildren();for(const market of ['NIFTY','MCX'])for(const regime of ['steady','choppy','trending','volatile_mixed']){const key=market+':'+regime,id=(data.leaders||{})[key],candidates=(data.regime_stats||[]).filter(x=>x.market===market&&x.regime===regime),top=candidates.sort((a,b)=>b.days-a.days)[0],card=node('div','card analytics-card');card.append(node('small','',market+' · '+regimeName(regime)),node('strong','',id?id.toUpperCase():'No proven leader yet'),node('small','',id?((data.comparison_days?.[key]||0)+' matched paper days · historical comparison'):(top?top.days+'/'+data.minimum_comparison_days+' observed days for '+top.strategy_id.toUpperCase()+' · matched comparison pending':'No strategy sessions in this condition yet')));if(id){const selected=candidates.find(x=>x.strategy_id===id);const score=Number(data.leader_scores?.[key]||0);card.append(node('div','value',score.toFixed(2)+'% avg/day on matched days'));color(card.lastChild,score);card.onclick=()=>openDetail(id)}leaders.append(card)}const cards=$('analytics-strategy-cards');cards.replaceChildren();const allSpecs=status.strategies||[];for(const market of marketOrder(allSpecs.map(spec=>spec.market))){const group=allSpecs.filter(spec=>spec.market===market),groupCards=marketSection(cards,market,group.length,'analytics-card-grid');for(const spec of group){const row=(data.strategy_rollup||[]).find(x=>x.strategy_id===spec.id),card=node('button','card analytics-card');card.type='button';card.append(node('small','',spec.market+' · paper'),node('strong','',spec.id.toUpperCase()),node('div','value',row?signed(row.total_pnl):'No recorded sessions'),node('small','',row?row.days+' days · '+row.win_days+' positive · mean daily '+row.mean_daily_return_pct.toFixed(2)+'%':'Start this strategy in paper mode to collect evidence'));if(row)color(card.querySelector('.value'),row.total_pnl);card.onclick=()=>openDetail(spec.id);groupCards.append(card)}}}
-function renderV1Variables(){
-  const panel=$('v1-variables-section');if(!panel||!detailStrategy)return;
-  panel.hidden=false;
-  const spec=strategy(detailStrategy)||{},entries=Object.entries(status?.sessions||{}).filter(([key,s])=>key===detailStrategy||key===detailStrategy+':legacy'||s.strategy_id===detailStrategy);
-  const session=entries.find(([,s])=>s.positions?.length)?.[1]||entries[0]?.[1],scheduled=status?.schedules?.[detailStrategy],groups=$('v1-variables-groups');groups.replaceChildren();
-  const show=value=>value===null||value===undefined?'—':typeof value==='boolean'?(value?'Yes':'No'):typeof value==='number'?Number(value.toFixed(4)).toLocaleString('en-IN',{maximumFractionDigits:4}):typeof value==='object'?JSON.stringify(value):String(value);
-  const group=(title,values,wide=false)=>{const box=node('div','v1-group'+(wide?' v1-group-wide':''));box.append(node('h3','',title));for(const [key,value] of Object.entries(values)){const row=node('div','v1-row');row.append(node('span','',key.replaceAll('_',' ')),node('strong','',show(value)));box.append(row)}groups.append(box)};
-  const models={
-    nfv1:{indicators:'KAMA(10,3,30) slope · EMA8/21 · ADX7 · opening drive',protection:'1000-point long wings',risk:'15% initial short-leg SL; 9% solo-leg trail'},
-    mcxv1:{indicators:'KAMA(5,3,30) slope · EMA8/21 · ADX7',protection:'No long hedge',risk:'10% initial short-leg SL; 5% solo-leg trail'},
-    nfv3:{indicators:'EMA9/21 · RSI14 · ATR14 · VWAP/mean anchor · opening drive',protection:'ATR-sized long wings',risk:'Basket stop in rupees; no per-leg premium stop'},
-    mcxv3:{indicators:'KAMA(10,3,30) · EMA8/21 · ATR14 · efficiency · flow score',protection:'No long hedge',risk:'Adaptive 12–28% short-leg SL; 5–16% trail'},
-    nfv5:{indicators:'One-second flow score · quality · efficiency · volatility ratio · adaptive bands',protection:'1000-point long wings',risk:'Adaptive 12–30% short-leg SL; 5–18% trail'}
-  };
-  const model=models[detailStrategy]||{indicators:spec.description||'Historical strategy',protection:'See recorded basket',risk:'See recorded session'};
-  group('Strategy rules',{market:spec.market||session?.market,entry_start:spec.entry_start,entry_end:spec.entry_end,flatten:spec.flatten,bar_minutes:spec.bar_minutes,max_entries:spec.max_entries,cooldown_seconds:spec.cooldown_seconds,session_loss_rupees_per_multiplier:spec.session_loss_per_unit,trade_risk_rupees_per_multiplier:spec.trade_risk_per_unit,indicators:model.indicators,protection:model.protection,stop_and_trail:model.risk});
-  if(scheduled)group('Scheduled start',scheduled);
-  if(!session){text($('v1-variables-time'),'No current session');text($('v1-variables-summary'),'Start this strategy in paper mode to see live variables.');return}
-  text($('v1-variables-time'),dateIST(status.server_time));
-  text($('v1-variables-summary'),session.state==='DATA_WAIT'?'DATA_WAIT: a required quote or candle is missing, stale, or rejected. Existing paper positions and their last marks are retained; the worker retries automatically. '+(session.reason||''):session.state+' · '+(session.reason||''));
-  const signal=session.signal||{},signalValues={};for(const [key,value] of Object.entries(signal))if(key!=='indicators')signalValues[key]=value;
-  group('Live signal and indicators',{...signalValues,...(signal.indicators||{})},true);
-  const sessionValues={};for(const [key,value] of Object.entries(session)){if(['signal','positions','trades'].includes(key))continue;sessionValues[key]=value}sessionValues.trade_count=session.trades?.length||0;
-  group('Session, risk, feed and P&L',sessionValues,true);
-  for(const [index,position] of (session.positions||[]).entries()){const values={};for(const [key,value] of Object.entries(position)){if(key==='contract'&&value&&typeof value==='object'){for(const [field,part] of Object.entries(value))values['contract_'+field]=part}else values[key]=value}group('Open leg '+(index+1)+' · '+(position.symbol||''),values)}
-  const last=session.trades?.at(-1);if(last)group('Last recorded fill',last,true);
+function detailSessions(){return Object.entries(status?.sessions||{}).filter(([key,session])=>
+  (session.strategy_id===detailStrategy||key===detailStrategy||key===detailStrategy+':legacy')&&Array.isArray(session.positions)).map(([,session])=>session)}
+function detailCapital(sessions,month){
+  const historical=(status?.strategy_history||[]).filter(row=>row.strategy_id===detailStrategy&&String(row.date||'').startsWith(month));
+  return Math.max(0,...historical.map(row=>Number(row.capital)||0),...sessions.filter(session=>String(session.date||'').startsWith(month)).map(session=>Number(session.capital)||0))||Number(status?.account?.configured_capital)||0;
 }
-function openDetail(id,push=true){if(!strategy(id))return;detailStrategy=id;detailMonth=monthKey(0);detailDay=null;if(push)window.history?.pushState?.({},'', '/strategy/'+id);tab('strategy-detail');renderDetailPositions()}
+function closedLegs(trades){
+  const inventory=new Map(),closed=[];
+  for(const fill of trades){
+    const side=String(fill.side||'').toUpperCase(),symbol=String(fill.symbol||'');
+    let remaining=Number(fill.quantity)||0;
+    const price=Number(fill.price),cost=Number(fill.cost)||0;
+    if(!symbol||!['BUY','SELL'].includes(side)||remaining<=0||!Number.isFinite(price))continue;
+    const fullQuantity=remaining,queue=inventory.get(symbol)||[];
+    while(remaining>0&&queue.length&&queue[0].side!==side){
+      const entry=queue[0],quantity=Math.min(remaining,entry.remaining);
+      const gross=(entry.side==='SELL'?entry.price-price:price-entry.price)*quantity;
+      const net=gross-entry.costPerUnit*quantity-cost*quantity/fullQuantity;
+      closed.push({ts:fill.ts||fill.timestamp,side:entry.side,symbol,quantity,entryPrice:entry.price,exitPrice:price,pnl:net});
+      entry.remaining-=quantity;remaining-=quantity;
+      if(entry.remaining<=0)queue.shift();
+    }
+    if(remaining>0)queue.push({side,price,remaining,costPerUnit:cost/fullQuantity});
+    inventory.set(symbol,queue);
+  }
+  return closed.reverse();
+}
+function renderClosedLegs(){
+  const sessions=detailSessions(),today=status?.today,selected=detailDay||(detailMonth===monthKey(0)?today:detailData?.day);
+  const live=selected===today;
+  const trades=live?sessions.flatMap(session=>session.date===today?(session.trades||[]):[]):detailData?.day===selected?(detailData.trades||[]):[];
+  const legs=closedLegs([...trades].sort((a,b)=>String(a.ts||a.timestamp||'').localeCompare(String(b.ts||b.timestamp||''))));
+  const capital=detailCapital(sessions,detailMonth||monthKey(0)),table=$('detail-closed');table.replaceChildren();
+  text($('detail-closed-count'),legs.length+' closed');
+  text($('detail-closed-state'),selected?selected+' · '+(live?'updating every second':'recorded fills'):'Select a day below');
+  if(!legs.length){const row=node('tr'),cell=node('td','empty',trades.length?'No matched closed legs for this day.':'No closed legs for this day.');cell.colSpan=7;row.append(cell);table.append(row);return}
+  for(const leg of legs){const row=node('tr');for(const value of [dateIST(leg.ts),leg.side,leg.symbol,leg.quantity,money(leg.entryPrice),money(leg.exitPrice),signed(leg.pnl)+' · '+percent(leg.pnl,capital)])row.append(node('td','',value));color(row.lastChild,leg.pnl);table.append(row)}
+}
+function openDetail(id,push=true){if(!strategy(id))return;detailStrategy=id;detailMonth=monthKey(0);detailDay=status?.today||null;detailData=null;if(push)window.history?.pushState?.({},'', '/strategy/'+id);tab('strategy-detail');renderDetailPositions()}
 function renderDetailPositions(){
   if(!status||!detailStrategy)return;
-  renderV1Variables();
-  const matches=Object.entries(status.sessions||{}).filter(([key,session])=>
-    (session.strategy_id===detailStrategy||key===detailStrategy||key===detailStrategy+':legacy')&&
-    Array.isArray(session.positions));
-  const open=matches.flatMap(([,session])=>session.positions.map(position=>({position,session})));
+  const matches=detailSessions(),open=matches.flatMap(session=>session.positions.map(position=>({position,session})));
   const table=$('detail-positions');table.replaceChildren();
   text($('detail-open-count'),open.length+' open');
   const scheduled=status.schedules?.[detailStrategy];
-  const current=matches.find(([,session])=>session.positions.length)?.[1]||matches[0]?.[1];
+  const current=matches.find(session=>session.positions.length)||matches[0];
   text($('detail-open-state'),open.length?'Current paper session · '+(current?.state||'open'):
     scheduled?'Paper session scheduled for '+scheduled.scheduled_for:
     current?(current.state||'Idle')+(current.reason?' · '+current.reason:''):'No paper session running');
-  if(!open.length){const row=node('tr'),cell=node('td','empty','No open positions for this strategy.');cell.colSpan=8;row.append(cell);table.append(row);text($('detail-open-note'),scheduled?'Positions will appear here when its session starts.':'Open legs appear here as soon as a paper basket enters.');return}
-  for(const {position:p,session} of open){
-    const row=node('tr');
-    const stop=premiumStop(p);const values=[p.side,p.symbol,p.quantity,money(p.entry_price),money(p.mark_price),money(p.best_mark??p.entry_price),stop.label+' · '+stop.value,signed(p.unrealized_pnl)];
-    for(const value of values)row.append(node('td','',value));
-    color(row.children[7],p.unrealized_pnl);
-    table.append(row);
+  if(!open.length){const row=node('tr'),cell=node('td','empty','No open positions for this strategy.');cell.colSpan=8;row.append(cell);table.append(row);text($('detail-open-note'),scheduled?'Positions will appear here when its session starts.':'Open legs appear here as soon as a paper basket enters.')}else{
+    for(const {position:p,session} of open){
+      const row=node('tr');
+      const stop=premiumStop(p);
+      const values=[p.side,p.symbol,p.quantity,money(p.entry_price),money(p.mark_price),money(p.best_mark??p.entry_price),stop.label+' · '+stop.value,signed(p.unrealized_pnl)+' · '+percent(p.unrealized_pnl,session.capital)];
+      for(const value of values)row.append(node('td','',value));
+      color(row.lastChild,p.unrealized_pnl);table.append(row);
+    }
+    const stale=matches.some(session=>session.positions.length&&session.valuation_stale);
+    text($('detail-open-note'),stale?'Some marks are stale; displayed leg P&L is the last known paper valuation.':'Leg P&L is simulated mark-to-market before basket-level costs. Percentages use the strategy allocation.');
   }
-  const stale=matches.some(([,session])=>session.positions.length&&session.valuation_stale);
-  text($('detail-open-note'),stale?'Some marks are stale; displayed leg P&L is the last known paper valuation.':
-    'Leg P&L is simulated mark-to-market before basket-level costs. ‘Basket stop only’ means this version has a rupee basket stop, not a per-leg premium stop.');
+  renderClosedLegs();
+  if(detailData)renderDetailMetrics();
+}
+function renderDetailMetrics(){
+  const data=detailData||{},rows=data.daily||[],sessions=detailSessions(),today=status?.today;
+  const current=sessions.find(session=>session.date===today&&session.state&&!['STOPPED','SESSION_COMPLETE'].includes(session.state))||sessions.find(session=>session.date===today);
+  const capital=detailCapital(sessions,data.month||detailMonth||monthKey(0));
+  const todayPnl=current?Number(current.net_pnl)||0:Number(rows.find(row=>row.day===today)?.pnl)||0;
+  let monthPnl=rows.reduce((sum,row)=>sum+(Number(row.pnl)||0),0);
+  if(current&&String(today||'').startsWith(data.month||detailMonth||monthKey(0)))monthPnl+=todayPnl-(Number(rows.find(row=>row.day===today)?.pnl)||0);
+  const realized=current?closedLegs(current.trades||[]).reduce((sum,leg)=>sum+leg.pnl,0):0;
+  const unrealized=current?Number(current.unrealized_pnl)||0:0;
+  const metric=(label,value,n)=>metricCard(label,signed(value)+' · '+percent(value,n),value);
+  $('detail-metrics').replaceChildren(metric('Today P&L',todayPnl,current?.capital||capital),metric('Closed P&L',realized,current?.capital||capital),metric('Open P&L',unrealized,current?.capital||capital),metric('Month P&L',monthPnl,capital));
 }
 async function loadDetail(){if(activeTab!=='strategy-detail'||!detailStrategy||!status)return;try{const query='?month='+encodeURIComponent(detailMonth||monthKey(0))+(detailDay?'&day='+encodeURIComponent(detailDay):'');detailData=await api('/api/analytics/strategy/'+encodeURIComponent(detailStrategy)+query);renderDetail()}catch(err){text($('detail-chart-note'),err.message)}}
-function renderDetail(){const data=detailData||{},rows=data.daily||[],total=rows.reduce((sum,row)=>sum+Number(row.pnl||0),0),selected=rows.find(row=>row.day===data.day),market=data.market_day||{},title=data.strategy_id?.toUpperCase()||'Strategy';text($('detail-title'),title);text($('detail-subtitle'),(data.market||'—')+' · independent paper ledger · '+(strategy(data.strategy_id)?.description||''));text($('detail-month'),data.month||'—');text($('detail-quality'),rows.length+' recorded day'+(rows.length===1?'':'s'));const metrics=$('detail-metrics');metrics.replaceChildren(metricCard('Month net P&L',signed(total),total),metricCard('Recorded days',rows.length),metricCard('Positive days',rows.filter(row=>row.pnl>0).length),metricCard('Worst day',rows.length?rows.reduce((a,b)=>a.pnl<b.pnl?a:b).return_pct.toFixed(2)+'%':'—',rows.length?Math.min(...rows.map(row=>row.pnl)):0));let cumulative=0;plot(rows.map(row=>(cumulative+=Number(row.pnl||0))),'detail-month-line','detail-month-zero');plot((data.curve||[]).map(row=>Number(row.pnl||0)),'detail-line','detail-zero');text($('detail-day-label'),data.day||'No selected day');text($('detail-day-regime'),market.regime?regimeName(market.regime):'Market condition unavailable');text($('detail-chart-note'),data.intraday_available?data.curve.length+' plotted samples · net simulated P&L after modeled costs':selected?'Daily ledger exists; intraday curve was not recorded for this older session.':'No paper session in this month.');const fills=$('detail-trades');fills.replaceChildren();if(!data.trades?.length)fills.append(node('div','empty','No recorded fills for this day.'));for(const trade of (data.trades||[]).slice(-50)){const row=node('div','analytics-row');row.append(node('span','',dateIST(trade.ts)+' · '+trade.side+' '+trade.symbol),node('strong','',trade.quantity+' @ '+fmt(trade.price)));fills.append(row)}const context=$('detail-market');context.replaceChildren();if(!data.market_day)context.append(node('div','empty','One-minute market data unavailable for this day.'));else for(const [label,value] of [['Condition',regimeName(market.regime)],['Coverage',market.bars+' one-minute bars · '+market.quality],['Efficiency',market.efficiency==null?'—':(100*market.efficiency).toFixed(1)+'%'],['Realized volatility',market.realized_vol_bps==null?'—':market.realized_vol_bps.toFixed(1)+' bps'],['Day move',market.move_bps==null?'—':market.move_bps.toFixed(1)+' bps'],['India VIX',market.vix_open==null?'—':fmt(market.vix_open)+' → '+fmt(market.vix_close)]]){const row=node('div','analytics-row');row.append(node('span','',label),node('strong','',value));context.append(row)}const regimes=$('detail-regimes');regimes.replaceChildren();if(!data.regime_stats?.length)regimes.append(node('div','empty','At least ten observed days per condition are needed to compare performance.'));for(const item of data.regime_stats||[]){const row=node('div','analytics-row');row.append(node('span','',regimeName(item.regime)+' · '+item.days+' day'+(item.days===1?'':'s')),node('strong','',item.mean_return_pct.toFixed(2)+'% avg'+(item.evidence==='comparable'?'':' · early')));color(row.lastChild,item.mean_return_pct);regimes.append(row)}const table=$('detail-daily');table.replaceChildren();if(!rows.length){const tr=node('tr'),td=node('td','empty','No daily results in this month.');td.colSpan=7;tr.append(td);table.append(tr)}for(const item of [...rows].reverse()){const tr=node('tr');tr.dataset.day=item.day;for(const value of [item.day,regimeName(item.regime),signed(item.pnl),item.return_pct.toFixed(2)+'%',item.entries,item.max_drawdown==null?'—':money(item.max_drawdown),item.sampled_points])tr.append(node('td','',value));color(tr.children[2],item.pnl);tr.onclick=()=>{detailDay=item.day;loadDetail()};if(item.day===data.day)tr.style.background='var(--panel2)';table.append(tr)}}
-function shiftDetailMonth(offset){const [year,month]=(detailMonth||monthKey(0)).split('-').map(Number),date=new Date(year,month-1+offset,1);detailMonth=date.getFullYear()+'-'+String(date.getMonth()+1).padStart(2,'0');detailDay=null;loadDetail()}
+function renderDetail(){
+  const data=detailData||{},rows=data.daily||[],selected=rows.find(row=>row.day===data.day),title=data.strategy_id?.toUpperCase()||'Strategy';
+  text($('detail-title'),title);
+  text($('detail-subtitle'),(data.market||'—')+' · independent paper ledger · '+(strategy(data.strategy_id)?.description||''));
+  text($('detail-month'),data.month||'—');
+  renderDetailMetrics();renderClosedLegs();
+  plot((data.curve||[]).map(row=>Number(row.pnl||0)),'detail-line','detail-zero');
+  text($('detail-day-label'),data.day||'No selected day');
+  text($('detail-chart-note'),data.intraday_available?data.curve.length+' plotted samples · net simulated P&L after modeled costs':selected?'Daily ledger exists; intraday curve was not recorded for this older session.':'No paper session in this month.');
+  const table=$('detail-daily');table.replaceChildren();
+  if(!rows.length){const tr=node('tr'),td=node('td','empty','No daily results in this month.');td.colSpan=4;tr.append(td);table.append(tr)}
+  for(const item of [...rows].reverse()){
+    const tr=node('tr');tr.dataset.day=item.day;
+    for(const value of [item.day,signed(item.pnl),Number(item.return_pct).toFixed(2)+'%',item.entries])tr.append(node('td','',value));
+    color(tr.children[1],item.pnl);tr.onclick=()=>{detailDay=item.day;loadDetail()};
+    if(item.day===data.day)tr.style.background='var(--panel2)';table.append(tr);
+  }
+}
+function shiftDetailMonth(offset){const [year,month]=(detailMonth||monthKey(0)).split('-').map(Number),date=new Date(year,month-1+offset,1);detailMonth=date.getFullYear()+'-'+String(date.getMonth()+1).padStart(2,'0');detailDay=detailMonth===monthKey(0)?status?.today||null:null;loadDetail()}
 $('detail-back').onclick=()=>tab('analytics');$('detail-prev').onclick=()=>shiftDetailMonth(-1);$('detail-next').onclick=()=>shiftDetailMonth(1);window.addEventListener('popstate',()=>{const id=location.pathname.startsWith('/strategy/')?location.pathname.slice('/strategy/'.length):'';if(strategy(id))openDetail(id,false);else tab('analytics')});
 async function poll(){if(!document.hidden)await loadStatus();setTimeout(poll,document.hidden?15000:2000)}async function pollChain(){if(!document.hidden)await loadChain();setTimeout(pollChain,document.hidden?10000:1000)}
 async function pollAnalytics(){if(!document.hidden&&activeTab==='analytics')await loadAnalytics();if(!document.hidden&&activeTab==='strategy-detail'&&detailData?.day===status?.today)await loadDetail();setTimeout(pollAnalytics,15000)}
