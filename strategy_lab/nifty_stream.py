@@ -138,6 +138,12 @@ class NiftyStream:
             return {'connected':self.connected,'authenticated':self.authenticated,
                     'ready':ready,'reason':self.error,'ticks':ticks,'books':books}
 
+    def latest_books(self, tokens):
+        """Copy requested option books without waiting on broker REST."""
+        with self.lock:
+            return {key:{**item, 'fields':dict(item['fields'])}
+                    for key in tokens if (item:=self.books.get(key)) is not None}
+
     def start(self):
         if self.thread and self.thread.is_alive():
             return

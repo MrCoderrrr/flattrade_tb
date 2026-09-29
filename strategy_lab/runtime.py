@@ -428,14 +428,18 @@ class Controller:
         by_symbol = {q.contract.symbol: q for q in quotes}
         total = 0.
         exit_costs = 0.
+        missing = False
+        thin = False
         for p in s["positions"]:
             q = by_symbol.get(p["symbol"])
             if q is None or not fresh(q, now):
-                raise FeedError("Open position quote is missing/stale; P&L is last known, exit remains pending")
+                missing = True
+                continue
             closing_buy = p["side"] == "SELL"
             size = q.ask_size if closing_buy else q.bid_size
             if size < p["quantity"]:
-                raise FeedError("Insufficient displayed depth to close; exposure retained")
+                thin = True
+                continue
             price = q.ask + q.contract.tick_size if closing_buy else max(q.contract.tick_size, q.bid-q.contract.tick_size)
             pnl = (price-p["entry_price"]) * p["quantity"] * (1 if p["side"] == "BUY" else -1)
             p.update(mark_price=price, unrealized_pnl=round(pnl, 4))
@@ -445,6 +449,12 @@ class Controller:
                 p["best_mark"] = min(p.get("best_mark", p["entry_price"]), price)
             total += pnl
             exit_costs += cost(price, p["quantity"])
+        # Refresh every available leg even when another leg has no executable
+        # depth. Basket P&L and all trading decisions still require every leg.
+        if missing:
+            raise FeedError("Open position quote is missing/stale; P&L is last known, exit remains pending")
+        if thin:
+            raise FeedError("Insufficient displayed depth to close; exposure retained")
         s["unrealized_pnl"] = round(total, 4)
         s["estimated_exit_costs"] = round(exit_costs, 4)
         s["net_pnl"] = round(s["realized_pnl"]+total-s["costs"]-exit_costs, 4)

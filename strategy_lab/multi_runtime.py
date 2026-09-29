@@ -175,6 +175,8 @@ class MultiController:
         return result
 
     def attach_nifty_stream(self, stream):
+        if hasattr(self.feed, 'attach_nifty_stream'):
+            self.feed.attach_nifty_stream(stream)
         self.children['nfv5'].attach_nifty_stream(stream)
         self.legacy.attach_nifty_stream(stream)
 

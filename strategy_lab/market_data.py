@@ -92,6 +92,29 @@ class FlattradeReadOnly:
         self._contracts_cache = {}
         self._quote_cache = {}
         self._quote_lock = threading.Lock()
+        self._nifty_stream = None
+
+    def attach_nifty_stream(self, stream):
+        self._nifty_stream = stream
+
+    @staticmethod
+    def _stream_quote(contract, book, now):
+        """Price only from a complete, fresh broker depth update."""
+        if not book or book.get('book_received_at') is None:
+            return None
+        stamp = book['book_received_at']
+        if not 0 <= (now-stamp).total_seconds() <= 10:
+            return None
+        fields = book.get('fields', {})
+        try:
+            bid, ask, last = (number(fields[key]) for key in ('bp1','sp1','lp'))
+            bid_size, ask_size = (number(fields[key]) for key in ('bq1','sq1'))
+            if (bid <= 0 or ask < bid or last <= 0 or bid_size < 0 or ask_size < 0 or
+                    bid_size != int(bid_size) or ask_size != int(ask_size)):
+                return None
+            return Quote(contract, stamp, bid, ask, last, int(bid_size), int(ask_size))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return None
 
     def _refresh_master(self, exchange, underlying, now):
         target = self.root / f"{exchange}_symbols_{now.date().isoformat()}.csv"
@@ -244,8 +267,18 @@ class FlattradeReadOnly:
     def quotes(self, contracts, now, *, strict=True):
         result = []
         last_error = None
+        stream_books = {}
+        if self._nifty_stream and contracts:
+            keys = [f'NFO|{contract.token}' for contract in contracts if contract.exchange == 'NFO']
+            if keys:
+                stream_books = self._nifty_stream.latest_books(keys)
         for contract in contracts:
             try:
+                if contract.exchange == 'NFO':
+                    streamed = self._stream_quote(contract,stream_books.get(f'NFO|{contract.token}'),now)
+                    if streamed is not None:
+                        result.append(streamed)
+                        continue
                 key = (contract.exchange, contract.token)
                 with self._quote_lock:
                     cached = self._quote_cache.get(key)
@@ -276,7 +309,7 @@ class FlattradeReadOnly:
         from .catalog import resolve
         interval = resolve(market, strategy_id).bar_minutes
         if held:
-            quotes = self.quotes(held, now)
+            quotes = self.quotes(held, now, strict=False)
             try:
                 bars = self.bars(market, now, interval) if interval == 1 else []
             except FeedError:
