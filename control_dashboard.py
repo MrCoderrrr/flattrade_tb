@@ -73,7 +73,7 @@ class ControlHTTPServer(ThreadingHTTPServer):
         if pin is not None and (not isinstance(pin,str) or len(pin) != 4 or not pin.isascii() or not pin.isdigit()):
             raise ValueError("Dashboard PIN must contain exactly four digits")
         self.pin = pin
-        self.sessions: dict[str, tuple[float,str]] = {}
+        self.sessions: dict[str, float] = {}
         self.login_failures: dict[str, list[float]] = {}
         self.auth_lock = threading.RLock()
         self.chain = chain
@@ -176,7 +176,9 @@ class ControlHandler(BaseHTTPRequestHandler):
         now = time.monotonic()
         with self.server.auth_lock:
             valid = self.server.sessions.get(supplied)
-            if valid and valid[0] > now and valid[1] == self.client_address[0]:
+            # Source IPs can change during an ISP or network handoff. The
+            # high-entropy, HttpOnly, SameSite cookie is the session proof.
+            if valid and valid > now:
                 return
         raise RequestError("Enter the dashboard PIN to unlock.", 401)
 
@@ -197,8 +199,8 @@ class ControlHandler(BaseHTTPRequestHandler):
                 raise RequestError("Incorrect dashboard PIN.", 401)
             self.server.login_failures.pop(address,None)
             token = secrets.token_urlsafe(32)
-            self.server.sessions[token] = (now+8*3600,address)
-            for old,(expiry,_) in list(self.server.sessions.items()):
+            self.server.sessions[token] = now+8*3600
+            for old,expiry in list(self.server.sessions.items()):
                 if expiry <= now:
                     self.server.sessions.pop(old,None)
         self._json(200,{"authenticated":True},cookie=f"desk_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800")
