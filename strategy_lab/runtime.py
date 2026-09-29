@@ -1197,7 +1197,9 @@ class Controller:
                                              s["locked"] or s["state"] == "RECOVERY_REQUIRED")):
                         bars, quotes = self._snapshot(market, now, [contract_from(p["contract"]) for p in s["positions"]])
                         self._mark(s, quotes, self.clock().astimezone(IST))
-                        if s["state"] == "DATA_WAIT" and not s["exit_requested"]:
+                        if (not s["exit_requested"] and
+                                (s.pop("feed_waiting", False) or s["state"] == "DATA_WAIT" or
+                                 s.get("reason", "").startswith("Recovered paper positions"))):
                             s.update(state="RUNNING", reason="Market data recovered; managing paper positions")
                         trade_net = (s["net_pnl"] - s.get("cycle_start_net", 0.)) if spec.id == "mcxv3" else s["unrealized_pnl"] - s["trade_costs"] - s["estimated_exit_costs"]
                         signal = {}
@@ -1317,6 +1319,7 @@ class Controller:
                         s["reason"] = "Signal qualifies; no liquid spread meets contract, premium and risk requirements"
                 except FeedError as exc:
                     s["reason"] = str(exc)
+                    s["feed_waiting"] = True
                     s["feed_error_count"] = s.get("feed_error_count", 0) + 1
                     s["last_feed_error_at"] = self.clock().astimezone(IST).isoformat()
                     if s["positions"]:
