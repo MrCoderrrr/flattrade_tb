@@ -20,7 +20,7 @@ class StrategySpec:
 
 
 SPECS = {
-    "nfv1": StrategySpec("nfv1", "NIFTY", 1, "Original-style KAMA ATM strangle · 1000-point wings · paper adaptation", "09:18", "15:33", "15:34", 1, 30, 60, 4000, 100000),
+    "nfv1": StrategySpec("nfv1", "NIFTY", 1, "Original-style KAMA ATM strangle · 1000-point wings · paper adaptation", "09:18", "15:33", "15:34", 1, 1000, 60, 4000, 100000),
     "mcxv1": StrategySpec("mcxv1", "MCX", 1, "Original KAMA ATM straddle · unhedged · paper adaptation", "16:00", "23:22", "23:24", 1, 1000, 5, None, None),
     "nfv3": StrategySpec("nfv3", "NIFTY", 3, "ATM short straddle · 1000-point call/put wings · indicator leg exits · continuous re-entry", "09:20", "15:33", "15:34", 1, 1000, 60, None, 65000),
     "nfv5": StrategySpec("nfv5", "NIFTY", 5, "One-second flow · ATM straddle · 1000-point wings · adaptive leg stops · paper", "09:20", "15:33", "15:34", 1, 60, 30, 4000, 100000),

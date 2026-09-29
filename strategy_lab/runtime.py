@@ -706,11 +706,16 @@ class Controller:
             self._event(f"{market}: simulated v1 {option} short exit")
         shorts = [p for p in s['positions'] if p['side'] == 'SELL']
         if not shorts:
-            # Original NIFTY keeps only wings after both shorts are gone. This
-            # controlled adaptation exits them too, so the dashboard is flat.
+            # Close stale wings, then allow the normal cooldown path to open
+            # another protected ATM strangle while the session is authorized.
             if market == 'NIFTY':
-                s.update(locked=True, exit_requested=True,
-                         reason='Both v1 shorts exited; closing protective wings')
+                loss_cap = resolve(market, s['strategy_id']).session_loss_per_unit*s['multiplier']
+                if s['net_pnl'] <= -loss_cap:
+                    s.update(locked=True, exit_requested=True,
+                             reason='NIFTY v1 session loss cap reached; closing protective wings')
+                else:
+                    s.update(exit_requested=True,
+                             reason='Both v1 shorts exited; closing wings before the next strangle')
             else:
                 s.update(state='COOLDOWN', last_exit=now.isoformat())
             return
