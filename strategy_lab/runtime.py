@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import fcntl
+import hashlib
 import json
 import math
 import sqlite3
@@ -25,6 +26,16 @@ from .nifty_flow import decision as flow_decision
 
 MARKETS = ("NIFTY", "MCX")
 LIVE_REASON = "Real orders are unavailable: this controller has no commissioned broker executor or partial-fill reconciliation."
+
+
+def risk_code_fingerprint():
+    """Identify the strategy rules used to calculate persisted paper stops."""
+    digest = hashlib.sha256()
+    for name in ("runtime.py", "legacy_v1.py", "active_v3.py", "nifty_flow.py",
+                 "nifty_v5.py", "strategies.py", "catalog.py", "opening_trend.py"):
+        digest.update(name.encode())
+        digest.update((Path(__file__).parent / name).read_bytes())
+    return digest.hexdigest()
 
 
 def fresh(quote, now):
@@ -102,6 +113,7 @@ class Controller:
         self.nifty_observer = None
         self.v5_flow_history = []
         self.record_market_data = False  # Keep trade ledgers, not raw option-book snapshots.
+        self._risk_code_fingerprint = risk_code_fingerprint()
         self._revision = 0
         self.db = sqlite3.connect(self.directory / "ledger.sqlite3", check_same_thread=False)
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -126,8 +138,15 @@ class Controller:
                 if (session.get("mode") == "paper" and session.get("date") == today
                         and not session.get("stop_requested") and not session.get("exit_requested")
                         and not session.get("locked")):
-                    session.update(state="RUNNING",
-                                   reason="Recovered paper positions; waiting for fresh executable quotes")
+                    if session.get("risk_code_fingerprint") != self._risk_code_fingerprint:
+                        # Keep the original fills and best premium. Only the
+                        # old rule's stop is discarded; the first fresh quote
+                        # passes the leg through the new rule before an exit.
+                        for position in session["positions"]:
+                            if position["side"] == "SELL":
+                                position["leg_stop"] = None
+                        session["risk_code_fingerprint"] = self._risk_code_fingerprint
+                    session.update(state="DATA_WAIT", reason="Recovered paper legs; refreshing quotes and stop rules")
                 else:
                     session.update(state="RECOVERY_REQUIRED", exit_requested=True, stop_requested=True,
                                    reason="Recovered paper positions; fresh quotes required to flatten")
@@ -571,7 +590,8 @@ class Controller:
         s.update(positions=positions, state="RUNNING", reason=plan.reason, stop_loss=plan.stop_loss,
                  take_profit=plan.take_profit, trade_costs=costs, max_loss=actual_risk,
                  entries=s["entries"]+1, entered_at=now.isoformat(), direction=plan.direction,
-                 reversal_count=0, reversal_bar=None)
+                 reversal_count=0, reversal_bar=None,
+                 risk_code_fingerprint=self._risk_code_fingerprint)
         if spec.version == 1:
             for p in positions:
                 if p["side"] == "SELL":
@@ -1398,11 +1418,15 @@ class Controller:
                 raise RuntimeError("Market-data worker is still finishing; keep controller running")
         with self.lock:
             for s in self.data["sessions"].values():
-                if (s["positions"] and s.get("mode") == "paper"
-                        and s.get("date") == self.clock().astimezone(IST).date().isoformat()
+                if (s.get("mode") == "paper" and s.get("date") == self.clock().astimezone(IST).date().isoformat()
                         and not s.get("stop_requested") and not s.get("exit_requested")
                         and not s.get("locked")):
-                    s.update(state="DATA_WAIT", reason="Paper worker restarting; awaiting fresh quotes")
+                    # A deployment is not a trading instruction. The durable
+                    # ledger retains entry, best mark, fills and trail state.
+                    if s["positions"]:
+                        s.update(state="DATA_WAIT", reason="Paper worker restarting; open legs preserved")
+                    elif s["state"] not in ("STOPPED", "SESSION_COMPLETE"):
+                        s.update(state="ARMED", reason="Paper worker restarting; session remains armed")
                 else:
                     s.update(state="RECOVERY_REQUIRED" if s["positions"] else "STOPPED",
                              stop_requested=True, exit_requested=bool(s["positions"]))
