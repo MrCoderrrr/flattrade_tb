@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote_plus
@@ -29,6 +30,7 @@ class FeedError(RuntimeError):
 
 _master_lock = threading.Lock()
 _master_attempts = {}
+_QUOTE_POOL = ThreadPoolExecutor(max_workers=6, thread_name_prefix="flattrade-quote")
 
 
 def number(value):
@@ -73,14 +75,13 @@ def parse_quote(contract, row):
     # as lots; convert it before comparing with the symbol-master lot size.
     depth_unit = contract.lot_size if contract.exchange == "MCX" else 1
     observed_at = None
-    if contract.exchange == "MCX":
-        try:
-            response_time = datetime.strptime(row["request_time"], "%H:%M:%S %d-%m-%Y").replace(tzinfo=IST)
-            received_at = datetime.now(IST)
-            if -2 <= (received_at-response_time).total_seconds() <= 5:
-                observed_at = received_at
-        except (KeyError, TypeError, ValueError):
-            pass
+    try:
+        response_time = datetime.strptime(row["request_time"], "%H:%M:%S %d-%m-%Y").replace(tzinfo=IST)
+        received_at = datetime.now(IST)
+        if -2 <= (received_at-response_time).total_seconds() <= 5:
+            observed_at = received_at
+    except (KeyError, TypeError, ValueError):
+        pass
     quote = Quote(contract, timestamp, number(row["bp1"]),
                   number(row["sp1"]), number(row["lp"]),
                   int(row.get("bq1", 0)) * depth_unit,
@@ -103,6 +104,9 @@ class FlattradeReadOnly:
         self._quote_cache = {}
         self._quote_lock = threading.Lock()
         self._quote_locks = {}
+        self._bars_cache_lock = threading.Lock()
+        self._bars_locks = {(market, interval): threading.Lock()
+                            for market in ("NIFTY", "MCX") for interval in (1, 5)}
         self._nifty_stream = None
 
     def attach_nifty_stream(self, stream):
@@ -251,64 +255,81 @@ class FlattradeReadOnly:
 
     def bars(self, market, now, interval=5):
         bucket = (market, interval, now.date(), now.hour, now.minute // interval)
-        if bucket in self._bars_cache:
-            return self._bars_cache[bucket]
-        exchange, token = self.underlying(market, now)
-        start = now.replace(hour=9 if market == "NIFTY" else 16,
-                            minute=15 if market == "NIFTY" else 0, second=0, microsecond=0)
-        if interval == 1:
-            start -= timedelta(days=7)
-        result = self._call("TPSeries", exch=exchange, token=token,
-                            st=str(int(start.timestamp())), et=str(int(now.timestamp())), intrv=str(interval))
-        if not isinstance(result, list):
-            raise FeedError("No intraday bars available")
-        bars = []
-        try:
-            for row in result:
-                stamp = exchange_time(row["time"])
-                if stamp + timedelta(minutes=interval) <= now:
-                    bars.append(Bar(stamp, number(row["into"]), number(row["inth"]),
-                                    number(row["intl"]), number(row["intc"]), number(row.get("intv", 0)), interval))
-        except (ValueError, KeyError):
-            raise FeedError("Malformed intraday bars") from None
-        bars.sort(key=lambda b: b.timestamp)
-        self._bars_cache = {bucket: bars}
-        return bars
+        with self._bars_locks[(market, interval)]:
+            with self._bars_cache_lock:
+                cached = self._bars_cache.get(bucket)
+            if cached is not None:
+                return cached
+            exchange, token = self.underlying(market, now)
+            start = now.replace(hour=9 if market == "NIFTY" else 16,
+                                minute=15 if market == "NIFTY" else 0, second=0, microsecond=0)
+            if interval == 1:
+                start -= timedelta(days=7)
+            result = self._call("TPSeries", exch=exchange, token=token,
+                                st=str(int(start.timestamp())), et=str(int(now.timestamp())), intrv=str(interval))
+            if not isinstance(result, list):
+                raise FeedError("No intraday bars available")
+            bars = []
+            try:
+                for row in result:
+                    stamp = exchange_time(row["time"])
+                    if stamp + timedelta(minutes=interval) <= now:
+                        bars.append(Bar(stamp, number(row["into"]), number(row["inth"]),
+                                        number(row["intl"]), number(row["intc"]), number(row.get("intv", 0)), interval))
+            except (ValueError, KeyError):
+                raise FeedError("Malformed intraday bars") from None
+            bars.sort(key=lambda b: b.timestamp)
+            # A broker response early in a new interval may omit the newest
+            # completed bar. Retry it instead of freezing that gap for a minute.
+            current = bool(bars) and 0 <= (now - (bars[-1].timestamp + timedelta(minutes=interval))).total_seconds() < interval*60
+            if current:
+                with self._bars_cache_lock:
+                    self._bars_cache[bucket] = bars
+                    while len(self._bars_cache) > 16:
+                        self._bars_cache.pop(next(iter(self._bars_cache)))
+            return bars
+
+    def _rest_quote(self, contract):
+        key = (contract.exchange, contract.token)
+        with self._quote_lock:
+            contract_lock = self._quote_locks.setdefault(key, threading.Lock())
+        with contract_lock:
+            with self._quote_lock:
+                cached = self._quote_cache.get(key)
+            if cached is not None and cached[1].contract == contract and time.monotonic() - cached[0] < 0.8:
+                return cached[1]
+            data = self._call("GetQuotes", exch=contract.exchange, token=contract.token)
+            if data.get("tsym") != contract.symbol or int(number(data.get("ls", 0))) != contract.lot_size:
+                raise FeedError("Broker contract metadata differs from symbol master")
+            quote = parse_quote(contract, data)
+            with self._quote_lock:
+                self._quote_cache[key] = (time.monotonic(), quote)
+                if len(self._quote_cache) > 64:
+                    self._quote_cache = {k: v for k, v in self._quote_cache.items()
+                                         if time.monotonic() - v[0] < 2.0}
+            return quote
 
     def quotes(self, contracts, now, *, strict=True):
-        result = []
-        last_error = None
+        contracts = list(contracts)
+        result, last_error = [], None
         stream_books = {}
         if self._nifty_stream and contracts:
             keys = [f'NFO|{contract.token}' for contract in contracts if contract.exchange == 'NFO']
             if keys:
                 stream_books = self._nifty_stream.latest_books(keys)
+        streamed = {}
+        for contract in contracts:
+            if contract.exchange == 'NFO':
+                quote = self._stream_quote(contract, stream_books.get(f'NFO|{contract.token}'), now)
+                if quote is not None:
+                    streamed[(contract.exchange, contract.token)] = quote
+        futures = {(c.exchange, c.token): _QUOTE_POOL.submit(self._rest_quote, c)
+                   for c in contracts if (c.exchange, c.token) not in streamed}
         for contract in contracts:
             try:
-                if contract.exchange == 'NFO':
-                    streamed = self._stream_quote(contract,stream_books.get(f'NFO|{contract.token}'),now)
-                    if streamed is not None:
-                        result.append(streamed)
-                        continue
                 key = (contract.exchange, contract.token)
-                with self._quote_lock:
-                    contract_lock = self._quote_locks.setdefault(key, threading.Lock())
-                with contract_lock:
-                    with self._quote_lock:
-                        cached = self._quote_cache.get(key)
-                    if cached is not None and time.monotonic() - cached[0] < 1.0:
-                        data = cached[1]
-                    else:
-                        data = self._call("GetQuotes", exch=contract.exchange, token=contract.token)
-                        with self._quote_lock:
-                            self._quote_cache[key] = (time.monotonic(), data)
-                            if len(self._quote_cache) > 64:
-                                self._quote_cache = {k: v for k, v in self._quote_cache.items()
-                                                     if time.monotonic() - v[0] < 2.0}
-                if data.get("tsym") != contract.symbol or int(number(data.get("ls", 0))) != contract.lot_size:
-                    raise FeedError("Broker contract metadata differs from symbol master")
-                result.append(parse_quote(contract, data))
-            except (KeyError, ValueError):
+                result.append(streamed[key] if key in streamed else futures[key].result())
+            except (KeyError, ValueError, TypeError, OverflowError):
                 last_error = FeedError("Broker returned incomplete depth data")
                 if strict:
                     raise last_error from None
@@ -324,11 +345,13 @@ class FlattradeReadOnly:
         from .catalog import resolve
         interval = resolve(market, strategy_id).bar_minutes
         if held:
-            quotes = self.quotes(held, now, strict=False)
             try:
                 bars = self.bars(market, now, interval) if interval == 1 else []
             except FeedError:
                 bars = []  # Missing indicators must not prevent pricing an exit.
+            # Quote the held legs last so slow historical bars cannot age a
+            # fresh order book before position stops are evaluated.
+            quotes = self.quotes(held, datetime.now(IST), strict=False)
             return bars, quotes
         bars = self.bars(market, now, interval)
         if not bars:

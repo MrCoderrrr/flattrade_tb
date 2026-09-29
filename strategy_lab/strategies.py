@@ -43,7 +43,7 @@ def _valid_quote(quote: Quote, market: str, now: datetime, *, protective_wing: b
     if not isinstance(quote, Quote) or not isinstance(quote.contract, Contract):
         return False
     contract = quote.contract
-    book_time = quote.book_observed_at if market == "MCX" and quote.book_observed_at else quote.timestamp
+    book_time = quote.book_observed_at or quote.timestamp
     if not _aware(book_time) or not 0 <= (now - book_time).total_seconds() <= MAX_QUOTE_AGE_SECONDS:
         return False
     if not all(_finite_positive(value) for value in (quote.bid, quote.ask, quote.last, contract.strike, contract.tick_size)):

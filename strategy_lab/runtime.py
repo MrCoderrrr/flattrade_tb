@@ -29,7 +29,7 @@ LIVE_REASON = "Real orders are unavailable: this controller has no commissioned 
 
 def fresh(quote, now):
     try:
-        book_time = quote.book_observed_at if quote.contract.exchange == 'MCX' and quote.book_observed_at else quote.timestamp
+        book_time = quote.book_observed_at or quote.timestamp
         return (0 <= (now-book_time).total_seconds() <= 10 and
                 all(math.isfinite(v) and v > 0 for v in (quote.bid, quote.ask, quote.last)) and
                 quote.ask >= quote.bid)
@@ -126,8 +126,8 @@ class Controller:
                 if (session.get("mode") == "paper" and session.get("date") == today
                         and not session.get("stop_requested") and not session.get("exit_requested")
                         and not session.get("locked")):
-                    session.update(state="DATA_WAIT",
-                                   reason="Recovered paper positions; awaiting fresh quotes")
+                    session.update(state="RUNNING",
+                                   reason="Recovered paper positions; waiting for fresh executable quotes")
                 else:
                     session.update(state="RECOVERY_REQUIRED", exit_requested=True, stop_requested=True,
                                    reason="Recovered paper positions; fresh quotes required to flatten")
@@ -1323,9 +1323,9 @@ class Controller:
                         # A failed data read is not a trading signal. Preserve
                         # the existing basket and retry; explicit stops and
                         # risk exits remain pending for fresh executable quotes.
-                        s["state"] = "EXIT_PENDING" if s["exit_requested"] else "RUNNING" if market == "MCX" else "DATA_WAIT"
+                        s["state"] = "EXIT_PENDING" if s["exit_requested"] else "RUNNING"
                     else:
-                        s["state"] = "ARMED" if market == "MCX" else "DATA_WAIT"
+                        s["state"] = "ARMED"
                 except Exception:
                     s.update(reason="Engine validation error; new entries halted, inspect local diagnostics", locked=True)
                     if s["positions"]:
