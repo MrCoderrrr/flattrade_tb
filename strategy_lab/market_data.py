@@ -72,10 +72,20 @@ def parse_quote(contract, row):
     # units. The exchange's Natural Gas option chain labels bid/ask quantity
     # as lots; convert it before comparing with the symbol-master lot size.
     depth_unit = contract.lot_size if contract.exchange == "MCX" else 1
+    observed_at = None
+    if contract.exchange == "MCX":
+        try:
+            response_time = datetime.strptime(row["request_time"], "%H:%M:%S %d-%m-%Y").replace(tzinfo=IST)
+            received_at = datetime.now(IST)
+            if -2 <= (received_at-response_time).total_seconds() <= 5:
+                observed_at = received_at
+        except (KeyError, TypeError, ValueError):
+            pass
     quote = Quote(contract, timestamp, number(row["bp1"]),
                   number(row["sp1"]), number(row["lp"]),
                   int(row.get("bq1", 0)) * depth_unit,
-                  int(row.get("sq1", 0)) * depth_unit)
+                  int(row.get("sq1", 0)) * depth_unit,
+                  book_observed_at=observed_at)
     if quote.bid <= 0 or quote.ask < quote.bid or quote.last <= 0:
         raise FeedError("Empty or crossed order book")
     return quote
@@ -92,6 +102,7 @@ class FlattradeReadOnly:
         self._contracts_cache = {}
         self._quote_cache = {}
         self._quote_lock = threading.Lock()
+        self._quote_locks = {}
         self._nifty_stream = None
 
     def attach_nifty_stream(self, stream):
@@ -281,15 +292,19 @@ class FlattradeReadOnly:
                         continue
                 key = (contract.exchange, contract.token)
                 with self._quote_lock:
-                    cached = self._quote_cache.get(key)
+                    contract_lock = self._quote_locks.setdefault(key, threading.Lock())
+                with contract_lock:
+                    with self._quote_lock:
+                        cached = self._quote_cache.get(key)
                     if cached is not None and time.monotonic() - cached[0] < 1.0:
                         data = cached[1]
                     else:
                         data = self._call("GetQuotes", exch=contract.exchange, token=contract.token)
-                        self._quote_cache[key] = (time.monotonic(), data)
-                    if len(self._quote_cache) > 64:
-                        self._quote_cache = {k: v for k, v in self._quote_cache.items()
-                                             if time.monotonic() - v[0] < 2.0}
+                        with self._quote_lock:
+                            self._quote_cache[key] = (time.monotonic(), data)
+                            if len(self._quote_cache) > 64:
+                                self._quote_cache = {k: v for k, v in self._quote_cache.items()
+                                                     if time.monotonic() - v[0] < 2.0}
                 if data.get("tsym") != contract.symbol or int(number(data.get("ls", 0))) != contract.lot_size:
                     raise FeedError("Broker contract metadata differs from symbol master")
                 result.append(parse_quote(contract, data))
@@ -344,14 +359,20 @@ class FlattradeReadOnly:
             # Both active MCX versions open at one common ATM strike. Fetching
             # the surrounding 14 strikes issued 28 quote calls per worker and
             # repeatedly exhausted the broker's quote endpoint.
-            calls = {c.strike for c in contracts if c.option_type == "CE"}
-            puts = {c.strike for c in contracts if c.option_type == "PE"}
-            common = calls & puts
-            if not common:
-                return bars, []
-            atm = min(common, key=lambda strike: abs(strike - spot))
-            selected = [c for c in contracts if c.strike == atm]
-            return bars, self.quotes(selected, now, strict=False)
+            # v1 prefers the full contract; v3's existing plan prefers mini.
+            # Choose one matched family/strike before requesting any depth.
+            families = (False, True) if strategy_id == "mcxv1" else (True, False)
+            for mini in families:
+                group = [c for c in contracts if c.symbol.upper().startswith("NATGASMINI") == mini]
+                calls = {c.strike for c in group if c.option_type == "CE"}
+                puts = {c.strike for c in group if c.option_type == "PE"}
+                common = calls & puts
+                if common:
+                    atm = min(common, key=lambda strike: abs(strike - spot))
+                    selected = [c for c in group if c.strike == atm and c.option_type in ("CE", "PE")]
+                    if len(selected) == 2:
+                        return bars, self.quotes(selected, now, strict=False)
+            return bars, []
         strikes = sorted({c.strike for c in contracts}, key=lambda k: abs(k-spot))[:(1 if strategy_id == "nfv5" else 14)]
         if strategy_id in ("nfv1", "nfv5"):
             # These paper baskets use wings at least 1000 points from ATM.

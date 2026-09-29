@@ -29,7 +29,8 @@ LIVE_REASON = "Real orders are unavailable: this controller has no commissioned 
 
 def fresh(quote, now):
     try:
-        return (0 <= (now-quote.timestamp).total_seconds() <= 10 and
+        book_time = quote.book_observed_at if quote.contract.exchange == 'MCX' and quote.book_observed_at else quote.timestamp
+        return (0 <= (now-book_time).total_seconds() <= 10 and
                 all(math.isfinite(v) and v > 0 for v in (quote.bid, quote.ask, quote.last)) and
                 quote.ask >= quote.bid)
     except (TypeError, ValueError):
@@ -411,12 +412,12 @@ class Controller:
         equity = a["lifetime_pnl"] + a["daily_pnl"]
         a["peak_pnl"] = max(a["peak_pnl"], equity)
         a["drawdown"] = a["peak_pnl"] - equity
-        uncapped_v3 = any(s.get('date') and s.get('strategy_id') == 'nfv3'
-                          for s in self.data['sessions'].values())
-        a['daily_loss_fraction'] = (None if uncapped_v3 else .05 if any(
+        uncapped = any(s.get('date') and s.get('strategy_id') in ('nfv3', 'mcxv1')
+                       for s in self.data['sessions'].values())
+        a['daily_loss_fraction'] = (None if uncapped else .05 if any(
             resolve(m, s.get('strategy_id')).version >= 3 and s['date']
             for m, s in self.data['sessions'].items()) else .01)
-        if not uncapped_v3 and (a["daily_pnl"] <= -a['daily_loss_fraction']*a["capital"] or
+        if not uncapped and (a["daily_pnl"] <= -a['daily_loss_fraction']*a["capital"] or
                                 a["drawdown"] >= .05*a["capital"]):
             a["halted"] = True
         if a["halted"]:
@@ -443,7 +444,7 @@ class Controller:
             price = q.ask + q.contract.tick_size if closing_buy else max(q.contract.tick_size, q.bid-q.contract.tick_size)
             pnl = (price-p["entry_price"]) * p["quantity"] * (1 if p["side"] == "BUY" else -1)
             p.update(mark_price=price, unrealized_pnl=round(pnl, 4),
-                     mark_timestamp=q.timestamp.isoformat())
+                     mark_timestamp=(q.book_observed_at or q.timestamp).isoformat())
             if p["side"] == "BUY":
                 p["best_mark"] = max(p.get("best_mark", p["entry_price"]), price)
             else:
@@ -460,7 +461,7 @@ class Controller:
         s["estimated_exit_costs"] = round(exit_costs, 4)
         s["net_pnl"] = round(s["realized_pnl"]+total-s["costs"]-exit_costs, 4)
         if quotes:
-            s["feed_timestamp"] = min(q.timestamp for q in quotes).isoformat()
+            s["feed_timestamp"] = min(q.book_observed_at or q.timestamp for q in quotes).isoformat()
 
     def _enter(self, market, s, plan, now):
         spec = resolve(market, s.get('strategy_id'))
@@ -663,7 +664,7 @@ class Controller:
         if (len(shorts) != 1 or s.get('paused') or not signal.get('eligible') or
                 now.strftime('%H:%M') >= resolve(market, s['strategy_id']).entry_end or
                 s['entries'] >= resolve(market, s['strategy_id']).max_entries or
-                s['net_pnl'] <= -resolve(market, s['strategy_id']).session_loss_per_unit*s['multiplier'] or
+                (market != 'MCX' and s['net_pnl'] <= -resolve(market, s['strategy_id']).session_loss_per_unit*s['multiplier']) or
                 not s.get('last_leg_exit') or
                 (now-datetime.fromisoformat(s['last_leg_exit'])).total_seconds() < 60):
             return
@@ -1208,7 +1209,7 @@ class Controller:
                                     s['reversal_count'] = s.get('reversal_count', 0)+1 if signal.get('direction') != s.get('direction') else 0
                                     if s['reversal_count'] >= 2:
                                         s.update(exit_requested=True, reason='Indicator regime changed for two completed bars')
-                        if (spec.session_loss_per_unit is not None and
+                        if (spec.id != 'mcxv1' and spec.session_loss_per_unit is not None and
                                 s["net_pnl"] <= -spec.session_loss_per_unit*s["multiplier"]):
                             s.update(locked=True, exit_requested=True, reason="Session loss limit reached")
                         elif spec.version != 1 and (trade_net <= -s["stop_loss"] or (spec.id != "mcxv3" and trade_net >= s["take_profit"])):
@@ -1301,7 +1302,7 @@ class Controller:
                     if not bars or (fresh_now-(bars[-1].timestamp+timedelta(minutes=spec.bar_minutes))).total_seconds() > (90 if spec.version in (1, 3) else 360):
                         raise FeedError("Completed underlying bars are missing or stale")
                     if quotes:
-                        s["feed_timestamp"] = min(q.timestamp for q in quotes).isoformat()
+                        s["feed_timestamp"] = min(q.book_observed_at or q.timestamp for q in quotes).isoformat()
                     signal = signal_fn(market, bars, fresh_now)
                     s["signal"] = signal
                     s["reason"] = signal.get("reason", "Waiting for a qualifying signal")
@@ -1318,9 +1319,9 @@ class Controller:
                         # A failed data read is not a trading signal. Preserve
                         # the existing basket and retry; explicit stops and
                         # risk exits remain pending for fresh executable quotes.
-                        s["state"] = "EXIT_PENDING" if s["exit_requested"] else "DATA_WAIT"
+                        s["state"] = "EXIT_PENDING" if s["exit_requested"] else "RUNNING" if market == "MCX" else "DATA_WAIT"
                     else:
-                        s["state"] = "DATA_WAIT"
+                        s["state"] = "ARMED" if market == "MCX" else "DATA_WAIT"
                 except Exception:
                     s.update(reason="Engine validation error; new entries halted, inspect local diagnostics", locked=True)
                     if s["positions"]:

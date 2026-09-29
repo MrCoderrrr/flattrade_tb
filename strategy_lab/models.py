@@ -46,6 +46,9 @@ class Quote:
     last: float
     bid_size: int = 0
     ask_size: int = 0
+    # REST response time for a current order-book observation. The timestamp
+    # above remains the exchange's last-trade/feed timestamp.
+    book_observed_at: datetime | None = None
 
 
 @dataclass(frozen=True)
