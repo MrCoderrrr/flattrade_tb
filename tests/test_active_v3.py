@@ -28,6 +28,23 @@ def fixture(market='NIFTY', direction=1):
 
 
 class ActiveTests(unittest.TestCase):
+    def test_nifty_v3_cumulative_daily_loss_does_not_halt_paper_session(self):
+        now = datetime(2026, 9, 29, 14, 30, tzinfo=IST)
+        with tempfile.TemporaryDirectory() as root:
+            controller = Controller(Path(root), clock=lambda: now)
+            try:
+                session = controller.data['sessions']['NIFTY']
+                session.update(date=now.date().isoformat(), strategy_id='nfv3',
+                               mode='paper', net_pnl=-15000., state='ARMED')
+                controller.data['account']['capital'] = 200000.
+                controller._account()
+                self.assertFalse(controller.data['account']['halted'])
+                self.assertFalse(session['locked'])
+                self.assertIsNone(controller.data['account']['daily_loss_fraction'])
+                self.assertIsNone(next(s for s in catalog() if s['id']=='nfv3')['session_loss_per_unit'])
+            finally:
+                controller.shutdown()
+
     def test_same_day_paper_positions_resume_after_worker_restart(self):
         bars, quotes, now = fixture('MCX')
         with tempfile.TemporaryDirectory() as root:

@@ -249,8 +249,10 @@ class Controller:
             self.data["history"].append({"date": account["date"], "net_pnl": account["daily_pnl"],
                                           "capital": account["capital"]})
             account["lifetime_pnl"] += account["daily_pnl"]
+        uncapped_v3 = any(s.get('date') and s.get('strategy_id') == 'nfv3'
+                          for s in self.data['sessions'].values())
         account.update(date=now.date().isoformat(), daily_pnl=0.,
-                       halted=account["drawdown"] >= .05 * account["capital"])
+                       halted=False if uncapped_v3 else account["drawdown"] >= .05 * account["capital"])
         self.data["sessions"] = {m: blank_session() for m in MARKETS}
 
     def start(self, market, mode, multiplier, capital, confirmation="", strategy_id=None):
@@ -283,7 +285,7 @@ class Controller:
             if s["positions"] or s["state"] not in ("STOPPED", "SESSION_COMPLETE"):
                 raise ValueError("Stop and flatten the existing session before starting")
             if (immediate and (s["locked"] or self.data["account"]["halted"]) or
-                    self.data["account"]["drawdown"] >= .05*capital):
+                    (spec.id != 'nfv3' and self.data["account"]["drawdown"] >= .05*capital)):
                 raise ValueError("Risk limit reached; restarting cannot clear the lock")
             if any(x["date"] for x in self.data["sessions"].values()) and capital != self.data["account"]["capital"]:
                 raise ValueError("Both sessions share one account; capital is fixed for the trading day")
@@ -409,8 +411,13 @@ class Controller:
         equity = a["lifetime_pnl"] + a["daily_pnl"]
         a["peak_pnl"] = max(a["peak_pnl"], equity)
         a["drawdown"] = a["peak_pnl"] - equity
-        a['daily_loss_fraction'] = .05 if any(resolve(m, s.get('strategy_id')).version >= 3 and s['date'] for m, s in self.data['sessions'].items()) else .01
-        if a["daily_pnl"] <= -a['daily_loss_fraction']*a["capital"] or a["drawdown"] >= .05*a["capital"]:
+        uncapped_v3 = any(s.get('date') and s.get('strategy_id') == 'nfv3'
+                          for s in self.data['sessions'].values())
+        a['daily_loss_fraction'] = (None if uncapped_v3 else .05 if any(
+            resolve(m, s.get('strategy_id')).version >= 3 and s['date']
+            for m, s in self.data['sessions'].items()) else .01)
+        if not uncapped_v3 and (a["daily_pnl"] <= -a['daily_loss_fraction']*a["capital"] or
+                                a["drawdown"] >= .05*a["capital"]):
             a["halted"] = True
         if a["halted"]:
             for s in self.data["sessions"].values():
@@ -787,7 +794,8 @@ class Controller:
         if (not anchor or not wing or s.get('paused') or s['entries'] >= spec.max_entries or
                 s['stop_requested'] or s['exit_requested'] or s['locked'] or
                 now.strftime('%H:%M') >= spec.entry_end or
-                s['net_pnl'] <= -spec.session_loss_per_unit*s['multiplier']):
+                (spec.session_loss_per_unit is not None and
+                 s['net_pnl'] <= -spec.session_loss_per_unit*s['multiplier'])):
             return False
         width = (wing['contract']['strike'] - anchor['strike'] if kind == 'CE'
                  else anchor['strike'] - wing['contract']['strike'])
@@ -1100,7 +1108,8 @@ class Controller:
                                     s['reversal_count'] = s.get('reversal_count', 0)+1 if signal.get('direction') != s.get('direction') else 0
                                     if s['reversal_count'] >= 2:
                                         s.update(exit_requested=True, reason='Indicator regime changed for two completed bars')
-                        if s["net_pnl"] <= -spec.session_loss_per_unit*s["multiplier"]:
+                        if (spec.session_loss_per_unit is not None and
+                                s["net_pnl"] <= -spec.session_loss_per_unit*s["multiplier"]):
                             s.update(locked=True, exit_requested=True, reason="Session loss limit reached")
                         elif spec.version != 1 and (trade_net <= -s["stop_loss"] or (spec.id != "mcxv3" and trade_net >= s["take_profit"])):
                             s.update(exit_requested=True, reason="Portfolio stop" if trade_net < 0 else "Portfolio take profit")
