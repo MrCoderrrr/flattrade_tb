@@ -412,6 +412,11 @@ class Controller:
             result['strategy_history'] = history
             for market, s in result["sessions"].items():
                 s["net_pnl"] = round(float(s["net_pnl"]) - float(s.get("pnl_reset_offset") or 0), 4)
+                s["unrealized_pnl"] = round(float(s["unrealized_pnl"]) - sum(
+                    float(p.get("pnl_reset_unrealized") or 0) for p in s["positions"]), 4)
+                for position in s["positions"]:
+                    position["unrealized_pnl"] = round(
+                        float(position["unrealized_pnl"]) - float(position.get("pnl_reset_unrealized") or 0), 4)
             result['account']['daily_pnl'] = round(sum(
                 s['net_pnl'] for s in result['sessions'].values()
                 if s.get('date') == now.date().isoformat()), 4)

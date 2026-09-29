@@ -190,10 +190,10 @@ function renderDetailMetrics(){
   const todayPnl=current?Number(current.net_pnl)||0:Number(rows.find(row=>row.day===today)?.pnl)||0;
   let monthPnl=rows.reduce((sum,row)=>sum+(Number(row.pnl)||0),0);
   if(current&&String(today||'').startsWith(data.month||detailMonth||monthKey(0)))monthPnl+=todayPnl-(Number(rows.find(row=>row.day===today)?.pnl)||0);
-  const realized=current?closedLegs(current.trades||[]).reduce((sum,leg)=>sum+leg.pnl,0):0;
   const unrealized=current?Number(current.unrealized_pnl)||0:0;
+  const realized=todayPnl-unrealized;
   const metric=(label,value,n)=>metricCard(label,signed(value)+' · '+percent(value,n),value);
-  $('detail-metrics').replaceChildren(metric('Today P&L',todayPnl,current?.capital||capital),metric('Closed P&L',realized,current?.capital||capital),metric('Open P&L',unrealized,current?.capital||capital),metric('Month P&L',monthPnl,capital));
+  $('detail-metrics').replaceChildren(metric('Today P&L',todayPnl,current?.capital||capital),metric('Closed + costs',realized,current?.capital||capital),metric('Open P&L',unrealized,current?.capital||capital),metric('Month P&L',monthPnl,capital));
 }
 async function loadDetail(){if(activeTab!=='strategy-detail'||!detailStrategy||!status)return;try{const query='?month='+encodeURIComponent(detailMonth||monthKey(0))+(detailDay?'&day='+encodeURIComponent(detailDay):'');detailData=await api('/api/analytics/strategy/'+encodeURIComponent(detailStrategy)+query);renderDetail()}catch(err){text($('detail-chart-note'),err.message)}}
 function renderDetail(){
