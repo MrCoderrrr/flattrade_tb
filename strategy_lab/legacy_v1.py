@@ -64,6 +64,21 @@ def explain_signal(market, bars, now):
     threshold = .15 if market == "NIFTY" else .02
     direction = 1 if slope >= threshold else -1 if slope <= -threshold else 0
     ema8, ema21 = _ema(closes, 8)[-1], _ema(closes, 21)[-1]
+    efficiency = None
+    ema_gap_floor = None
+    if market == "MCX":
+        # KAMA(5) reacts quickly, but a slope alone can reverse inside a noisy
+        # minute. Require its efficiency ratio and EMA spread to agree before
+        # removing a short leg; neutral signals still allow the two-leg entry.
+        noise = sum(abs(closes[j]-closes[j-1]) for j in range(len(closes)-5, len(closes)))
+        efficiency = abs(closes[-1]-closes[-6])/noise if noise else 0.
+        atr_window = recent[-15:]
+        ranges = [max(b.high-b.low, abs(b.high-a.close), abs(b.low-a.close))
+                  for a,b in zip(atr_window, atr_window[1:])]
+        atr14 = sum(ranges)/len(ranges)
+        ema_gap_floor = max(.02, .08*atr14)
+        if efficiency < .35 or direction*(ema8-ema21) <= ema_gap_floor:
+            direction = 0
     adx = _adx(today, 7)
     opening = 0
     if market == "NIFTY":
@@ -74,6 +89,7 @@ def explain_signal(market, bars, now):
                   indicators={"close": closes[-1], "kama": kama[-1],
                               "kama_slope": slope, "kama_threshold": threshold,
                               "ema8": ema8, "ema21": ema21, "adx7_1m": adx,
+                              "efficiency5": efficiency, "ema_gap_floor": ema_gap_floor,
                               "opening_drive": opening,
                               "last_bar_open": recent[-1].timestamp.isoformat()})
     if opening and direction == -opening:

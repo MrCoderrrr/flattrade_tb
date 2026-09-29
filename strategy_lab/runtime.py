@@ -538,6 +538,8 @@ class Controller:
             position = {"symbol": q.contract.symbol, "contract": contract_dict(q.contract),
                         "side": leg.side, "quantity": qty, "entry_price": price,
                         "mark_price": price, "unrealized_pnl": 0.}
+            if spec.id == "mcxv1":
+                position["entry_signal_bar"] = s.get("signal", {}).get("indicators", {}).get("last_bar_open")
             positions.append(position)
             risk_positions.append(position)
             fills.append({"timestamp": now.isoformat(), "symbol": q.contract.symbol,
@@ -575,7 +577,8 @@ class Controller:
                 if p["side"] == "SELL":
                     p.update(best_mark=p["entry_price"], leg_stop=None, trail_armed=False)
         if spec.id == "mcxv3":
-            s.update(cycle_start_net=s["net_pnl"], trend_count=0, trend_bar=None,
+            s.update(cycle_start_net=s["net_pnl"], trend_count=0,
+                     trend_bar=s.get("signal", {}).get("indicators", {}).get("last_bar_open"),
                      reentry_count=0, reentry_bar=None, leg_reentries=s.get("leg_reentries", 0))
             for p in positions:
                 p.update(best_mark=p["entry_price"], leg_stop=None, trail_armed=False)
@@ -648,9 +651,12 @@ class Controller:
             return
         slope = signal.get('indicators', {}).get('kama_slope', 0.) if signal.get('eligible') else 0.
         direction = signal.get('direction', 0) if signal.get('eligible') else 0
+        signal_bar = signal.get('indicators', {}).get('last_bar_open')
         initial = .15 if market == 'NIFTY' else .10
         solo_trail = .09 if market == 'NIFTY' else .05
         for p in list(shorts):
+            if market == 'MCX' and not p.get('entry_signal_bar'):
+                p['entry_signal_bar'] = signal_bar
             entry, mark = p['entry_price'], p['mark_price']
             p['best_mark'] = min(p.get('best_mark', entry), mark)
             solo = len([x for x in s['positions'] if x['side'] == 'SELL']) == 1
@@ -658,7 +664,8 @@ class Controller:
             p['leg_stop'] = min(p.get('leg_stop') or stop, stop)
             p['trail_armed'] = solo
             option = _option_type(contract_from(p['contract']))
-            impulse = (direction > 0 and option == 'CE' or direction < 0 and option == 'PE')
+            impulse = ((direction > 0 and option == 'CE' or direction < 0 and option == 'PE')
+                       and (market != 'MCX' or (signal_bar and signal_bar > p['entry_signal_bar'])))
             if mark < p['leg_stop'] and not (impulse and abs(slope) >= (.5 if market == 'NIFTY' else .05)):
                 continue
             fee = cost(mark, p['quantity'])
@@ -730,7 +737,8 @@ class Controller:
         s['positions'].append({'symbol': q.contract.symbol, 'contract': contract_dict(q.contract),
                                'side': 'SELL', 'quantity': held['quantity'], 'entry_price': price,
                                'mark_price': price, 'unrealized_pnl': 0., 'best_mark': price,
-                               'leg_stop': None, 'trail_armed': False})
+                               'leg_stop': None, 'trail_armed': False,
+                               'entry_signal_bar': signal_bar})
         s['costs'] += fee
         s['trades'].append({'timestamp': now.isoformat(), 'symbol': q.contract.symbol,
                             'side': 'SELL', 'quantity': held['quantity'], 'price': price,
@@ -840,6 +848,7 @@ class Controller:
         s["leg_reentries"] += 1
         s["reentry_count"] = 0
         s["trend_count"] = 0
+        s["trend_bar"] = bar
         s["missing_armed"] = False
         s["reason"] = "KAMA/EMA reversal; ATM straddle restored"
         self._mark(s, quotes+[q], now)
