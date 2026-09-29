@@ -131,9 +131,26 @@ class Controller:
         self.data['account'].setdefault('configured_capital',float(self.data['account']['capital']))
         self.data['account'].setdefault('live_permission',False)
         self.data.setdefault('schedules', {})
+        self.data.setdefault('strategy_authorizations', {})
+        # A pending start was already an explicit user request in older
+        # releases. Promote it to a persistent authorization on upgrade.
+        for market, planned in self.data['schedules'].items():
+            self.data['strategy_authorizations'].setdefault(market, {
+                key: planned[key] for key in ('strategy_id','mode','multiplier','capital')
+                if key in planned
+            })
         today = self.clock().astimezone(IST).date().isoformat()
-        for session in self.data["sessions"].values():
+        for market, session in self.data["sessions"].items():
             session.pop('flow_history',None)  # Prior releases stored oversized per-second histories.
+            if (market not in self.data['strategy_authorizations'] and
+                    session.get('mode') == 'paper' and session.get('date') == today and
+                    not session.get('stop_requested') and not session.get('exit_requested') and
+                    not session.get('locked') and session.get('strategy_id') and
+                    session.get('state') not in ('STOPPED','SESSION_COMPLETE')):
+                self.data['strategy_authorizations'][market] = {
+                    **{key: session[key] for key in ('strategy_id','mode','multiplier','capital')},
+                    'auto_restart':True,
+                }
             if session["positions"]:
                 if (session.get("mode") == "paper" and session.get("date") == today
                         and not session.get("stop_requested") and not session.get("exit_requested")
@@ -324,6 +341,10 @@ class Controller:
             if immediate and other["positions"]:
                 raise ValueError("Flatten the other session before reusing account capital")
             self.data["account"]["capital"] = float(capital)
+            authorization = {"strategy_id":spec.id, "mode":mode,
+                             "multiplier":multiplier, "capital":float(capital),
+                             "auto_restart":True}
+            self.data['strategy_authorizations'][market] = authorization
             self._revision += 1
             if immediate:
                 s.update(state="ARMED", mode=mode, multiplier=multiplier, capital=float(capital), strategy_id=spec.id,
@@ -331,8 +352,7 @@ class Controller:
                          stop_requested=False, exit_requested=False, paused=False)
                 self._event(f"{market}: PAPER session authorized at {multiplier}×; shared capital ₹{capital:,.0f}")
             else:
-                self.data['schedules'][market] = {"strategy_id":spec.id, "mode":mode,
-                    "multiplier":multiplier, "capital":float(capital), "scheduled_for":target.isoformat()}
+                self.data['schedules'][market] = {**authorization, "scheduled_for":target.isoformat()}
                 self._event(f"{market}: PAPER {spec.id} scheduled for {target.isoformat()} {spec.entry_start} IST at {multiplier}×")
             self._save()
             return self.status()
@@ -372,6 +392,7 @@ class Controller:
             if market not in MARKETS:
                 raise ValueError("Unknown market")
             scheduled = self.data['schedules'].pop(market, None)
+            self.data['strategy_authorizations'].pop(market, None)
             s = self.data["sessions"][market]
             self._revision += 1
             if s["positions"] or s["state"] not in ("STOPPED", "SESSION_COMPLETE"):
@@ -1182,6 +1203,7 @@ class Controller:
         self._event(f"{market}: {count} paper legs closed at last observed marks after session cutoff")
 
     def _activate_schedules(self, now):
+        self._queue_authorized_schedules(now)
         for market, planned in list(self.data['schedules'].items()):
             spec = resolve(market, planned['strategy_id'])
             if now.date().isoformat() < planned['scheduled_for'] or now.weekday() >= 5:
@@ -1205,6 +1227,7 @@ class Controller:
             if (planned['capital'] != self.data['account']['configured_capital'] or
                     planned['capital'] < 200000*planned['multiplier']):
                 del self.data['schedules'][market]
+                self.data['strategy_authorizations'].pop(market, None)
                 self._event(f"{market}: scheduled start canceled; account capital changed")
                 continue
             s.update(state='ARMED', mode=planned['mode'], multiplier=planned['multiplier'],
@@ -1215,6 +1238,33 @@ class Controller:
             del self.data['schedules'][market]
             self._revision += 1
             self._event(f"{market}: scheduled PAPER {spec.id} activated at {planned['multiplier']}×")
+
+    def _queue_authorized_schedules(self, now):
+        """Re-arm an explicitly enabled strategy for its next session.
+
+        Session flattening is daily; the user's On authorization is durable
+        until stop() removes it. Schedule the following exchange weekday once
+        the runtime is flat and has stopped for the day.
+        """
+        for market, authorization in list(self.data.get('strategy_authorizations', {}).items()):
+            if market in self.data['schedules']:
+                continue
+            session = self.data['sessions'][market]
+            if session['positions'] or session['state'] not in ('STOPPED','SESSION_COMPLETE'):
+                continue
+            try:
+                spec = resolve(market, authorization.get('strategy_id'))
+            except ValueError:
+                self.data['strategy_authorizations'].pop(market, None)
+                continue
+            # End-of-session, risk-stop, and a recovered prior-day session all
+            # resume at the next session start, never immediately re-enter.
+            base_time = (now.replace(hour=23, minute=59, second=59)
+                         if session.get('date') == now.date().isoformat() else now)
+            target = next_session_date(base_time, spec)
+            self.data['schedules'][market] = {**authorization, 'scheduled_for':target.isoformat()}
+            session['reason'] = f"Strategy remains ON; next session scheduled for {target.isoformat()} {spec.entry_start} IST"
+            self._event(f"{market}: {spec.id} remains ON; next PAPER session scheduled for {target.isoformat()} {spec.entry_start} IST")
 
     def tick(self):
         with self.lock:
@@ -1406,6 +1456,7 @@ class Controller:
                     else:
                         s["state"] = "STOPPED"
             self._account()
+            self._queue_authorized_schedules(now)
             self._save()
 
     def start_worker(self):
