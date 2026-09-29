@@ -27,6 +27,26 @@
 #page-dashboard{padding-top:12px}#page-dashboard .hero{padding:17px 22px;gap:14px}#page-dashboard .hero .big{font-size:clamp(30px,3vw,42px);margin:4px 0}#page-dashboard .heroitem{padding-left:14px}#page-dashboard .section{padding:16px}#page-dashboard .sectionline{margin-bottom:9px}#page-dashboard .sectionline p{display:none}#page-dashboard .grid2{gap:12px;margin-top:12px}#page-dashboard .trade{padding:9px 0}#page-dashboard .events{gap:8px;max-height:290px}
 @media(max-width:720px){#page-dashboard{padding-top:8px}#page-dashboard .hero{padding:15px;gap:10px}#page-dashboard .hero .big{font-size:30px}#page-dashboard .heroitem{padding:0;border:0}.dashboard-meta{margin-bottom:7px}}
 .pnl-percent{display:inline!important;font-size:.76em;font-weight:500;color:var(--muted);white-space:nowrap;letter-spacing:0}.hero .meta #today-return{font-size:inherit;font-weight:600}
+/* Terminal-grade visual system: compact data surfaces, instrument-style type, and restrained signal color. */
+:root{--gridline:color-mix(in srgb,var(--line) 28%,transparent);--terminal-glow:color-mix(in srgb,var(--teal) 12%,transparent)}
+body{background-color:var(--bg);background-image:linear-gradient(var(--gridline) 1px,transparent 1px),linear-gradient(90deg,var(--gridline) 1px,transparent 1px),radial-gradient(ellipse at 50% -20%,var(--terminal-glow),transparent 56%);background-size:32px 32px,32px 32px,auto;background-attachment:fixed}
+.app{max-width:1600px}.topbar{height:70px;border-bottom-color:color-mix(in srgb,var(--teal) 28%,var(--line));backdrop-filter:blur(14px)}
+.brand{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;letter-spacing:.13em}.brandmark{border-radius:7px;box-shadow:0 0 18px #43d8bd33}
+.nav button{border-radius:7px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;letter-spacing:.025em;text-transform:uppercase}.nav button[aria-selected=true]{color:var(--teal);background:color-mix(in srgb,var(--teal) 9%,var(--panel));box-shadow:inset 0 -2px var(--teal)}
+.toptools small,.asof,.badge,.eyebrow,.strategy .metriclabel,.premiumcell small,.analytics-table th,.chaintable th{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.035em}
+.card{border-radius:13px;box-shadow:0 8px 26px #0002}.section,.setting,.mlpanel{background:linear-gradient(145deg,color-mix(in srgb,var(--panel) 97%,var(--teal)),var(--panel))}
+.hero{border-color:color-mix(in srgb,var(--teal) 34%,var(--line));background:radial-gradient(ellipse at 8% 0%,color-mix(in srgb,var(--teal) 13%,transparent),transparent 45%),linear-gradient(110deg,var(--panel),color-mix(in srgb,var(--panel2) 72%,var(--bg)))}
+.hero .big,.heroitem strong,.historycard .value,.analytics-card .value,.analytics-metrics strong,.mlmetric strong,.chainstat strong,.strategy .metricval,.tradepnl,.premiumcell strong,.analytics-table td,.chaintable td,.active-strategy .value{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-variant-numeric:tabular-nums lining-nums;letter-spacing:-.045em}
+.heroitem small,.sectionline h2,.market-head h2{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;text-transform:uppercase;letter-spacing:.06em;font-size:11px;color:var(--muted)}
+.sectionline{border-bottom:1px solid var(--line);padding-bottom:9px}.sectionline h2{font-size:12px;color:var(--text)}
+.active-strategy,.strategy,.analytics-card,.historycard,.chainstat{border-radius:10px;background:color-mix(in srgb,var(--panel2) 88%,transparent);transition:border-color .16s ease,background .16s ease,transform .16s ease}
+.active-strategy:hover,.strategy:hover,.analytics-card:hover,.historycard:hover{border-color:color-mix(in srgb,var(--teal) 55%,var(--line));background:color-mix(in srgb,var(--panel2) 96%,var(--teal));transform:translateY(-1px)}
+.badge{border-radius:5px;text-transform:uppercase;font-size:9px;letter-spacing:.08em}.paper-badge{border-color:color-mix(in srgb,var(--amber) 35%,var(--line));background:color-mix(in srgb,var(--amber) 8%,transparent)}
+.strategy .name{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.02em}.strategy .name span{border-radius:4px}.strategy input[type=number],.setting input[type=number],.setting .auth-input,select{border-radius:6px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-variant-numeric:tabular-nums}
+.analytics-chart{border-radius:8px;background-color:color-mix(in srgb,var(--panel2) 90%,transparent);background-image:linear-gradient(var(--gridline) 1px,transparent 1px);background-size:100% 24px}
+.analytics-table th,.chaintable th{position:sticky;top:0;z-index:1}.analytics-table td,.chaintable td{letter-spacing:-.025em}.analytics-table tr[data-day]:hover,.chaintable tr:hover{background:color-mix(in srgb,var(--teal) 6%,transparent)}
+.positive .pnl-percent,.negative .pnl-percent{color:color-mix(in srgb,currentColor 68%,var(--muted))}.iconbtn,.primary,.dangerbtn{border-radius:7px}.primary{box-shadow:0 0 14px color-mix(in srgb,var(--teal) 20%,transparent)}
+@media(max-width:720px){body{background-size:24px 24px,24px 24px,auto}.topbar{min-height:63px}.sectionline{padding-bottom:7px}.hero{border-radius:10px}}
 </style>
 </head>
 <body>
