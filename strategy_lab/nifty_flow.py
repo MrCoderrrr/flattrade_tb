@@ -104,7 +104,10 @@ def evaluate(bars1: list[Bar], bars5: list[Bar], ticks: list[IndexTick], now: da
     if any(a.timestamp >= b.timestamp for a,b in zip(ticks,ticks[1:])):
         return {**result,"reason":"Unordered index ticks"}
     last = ticks[-1]
-    if last.timestamp > now or (now-last.timestamp).total_seconds() > 3:
+    # Receive time and observer time are sampled on separate threads; tolerate
+    # brief ordering jitter while still rejecting genuinely stale/future ticks.
+    age = (now-last.timestamp).total_seconds()
+    if age < -1.0 or age > 3.0:
         return {**result,"reason":"Index stream stale or future-dated"}
     if len(bars1) < 30 or any(b.interval_minutes != 1 or b.timestamp.tzinfo is None for b in bars1):
         return {**result,"reason":"Need 30 completed one-minute bars"}

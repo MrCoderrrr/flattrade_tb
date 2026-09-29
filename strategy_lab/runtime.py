@@ -1143,13 +1143,22 @@ class Controller:
                 entry = float(p["entry_price"])
                 quantity = int(p["quantity"])
             except (KeyError, TypeError, ValueError, OverflowError):
-                price, entry, quantity = 0., 0., 0
-            if not (math.isfinite(price) and price > 0 and math.isfinite(entry)
-                    and entry > 0 and quantity > 0):
-                s.update(state="EXIT_PENDING", reason="Paper EOD close needs a recorded mark for every leg")
+                price = 0.
+                try:
+                    entry = float(p["entry_price"])
+                    quantity = int(p["quantity"])
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    entry, quantity = 0., 0
+            if not (math.isfinite(entry) and entry > 0 and quantity > 0):
+                s.update(state="EXIT_PENDING", reason="Paper EOD close blocked by invalid leg entry data")
                 return
-            marks.append((p, price, entry, quantity))
-        for p, price, entry, quantity in marks:
+            has_mark = math.isfinite(price) and price > 0
+            if not has_mark:
+                # A missing final quote must not leave a simulated leg open.
+                # Entry price is a neutral fallback, explicitly labeled below.
+                price = entry
+            marks.append((p, price, entry, quantity, has_mark))
+        for p, price, entry, quantity, has_mark in marks:
             pnl = (price-entry)*quantity*(1 if p["side"] == "BUY" else -1)
             fee = cost(price, quantity)
             s["realized_pnl"] += pnl
@@ -1159,7 +1168,9 @@ class Controller:
                                 "quantity": quantity, "price": price, "cost": fee,
                                 "mode": "paper", "simulated": True,
                                 "last_mark_timestamp": p.get("mark_timestamp") or s.get("feed_timestamp"),
-                                "reason": "EOD paper close at last observed mark; not an executable broker fill"})
+                                "reason": ("EOD paper close at last observed mark; not an executable broker fill"
+                                           if has_mark else
+                                           "EOD paper close; no mark available, entry-price accounting fallback; not executable")})
         count = len(marks)
         s["positions"] = []
         s.update(unrealized_pnl=0., estimated_exit_costs=0.,
@@ -1217,7 +1228,8 @@ class Controller:
                 spec = resolve(market, s.get('strategy_id'))
                 signal_fn = legacy_v1.explain_signal if spec.version == 1 else active_v3.explain_signal
                 plan_fn = legacy_v1.build_plan if spec.version == 1 else active_v3.build_plan
-                deadline = spec.flatten
+                # Close positions before exchange close; NIFTY options close at 15:30.
+                deadline = min(spec.flatten, "15:29" if market == "NIFTY" else "23:24")
                 ended = s["date"] != now.date().isoformat() or now.strftime("%H:%M") >= deadline or now.weekday() >= 5
                 if ended:
                     s.update(stop_requested=True, exit_requested=bool(s["positions"]),
@@ -1229,7 +1241,8 @@ class Controller:
                 # cannot fill, close paper legs at their last recorded marks.
                 # Never use this accounting fallback for real broker positions.
                 minute_now = now.hour*60+now.minute
-                minute_limit = int(deadline[:2])*60+int(deadline[3:])+1
+                # Use the configured cutoff itself, never a minute after it.
+                minute_limit = int(deadline[:2])*60+int(deadline[3:])
                 if (ended and s["positions"] and s.get("mode") == "paper" and
                         (s.get("date") != now.date().isoformat() or
                          now.weekday() >= 5 or minute_now >= minute_limit)):

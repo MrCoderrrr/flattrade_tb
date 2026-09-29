@@ -134,7 +134,8 @@ class NiftyStream:
         with self.lock:
             ticks=list(self.ticks)
             books={key:{**item,'fields':dict(item['fields'])} for key,item in self.books.items()}
-            ready=self.authenticated and bool(ticks) and 0 <= (now-ticks[-1].timestamp).total_seconds() <= 3
+            age=(now-ticks[-1].timestamp).total_seconds() if ticks else None
+            ready=self.authenticated and age is not None and -1 <= age <= 3
             return {'connected':self.connected,'authenticated':self.authenticated,
                     'ready':ready,'reason':self.error,'ticks':ticks,'books':books}
 
