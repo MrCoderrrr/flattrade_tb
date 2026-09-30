@@ -126,7 +126,7 @@ def stop_parameters(observation: dict, solo: bool, entry_premium=None,
                                solo=solo, stop_bounds=(.10, .27), trail_bounds=(.04, .15))
 
 
-def build_plan(bars, quotes, now, multiplier, capital, observation):
+def build_plan(bars, quotes, now, multiplier, capital, observation, fixed_wings=()):
     if (type(multiplier) is not int or multiplier < 1 or capital < 200000*multiplier or
             not observation.get('eligible')):
         return None
@@ -134,12 +134,15 @@ def build_plan(bars, quotes, now, multiplier, capital, observation):
     valid = [q for q in quotes if _valid_quote(q, 'NIFTY', now)]
     if len({(q.contract.exchange,q.contract.token) for q in valid}) != len(valid):
         return None
+    retained = [q for q in fixed_wings if _valid_quote(q, 'NIFTY', now, protective_wing=True)]
+    if fixed_wings and len(retained) != len(fixed_wings):
+        return None
     for expiry in sorted({q.contract.expiry for q in valid}):
         group = [q for q in valid if q.contract.expiry == expiry]
         for lot in sorted({q.contract.lot_size for q in group}):
             chain = [q for q in group if q.contract.lot_size == lot]
             strikes = sorted({q.contract.strike for q in chain},key=lambda x:abs(x-spot))
-            for strike in strikes[:3]:
+            for strike in (strikes if retained else strikes[:3]):
                 quantity = lot*multiplier
                 short = [next((q for q in chain if q.contract.strike == strike and
                                _option_type(q.contract) == kind and q.bid_size >= quantity),None)
@@ -148,9 +151,15 @@ def build_plan(bars, quotes, now, multiplier, capital, observation):
                     continue
                 wings = []
                 for kind,target in (('CE',strike+1000),('PE',strike-1000)):
-                    candidates = [q for q in chain if _option_type(q.contract) == kind and
-                                  (q.contract.strike >= target if kind == 'CE' else q.contract.strike <= target) and
-                                  q.ask_size >= quantity]
+                    if retained:
+                        candidates = [q for q in retained if _option_type(q.contract) == kind and
+                                      q.contract.expiry == expiry and q.contract.lot_size == lot and
+                                      (q.contract.strike > strike if kind == 'CE' else q.contract.strike < strike) and
+                                      q.bid_size >= quantity]
+                    else:
+                        candidates = [q for q in chain if _option_type(q.contract) == kind and
+                                      (q.contract.strike >= target if kind == 'CE' else q.contract.strike <= target) and
+                                      q.ask_size >= quantity]
                     if not candidates:
                         break
                     wings.append(min(candidates,key=lambda q:abs(q.contract.strike-target)))
@@ -165,6 +174,7 @@ def build_plan(bars, quotes, now, multiplier, capital, observation):
                     continue
                 return Plan('nfv5',[Leg(q,'BUY',quantity) for q in wings]+[
                     Leg(q,'SELL',quantity) for q in short],
+                    'NIFTY v5 paper ATM straddle with retained protective wings' if retained else
                     'NIFTY v5 paper ATM straddle with 1000-point protective wings',
                     4000*multiplier, 1e12, max_loss)
     return None

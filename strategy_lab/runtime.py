@@ -562,14 +562,33 @@ class Controller:
             if revision != self._revision or s['stop_requested'] or s['exit_requested'] or s['locked']:
                 raise FeedError('Control request changed during hedge refresh; entry discarded')
             self._mark(s, held_quotes, now)
-        # A new ATM strike may need a different 1000-point hedge pair. Buy
-        # replacements in the plan and retire only the older, superseded
-        # wings; otherwise successive baskets accumulate four or six longs.
-        planned_wings = {leg.quote.contract.symbol for leg in plan.legs if leg.side == "BUY"}
-        retiring = ([p for p in held if p["side"] == "BUY" and p["symbol"] not in planned_wings]
-                    if spec.id in ("nfv1", "nfv3") else [])
-        active_held = [p for p in held if p not in retiring]
-        positions, risk_positions, fills, costs = list(active_held), [], [], 0.
+        # Protection is bought once per session. Later baskets reuse held
+        # wings; never replace or retire them before the release cutoff.
+        held_wings = [p for p in held if p['side'] == 'BUY']
+        if market == 'NIFTY':
+            planned_wings = [leg for leg in plan.legs if leg.side == 'BUY']
+            planned_shorts = [leg for leg in plan.legs if leg.side == 'SELL']
+            if (len(planned_wings) != 2 or len(planned_shorts) != 2 or
+                    {_option_type(leg.quote.contract) for leg in planned_wings} != {'CE', 'PE'} or
+                    {_option_type(leg.quote.contract) for leg in planned_shorts} != {'CE', 'PE'}):
+                raise ValueError('NIFTY entry requires one protected short on each side')
+            for short in planned_shorts:
+                kind = _option_type(short.quote.contract)
+                wing = next(leg for leg in planned_wings if _option_type(leg.quote.contract) == kind)
+                if (wing.quantity != short.quantity or
+                        wing.quote.contract.expiry != short.quote.contract.expiry or
+                        wing.quote.contract.lot_size != short.quote.contract.lot_size or
+                        not (wing.quote.contract.strike > short.quote.contract.strike if kind == 'CE'
+                             else wing.quote.contract.strike < short.quote.contract.strike)):
+                    s['reason'] = 'Fixed hedge strike or expiry does not protect the short'
+                    return
+        if market == 'NIFTY' and held_wings:
+            if any(not any(p['symbol'] == leg.quote.contract.symbol and
+                                p['quantity'] == leg.quantity for p in held_wings)
+                   for leg in planned_wings):
+                s['reason'] = 'Fixed session hedges do not protect this new short basket'
+                return
+        positions, risk_positions, fills, costs = list(held), [], [], 0.
         reused = set()
         reused_exit_cost = 0.
         # Validate entire synthetic basket before recording any fill.
@@ -578,13 +597,14 @@ class Controller:
             qty = leg.quantity
             if leg.side not in ("BUY", "SELL") or type(qty) is not int or qty <= 0 or qty % q.contract.lot_size:
                 raise ValueError("Invalid leg quantity or side")
-            if not fresh(q, now) or (q.ask_size if leg.side == "BUY" else q.bid_size) < qty:
-                raise FeedError("Entry book is stale or too small")
+            existing = next((p for p in held if leg.side == 'BUY' and p['symbol'] == q.contract.symbol
+                             and p['quantity'] == qty and p['symbol'] not in reused), None)
+            if not fresh(q, now) or (q.bid_size if existing is not None else
+                                     q.ask_size if leg.side == 'BUY' else q.bid_size) < qty:
+                raise FeedError("Entry or retained-hedge book is stale or too small")
             price = q.ask + q.contract.tick_size if leg.side == "BUY" else q.bid-q.contract.tick_size
             if price <= 0:
                 raise FeedError("Option premium cannot cover slippage")
-            existing = next((p for p in active_held if leg.side == 'BUY' and p['symbol'] == q.contract.symbol
-                             and p['quantity'] == qty and p['symbol'] not in reused), None)
             if existing is not None:
                 reused.add(existing['symbol'])
                 risk_positions.append({**existing, 'entry_price': price})
@@ -603,7 +623,7 @@ class Controller:
                           "side": leg.side, "quantity": qty, "price": price, "cost": fee,
                           "mode": "paper", "reason": "ENTRY", "simulated": True})
         held_by_symbol = {q.contract.symbol: q for q in held_quotes}
-        for existing in active_held:
+        for existing in held:
             if existing['symbol'] not in reused:
                 q = held_by_symbol[existing['symbol']]
                 risk_positions.append({**existing, 'entry_price': q.ask + q.contract.tick_size})
@@ -625,21 +645,6 @@ class Controller:
         if not naked and actual_risk > limit:
             s["reason"] = "Executable fill and cost model exceed this strategy's maximum loss budget"
             return
-        retire_fills, retire_costs, retire_realized = [], 0.0, 0.0
-        for old in retiring:
-            quote = held_by_symbol.get(old["symbol"])
-            if (quote is None or not fresh(quote, now) or
-                    quote.bid_size < old["quantity"]):
-                raise FeedError("Superseded hedge cannot be retired on fresh executable depth")
-            price = max(quote.contract.tick_size, quote.bid-quote.contract.tick_size)
-            fee = cost(price, old["quantity"])
-            retire_costs += fee
-            retire_realized += (price-old["entry_price"])*old["quantity"]
-            retire_fills.append({"timestamp":now.isoformat(), "symbol":old["symbol"],
-                                 "side":"SELL", "quantity":old["quantity"],
-                                 "price":price, "cost":fee, "mode":"paper",
-                                 "reason":"Replaced superseded hedge after new protection",
-                                 "simulated":True})
         # A basket stop is measured from this entry, while the session ledger
         # continues to include every earlier closed leg and its costs.
         basket_start_net = s["net_pnl"]
@@ -674,9 +679,8 @@ class Controller:
             for p in positions:
                 if p['side'] == 'SELL':
                     p.update(best_mark=p['entry_price'], leg_stop=None, trail_armed=False)
-        s["costs"] += costs + retire_costs
-        s["realized_pnl"] += retire_realized
-        s["trades"].extend(fills + retire_fills)
+        s["costs"] += costs
+        s["trades"].extend(fills)
         self._mark(s, [leg.quote for leg in plan.legs] + held_quotes, now)
         self._event(f"{market}: simulated {plan.strategy} entry; {len(positions)} legs")
 
@@ -758,7 +762,7 @@ class Controller:
         candidates = [q for q in chain if _option_type(q.contract) == missing
                       and q.contract.expiry.isoformat() == held['contract']['expiry']
                       and q.contract.lot_size == held['contract']['lot_size']
-                      and (market != 'MCX' or q.contract.strike == held['contract']['strike'])
+                      and q.contract.strike == held['contract']['strike']
                       and q.bid_size >= held['quantity'] and fresh(q, self.clock().astimezone(IST))]
         if market == 'NIFTY':
             wing = next((p for p in s['positions'] if p['side'] == 'BUY'
@@ -767,8 +771,8 @@ class Controller:
                 return False
             strike = wing['contract']['strike']
             candidates = [q for q in candidates if
-                          (q.contract.strike <= strike-1000 if missing == 'CE' else
-                           q.contract.strike >= strike+1000)]
+                          (q.contract.strike < strike if missing == 'CE' else
+                           q.contract.strike > strike)]
         if not candidates:
             s['reason'] = 'V1 restore waiting for protected opposite-leg depth'
             return False
@@ -1036,7 +1040,7 @@ class Controller:
             return False
         width = (wing['contract']['strike'] - anchor['strike'] if kind == 'CE'
                  else anchor['strike'] - wing['contract']['strike'])
-        if width != 1000 or wing['quantity'] != anchor['lot_size']*s['multiplier']:
+        if width <= 0 or wing['quantity'] != anchor['lot_size']*s['multiplier']:
             return False
         try:
             _, candidates = self._snapshot('NIFTY', now, [contract_from(anchor)])
@@ -1182,7 +1186,7 @@ class Controller:
                      _option_type(contract_from(p['contract'])) == missing),None)
         if (wing is None or wing['quantity'] != s['multiplier']*anchor['lot_size'] or
                 (wing['contract']['strike']-anchor['strike'] if missing == 'CE' else
-                 anchor['strike']-wing['contract']['strike']) < 1000):
+                 anchor['strike']-wing['contract']['strike']) <= 0):
             return False
         try:
             _, candidate = self._snapshot('NIFTY',now,[contract_from(anchor)])
@@ -1519,6 +1523,7 @@ class Controller:
                             self._exit(market, s, quotes, self.clock().astimezone(IST))
                         continue
                     long_only_v3 = False
+                    held_quotes = []
                     if s["positions"]:
                         # Long-only protection survives a prior short exit. Keep
                         # marking it while allowing the next paper short cycle.
@@ -1531,8 +1536,7 @@ class Controller:
                                         all(p['side'] == 'BUY' for p in s['positions']))
                         if long_only_v3:
                             # The previous shorts are gone. Start a fresh ATM
-                            # pair with 1000-point wings; matching wings are
-                            # reused, while older protection remains held.
+                            # pair using only the protection already held.
                             s['reason'] = 'V3 shorts flat; seeking a new protected ATM straddle'
                     self._account()
                     if s["locked"] or self.data["account"]["halted"]:
@@ -1573,7 +1577,9 @@ class Controller:
                         if (not bars or not quotes or not observation.get('eligible') or
                                 not nifty_v5.ready_to_open(self.v5_flow_history)):
                             raise FeedError('NIFTY flow or option-chain depth stale before entry')
-                        plan = nifty_v5.build_plan(bars,quotes,fresh_now,s['multiplier'],s['capital'],observation)
+                        plan = nifty_v5.build_plan(
+                            bars,quotes,fresh_now,s['multiplier'],s['capital'],observation,
+                            fixed_wings=held_quotes)
                         if plan:
                             self._enter(market,s,plan,fresh_now)
                         else:
@@ -1592,7 +1598,8 @@ class Controller:
                     signal = signal_fn(market, bars, fresh_now)
                     s["signal"] = signal
                     s["reason"] = signal.get("reason", "Waiting for a qualifying signal")
-                    plan = plan_fn(market, bars, quotes, fresh_now, s["multiplier"], s["capital"])
+                    plan = plan_fn(market, bars, quotes, fresh_now, s["multiplier"],
+                                   s["capital"], fixed_wings=held_quotes)
                     if plan:
                         self._enter(market, s, plan, fresh_now)
                     elif signal.get("eligible"):

@@ -155,7 +155,7 @@ def explain_signal(market, bars, now):
                            "bar_minutes":1,"last_bar_open":recent[-1].timestamp.isoformat()}}
 
 
-def build_plan(market, bars, quotes, now, multiplier, capital):
+def build_plan(market, bars, quotes, now, multiplier, capital, fixed_wings=()):
     if type(multiplier) is not int or multiplier < 1 or not isinstance(capital,(int,float)) or not isfinite(capital) or capital < multiplier*200000:
         return None
     signal = explain_signal(market,bars,now)
@@ -164,6 +164,9 @@ def build_plan(market, bars, quotes, now, multiplier, capital):
     available = [q for q in quotes if _valid_quote(q,market,now) or
                  (market == 'NIFTY' and _valid_quote(q,market,now,protective_wing=True))]
     if len({(q.contract.exchange,q.contract.token) for q in available}) != len(available):
+        return None
+    retained = [q for q in fixed_wings if _valid_quote(q,market,now,protective_wing=True)]
+    if fixed_wings and len(retained) != len(fixed_wings):
         return None
     groups = {}
     for q in available:
@@ -179,9 +182,18 @@ def build_plan(market, bars, quotes, now, multiplier, capital):
               and q.bid_size >= quantity and _valid_quote(q,market,now)}
         pe = {q.contract.strike for q in chain if _option_type(q.contract) == "PE"
               and q.bid_size >= quantity and _valid_quote(q,market,now)}
-        if not ce.intersection(pe):
+        common = ce.intersection(pe)
+        if market == 'NIFTY' and retained:
+            common = {strike for strike in common if
+                      any(_option_type(q.contract) == 'CE' and q.contract.expiry == group[0]
+                          and q.contract.lot_size == group[1] and q.contract.strike > strike
+                          and q.bid_size >= quantity for q in retained) and
+                      any(_option_type(q.contract) == 'PE' and q.contract.expiry == group[0]
+                          and q.contract.lot_size == group[1] and q.contract.strike < strike
+                          and q.bid_size >= quantity for q in retained)}
+        if not common:
             continue
-        common_strike = min(ce.intersection(pe), key=lambda strike:abs(strike-spot))
+        common_strike = min(common, key=lambda strike:abs(strike-spot))
         for option in sides:
             candidates=[q for q in chain if _option_type(q.contract)==option and
                         q.contract.strike == common_strike and q.bid_size >= quantity
@@ -191,10 +203,16 @@ def build_plan(market, bars, quotes, now, multiplier, capital):
             shorts.append(Leg(short,"SELL",quantity))
             if market=="NIFTY":
                 wing_strike = common_strike + (1000 if option == "CE" else -1000)
-                wings=[q for q in chain if _option_type(q.contract)==option and
-                       q.contract.strike == wing_strike and q.ask_size>=quantity]
+                if retained:
+                    wings=[q for q in retained if _option_type(q.contract)==option and
+                           q.contract.expiry == group[0] and q.contract.lot_size == group[1] and
+                           (q.contract.strike > common_strike if option == 'CE'
+                            else q.contract.strike < common_strike) and q.bid_size>=quantity]
+                else:
+                    wings=[q for q in chain if _option_type(q.contract)==option and
+                           q.contract.strike == wing_strike and q.ask_size>=quantity]
                 if not wings:break
-                hedge=min(wings,key=lambda q:abs(q.contract.strike-short.contract.strike))
+                hedge=min(wings,key=lambda q:abs(q.contract.strike-wing_strike))
                 hedges.append(Leg(hedge,"BUY",quantity))
         if len(shorts)!=len(sides) or (market=="NIFTY" and len(hedges)!=len(sides)):
             continue

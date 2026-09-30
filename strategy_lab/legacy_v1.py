@@ -135,7 +135,7 @@ def explain_signal(market, bars, now):
     return result
 
 
-def build_plan(market, bars, quotes, now, multiplier, capital):
+def build_plan(market, bars, quotes, now, multiplier, capital, fixed_wings=()):
     if type(multiplier) is not int or multiplier < 1 or capital < 200000*multiplier:
         return None
     signal = explain_signal(market, bars, now)
@@ -143,6 +143,9 @@ def build_plan(market, bars, quotes, now, multiplier, capital):
         return None
     valid = [q for q in quotes if _valid_quote(q, market, now)]
     if len({(q.contract.exchange, q.contract.token) for q in valid}) != len(valid):
+        return None
+    retained = [q for q in fixed_wings if _valid_quote(q, market, now, protective_wing=True)]
+    if fixed_wings and len(retained) != len(fixed_wings):
         return None
     spot = signal["indicators"]["close"]
     for expiry in sorted({q.contract.expiry for q in valid}):
@@ -158,7 +161,7 @@ def build_plan(market, bars, quotes, now, multiplier, capital):
                 family_quotes = [q for q in group if q.contract.symbol.upper().startswith(family)
                                  and (family != "NATURALGAS" or not q.contract.symbol.upper().startswith("NATGASMINI"))]
                 strikes = sorted({q.contract.strike for q in family_quotes}, key=lambda x: abs(x-spot))
-                for strike in strikes[:3]:
+                for strike in (strikes if retained and market == 'NIFTY' else strikes[:3]):
                     shorts = []
                     quantity = lot*multiplier
                     for kind in ("CE", "PE"):
@@ -174,9 +177,16 @@ def build_plan(market, bars, quotes, now, multiplier, capital):
                                     3000*multiplier, 3000*multiplier, None, signal["direction"])
                     hedges = []
                     for kind, target in (("CE", strike+1000), ("PE", strike-1000)):
-                        candidates = [q for q in family_quotes if _option_type(q.contract) == kind
-                                      and (q.contract.strike >= target if kind == "CE" else q.contract.strike <= target)
-                                      and q.ask_size >= quantity]
+                        if retained:
+                            candidates = [q for q in retained if _option_type(q.contract) == kind
+                                          and q.contract.expiry == expiry and q.contract.lot_size == lot
+                                          and (q.contract.strike > strike if kind == 'CE'
+                                               else q.contract.strike < strike)
+                                          and q.bid_size >= quantity]
+                        else:
+                            candidates = [q for q in family_quotes if _option_type(q.contract) == kind
+                                          and (q.contract.strike >= target if kind == "CE" else q.contract.strike <= target)
+                                          and q.ask_size >= quantity]
                         if not candidates:
                             break
                         hedge = min(candidates, key=lambda q: abs(q.contract.strike-target))
@@ -189,6 +199,7 @@ def build_plan(market, bars, quotes, now, multiplier, capital):
                     if credit <= 0:
                         continue
                     max_loss = max(0, width*quantity-credit)+400*multiplier
-                    return Plan("nfv1", hedges+shorts, signal["reason"]+"; 1000-point protective wings",
+                    return Plan("nfv1", hedges+shorts, signal["reason"]+
+                                ("; retained protective wings" if retained else "; 1000-point protective wings"),
                                 3000*multiplier, 3000*multiplier, max_loss, signal["direction"])
     return None
