@@ -614,11 +614,16 @@ class Controller:
         if not naked and actual_risk > limit:
             s["reason"] = "Executable fill and cost model exceed this strategy's maximum loss budget"
             return
+        # A basket stop is measured from this entry, while the session ledger
+        # continues to include every earlier closed leg and its costs.
+        basket_start_net = s["net_pnl"]
         s.update(positions=positions, state="RUNNING", reason=plan.reason, stop_loss=plan.stop_loss,
                  take_profit=plan.take_profit, trade_costs=costs, max_loss=actual_risk,
                  entries=s["entries"]+1, entered_at=now.isoformat(), direction=plan.direction,
                  reversal_count=0, reversal_bar=None,
                  risk_code_fingerprint=self._risk_code_fingerprint)
+        if spec.id == "nfv3":
+            s["cycle_start_net"] = basket_start_net
         if spec.version == 1:
             for p in positions:
                 if p["side"] == "SELL":
@@ -1347,12 +1352,16 @@ class Controller:
                                 (s.pop("feed_waiting", False) or s["state"] == "DATA_WAIT" or
                                  s.get("reason", "").startswith("Recovered paper positions"))):
                             s.update(state="RUNNING", reason="Market data recovered; managing paper positions")
-                        # Use the whole session's net MTM for portfolio stops:
-                        # net_pnl includes realized P&L from every completed entry,
-                        # current MTM across every open leg, and all trading costs.
-                        # MCX v3 keeps its per-cycle guard; its session MTM still
-                        # accumulates every cycle for reporting.
-                        trade_net = (s["net_pnl"] - s.get("cycle_start_net", 0.)) if spec.id == "mcxv3" else s["net_pnl"]
+                        # Report the whole-session net MTM, but apply a basket
+                        # stop to movement since that basket opened. Comparing
+                        # cumulative loss with a fresh basket stop caused v3 to
+                        # exit and re-enter every few seconds after one loss.
+                        baseline = s.get("cycle_start_net")
+                        if spec.id in ("mcxv3", "nfv3"):
+                            trade_net = s["net_pnl"] - (baseline if isinstance(baseline, (int, float))
+                                                        and math.isfinite(baseline) else s["net_pnl"])
+                        else:
+                            trade_net = s["net_pnl"]
                         signal = {}
                         if spec.id == 'nfv5':
                             signal = self._v5_observation(s,bars,self.clock().astimezone(IST))
