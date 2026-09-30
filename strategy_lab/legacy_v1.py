@@ -101,6 +101,18 @@ def explain_signal(market, bars, now):
     risk_atr = sum(risk_ranges[-14:])/min(14, len(risk_ranges)) if risk_ranges else 0.0
     risk_baseline = median(risk_ranges[-34:-14]) if len(risk_ranges) >= 34 else risk_atr
     volatility_ratio = min(2.5, max(.5, risk_atr/risk_baseline)) if risk_baseline > 0 else 1.0
+    if market == "NIFTY":
+        # A tiny KAMA turn inside a wide one-minute range is not a trend.
+        # Keep entry as an ATM pair; this score only governs directional exits.
+        threshold = max(.15, .08*risk_atr)
+        direction = 1 if slope >= threshold else -1 if slope <= -threshold else 0
+        noise10 = sum(abs(closes[j]-closes[j-1])
+                      for j in range(len(closes)-10, len(closes)))
+        efficiency = abs(closes[-1]-closes[-11])/noise10 if noise10 else 0.0
+        ema_gap_floor = max(.05, .08*risk_atr)
+        if direction and (efficiency < .25 or
+                          direction*(ema8-ema21) < ema_gap_floor):
+            direction = 0
     adx = _adx(today, 7)
     opening = 0
     if market == "NIFTY":

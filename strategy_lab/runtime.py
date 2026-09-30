@@ -297,7 +297,7 @@ class Controller:
             self.data["history"].append({"date": account["date"], "net_pnl": visible_daily_pnl,
                                           "capital": account["capital"]})
             account["lifetime_pnl"] += visible_daily_pnl
-        uncapped_v3 = any(s.get('date') and s.get('strategy_id') in ('nfv3', 'mcxv1', 'mcxv3')
+        uncapped_v3 = any(s.get('date') and s.get('strategy_id') in ('nfv1', 'nfv3', 'mcxv1', 'mcxv3')
                           for s in self.data['sessions'].values())
         account.update(date=now.date().isoformat(), daily_pnl=0.,
                        halted=False if uncapped_v3 else account["drawdown"] >= .05 * account["capital"])
@@ -333,7 +333,7 @@ class Controller:
             if s["positions"] or s["state"] not in ("STOPPED", "SESSION_COMPLETE"):
                 raise ValueError("Stop and flatten the existing session before starting")
             if (immediate and (s["locked"] or self.data["account"]["halted"]) or
-                    (spec.id not in ('nfv3', 'mcxv1', 'mcxv3') and
+                    (spec.id not in ('nfv1', 'nfv3', 'mcxv1', 'mcxv3') and
                      self.data["account"]["drawdown"] >= .05*capital)):
                 raise ValueError("Risk limit reached; restarting cannot clear the lock")
             if any(x["date"] for x in self.data["sessions"].values()) and capital != self.data["account"]["capital"]:
@@ -475,7 +475,7 @@ class Controller:
         equity = a["lifetime_pnl"] + a["daily_pnl"]
         a["peak_pnl"] = max(a["peak_pnl"], equity)
         a["drawdown"] = a["peak_pnl"] - equity
-        uncapped = any(s.get('date') and s.get('strategy_id') in ('nfv3', 'mcxv1', 'mcxv3')
+        uncapped = any(s.get('date') and s.get('strategy_id') in ('nfv1', 'nfv3', 'mcxv1', 'mcxv3')
                        for s in self.data['sessions'].values())
         a['daily_loss_fraction'] = (None if uncapped else .05 if any(
             resolve(m, s.get('strategy_id')).version >= 3 and s['date']
@@ -558,7 +558,14 @@ class Controller:
             if revision != self._revision or s['stop_requested'] or s['exit_requested'] or s['locked']:
                 raise FeedError('Control request changed during hedge refresh; entry discarded')
             self._mark(s, held_quotes, now)
-        positions, risk_positions, fills, costs = list(held), [], [], 0.
+        # A new ATM strike may need a different 1000-point hedge pair. Buy
+        # replacements in the plan and retire only the older, superseded
+        # wings; otherwise successive baskets accumulate four or six longs.
+        planned_wings = {leg.quote.contract.symbol for leg in plan.legs if leg.side == "BUY"}
+        retiring = ([p for p in held if p["side"] == "BUY" and p["symbol"] not in planned_wings]
+                    if spec.id in ("nfv1", "nfv3") else [])
+        active_held = [p for p in held if p not in retiring]
+        positions, risk_positions, fills, costs = list(active_held), [], [], 0.
         reused = set()
         reused_exit_cost = 0.
         # Validate entire synthetic basket before recording any fill.
@@ -572,7 +579,7 @@ class Controller:
             price = q.ask + q.contract.tick_size if leg.side == "BUY" else q.bid-q.contract.tick_size
             if price <= 0:
                 raise FeedError("Option premium cannot cover slippage")
-            existing = next((p for p in held if leg.side == 'BUY' and p['symbol'] == q.contract.symbol
+            existing = next((p for p in active_held if leg.side == 'BUY' and p['symbol'] == q.contract.symbol
                              and p['quantity'] == qty and p['symbol'] not in reused), None)
             if existing is not None:
                 reused.add(existing['symbol'])
@@ -584,7 +591,7 @@ class Controller:
             position = {"symbol": q.contract.symbol, "contract": contract_dict(q.contract),
                         "side": leg.side, "quantity": qty, "entry_price": price,
                         "mark_price": price, "unrealized_pnl": 0.}
-            if spec.id == "mcxv1":
+            if spec.id in ("nfv1", "mcxv1"):
                 position["entry_signal_bar"] = s.get("signal", {}).get("indicators", {}).get("last_bar_open")
             positions.append(position)
             risk_positions.append(position)
@@ -592,7 +599,7 @@ class Controller:
                           "side": leg.side, "quantity": qty, "price": price, "cost": fee,
                           "mode": "paper", "reason": "ENTRY", "simulated": True})
         held_by_symbol = {q.contract.symbol: q for q in held_quotes}
-        for existing in held:
+        for existing in active_held:
             if existing['symbol'] not in reused:
                 q = held_by_symbol[existing['symbol']]
                 risk_positions.append({**existing, 'entry_price': q.ask + q.contract.tick_size})
@@ -614,6 +621,21 @@ class Controller:
         if not naked and actual_risk > limit:
             s["reason"] = "Executable fill and cost model exceed this strategy's maximum loss budget"
             return
+        retire_fills, retire_costs, retire_realized = [], 0.0, 0.0
+        for old in retiring:
+            quote = held_by_symbol.get(old["symbol"])
+            if (quote is None or not fresh(quote, now) or
+                    quote.bid_size < old["quantity"]):
+                raise FeedError("Superseded hedge cannot be retired on fresh executable depth")
+            price = max(quote.contract.tick_size, quote.bid-quote.contract.tick_size)
+            fee = cost(price, old["quantity"])
+            retire_costs += fee
+            retire_realized += (price-old["entry_price"])*old["quantity"]
+            retire_fills.append({"timestamp":now.isoformat(), "symbol":old["symbol"],
+                                 "side":"SELL", "quantity":old["quantity"],
+                                 "price":price, "cost":fee, "mode":"paper",
+                                 "reason":"Replaced superseded hedge after new protection",
+                                 "simulated":True})
         # A basket stop is measured from this entry, while the session ledger
         # continues to include every earlier closed leg and its costs.
         basket_start_net = s["net_pnl"]
@@ -648,8 +670,9 @@ class Controller:
             for p in positions:
                 if p['side'] == 'SELL':
                     p.update(best_mark=p['entry_price'], leg_stop=None, trail_armed=False)
-        s["costs"] += costs
-        s["trades"].extend(fills)
+        s["costs"] += costs + retire_costs
+        s["realized_pnl"] += retire_realized
+        s["trades"].extend(fills + retire_fills)
         self._mark(s, [leg.quote for leg in plan.legs] + held_quotes, now)
         self._event(f"{market}: simulated {plan.strategy} entry; {len(positions)} legs")
 
@@ -710,7 +733,7 @@ class Controller:
         solo_trail = .09 if market == 'NIFTY' else min(.14, .08 + .06*(1-efficiency))
         volatility_ratio = signal.get('indicators', {}).get('volatility_ratio', 1.0)
         for p in list(shorts):
-            if market == 'MCX' and not p.get('entry_signal_bar'):
+            if not p.get('entry_signal_bar'):
                 p['entry_signal_bar'] = signal_bar
             entry, mark = p['entry_price'], p['mark_price']
             p['best_mark'] = min(p.get('best_mark', entry), mark)
@@ -724,7 +747,8 @@ class Controller:
             p['trail_armed'] = solo
             option = _option_type(contract_from(p['contract']))
             impulse = ((direction > 0 and option == 'CE' or direction < 0 and option == 'PE')
-                       and (market != 'MCX' or (signal_bar and signal_bar > p['entry_signal_bar'])))
+                       and signal_bar and p.get('entry_signal_bar') and
+                       signal_bar > p['entry_signal_bar'])
             if mark < p['leg_stop'] and not (impulse and abs(slope) >= (.5 if market == 'NIFTY' else .05)):
                 continue
             fee = cost(mark, p['quantity'])
@@ -744,20 +768,21 @@ class Controller:
             # Close stale wings, then allow the normal cooldown path to open
             # another protected ATM strangle while the session is authorized.
             if market == 'NIFTY':
-                loss_cap = resolve(market, s['strategy_id']).session_loss_per_unit*s['multiplier']
-                if s['net_pnl'] <= -loss_cap:
+                session_limit = resolve(market, s['strategy_id']).session_loss_per_unit
+                if session_limit is not None and s['net_pnl'] <= -session_limit*s['multiplier']:
                     s.update(locked=True, exit_requested=True,
                              reason='NIFTY v1 session loss cap reached; closing protective wings')
                 else:
-                    s.update(exit_requested=True,
-                             reason='Both v1 shorts exited; closing wings before the next strangle')
+                    s.update(exit_requested=True, last_exit=now.isoformat(),
+                             reason='Both v1 shorts exited; next protected strangle after cooldown')
             else:
                 s.update(state='COOLDOWN', last_exit=now.isoformat())
             return
         if (len(shorts) != 1 or s.get('paused') or not signal.get('eligible') or
                 now.strftime('%H:%M') >= resolve(market, s['strategy_id']).entry_end or
                 s['entries'] >= resolve(market, s['strategy_id']).max_entries or
-                (market != 'MCX' and s['net_pnl'] <= -resolve(market, s['strategy_id']).session_loss_per_unit*s['multiplier']) or
+                (market != 'MCX' and resolve(market, s['strategy_id']).session_loss_per_unit is not None and
+                 s['net_pnl'] <= -resolve(market, s['strategy_id']).session_loss_per_unit*s['multiplier']) or
                 not s.get('last_leg_exit') or
                 (now-datetime.fromisoformat(s['last_leg_exit'])).total_seconds() < 60):
             return
