@@ -281,8 +281,11 @@ function renderDetail(){
 }
 function shiftDetailMonth(offset){const [year,month]=(detailMonth||monthKey(0)).split('-').map(Number),date=new Date(year,month-1+offset,1);detailMonth=date.getFullYear()+'-'+String(date.getMonth()+1).padStart(2,'0');detailDay=detailMonth===monthKey(0)?status?.today||null:null;loadDetail()}
 $('detail-back').onclick=()=>tab('analytics');$('detail-prev').onclick=()=>shiftDetailMonth(-1);$('detail-next').onclick=()=>shiftDetailMonth(1);window.addEventListener('popstate',()=>{const id=location.pathname.startsWith('/strategy/')?location.pathname.slice('/strategy/'.length):'';if(strategy(id))openDetail(id,false);else tab('analytics')});
-async function poll(){if(!document.hidden)await loadStatus();setTimeout(poll,document.hidden?15000:1000)}async function pollChain(){if(!document.hidden)await loadChain();setTimeout(pollChain,document.hidden?10000:1000)}
-async function pollAnalytics(){if(!document.hidden&&activeTab==='analytics')await loadAnalytics();if(!document.hidden&&activeTab==='strategy-detail'&&detailData?.day===status?.today)await loadDetail();setTimeout(pollAnalytics,15000)}
-async function pollBrokerAuth(){if(!document.hidden&&activeTab==='settings')await loadBrokerAuth();setTimeout(pollBrokerAuth,60000)}
+let statusTimer,chainTimer,analyticsTimer,brokerAuthTimer,statusPollBusy=false,chainPollBusy=false;
+async function poll(){if(!document.hidden&&!statusPollBusy){statusPollBusy=true;try{await loadStatus()}finally{statusPollBusy=false}}statusTimer=setTimeout(poll,document.hidden?15000:1000)}
+async function pollChain(){if(!document.hidden&&!chainPollBusy){chainPollBusy=true;try{await loadChain()}finally{chainPollBusy=false}}chainTimer=setTimeout(pollChain,document.hidden?10000:1000)}
+async function pollAnalytics(){if(!document.hidden&&activeTab==='analytics')await loadAnalytics();if(!document.hidden&&activeTab==='strategy-detail'&&detailData?.day===status?.today)await loadDetail();analyticsTimer=setTimeout(pollAnalytics,15000)}
+async function pollBrokerAuth(){if(!document.hidden&&activeTab==='settings')await loadBrokerAuth();brokerAuthTimer=setTimeout(pollBrokerAuth,60000)}
+document.addEventListener('visibilitychange',()=>{if(document.hidden)return;clearTimeout(statusTimer);clearTimeout(chainTimer);clearTimeout(analyticsTimer);clearTimeout(brokerAuthTimer);poll();pollChain();if(activeTab==='analytics'||activeTab==='strategy-detail')pollAnalytics();if(activeTab==='settings')pollBrokerAuth()});
 poll();pollChain();pollAnalytics();pollBrokerAuth();
 })();
