@@ -6,6 +6,7 @@ always has farther-strike protection; Natural Gas intentionally has none.
 """
 from datetime import timedelta
 from math import isfinite, tanh
+from statistics import median
 
 from .catalog import resolve
 from .models import Bar, IST, Leg, Plan
@@ -86,10 +87,15 @@ def explain_signal(market, bars, now):
     for c in changes[14:]:
         gain, loss = (gain*13+max(0,c))/14, (loss*13+max(0,-c))/14
     rsi = 50. if gain == loss == 0 else 100. if loss == 0 else 100-100/(1+gain/loss)
-    ranges = [max(b.high-b.low, abs(b.high-a.close), abs(b.low-a.close)) for a,b in zip(recent,recent[1:])]
+    ranges = []
+    for left, right in zip(recent, recent[1:]):
+        reference = left.close if left.timestamp.astimezone(IST).date() == right.timestamp.astimezone(IST).date() else right.open
+        ranges.append(max(right.high-right.low, abs(right.high-reference), abs(right.low-reference)))
     atr = sum(ranges[:14])/14
     for value in ranges[14:]:
         atr = (atr*13+value)/14
+    baseline = median(ranges[-34:-14]) if len(ranges) >= 34 else atr
+    volatility_ratio = min(2.5, max(.5, atr/baseline)) if baseline > 0 else 1.0
     if atr <= 0:
         return result
     if market == "MCX":
@@ -124,7 +130,7 @@ def explain_signal(market, bars, now):
                                "slow_ema34_slope10":round(slow_slope,4),
                                "swing_breakout_up":breakout_up,
                                "swing_breakout_down":breakout_down,
-                               "bar_minutes":1,"last_bar_open":recent[-1].timestamp.isoformat()}}
+                               "volatility_ratio":round(volatility_ratio,3), "bar_minutes":1,"last_bar_open":recent[-1].timestamp.isoformat()}}
     volume = sum(b.volume for b in today)
     anchor = sum((b.high+b.low+b.close)/3*(b.volume if volume else 1) for b in today)/(volume or len(today))
     # Small dead bands prevent a one-tick change from voting as a trend.
@@ -145,7 +151,8 @@ def explain_signal(market, bars, now):
                        0:"Balanced indicators; protected ATM straddle"}[direction],
             "indicators": {"close":closes[-1],"ema9":ema9,"ema21":ema21,"rsi14":round(rsi,2),"atr14":atr,
                            "anchor":anchor,"anchor_kind":"vwap" if volume else "mean_typical_price",
-                           "votes":votes,"bar_minutes":1,"last_bar_open":recent[-1].timestamp.isoformat()}}
+                           "volatility_ratio":round(volatility_ratio,3), "votes":votes,
+                           "bar_minutes":1,"last_bar_open":recent[-1].timestamp.isoformat()}}
 
 
 def build_plan(market, bars, quotes, now, multiplier, capital):

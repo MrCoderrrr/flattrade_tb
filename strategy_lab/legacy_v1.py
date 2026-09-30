@@ -7,6 +7,7 @@ KAMA-led direction, but does not claim tick-for-tick parity with those engines.
 """
 from datetime import timedelta
 from math import isfinite
+from statistics import median
 
 from .active_v3 import _kama
 from .catalog import resolve
@@ -93,6 +94,13 @@ def explain_signal(market, bars, now):
             if ((direction > 0 and slow_slope < -.05*atr14 and not breakout_up) or
                     (direction < 0 and slow_slope > .05*atr14 and not breakout_down)):
                 direction = 0
+    risk_ranges = []
+    for left, right in zip(recent, recent[1:]):
+        reference = left.close if left.timestamp.astimezone(IST).date() == right.timestamp.astimezone(IST).date() else right.open
+        risk_ranges.append(max(right.high-right.low, abs(right.high-reference), abs(right.low-reference)))
+    risk_atr = sum(risk_ranges[-14:])/min(14, len(risk_ranges)) if risk_ranges else 0.0
+    risk_baseline = median(risk_ranges[-34:-14]) if len(risk_ranges) >= 34 else risk_atr
+    volatility_ratio = min(2.5, max(.5, risk_atr/risk_baseline)) if risk_baseline > 0 else 1.0
     adx = _adx(today, 7)
     opening = 0
     if market == "NIFTY":
@@ -107,7 +115,7 @@ def explain_signal(market, bars, now):
                               "slow_ema34_slope10": slow_slope,
                               "swing_breakout_up": breakout_up,
                               "swing_breakout_down": breakout_down,
-                              "opening_drive": opening,
+                              "opening_drive": opening, "volatility_ratio": volatility_ratio,
                               "last_bar_open": recent[-1].timestamp.isoformat()})
     if opening and direction == -opening:
         result.update(eligible=False, direction=0,

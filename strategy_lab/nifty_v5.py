@@ -111,15 +111,19 @@ def ready_to_open(history: list[dict]) -> bool:
         return False
 
 
-def stop_parameters(observation: dict, solo: bool) -> tuple[float, float]:
-    """Premium stop/trail percentages, bounded even for noisy observations."""
+def stop_parameters(observation: dict, solo: bool, entry_premium=None,
+                    premium_marks=None) -> tuple[float, float]:
+    """Bounded stop/trail adapting to high entry premiums and observed noise."""
+    from .risk import adaptive_short_stop
+
     quality = max(0., min(1., float(observation.get('quality', .5))))
-    volatility = max(.5, min(2., float(observation.get('volatility_ratio', 1.))))
+    volatility = max(.5, min(2.5, float(observation.get('volatility_ratio', 1.))))
     stop = min(.30, max(.12, .15 + .10*(1-quality) + .05*max(0.,volatility-1)))
     trail = min(.18, max(.05, .06 + .08*(1-quality) + .03*max(0.,volatility-1)))
     if solo:
         trail = max(.05, trail-.025)
-    return round(stop,4), round(trail,4)
+    return adaptive_short_stop(entry_premium, premium_marks, volatility, stop, trail,
+                               solo=solo, stop_bounds=(.10, .27), trail_bounds=(.04, .15))
 
 
 def build_plan(bars, quotes, now, multiplier, capital, observation):

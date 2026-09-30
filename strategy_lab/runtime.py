@@ -23,6 +23,7 @@ from .strategies import _option_type
 from .catalog import resolve, catalog
 from . import active_v3, legacy_v1, nifty_v5
 from .nifty_flow import decision as flow_decision
+from .risk import adaptive_short_stop
 
 MARKETS = ("NIFTY", "MCX")
 LIVE_REASON = "Real orders are unavailable: this controller has no commissioned broker executor or partial-fill reconciliation."
@@ -32,7 +33,7 @@ def risk_code_fingerprint():
     """Identify the strategy rules used to calculate persisted paper stops."""
     digest = hashlib.sha256()
     for name in ("runtime.py", "legacy_v1.py", "active_v3.py", "nifty_flow.py",
-                 "nifty_v5.py", "strategies.py", "catalog.py", "opening_trend.py"):
+                 "nifty_v5.py", "risk.py", "strategies.py", "catalog.py", "opening_trend.py"):
         digest.update(name.encode())
         digest.update((Path(__file__).parent / name).read_bytes())
     return digest.hexdigest()
@@ -505,8 +506,13 @@ class Controller:
                 continue
             price = q.ask + q.contract.tick_size if closing_buy else max(q.contract.tick_size, q.bid-q.contract.tick_size)
             pnl = (price-p["entry_price"]) * p["quantity"] * (1 if p["side"] == "BUY" else -1)
-            p.update(mark_price=price, unrealized_pnl=round(pnl, 4),
-                     mark_timestamp=(q.book_observed_at or q.timestamp).isoformat())
+            mark_stamp = (q.book_observed_at or q.timestamp).isoformat()
+            p.update(mark_price=price, unrealized_pnl=round(pnl, 4), mark_timestamp=mark_stamp)
+            if p["side"] == "SELL":
+                samples = p.setdefault("premium_marks", [])
+                if not samples or samples[-1].get("timestamp") != mark_stamp:
+                    samples.append({"timestamp": mark_stamp, "price": round(price, 4)})
+                    del samples[:-31]
             if p["side"] == "BUY":
                 p["best_mark"] = max(p.get("best_mark", p["entry_price"]), price)
             else:
@@ -694,18 +700,21 @@ class Controller:
         direction = signal.get('direction', 0) if signal.get('eligible') else 0
         signal_bar = signal.get('indicators', {}).get('last_bar_open')
         initial = .15 if market == 'NIFTY' else .10
-        # MCX premium bounces are larger than NIFTY's; keep the hard 10%
-        # entry stop while allowing the trailing stop room when KAMA is noisy.
         efficiency = signal.get('indicators', {}).get('efficiency5')
         efficiency = efficiency if isinstance(efficiency, (int, float)) else .5
         solo_trail = .09 if market == 'NIFTY' else min(.14, .08 + .06*(1-efficiency))
+        volatility_ratio = signal.get('indicators', {}).get('volatility_ratio', 1.0)
         for p in list(shorts):
             if market == 'MCX' and not p.get('entry_signal_bar'):
                 p['entry_signal_bar'] = signal_bar
             entry, mark = p['entry_price'], p['mark_price']
             p['best_mark'] = min(p.get('best_mark', entry), mark)
             solo = len([x for x in s['positions'] if x['side'] == 'SELL']) == 1
-            stop = min(entry*(1+initial), p['best_mark']*(1+solo_trail) if solo else entry*(1+initial))
+            stop_pct, trail_pct = adaptive_short_stop(
+                entry, p.get('premium_marks'), volatility_ratio, initial, solo_trail,
+                solo=solo, stop_bounds=(.07, .20 if market == 'NIFTY' else .16),
+                trail_bounds=(.04, .12 if market == 'NIFTY' else .16))
+            stop = min(entry*(1+stop_pct), p['best_mark']*(1+trail_pct) if solo else entry*(1+stop_pct))
             p['leg_stop'] = min(p.get('leg_stop') or stop, stop)
             p['trail_armed'] = solo
             option = _option_type(contract_from(p['contract']))
@@ -804,8 +813,9 @@ class Controller:
             return
         indicators = signal.get("indicators", {}) if signal.get("eligible") else {}
         er, atr, spot = indicators.get("efficiency", .5), indicators.get("atr14", 0.), indicators.get("close", 1.)
-        stop_pct = min(.28, max(.12, .16 + .08*(1-er) + min(.04, 2*atr/spot)))
-        trail_pct = min(.16, max(.05, .05 + .08*(1-er) + min(.03, atr/spot)))
+        base_stop = min(.28, max(.12, .16 + .08*(1-er) + min(.04, 2*atr/spot)))
+        base_trail = min(.16, max(.05, .05 + .08*(1-er) + min(.03, atr/spot)))
+        volatility_ratio = indicators.get("volatility_ratio", 1.0)
         for p in list(s["positions"]):
             entry, mark = p["entry_price"], p["mark_price"]
             p["best_mark"] = min(p.get("best_mark", entry), mark)
@@ -813,9 +823,12 @@ class Controller:
                 p["trail_armed"] = True
             # A lone short remains trailed, but its cushion expands in noisy
             # MCX moves. The separate adaptive premium stop still caps loss.
-            leg_trail_pct = (min(.18, max(trail_pct, .10 + .08*(1-er)))
-                             if len(s["positions"]) == 1 else trail_pct)
-            distance = max(p["contract"]["tick_size"], entry*leg_trail_pct)
+            leg_trail_pct = (min(.18, max(base_trail, .10 + .08*(1-er)))
+                             if len(s["positions"]) == 1 else base_trail)
+            stop_pct, trail_pct = adaptive_short_stop(
+                entry, p.get("premium_marks"), volatility_ratio, base_stop, leg_trail_pct,
+                solo=len(s["positions"]) == 1, stop_bounds=(.10, .28), trail_bounds=(.04, .18))
+            distance = max(p["contract"]["tick_size"], entry*trail_pct)
             stop = entry*(1+stop_pct)
             if p["trail_armed"]:
                 stop = min(stop, p["best_mark"]+distance)
@@ -978,16 +991,21 @@ class Controller:
         atr = indicators.get('atr14', 0.)
         spot = indicators.get('close', 0.)
         volatility = atr/spot if spot and atr else 0.
-        stop_pct = min(.30, max(.15, .18 + 8*volatility))
-        trail_pct = min(.16, max(.05, .07 + 4*volatility))
+        base_stop = min(.30, max(.15, .18 + 8*volatility))
+        base_trail = min(.16, max(.05, .07 + 4*volatility))
+        volatility_ratio = indicators.get('volatility_ratio', 1.0)
         for p in list(shorts):
             mark, entry = p['mark_price'], p['entry_price']
             p['best_mark'] = min(p.get('best_mark', entry), mark)
             solo = len(shorts) == 1
-            p['trail_armed'] = solo and p['best_mark'] <= .85*entry
+            arm_fraction = min(.12, max(.06, .08 + .03*(volatility_ratio-1)))
+            p['trail_armed'] = solo and p['best_mark'] <= entry*(1-arm_fraction)
+            stop_pct, trail_pct = adaptive_short_stop(
+                entry, p.get('premium_marks'), volatility_ratio, base_stop, base_trail,
+                solo=solo, stop_bounds=(.10, .27), trail_bounds=(.04, .14))
             hard_stop = entry*(1+stop_pct)
             trail = p['best_mark']*(1+trail_pct) if p['trail_armed'] else hard_stop
-            p['leg_stop'] = round(min(hard_stop, trail), 4)
+            p['leg_stop'] = round(min(p.get('leg_stop') or min(hard_stop, trail), hard_stop, trail), 4)
             kind = _option_type(contract_from(p['contract']))
             trend_exit = len(shorts) == 2 and confirmed and ((direction == 1 and kind == 'CE') or
                                         (direction == -1 and kind == 'PE'))
@@ -1002,7 +1020,11 @@ class Controller:
         if len(shorts) == 1 and confirmed:
             held_kind = _option_type(contract_from(shorts[0]['contract']))
             missing = 'CE' if held_kind == 'PE' else 'PE'
-            if direction == 0 or (held_kind == 'PE' and direction == -1) or (held_kind == 'CE' and direction == 1):
+            reversal = (held_kind == 'PE' and direction == -1) or (held_kind == 'CE' and direction == 1)
+            last_exit = s.get('last_leg_exit')
+            cooldown_done = (not last_exit or
+                             (now-datetime.fromisoformat(last_exit)).total_seconds() >= 60)
+            if reversal and cooldown_done:
                 self._reenter_nifty_v3_leg(s, missing, quotes, now)
 
     def _close_v5_leg(self, s, position, quotes, now, reason):
@@ -1025,7 +1047,7 @@ class Controller:
                 s['entries'] >= spec.max_entries or now.strftime('%H:%M') >= spec.entry_end or
                 s['net_pnl'] <= -spec.session_loss_per_unit*s['multiplier'] or
                 not s.get('last_leg_exit') or
-                (now-datetime.fromisoformat(s['last_leg_exit'])).total_seconds() < 5):
+                (now-datetime.fromisoformat(s['last_leg_exit'])).total_seconds() < 30):
             return False
         anchor = s.get('v5_anchor',{}).get(missing)
         if not anchor:
@@ -1078,10 +1100,12 @@ class Controller:
                  'SOLO_PE' if _option_type(contract_from(shorts[0]['contract'])) == 'PE' else 'SOLO_CE')
         s['v5_state'] = state
         action = flow_decision(self.v5_flow_history,state) if observation.get('eligible') else None
-        stop_pct,trail_pct = nifty_v5.stop_parameters(observation,len(shorts)==1)
+        volatility_ratio = observation.get('volatility_ratio', 1.0)
         for p in list(shorts):
             mark,entry = p['mark_price'],p['entry_price']
             p['best_mark'] = min(p.get('best_mark',entry),mark)
+            stop_pct,trail_pct = nifty_v5.stop_parameters(
+                observation, len(shorts)==1, entry, p.get('premium_marks'))
             p['trail_armed'] = len(shorts)==1 or p.get('trail_armed',False) or mark <= .90*entry
             stop = entry*(1+stop_pct)
             if p['trail_armed']:
