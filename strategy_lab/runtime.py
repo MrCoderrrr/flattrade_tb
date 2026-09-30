@@ -731,6 +731,14 @@ class Controller:
                     last_restructured_at=now.isoformat())
         s['restructures'] = s.get('restructures', 0) + 1
 
+    def _restructure_attempt_due(self, s, now):
+        """Limit repeated missing-leg lookups while still marking every second."""
+        previous = s.get('last_restructure_attempt')
+        if previous and (now-datetime.fromisoformat(previous)).total_seconds() < 3:
+            return False
+        s['last_restructure_attempt'] = now.isoformat()
+        return True
+
     def _reenter_v1_leg(self, market, s, held, missing, signal, quotes, now, reason):
         spec = resolve(market, s['strategy_id'])
         if (s.get('paused') or s.get('locked') or s.get('exit_requested') or
@@ -820,8 +828,9 @@ class Controller:
             trail_hit = solo and mark >= p['leg_stop'] and mark < hard_stop
             if trail_hit:
                 missing = 'CE' if option == 'PE' else 'PE'
-                if self._reenter_v1_leg(market, s, p, missing, signal, quotes, now,
-                                        'V1 trailing-stop strangle restructure'):
+                if (self._restructure_attempt_due(s, now) and
+                        self._reenter_v1_leg(market, s, p, missing, signal, quotes, now,
+                                             'V1 trailing-stop strangle restructure')):
                     reset_mark = p['mark_price']
                     dual_stop, _ = adaptive_short_stop(
                         reset_mark, None, volatility_ratio, initial, solo_trail, solo=False,
@@ -903,9 +912,10 @@ class Controller:
             p["stop_pct_cap"] = .28
             if len(s["positions"]) == 1 and mark >= p["leg_stop"] and mark < hard_stop:
                 missing = 'CE' if _option_type(contract_from(p['contract'])) == 'PE' else 'PE'
-                if self._reenter_mcx_v3_leg(s, p, missing, quotes, now,
-                                            'MCX trailing-stop straddle restructure',
-                                            indicators.get('last_bar_open')):
+                if (self._restructure_attempt_due(s, now) and
+                        self._reenter_mcx_v3_leg(s, p, missing, quotes, now,
+                                                 'MCX trailing-stop straddle restructure',
+                                                 indicators.get('last_bar_open'))):
                     reset_mark = p['mark_price']
                     dual_stop, _ = adaptive_short_stop(
                         reset_mark, None, volatility_ratio, base_stop, base_trail,
@@ -1095,8 +1105,9 @@ class Controller:
                                         (direction == -1 and kind == 'PE'))
             if solo and mark >= p['leg_stop'] and mark < hard_stop:
                 missing = 'CE' if kind == 'PE' else 'PE'
-                if self._reenter_nifty_v3_leg(s, missing, quotes, now,
-                                               'V3 trailing-stop straddle restructure'):
+                if (self._restructure_attempt_due(s, now) and
+                        self._reenter_nifty_v3_leg(s, missing, quotes, now,
+                                                    'V3 trailing-stop straddle restructure')):
                     reset_mark = p['mark_price']
                     dual_stop, _ = adaptive_short_stop(
                         reset_mark, None, volatility_ratio, base_stop, base_trail,
@@ -1218,7 +1229,7 @@ class Controller:
             # premium stop still takes precedence over this optimization.
             if len(shorts)==1 and stop_hit and mark < entry*(1+stop_pct):
                 missing = 'CE' if kind=='PE' else 'PE'
-                if self._reenter_v5(s,missing,quotes,now,restructure=True):
+                if self._restructure_attempt_due(s,now) and self._reenter_v5(s,missing,quotes,now,restructure=True):
                     reset_mark = p['mark_price']
                     dual_stop,_ = nifty_v5.stop_parameters(observation,False,reset_mark,None)
                     self._restructure_held_short(s,p,reset_mark*(1+dual_stop),now)
