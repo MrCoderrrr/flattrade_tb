@@ -1323,7 +1323,12 @@ class Controller:
                                 (s.pop("feed_waiting", False) or s["state"] == "DATA_WAIT" or
                                  s.get("reason", "").startswith("Recovered paper positions"))):
                             s.update(state="RUNNING", reason="Market data recovered; managing paper positions")
-                        trade_net = (s["net_pnl"] - s.get("cycle_start_net", 0.)) if spec.id == "mcxv3" else s["unrealized_pnl"] - s["trade_costs"] - s["estimated_exit_costs"]
+                        # Use the whole session's net MTM for portfolio stops:
+                        # net_pnl includes realized P&L from every completed entry,
+                        # current MTM across every open leg, and all trading costs.
+                        # MCX v3 keeps its per-cycle guard; its session MTM still
+                        # accumulates every cycle for reporting.
+                        trade_net = (s["net_pnl"] - s.get("cycle_start_net", 0.)) if spec.id == "mcxv3" else s["net_pnl"]
                         signal = {}
                         if spec.id == 'nfv5':
                             signal = self._v5_observation(s,bars,self.clock().astimezone(IST))
