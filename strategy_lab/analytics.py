@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .catalog import SPECS
 from .models import IST
+from .runtime import cost
 
 
 class AnalyticsStore:
@@ -106,15 +107,18 @@ class AnalyticsStore:
                 if strategy_id not in SPECS:
                     continue
                 leg_count = len(session.get('positions', []))
+                net_pnl = float(session['net_pnl'])-float(session.get('pnl_reset_offset') or 0)
+                open_gross = float(session['unrealized_pnl'])-sum(
+                    float(p.get('pnl_reset_unrealized') or 0)
+                    for p in session.get('positions', []))
+                open_net = (open_gross-sum(cost(p['entry_price'], p['quantity'])
+                                           for p in session.get('positions', []))-
+                            float(session.get('estimated_exit_costs') or 0))
                 with self.lock, self.db:
                     self.db.execute('''INSERT OR REPLACE INTO strategy_ticks VALUES
                         (?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                         (strategy_id, now.isoformat(), day, session['state'],
-                         float(session['net_pnl'])-float(session.get('pnl_reset_offset') or 0),
-                         float(session['realized_pnl']),
-                         float(session['unrealized_pnl'])-sum(
-                             float(p.get('pnl_reset_unrealized') or 0)
-                             for p in session.get('positions', [])),
+                         net_pnl, net_pnl-open_net, open_net,
                          float(session['capital']), int(session['multiplier']), leg_count,
                          None, None, None, None))
                     for trade in session.get('trades', []):

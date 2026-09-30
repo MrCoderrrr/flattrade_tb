@@ -64,9 +64,7 @@ function terminalPanel(session,id,spec,capital){
   for(const p of positions){const row=node('tr'),contract=p.contract||{},leg=contract.option_type||String(p.symbol||'').match(/(?:CE|PE)$/)?.[0]||'LEG',stop=premiumStop(p);const values=[leg,contract.strike??'—',p.side||'—',p.quantity??'—',money(p.entry_price),money(p.mark_price),money(p.best_mark??p.entry_price),stop.label+' '+stop.value];for(const value of values)row.append(node('td','',value));const pnl=node('td','',signed(p.unrealized_pnl));color(pnl,p.unrealized_pnl);row.append(pnl);body.append(row)}
   table.append(thead,body);positionWrap.append(table);panel.append(positionWrap);
   const footer=node('div','terminal-footer'),pnlGrid=node('div','terminal-pnl');
-  const closedFills=closedLegs([...(Array.isArray(session.trades)?session.trades:[])].sort((a,b)=>String(a.ts||a.timestamp||'').localeCompare(String(b.ts||b.timestamp||''))));
-  const realizedNet=closedFills.length?closedFills.reduce((sum,leg)=>sum+leg.pnl,0):(Number(session.realized_pnl)||0);
-  for(const [label,value] of [['REALIZED',realizedNet],['UNREALIZED',session.unrealized_pnl],['NET MTM',session.net_pnl]]){const item=node('div','terminal-pnl-item');item.append(node('small','',label),node('strong','',signed(value)));color(item.lastChild,value);pnlGrid.append(item)}
+  for(const [label,value] of [['REALIZED NET',session.realized_pnl],['OPEN NET',session.unrealized_pnl],['NET MTM',session.net_pnl]]){const item=node('div','terminal-pnl-item');item.append(node('small','',label),node('strong','',signed(value)));color(item.lastChild,value);pnlGrid.append(item)}
   const returnItem=node('div','terminal-pnl-item');returnItem.append(node('small','','RETURN'),node('strong','',`(${percent(session.net_pnl,session.capital||capital)})`));pnlGrid.append(returnItem);
   const meta=node('div','terminal-meta');meta.append(node('span','',String(session.mode||'paper').toUpperCase()+' · '+(session.entries||0)+' ENTRIES'),node('span','','FEED '+age),node('span','',barTime));
   footer.append(pnlGrid,meta);panel.append(footer);
@@ -258,9 +256,9 @@ function renderDetailMetrics(){
   let monthPnl=rows.reduce((sum,row)=>sum+(Number(row.pnl)||0),0);
   if(current&&String(today||'').startsWith(data.month||detailMonth||monthKey(0)))monthPnl+=todayPnl-(Number(rows.find(row=>row.day===today)?.pnl)||0);
   const unrealized=current?Number(current.unrealized_pnl)||0:0;
-  const realized=todayPnl-unrealized;
+  const realized=current?Number(current.realized_pnl)||0:todayPnl;
   const metric=(label,value,n)=>{const card=node('div','card'),title=node('small','',label),amount=node('strong','');amount.append(node('span','',signed(value)),pctLabel(percent(value,n)));color(amount,value);card.append(title,amount);return card};
-  $('detail-metrics').replaceChildren(metric('Today P&L',todayPnl,current?.capital||capital),metric('Closed + costs',realized,current?.capital||capital),metric('Open P&L',unrealized,current?.capital||capital),metric('Month P&L',monthPnl,capital));
+  $('detail-metrics').replaceChildren(metric('Today net MTM',todayPnl,current?.capital||capital),metric('Realized net',realized,current?.capital||capital),metric('Open net',unrealized,current?.capital||capital),metric('Month P&L',monthPnl,capital));
 }
 async function loadDetail(){if(activeTab!=='strategy-detail'||!detailStrategy||!status)return;try{const query='?month='+encodeURIComponent(detailMonth||monthKey(0))+(detailDay?'&day='+encodeURIComponent(detailDay):'');detailData=await api('/api/analytics/strategy/'+encodeURIComponent(detailStrategy)+query);renderDetail()}catch(err){text($('detail-chart-note'),err.message)}}
 function renderDetail(){

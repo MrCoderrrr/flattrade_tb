@@ -452,9 +452,13 @@ class Controller:
                                         capital=session['capital'], entries=session['entries']))
             result['strategy_history'] = history
             for market, s in result["sessions"].items():
-                s["net_pnl"] = round(float(s["net_pnl"]) - float(s.get("pnl_reset_offset") or 0), 4)
-                s["unrealized_pnl"] = round(float(s["unrealized_pnl"]) - sum(
-                    float(p.get("pnl_reset_unrealized") or 0) for p in s["positions"]), 4)
+                s["net_pnl"] = round(float(s["net_pnl"]) - float(s.get("pnl_reset_offset") or 0), 2)
+                open_gross = float(s["unrealized_pnl"]) - sum(
+                    float(p.get("pnl_reset_unrealized") or 0) for p in s["positions"])
+                open_entry_costs = sum(cost(p["entry_price"], p["quantity"]) for p in s["positions"])
+                s["unrealized_pnl"] = round(open_gross - open_entry_costs -
+                                            float(s.get("estimated_exit_costs") or 0), 2)
+                s["realized_pnl"] = round(s["net_pnl"] - s["unrealized_pnl"], 2)
                 for position in s["positions"]:
                     position["unrealized_pnl"] = round(
                         float(position["unrealized_pnl"]) - float(position.get("pnl_reset_unrealized") or 0), 4)
@@ -719,6 +723,69 @@ class Controller:
             raise FeedError('Matching MCX opposite leg has no fresh executable bid')
         return quote
 
+    def _restructure_held_short(self, s, held, stop, now):
+        """Keep the original fill/P&L, but begin a fresh stop cycle at this mark."""
+        mark = held['mark_price']
+        held.update(risk_entry_price=mark, best_mark=mark, leg_stop=round(stop, 4),
+                    trail_armed=False, premium_marks=[{'timestamp':now.isoformat(), 'price':mark}],
+                    last_restructured_at=now.isoformat())
+        s['restructures'] = s.get('restructures', 0) + 1
+
+    def _reenter_v1_leg(self, market, s, held, missing, signal, quotes, now, reason):
+        spec = resolve(market, s['strategy_id'])
+        if (s.get('paused') or s.get('locked') or s.get('exit_requested') or
+                s.get('stop_requested') or s['entries'] >= spec.max_entries or
+                not spec.entry_start <= now.strftime('%H:%M') < spec.entry_end):
+            return False
+        try:
+            if market == 'MCX':
+                chain = [self._mcx_reentry_quote(held, missing, now)]
+            else:
+                _, chain = self._snapshot(market, now)
+        except FeedError:
+            s['reason'] = 'V1 restore waiting for fresh opposite-leg depth'
+            return False
+        if s.get('exit_requested') or s.get('stop_requested'):
+            return False
+        candidates = [q for q in chain if _option_type(q.contract) == missing
+                      and q.contract.expiry.isoformat() == held['contract']['expiry']
+                      and q.contract.lot_size == held['contract']['lot_size']
+                      and (market != 'MCX' or q.contract.strike == held['contract']['strike'])
+                      and q.bid_size >= held['quantity'] and fresh(q, self.clock().astimezone(IST))]
+        if market == 'NIFTY':
+            wing = next((p for p in s['positions'] if p['side'] == 'BUY'
+                         and _option_type(contract_from(p['contract'])) == missing), None)
+            if wing is None:
+                return False
+            strike = wing['contract']['strike']
+            candidates = [q for q in candidates if
+                          (q.contract.strike <= strike-1000 if missing == 'CE' else
+                           q.contract.strike >= strike+1000)]
+        if not candidates:
+            s['reason'] = 'V1 restore waiting for protected opposite-leg depth'
+            return False
+        spot = signal.get('indicators', {}).get('close') or held['contract']['strike']
+        q = min(candidates, key=lambda item: abs(item.contract.strike-spot))
+        price = q.bid-q.contract.tick_size
+        if price <= 0:
+            return False
+        fee = cost(price, held['quantity'])
+        s['positions'].append({'symbol': q.contract.symbol, 'contract': contract_dict(q.contract),
+                               'side': 'SELL', 'quantity': held['quantity'], 'entry_price': price,
+                               'mark_price': price, 'unrealized_pnl': 0., 'best_mark': price,
+                               'leg_stop': None, 'trail_armed': False,
+                               'entry_signal_bar': signal.get('indicators', {}).get('last_bar_open')})
+        s['costs'] += fee
+        s['trades'].append({'timestamp': now.isoformat(), 'symbol': q.contract.symbol,
+                            'side': 'SELL', 'quantity': held['quantity'], 'price': price,
+                            'cost': fee, 'mode': 'paper', 'reason': reason,
+                            'simulated': True})
+        s['entries'] += 1
+        s['reason'] = 'V1 paper strangle restored'
+        self._mark(s, quotes+[q], now)
+        self._event(f'{market}: simulated v1 {missing} re-entry')
+        return True
+
     def _manage_v1(self, market, s, signal, quotes, now):
         """Manage the dashboard v1 paper port without invoking legacy broker code."""
         shorts = [p for p in s['positions'] if p['side'] == 'SELL']
@@ -735,20 +802,34 @@ class Controller:
         for p in list(shorts):
             if not p.get('entry_signal_bar'):
                 p['entry_signal_bar'] = signal_bar
-            entry, mark = p['entry_price'], p['mark_price']
+            entry, mark = p.get('risk_entry_price', p['entry_price']), p['mark_price']
             p['best_mark'] = min(p.get('best_mark', entry), mark)
             solo = len([x for x in s['positions'] if x['side'] == 'SELL']) == 1
             stop_pct, trail_pct = adaptive_short_stop(
                 entry, p.get('premium_marks'), volatility_ratio, initial, solo_trail,
                 solo=solo, stop_bounds=(.07, .20 if market == 'NIFTY' else .16),
                 trail_bounds=(.04, .12 if market == 'NIFTY' else .16))
-            stop = min(entry*(1+stop_pct), p['best_mark']*(1+trail_pct) if solo else entry*(1+stop_pct))
+            hard_stop = entry*(1+stop_pct)
+            stop = min(hard_stop, p['best_mark']*(1+trail_pct) if solo else hard_stop)
             p['leg_stop'] = min(p.get('leg_stop') or stop, stop)
             p['trail_armed'] = solo
             option = _option_type(contract_from(p['contract']))
             impulse = ((direction > 0 and option == 'CE' or direction < 0 and option == 'PE')
                        and signal_bar and p.get('entry_signal_bar') and
                        signal_bar > p['entry_signal_bar'])
+            trail_hit = solo and mark >= p['leg_stop'] and mark < hard_stop
+            if trail_hit:
+                missing = 'CE' if option == 'PE' else 'PE'
+                if self._reenter_v1_leg(market, s, p, missing, signal, quotes, now,
+                                        'V1 trailing-stop strangle restructure'):
+                    reset_mark = p['mark_price']
+                    dual_stop, _ = adaptive_short_stop(
+                        reset_mark, None, volatility_ratio, initial, solo_trail, solo=False,
+                        stop_bounds=(.07, .20 if market == 'NIFTY' else .16),
+                        trail_bounds=(.04, .12 if market == 'NIFTY' else .16))
+                    self._restructure_held_short(s, p, reset_mark*(1+dual_stop), now)
+                    s['reason'] = 'V1 strangle restructured; held short retained at original fill'
+                return
             if mark < p['leg_stop'] and not (impulse and abs(slope) >= (.5 if market == 'NIFTY' else .05)):
                 continue
             fee = cost(mark, p['quantity'])
@@ -790,53 +871,8 @@ class Controller:
         missing = 'CE' if _option_type(contract_from(held['contract'])) == 'PE' else 'PE'
         if direction != (-1 if missing == 'CE' else 1):
             return
-        try:
-            if market == 'MCX':
-                chain = [self._mcx_reentry_quote(held, missing, now)]
-            else:
-                _, chain = self._snapshot(market, now)
-        except FeedError:
-            s['reason'] = 'KAMA reversal; waiting for fresh same-strike option depth'
-            return
-        if s['exit_requested'] or s['stop_requested']:
-            return
-        spot = signal['indicators']['close']
-        candidates = [q for q in chain if _option_type(q.contract) == missing
-                      and q.contract.expiry.isoformat() == held['contract']['expiry']
-                      and q.contract.lot_size == held['contract']['lot_size']
-                      and (market != 'MCX' or q.contract.strike == held['contract']['strike'])
-                      and q.bid_size >= held['quantity'] and fresh(q, self.clock().astimezone(IST))]
-        if market == 'NIFTY':
-            wing = next((p for p in s['positions'] if p['side'] == 'BUY'
-                         and _option_type(contract_from(p['contract'])) == missing), None)
-            if wing is None:
-                return
-            strike = wing['contract']['strike']
-            candidates = [q for q in candidates if
-                          (q.contract.strike <= strike-1000 if missing == 'CE' else
-                           q.contract.strike >= strike+1000)]
-        if not candidates:
-            s['reason'] = 'V1 reversal confirmed; suitable ATM option or protection unavailable'
-            return
-        q = min(candidates, key=lambda item: abs(item.contract.strike-spot))
-        price = q.bid-q.contract.tick_size
-        if price <= 0:
-            return
-        fee = cost(price, held['quantity'])
-        s['positions'].append({'symbol': q.contract.symbol, 'contract': contract_dict(q.contract),
-                               'side': 'SELL', 'quantity': held['quantity'], 'entry_price': price,
-                               'mark_price': price, 'unrealized_pnl': 0., 'best_mark': price,
-                               'leg_stop': None, 'trail_armed': False,
-                               'entry_signal_bar': signal_bar})
-        s['costs'] += fee
-        s['trades'].append({'timestamp': now.isoformat(), 'symbol': q.contract.symbol,
-                            'side': 'SELL', 'quantity': held['quantity'], 'price': price,
-                            'cost': fee, 'mode': 'paper', 'reason': 'V1 KAMA reversal re-entry',
-                            'simulated': True})
-        s['entries'] += 1
-        s['reason'] = 'V1 KAMA reversal; paper strangle restored'
-        self._mark(s, quotes+[q], now)
-        self._event(f"{market}: simulated v1 {missing} re-entry")
+        self._reenter_v1_leg(market, s, held, missing, signal, quotes, now,
+                             'V1 KAMA reversal re-entry')
 
     def _manage_mcx_v3(self, s, signal, quotes, now):
         if s["exit_requested"] or s["stop_requested"]:
@@ -847,7 +883,7 @@ class Controller:
         base_trail = min(.16, max(.05, .05 + .08*(1-er) + min(.03, atr/spot)))
         volatility_ratio = indicators.get("volatility_ratio", 1.0)
         for p in list(s["positions"]):
-            entry, mark = p["entry_price"], p["mark_price"]
+            entry, mark = p.get("risk_entry_price", p["entry_price"]), p["mark_price"]
             p["best_mark"] = min(p.get("best_mark", entry), mark)
             if len(s["positions"]) == 1 or mark <= .92*entry:
                 p["trail_armed"] = True
@@ -859,11 +895,24 @@ class Controller:
                 entry, p.get("premium_marks"), volatility_ratio, base_stop, leg_trail_pct,
                 solo=len(s["positions"]) == 1, stop_bounds=(.10, .28), trail_bounds=(.04, .18))
             distance = max(p["contract"]["tick_size"], entry*trail_pct)
-            stop = entry*(1+stop_pct)
+            hard_stop = entry*(1+stop_pct)
+            stop = hard_stop
             if p["trail_armed"]:
                 stop = min(stop, p["best_mark"]+distance)
             p["leg_stop"] = round(min(p.get("leg_stop") or stop, stop), 4)
             p["stop_pct_cap"] = .28
+            if len(s["positions"]) == 1 and mark >= p["leg_stop"] and mark < hard_stop:
+                missing = 'CE' if _option_type(contract_from(p['contract'])) == 'PE' else 'PE'
+                if self._reenter_mcx_v3_leg(s, p, missing, quotes, now,
+                                            'MCX trailing-stop straddle restructure',
+                                            indicators.get('last_bar_open')):
+                    reset_mark = p['mark_price']
+                    dual_stop, _ = adaptive_short_stop(
+                        reset_mark, None, volatility_ratio, base_stop, base_trail,
+                        solo=False, stop_bounds=(.10, .28), trail_bounds=(.04, .18))
+                    self._restructure_held_short(s, p, reset_mark*(1+dual_stop), now)
+                    s['reason'] = 'MCX straddle restructured; held short retained at original fill'
+                return
             if mark >= p["leg_stop"]:
                 self._close_mcx_leg(s, p, quotes, now,
                                     "MCX premium trailing stop" if p["trail_armed"] else "MCX premium stop")
@@ -907,49 +956,47 @@ class Controller:
             return
         if not s.get("last_leg_exit") or (now-datetime.fromisoformat(s["last_leg_exit"])).total_seconds() < 60:
             return
-        if not resolve("MCX", "mcxv3").entry_start <= now.strftime("%H:%M") < resolve("MCX", "mcxv3").entry_end:
-            return
+        self._reenter_mcx_v3_leg(s, held, missing, quotes, now,
+                                  'KAMA/EMA reversal re-entry', bar)
+
+    def _reenter_mcx_v3_leg(self, s, held, missing, quotes, now, reason, bar):
+        spec = resolve('MCX', 'mcxv3')
+        if (s.get('paused') or s.get('exit_requested') or s.get('stop_requested') or
+                s['entries'] >= spec.max_entries or s.get('leg_reentries', 0) >= 12 or
+                not spec.entry_start <= now.strftime('%H:%M') < spec.entry_end):
+            return False
         self._account()
-        if s["locked"] or self.data["account"]["halted"]:
-            return
+        if s['locked'] or self.data['account']['halted']:
+            return False
         try:
-            chain = [self._mcx_reentry_quote(held, missing, now)]
+            q = self._mcx_reentry_quote(held, missing, now)
         except FeedError:
-            s["reason"] = "KAMA reversal confirmed; waiting for the original-strike opposite leg"
-            return
-        if s["exit_requested"] or s["stop_requested"]:
-            return
-        candidates = [q for q in chain if _option_type(q.contract) == missing and
-                      q.contract.expiry.isoformat() == held["contract"]["expiry"] and
-                      q.contract.lot_size == held["contract"]["lot_size"] and
-                      q.contract.strike == held["contract"]["strike"] and
-                      q.bid_size >= held["quantity"] and fresh(q, self.clock().astimezone(IST))]
-        if not candidates:
-            s["reason"] = "KAMA reversal confirmed; waiting for fresh ATM opposite-leg depth"
-            return
-        q = min(candidates, key=lambda item:abs(item.contract.strike-spot))
+            s['reason'] = 'MCX restore waiting for original-strike opposite-leg depth'
+            return False
+        if s.get('exit_requested') or s.get('stop_requested'):
+            return False
         price = q.bid-q.contract.tick_size
         if price <= 0:
-            return
-        fee = cost(price, held["quantity"])
-        s["positions"].append({"symbol":q.contract.symbol, "contract":contract_dict(q.contract),
-                               "side":"SELL", "quantity":held["quantity"], "entry_price":price,
-                               "mark_price":price, "unrealized_pnl":0., "best_mark":price,
-                               "leg_stop":None, "trail_armed":False})
-        s["costs"] += fee
-        s["trades"].append({"timestamp":now.isoformat(), "symbol":q.contract.symbol,
-                            "side":"SELL", "quantity":held["quantity"], "price":price,
-                            "cost":fee, "mode":"paper", "reason":"KAMA/EMA reversal re-entry",
-                            "simulated":True})
-        s["entries"] += 1
-        s["leg_reentries"] += 1
-        s["reentry_count"] = 0
-        s["trend_count"] = 0
-        s["trend_bar"] = bar
-        s["missing_armed"] = False
-        s["reason"] = "KAMA/EMA reversal; ATM straddle restored"
+            return False
+        fee = cost(price, held['quantity'])
+        s['positions'].append({'symbol':q.contract.symbol, 'contract':contract_dict(q.contract),
+                               'side':'SELL', 'quantity':held['quantity'], 'entry_price':price,
+                               'mark_price':price, 'unrealized_pnl':0., 'best_mark':price,
+                               'leg_stop':None, 'trail_armed':False})
+        s['costs'] += fee
+        s['trades'].append({'timestamp':now.isoformat(), 'symbol':q.contract.symbol,
+                            'side':'SELL', 'quantity':held['quantity'], 'price':price,
+                            'cost':fee, 'mode':'paper', 'reason':reason, 'simulated':True})
+        s['entries'] += 1
+        s['leg_reentries'] = s.get('leg_reentries', 0)+1
+        s['reentry_count'] = 0
+        s['trend_count'] = 0
+        s['trend_bar'] = bar
+        s['missing_armed'] = False
+        s['reason'] = 'MCX ATM straddle restored'
         self._mark(s, quotes+[q], now)
-        self._event(f"MCX: simulated ATM {missing} re-entry after confirmed KAMA/EMA reversal")
+        self._event(f'MCX: simulated ATM {missing} re-entry')
+        return True
 
     def _close_nifty_v3_leg(self, s, position, quotes, now, reason):
         fee = cost(position['mark_price'], position['quantity'])
@@ -965,7 +1012,8 @@ class Controller:
         self._mark(s, quotes, now)
         self._event(f'NIFTY v3: simulated {_option_type(contract_from(position["contract"]))} short exit — {reason}')
 
-    def _reenter_nifty_v3_leg(self, s, kind, quotes, now):
+    def _reenter_nifty_v3_leg(self, s, kind, quotes, now,
+                               reason='V3 trend pause/reversal re-entry'):
         spec = resolve('NIFTY', 'nfv3')
         anchor = s.get('v3_anchor', {}).get(kind)
         wing = next((p for p in s['positions'] if p['side'] == 'BUY' and
@@ -980,10 +1028,16 @@ class Controller:
                  else anchor['strike'] - wing['contract']['strike'])
         if width != 1000 or wing['quantity'] != anchor['lot_size']*s['multiplier']:
             return False
-        _, candidates = self._snapshot('NIFTY', now, [contract_from(anchor)])
+        try:
+            _, candidates = self._snapshot('NIFTY', now, [contract_from(anchor)])
+        except FeedError:
+            s['reason'] = 'V3 restore waiting for fresh original-strike depth'
+            return False
+        if s.get('stop_requested') or s.get('exit_requested'):
+            return False
         q = next((q for q in candidates if q.contract.symbol == anchor['symbol']), None)
         quantity = anchor['lot_size']*s['multiplier']
-        if q is None or not fresh(q, now) or q.bid_size < quantity:
+        if q is None or not fresh(q, self.clock().astimezone(IST)) or q.bid_size < quantity:
             return False
         price = q.bid - q.contract.tick_size
         if price <= 0:
@@ -998,7 +1052,7 @@ class Controller:
         s['leg_reentries'] = s.get('leg_reentries', 0) + 1
         s['trades'].append({'timestamp':now.isoformat(), 'symbol':q.contract.symbol,
                             'side':'SELL', 'quantity':quantity, 'price':price, 'cost':fee,
-                            'mode':'paper', 'reason':'V3 trend pause/reversal re-entry',
+                            'mode':'paper', 'reason':reason,
                             'simulated':True})
         self._mark(s, quotes+[q], now)
         s['reason'] = 'V3 ATM straddle restored at the protected anchor'
@@ -1025,7 +1079,7 @@ class Controller:
         base_trail = min(.16, max(.05, .07 + 4*volatility))
         volatility_ratio = indicators.get('volatility_ratio', 1.0)
         for p in list(shorts):
-            mark, entry = p['mark_price'], p['entry_price']
+            mark, entry = p['mark_price'], p.get('risk_entry_price', p['entry_price'])
             p['best_mark'] = min(p.get('best_mark', entry), mark)
             solo = len(shorts) == 1
             arm_fraction = min(.12, max(.06, .08 + .03*(volatility_ratio-1)))
@@ -1039,6 +1093,17 @@ class Controller:
             kind = _option_type(contract_from(p['contract']))
             trend_exit = len(shorts) == 2 and confirmed and ((direction == 1 and kind == 'CE') or
                                         (direction == -1 and kind == 'PE'))
+            if solo and mark >= p['leg_stop'] and mark < hard_stop:
+                missing = 'CE' if kind == 'PE' else 'PE'
+                if self._reenter_nifty_v3_leg(s, missing, quotes, now,
+                                               'V3 trailing-stop straddle restructure'):
+                    reset_mark = p['mark_price']
+                    dual_stop, _ = adaptive_short_stop(
+                        reset_mark, None, volatility_ratio, base_stop, base_trail,
+                        solo=False, stop_bounds=(.10, .27), trail_bounds=(.04, .14))
+                    self._restructure_held_short(s, p, reset_mark*(1+dual_stop), now)
+                    s['reason'] = 'V3 straddle restructured; held short retained at original fill'
+                return
             if mark >= p['leg_stop'] or trend_exit:
                 self._close_nifty_v3_leg(s, p, quotes, now,
                                          'V3 premium stop/trail' if mark >= p['leg_stop']
@@ -1071,13 +1136,13 @@ class Controller:
         self._mark(s, quotes, now)
         self._event(f"NIFTY v5: simulated {_option_type(contract_from(position['contract']))} short exit — {reason}")
 
-    def _reenter_v5(self, s, missing, quotes, now):
+    def _reenter_v5(self, s, missing, quotes, now, restructure=False):
         spec = resolve('NIFTY','nfv5')
         if (s.get('paused') or s.get('exit_requested') or s.get('stop_requested') or
                 s['entries'] >= spec.max_entries or now.strftime('%H:%M') >= spec.entry_end or
                 s['net_pnl'] <= -spec.session_loss_per_unit*s['multiplier'] or
-                not s.get('last_leg_exit') or
-                (now-datetime.fromisoformat(s['last_leg_exit'])).total_seconds() < 30):
+                (not restructure and (not s.get('last_leg_exit') or
+                 (now-datetime.fromisoformat(s['last_leg_exit'])).total_seconds() < 30))):
             return False
         anchor = s.get('v5_anchor',{}).get(missing)
         if not anchor:
@@ -1097,7 +1162,7 @@ class Controller:
             return False
         q = next((q for q in candidate if q.contract.symbol == anchor['symbol']),None)
         quantity = s['multiplier']*anchor['lot_size']
-        if q is None or not fresh(q,now) or q.bid_size < quantity:
+        if q is None or not fresh(q,self.clock().astimezone(IST)) or q.bid_size < quantity:
             s['reason'] = 'V5 re-entry waiting for executable original-strike bid'
             return False
         price = q.bid-q.contract.tick_size
@@ -1113,7 +1178,8 @@ class Controller:
         s['v5_state'] = 'DUAL'
         s['trades'].append({'timestamp':now.isoformat(),'symbol':q.contract.symbol,
                             'side':'SELL','quantity':quantity,'price':price,'cost':fee,
-                            'mode':'paper','reason':'V5 flow re-entry at protected anchor',
+                            'mode':'paper','reason':('V5 trailing-stop straddle restructure' if restructure
+                                                    else 'V5 flow re-entry at protected anchor'),
                             'simulated':True})
         self._mark(s,quotes+candidate,now)
         s['reason'] = 'V5 protected ATM straddle restored at original strike'
@@ -1132,7 +1198,7 @@ class Controller:
         action = flow_decision(self.v5_flow_history,state) if observation.get('eligible') else None
         volatility_ratio = observation.get('volatility_ratio', 1.0)
         for p in list(shorts):
-            mark,entry = p['mark_price'],p['entry_price']
+            mark,entry = p['mark_price'],p.get('risk_entry_price',p['entry_price'])
             p['best_mark'] = min(p.get('best_mark',entry),mark)
             stop_pct,trail_pct = nifty_v5.stop_parameters(
                 observation, len(shorts)==1, entry, p.get('premium_marks'))
@@ -1150,14 +1216,14 @@ class Controller:
             # If a profitable solo leg trails out just as the trend stalls,
             # restore the protected straddle and reset its trail once. A hard
             # premium stop still takes precedence over this optimization.
-            if (len(shorts)==1 and stop_hit and mark < entry*(1+stop_pct) and
-                    action == 'REENTER_'+('CE' if kind=='PE' else 'PE')):
+            if len(shorts)==1 and stop_hit and mark < entry*(1+stop_pct):
                 missing = 'CE' if kind=='PE' else 'PE'
-                if self._reenter_v5(s,missing,quotes,now):
-                    p['best_mark'] = mark
-                    p['leg_stop'] = round(entry*(1+stop_pct),4)
-                    p['trail_armed'] = False
-                    return
+                if self._reenter_v5(s,missing,quotes,now,restructure=True):
+                    reset_mark = p['mark_price']
+                    dual_stop,_ = nifty_v5.stop_parameters(observation,False,reset_mark,None)
+                    self._restructure_held_short(s,p,reset_mark*(1+dual_stop),now)
+                    s['reason'] = 'V5 straddle restructured; held short retained at original fill'
+                return
             self._close_v5_leg(s,p,quotes,now,'V5 flow exit' if signal_exit else 'V5 premium stop/trail')
             shorts = [x for x in s['positions'] if x['side']=='SELL']
             if not shorts:
