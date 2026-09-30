@@ -56,11 +56,67 @@ body{background-color:var(--bg);background-image:linear-gradient(var(--gridline)
 .terminal-footer{display:flex;justify-content:space-between;align-items:center;gap:14px;border-top:1px solid var(--terminal-line);padding-top:9px}.terminal-pnl{display:flex;align-items:center;gap:20px;flex-wrap:wrap}.terminal-pnl-item small{display:block;color:var(--terminal-muted);font-size:8px;letter-spacing:.08em}.terminal-pnl-item strong{font-size:12px;font-weight:650;font-variant-numeric:tabular-nums}.terminal-meta{display:flex;justify-content:flex-end;gap:12px;flex-wrap:wrap;color:var(--terminal-muted);font-size:9px;text-align:right}.terminal-reason{margin-top:8px;padding-top:7px;border-top:1px dashed #203542;color:var(--terminal-muted);overflow-wrap:anywhere;font-size:9px}
 @media(max-width:1000px){.terminal-stats{grid-template-columns:repeat(4,minmax(0,1fr))}.terminal-stat:nth-child(5){border-left:0}}
 @media(max-width:600px){.active-runtime>.active-strategy{padding:12px}.strategy-terminal{margin:0 7px 7px;padding:10px}.terminal-stats{grid-template-columns:repeat(3,minmax(0,1fr))}.terminal-stat:nth-child(4),.terminal-stat:nth-child(7),.terminal-stat:nth-child(10),.terminal-stat:nth-child(13){border-left:0}.terminal-footer{align-items:flex-start;flex-direction:column}.terminal-pnl{gap:12px}.terminal-meta{justify-content:flex-start;text-align:left}.terminal-positions{min-width:790px}}
+/* Phone layout: keep controls and key metrics readable without page-wide overflow. */
+.mobile-nav-toggle{display:none}
+@media(max-width:600px){
+  html,body{max-width:100%;overflow-x:hidden}
+  .app{padding-left:10px;padding-right:10px}
+  .topbar{position:sticky;top:0;display:flex;flex-wrap:wrap;gap:7px;padding:8px 0;background:color-mix(in srgb,var(--bg) 97%,transparent)}
+  .nav{display:none;order:3;flex:0 0 100%;width:100%;max-width:100%;margin:0;padding:7px;gap:5px;overflow:visible;border:1px solid var(--line);border-radius:10px;background:var(--panel);grid-template-columns:repeat(2,minmax(0,1fr))}
+  .topbar.nav-open .nav{display:grid}
+  .nav button{width:100%;padding:10px 9px;text-align:left;border-radius:7px}
+  .nav button[aria-selected=true]{box-shadow:inset 3px 0 var(--teal)}
+  .toptools{margin-left:auto;gap:7px}
+  .toptools small{font-size:10px}
+  .toptools #feed-health{display:none}
+  .mobile-nav-toggle{display:inline-grid;place-items:center;font-size:18px}
+  .page{padding-top:14px}
+  .pagehead{margin-bottom:14px}
+  .pagehead h1{font-size:27px}
+  .pagehead p{font-size:12px}
+  .hero{grid-template-columns:repeat(2,minmax(0,1fr));padding:14px;gap:12px}
+  .hero>div:first-child{grid-column:1/-1}
+  .hero .big{font-size:29px!important}
+  .heroitem{min-width:0}
+  .heroitem strong{font-size:16px;overflow-wrap:anywhere}
+  .section{padding:13px}
+  .sectionline{align-items:flex-start}
+  .strategy{grid-template-columns:minmax(0,1fr) 70px;gap:9px;padding:13px}
+  .strategy .name{font-size:14px}
+  .modecol{grid-column:1/-1}
+  .active-strategy{padding:11px!important;gap:8px}
+  .active-strategy strong{font-size:13px;overflow-wrap:anywhere}
+  .active-strategy .value{font-size:13px;white-space:nowrap}
+  .terminal-stats{grid-template-columns:repeat(2,minmax(0,1fr));padding:6px 0}
+  .terminal-stat,.terminal-stat:nth-child(n){padding:5px 7px;border-left:1px solid var(--terminal-line)}
+  .terminal-stat:nth-child(odd){border-left:0}
+  .terminal-stat small{font-size:8px;white-space:normal;line-height:1.2}
+  .terminal-stat strong{font-size:11px;white-space:normal;overflow-wrap:anywhere}
+  .terminal-positions{min-width:650px;width:100%}
+  .terminal-positions-wrap{max-width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch;overscroll-behavior-x:contain}
+  .terminal-positions th,.terminal-positions td{padding:6px 5px;font-size:9px}
+  .terminal-footer{gap:8px}
+  .terminal-pnl{width:100%;justify-content:space-between;flex-wrap:wrap}
+  .terminal-meta{font-size:9px;overflow-wrap:anywhere}
+  .historytools,.analytics-toolbar{width:100%;flex-wrap:wrap}
+  .historytools>*{max-width:100%}
+  .analytics-metrics{gap:7px}
+  .analytics-metrics .card,.mlmetric{padding:11px}
+  .analytics-metrics strong,.mlmetric strong{font-size:18px}
+  .chainhead{gap:7px}
+  .chainstat{padding:11px}
+  .trade{grid-template-columns:minmax(0,1fr) auto}
+  .analytics-scroll,.tablewrap{max-width:calc(100vw - 46px);overflow-x:auto;-webkit-overflow-scrolling:touch;overscroll-behavior-x:contain}
+  .analytics-table,.chaintable{min-width:570px}
+  .loginbox{padding:24px}
+  .dialoghead,.dialogbody,.dialogfoot{padding-left:14px;padding-right:14px}
+}
+@media(max-width:360px){.app{padding-left:7px;padding-right:7px}.hero{padding:11px}.hero .big{font-size:25px!important}.nav button{font-size:11px;padding:8px 9px}.terminal-positions{min-width:620px}.terminal-positions th,.terminal-positions td{font-size:8px;padding:5px 3px}}
 </style>
 </head>
 <body>
 <div class="app">
-<header class="topbar"><div class="brand"><div class="brandmark">↗</div><span>TRADEDESK</span></div><nav class="nav" aria-label="Main navigation"><button data-tab="dashboard" aria-selected="true">Dashboard</button><button data-tab="strategies">Strategies</button><button data-tab="chain">Option chain</button><button data-tab="history">History</button><button data-tab="analytics">Analytics</button><button data-tab="settings">Settings</button></nav><div class="toptools"><span class="statusdot" id="connection-dot"></span><small id="connection">Offline</small><small id="feed-health" title="Market data connection and freshness" style="max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Feed status unknown</small><button class="iconbtn" id="theme" aria-label="Toggle light or dark mode" title="Light / dark mode">◐</button></div></header>
+<header class="topbar"><div class="brand"><div class="brandmark">↗</div><span>TRADEDESK</span></div><nav class="nav" id="main-nav" aria-label="Main navigation"><button data-tab="dashboard" aria-selected="true">Dashboard</button><button data-tab="strategies">Strategies</button><button data-tab="chain">Option chain</button><button data-tab="history">History</button><button data-tab="analytics">Analytics</button><button data-tab="settings">Settings</button></nav><div class="toptools"><span class="statusdot" id="connection-dot"></span><small id="connection">Offline</small><small id="feed-health" title="Market data connection and freshness" style="max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Feed status unknown</small><button class="iconbtn" id="theme" aria-label="Toggle light or dark mode" title="Light / dark mode">◐</button><button class="iconbtn mobile-nav-toggle" id="mobile-nav-toggle" type="button" aria-label="Open navigation" aria-controls="main-nav" aria-expanded="false">☰</button></div></header>
 <main>
 <section class="page active" id="page-dashboard"><div class="dashboard-meta"><span class="asof" id="asof">Waiting for server</span><span class="badge paper-badge" id="paper-banner">PAPER · Simulated fills</span></div><div class="hero card"><div><div class="eyebrow">Today's total P&amp;L</div><div class="big" id="today-pnl">₹0.00</div><div class="meta"><strong id="today-return">0.00%</strong> simulated return</div></div><div class="heroitem"><small>On or scheduled</small><strong id="active-count">0</strong></div><div class="heroitem"><small>Open legs</small><strong id="open-count">0</strong></div><div class="heroitem"><small>Account capital</small><strong id="account-capital">₹2,00,000</strong></div></div><section class="card section"><div class="sectionline"><div><h2>Strategies on or scheduled</h2></div><span class="badge" id="active-badge">0 ON</span></div><div id="active-strategy-cards" class="active-strategy-grid"><div class="empty">No strategy is on right now.</div></div></section><div class="grid2"><section class="card section"><div class="sectionline"><div><h2>Open positions</h2></div><span class="badge" id="positions-badge">0 OPEN</span></div><div id="active-trades" class="empty">No open positions right now.</div></section></div></section>
 <section class="page" id="page-strategies"><div class="pagehead"><div><div class="eyebrow">Control center</div><h1>Strategies</h1><p>Set the multiplier, choose Paper or Live, then use the switch. You can switch on before market hours.</p></div><div class="asof">₹2,00,000 minimum capital per multiplier</div></div><div class="market-sections" id="strategy-list"></div><div class="notice">Paper is selected by default. ON remains enabled across sessions: after each session closes, the strategy is scheduled for its next eligible session. Switch OFF to cancel future runs. Exchange holidays still require a live market-data check. Live requests require account permission and a dashboard PIN; real orders are not yet available in this controller. Paper versions run independently, including multiple versions of the same market; each simulates its own capital allocation.</div></section>
