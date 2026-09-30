@@ -1096,21 +1096,30 @@ class Controller:
             solo = len(shorts) == 1
             gain_fraction = max(0., (entry-p['best_mark'])/entry) if entry > 0 else 0.
             arm_fraction = min(.03, max(.015, .02 + .005*(regime-1)))
-            p['trail_armed'] = solo and gain_fraction >= arm_fraction
+            p['trail_armed'] = solo
             stop_pct, trail_pct = adaptive_short_stop(
                 entry, p.get('premium_marks'), volatility_ratio, base_stop, base_trail,
                 solo=solo, stop_bounds=(.10, .27), trail_bounds=(.04, .14))
             hard_stop = entry*(1+stop_pct)
+            if solo and p.get('risk_entry_price') is not None:
+                original_entry = p['entry_price']
+                # Rebuilding the straddle never raises the original leg's
+                # loss allowance indefinitely as its risk reference resets.
+                original_cap = (original_entry-.35*(original_entry-entry)
+                                if entry < original_entry else original_entry*1.08)
+                hard_stop = min(hard_stop, original_cap)
             trail = hard_stop
             if p['trail_armed']:
                 # The adaptive trail alone can allow most of a profitable
                 # premium decay to reverse. Bound that distance and lock an
                 # increasing share of the best observed gain.
                 max_trail_pct = min(.05, max(.025, .035 + .01*(regime-1)))
-                lock_share = min(.75, .45 + 1.5*max(0., gain_fraction-.02))
-                trail = min(p['best_mark']*(1+min(trail_pct, max_trail_pct)),
-                            entry-(entry-p['best_mark'])*lock_share)
+                trail = p['best_mark']*(1+min(trail_pct, max_trail_pct))
+                if gain_fraction >= arm_fraction:
+                    lock_share = min(.75, .45 + 1.5*max(0., gain_fraction-.02))
+                    trail = min(trail, entry-(entry-p['best_mark'])*lock_share)
             p['leg_stop'] = round(min(p.get('leg_stop') or min(hard_stop, trail), hard_stop, trail), 4)
+            p['trail_armed'] = solo and trail < hard_stop
             kind = _option_type(contract_from(p['contract']))
             trend_exit = len(shorts) == 2 and confirmed and ((direction == 1 and kind == 'CE') or
                                         (direction == -1 and kind == 'PE'))
