@@ -154,6 +154,13 @@ class Controller:
                     not self.data['account'].get('halted')):
                 session.update(locked=False, stop_requested=False, exit_requested=False,
                                state='COOLDOWN', reason='Paper v5 resumed with retained protection')
+            if (market == 'NIFTY' and session.get('strategy_id') == 'nfv5' and
+                    session.get('date') == today and
+                    any(p['side'] == 'SELL' for p in session['positions']) and
+                    not isinstance(session.get('cycle_start_net'), (int, float))):
+                # An already-open basket predates per-basket accounting. Begin
+                # its new risk cycle at its preserved current paper MTM.
+                session['cycle_start_net'] = session['net_pnl']
             if (market not in self.data['strategy_authorizations'] and
                     session.get('mode') == 'paper' and session.get('date') == today and
                     not session.get('stop_requested') and not session.get('exit_requested') and
