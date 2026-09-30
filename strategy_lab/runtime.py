@@ -143,6 +143,17 @@ class Controller:
         today = self.clock().astimezone(IST).date().isoformat()
         for market, session in self.data["sessions"].items():
             session.pop('flow_history',None)  # Prior releases stored oversized per-second histories.
+            # Retire only the old v5 daily-loss latch. Preserve today's paper
+            # ledger and held protection; an explicit user stop stays stopped.
+            last_trade = (session.get('trades') or [{}])[-1]
+            if (market == 'NIFTY' and session.get('strategy_id') == 'nfv5' and
+                    session.get('date') == today and session.get('mode') == 'paper' and
+                    session.get('locked') and session.get('stop_requested') and
+                    last_trade.get('reason') == 'Session loss limit reached' and
+                    self.data['strategy_authorizations'].get('NIFTY', {}).get('strategy_id') == 'nfv5' and
+                    not self.data['account'].get('halted')):
+                session.update(locked=False, stop_requested=False, exit_requested=False,
+                               state='COOLDOWN', reason='Paper v5 resumed with retained protection')
             if (market not in self.data['strategy_authorizations'] and
                     session.get('mode') == 'paper' and session.get('date') == today and
                     not session.get('stop_requested') and not session.get('exit_requested') and
@@ -297,7 +308,7 @@ class Controller:
             self.data["history"].append({"date": account["date"], "net_pnl": visible_daily_pnl,
                                           "capital": account["capital"]})
             account["lifetime_pnl"] += visible_daily_pnl
-        uncapped_v3 = any(s.get('date') and s.get('strategy_id') in ('nfv1', 'nfv3', 'mcxv1', 'mcxv3')
+        uncapped_v3 = any(s.get('date') and s.get('strategy_id') in ('nfv1', 'nfv3', 'nfv5', 'mcxv1', 'mcxv3')
                           for s in self.data['sessions'].values())
         account.update(date=now.date().isoformat(), daily_pnl=0.,
                        halted=False if uncapped_v3 else account["drawdown"] >= .05 * account["capital"])
@@ -479,7 +490,7 @@ class Controller:
         equity = a["lifetime_pnl"] + a["daily_pnl"]
         a["peak_pnl"] = max(a["peak_pnl"], equity)
         a["drawdown"] = a["peak_pnl"] - equity
-        uncapped = any(s.get('date') and s.get('strategy_id') in ('nfv1', 'nfv3', 'mcxv1', 'mcxv3')
+        uncapped = any(s.get('date') and s.get('strategy_id') in ('nfv1', 'nfv3', 'nfv5', 'mcxv1', 'mcxv3')
                        for s in self.data['sessions'].values())
         a['daily_loss_fraction'] = (None if uncapped else .05 if any(
             resolve(m, s.get('strategy_id')).version >= 3 and s['date']
@@ -653,7 +664,7 @@ class Controller:
                  entries=s["entries"]+1, entered_at=now.isoformat(), direction=plan.direction,
                  reversal_count=0, reversal_bar=None,
                  risk_code_fingerprint=self._risk_code_fingerprint)
-        if spec.id == "nfv3":
+        if spec.id in ("nfv3", "nfv5"):
             s["cycle_start_net"] = basket_start_net
         if spec.version == 1:
             for p in positions:
@@ -811,6 +822,11 @@ class Controller:
         efficiency = efficiency if isinstance(efficiency, (int, float)) else .5
         solo_trail = .09 if market == 'NIFTY' else min(.14, .08 + .06*(1-efficiency))
         volatility_ratio = signal.get('indicators', {}).get('volatility_ratio', 1.0)
+        strength = signal.get('indicators', {}).get('trend_strength', 0.)
+        breakout_direction = signal.get('indicators', {}).get('breakout_direction', 0)
+        if market == 'NIFTY' and signal.get('eligible') and signal_bar != s.get('v1_range_bar'):
+            s['v1_range_bar'] = signal_bar
+            s['v1_range_count'] = (s.get('v1_range_count', 0)+1 if strength < .55 else 0)
         for p in list(shorts):
             if not p.get('entry_signal_bar'):
                 p['entry_signal_bar'] = signal_bar
@@ -829,6 +845,9 @@ class Controller:
             impulse = ((direction > 0 and option == 'CE' or direction < 0 and option == 'PE')
                        and signal_bar and p.get('entry_signal_bar') and
                        signal_bar > p['entry_signal_bar'])
+            confirmed_impulse = (impulse and abs(slope) >= (.5 if market == 'NIFTY' else .05)
+                                 and (market != 'NIFTY' or
+                                      (strength >= .72 and breakout_direction == direction)))
             trail_hit = solo and mark >= p['leg_stop'] and mark < hard_stop
             if trail_hit:
                 missing = 'CE' if option == 'PE' else 'PE'
@@ -843,7 +862,7 @@ class Controller:
                     self._restructure_held_short(s, p, reset_mark*(1+dual_stop), now)
                     s['reason'] = 'V1 strangle restructured; held short retained at original fill'
                 return
-            if mark < p['leg_stop'] and not (impulse and abs(slope) >= (.5 if market == 'NIFTY' else .05)):
+            if mark < p['leg_stop'] and not confirmed_impulse:
                 continue
             fee = cost(mark, p['quantity'])
             s['costs'] += fee
@@ -851,7 +870,7 @@ class Controller:
             s['trades'].append({'timestamp': now.isoformat(), 'symbol': p['symbol'],
                                 'side': 'BUY', 'quantity': p['quantity'], 'price': mark,
                                 'cost': fee, 'mode': 'paper', 'simulated': True,
-                                'reason': 'V1 KAMA impulse' if impulse and mark < p['leg_stop'] else 'V1 premium stop'})
+                                'reason': 'V1 confirmed breakout' if confirmed_impulse and mark < p['leg_stop'] else 'V1 premium stop'})
             s['positions'].remove(p)
             s['last_leg_exit'] = now.isoformat()
             s['reason'] = 'V1 paper leg exited on KAMA impulse or premium stop'
@@ -882,9 +901,12 @@ class Controller:
             return
         held = shorts[0]
         missing = 'CE' if _option_type(contract_from(held['contract'])) == 'PE' else 'PE'
-        if direction != (-1 if missing == 'CE' else 1):
+        reversal = direction == (-1 if missing == 'CE' else 1)
+        range_restore = market == 'NIFTY' and s.get('v1_range_count', 0) >= 2
+        if not reversal and not range_restore:
             return
         self._reenter_v1_leg(market, s, held, missing, signal, quotes, now,
+                             'V1 range straddle restoration' if range_restore else
                              'V1 KAMA reversal re-entry')
 
     def _manage_mcx_v3(self, s, signal, quotes, now):
@@ -1064,6 +1086,10 @@ class Controller:
         s['costs'] += fee
         s['entries'] += 1
         s['leg_reentries'] = s.get('leg_reentries', 0) + 1
+        # Require fresh completed bars before another directional exit. A
+        # restored side must not be closed again on the bar that restored it.
+        s['v3_trend_count'] = 0
+        s['v3_trend_bar'] = s.get('signal', {}).get('indicators', {}).get('last_bar_open')
         s['trades'].append({'timestamp':now.isoformat(), 'symbol':q.contract.symbol,
                             'side':'SELL', 'quantity':quantity, 'price':price, 'cost':fee,
                             'mode':'paper', 'reason':reason,
@@ -1080,11 +1106,14 @@ class Controller:
         indicators = signal.get('indicators', {}) if signal.get('eligible') else {}
         direction = signal.get('direction', 0) if indicators else 0
         bar = indicators.get('last_bar_open')
+        strength = indicators.get('trend_strength', 0.)
+        breakout_direction = indicators.get('breakout_direction', 0)
         if bar and bar != s.get('v3_trend_bar'):
             s['v3_trend_count'] = (s.get('v3_trend_count', 0) + 1
                                    if direction == s.get('v3_trend_direction') else 1)
             s['v3_trend_bar'] = bar
             s['v3_trend_direction'] = direction
+            s['v3_range_count'] = (s.get('v3_range_count', 0)+1 if strength < .55 else 0)
         confirmed = s.get('v3_trend_count', 0) >= 2
         atr = indicators.get('atr14', 0.)
         spot = indicators.get('close', 0.)
@@ -1125,8 +1154,10 @@ class Controller:
             p['leg_stop'] = round(min(p.get('leg_stop') or min(hard_stop, trail), hard_stop, trail), 4)
             p['trail_armed'] = solo and trail < hard_stop
             kind = _option_type(contract_from(p['contract']))
-            trend_exit = len(shorts) == 2 and confirmed and ((direction == 1 and kind == 'CE') or
-                                        (direction == -1 and kind == 'PE'))
+            trend_exit = (len(shorts) == 2 and confirmed and strength >= .72 and
+                          breakout_direction == direction and
+                          ((direction == 1 and kind == 'CE') or
+                           (direction == -1 and kind == 'PE')))
             if solo and mark >= p['leg_stop'] and mark < hard_stop:
                 missing = 'CE' if kind == 'PE' else 'PE'
                 if (self._restructure_attempt_due(s, now) and
@@ -1147,15 +1178,21 @@ class Controller:
                 if not shorts:
                     s.update(exit_requested=True, reason='V3 shorts exited; protective wings retained')
                 return
-        if len(shorts) == 1 and confirmed:
+        if len(shorts) == 1:
             held_kind = _option_type(contract_from(shorts[0]['contract']))
             missing = 'CE' if held_kind == 'PE' else 'PE'
-            reversal = (held_kind == 'PE' and direction == -1) or (held_kind == 'CE' and direction == 1)
+            reversal = (confirmed and strength >= .72 and breakout_direction == direction and
+                        ((held_kind == 'PE' and direction == -1) or
+                         (held_kind == 'CE' and direction == 1)))
+            range_restore = s.get('v3_range_count', 0) >= 2
             last_exit = s.get('last_leg_exit')
             cooldown_done = (not last_exit or
                              (now-datetime.fromisoformat(last_exit)).total_seconds() >= 60)
-            if reversal and cooldown_done:
-                self._reenter_nifty_v3_leg(s, missing, quotes, now)
+            if (reversal or range_restore) and cooldown_done:
+                self._reenter_nifty_v3_leg(
+                    s, missing, quotes, now,
+                    'V3 range straddle restoration' if range_restore else
+                    'V3 confirmed reversal re-entry')
 
     def _close_v5_leg(self, s, position, quotes, now, reason):
         fee = cost(position['mark_price'], position['quantity'])
@@ -1175,7 +1212,8 @@ class Controller:
         spec = resolve('NIFTY','nfv5')
         if (s.get('paused') or s.get('exit_requested') or s.get('stop_requested') or
                 s['entries'] >= spec.max_entries or now.strftime('%H:%M') >= spec.entry_end or
-                s['net_pnl'] <= -spec.session_loss_per_unit*s['multiplier'] or
+                (spec.session_loss_per_unit is not None and
+                 s['net_pnl'] <= -spec.session_loss_per_unit*s['multiplier']) or
                 (not restructure and (not s.get('last_leg_exit') or
                  (now-datetime.fromisoformat(s['last_leg_exit'])).total_seconds() < 30))):
             return False
@@ -1231,6 +1269,11 @@ class Controller:
                  'SOLO_PE' if _option_type(contract_from(shorts[0]['contract'])) == 'PE' else 'SOLO_CE')
         s['v5_state'] = state
         action = flow_decision(self.v5_flow_history,state) if observation.get('eligible') else None
+        strength = observation.get('trend_strength', 0.)
+        breakout_direction = observation.get('breakout_direction', 0)
+        if action in ('EXIT_CE', 'EXIT_PE') and not (
+                strength >= .72 and breakout_direction == (1 if action == 'EXIT_CE' else -1)):
+            action = None
         volatility_ratio = observation.get('volatility_ratio', 1.0)
         for p in list(shorts):
             mark,entry = p['mark_price'],p.get('risk_entry_price',p['entry_price'])
@@ -1270,7 +1313,7 @@ class Controller:
             kind = _option_type(contract_from(shorts[0]['contract']))
             s['v5_state'] = 'SOLO_'+kind
             missing = 'CE' if kind=='PE' else 'PE'
-            if action == 'REENTER_'+missing:
+            if action == 'REENTER_'+missing or strength < .55:
                 self._reenter_v5(s,missing,quotes,now)
 
     def _exit(self, market, s, quotes, now):
@@ -1483,7 +1526,7 @@ class Controller:
                         # cumulative loss with a fresh basket stop caused v3 to
                         # exit and re-enter every few seconds after one loss.
                         baseline = s.get("cycle_start_net")
-                        if spec.id in ("mcxv3", "nfv3"):
+                        if spec.id in ("mcxv3", "nfv3", "nfv5"):
                             trade_net = s["net_pnl"] - (baseline if isinstance(baseline, (int, float))
                                                         and math.isfinite(baseline) else s["net_pnl"])
                         else:

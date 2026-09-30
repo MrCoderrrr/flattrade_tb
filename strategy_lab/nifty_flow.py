@@ -11,6 +11,7 @@ from math import isfinite, tanh
 from statistics import median
 
 from .models import Bar, IST
+from .risk import intraday_regime
 from .strategies import _ema
 
 
@@ -159,6 +160,7 @@ def evaluate(bars1: list[Bar], bars5: list[Bar], ticks: list[IndexTick], now: da
     valid5 = valid5 and all(b.low<=min(b.open,b.close) and b.high>=max(b.open,b.close) for b in current5)
     valid5 = valid5 and all(b.timestamp-a.timestamp==timedelta(minutes=5) for a,b in zip(current5,current5[1:]))
     adx = _adx(current5) if valid5 else None
+    regime = intraday_regime(today, atr, _adx(today, 14 if len(today) >= 29 else 7))
     adx_strength = _clip(((adx or 15.)-15)/20,0,1)
     quality = efficiency if adx is None else .55*efficiency+.45*adx_strength
     weights = _weights(quality,vol_ratio)
@@ -172,6 +174,9 @@ def evaluate(bars1: list[Bar], bars5: list[Bar], ticks: list[IndexTick], now: da
             "timestamp":last.timestamp.isoformat(),"spot":last.price,"atr14":round(atr,4),
             "quality":round(quality,3),"efficiency":round(efficiency,3),
             "adx7_5m":round(adx,2) if adx is not None else None,
+            "choppiness14":regime['choppiness'],
+            "trend_strength":regime['strength'],
+            "breakout_direction":regime['breakout_direction'],
             "volatility_ratio":round(vol_ratio,3),
             "weights":dict(zip(('impulse','ema','breakout','acceleration'),(round(x,3) for x in weights))),
             "components":dict(zip(('impulse','ema','breakout','acceleration'),

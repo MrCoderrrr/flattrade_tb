@@ -10,6 +10,8 @@ from statistics import median
 
 from .catalog import resolve
 from .models import Bar, IST, Leg, Plan
+from .nifty_flow import _adx
+from .risk import intraday_regime
 from .strategies import _ema, _valid_quote, _option_type
 
 
@@ -145,13 +147,24 @@ def explain_signal(market, bars, now):
         # Conflicting trend votes may postpone a leg exit, but must not turn
         # the initial protected straddle into a one-sided entry.
         direction = 0
+    adx = _adx(today, 14 if len(today) >= 29 else 7)
+    regime = intraday_regime(today, atr, adx)
+    if drive and direction == drive and len(today) < 14:
+        regime['strength'] = max(.75, regime['strength'])
+        regime['breakout_direction'] = drive
     return {"eligible": True, "direction": direction,
-            "reason": {1:"Bullish indicators; protected ATM straddle, monitor call short",
-                       -1:"Bearish indicators; protected ATM straddle, monitor put short",
-                       0:"Balanced indicators; protected ATM straddle"}[direction],
+            "reason": ("Range regime; maintain protected ATM straddle"
+                       if regime['strength'] < .72 else
+                       {1:"Bullish breakout; monitor call short",
+                        -1:"Bearish breakout; monitor put short",
+                        0:"Balanced indicators; protected ATM straddle"}[direction]),
             "indicators": {"close":closes[-1],"ema9":ema9,"ema21":ema21,"rsi14":round(rsi,2),"atr14":atr,
                            "anchor":anchor,"anchor_kind":"vwap" if volume else "mean_typical_price",
                            "volatility_ratio":round(volatility_ratio,3), "votes":votes,
+                           "adx14_1m":round(adx,2) if adx is not None else None,
+                           "choppiness14":regime['choppiness'],
+                           "trend_strength":regime['strength'],
+                           "breakout_direction":regime['breakout_direction'],
                            "bar_minutes":1,"last_bar_open":recent[-1].timestamp.isoformat()}}
 
 

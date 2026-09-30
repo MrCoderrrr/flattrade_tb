@@ -13,6 +13,7 @@ from .active_v3 import _kama
 from .catalog import resolve
 from .models import Bar, IST, Leg, Plan
 from .nifty_flow import _adx
+from .risk import intraday_regime
 from .strategies import _ema, _option_type, _valid_quote
 
 
@@ -115,9 +116,15 @@ def explain_signal(market, bars, now):
             direction = 0
     adx = _adx(today, 7)
     opening = 0
+    regime = None
     if market == "NIFTY":
         from .opening_trend import opening_drive
         opening = opening_drive(bars, now)
+        regime_adx = _adx(today, 14 if len(today) >= 29 else 7)
+        regime = intraday_regime(today, risk_atr, regime_adx)
+        if opening and direction == opening and len(today) < 14:
+            regime['strength'] = max(.75, regime['strength'])
+            regime['breakout_direction'] = opening
     result.update(eligible=True, direction=direction,
                   reason=f"V1 paper ATM entry; KAMA({period},3,30) slope {slope:+.3f}",
                   indicators={"close": closes[-1], "kama": kama[-1],
@@ -128,6 +135,9 @@ def explain_signal(market, bars, now):
                               "swing_breakout_up": breakout_up,
                               "swing_breakout_down": breakout_down,
                               "opening_drive": opening, "volatility_ratio": volatility_ratio,
+                              "choppiness14": regime['choppiness'] if regime else None,
+                              "trend_strength": regime['strength'] if regime else None,
+                              "breakout_direction": regime['breakout_direction'] if regime else 0,
                               "last_bar_open": recent[-1].timestamp.isoformat()})
     if opening and direction == -opening:
         result.update(eligible=False, direction=0,

@@ -5,6 +5,42 @@ import math
 from statistics import median
 
 
+def intraday_regime(completed_bars, atr, adx=None):
+    """One bounded trend-strength value from completed same-session candles.
+
+    A directional exit needs a two-bar range break; CHOP and ADX decide
+    whether that break is more than a brief oscillation inside a range.
+    """
+    bars = completed_bars
+    if len(bars) < 10 or not isinstance(atr, (int, float)) or atr <= 0:
+        return {'strength': 0.0, 'breakout_direction': 0, 'choppiness': None}
+    period = min(14, len(bars)-1)
+    window = bars[-period:]
+    previous = bars[-period-1]
+    true_range_sum = 0.0
+    for bar in window:
+        true_range_sum += max(bar.high-bar.low, abs(bar.high-previous.close),
+                              abs(bar.low-previous.close))
+        previous = bar
+    span = max(bar.high for bar in window)-min(bar.low for bar in window)
+    ratio = true_range_sum/span if span > 0 else float('inf')
+    chop = min(100., max(0., 100.*math.log10(max(1., ratio))/math.log10(period)))
+    prior = bars[-min(20, len(bars)-2)-2:-2]
+    high = max(bar.high for bar in prior)
+    low = min(bar.low for bar in prior)
+    threshold = .15*atr
+    breakout = (1 if bars[-2].close > high+threshold and bars[-1].close > high+threshold
+                else -1 if bars[-2].close < low-threshold and bars[-1].close < low-threshold
+                else 0)
+    adx_strength = min(1., max(0., (float(adx)-18.)/20.)) if adx is not None else 0.
+    chop_strength = min(1., max(0., (60.-chop)/25.))
+    strength = .55*bool(breakout)+.25*adx_strength+.20*chop_strength
+    if chop >= 60.:
+        strength = min(strength, .60)
+    return {'strength': round(strength, 3), 'breakout_direction': breakout,
+            'choppiness': round(chop, 2)}
+
+
 def adaptive_short_stop(entry_premium, premium_marks, volatility_ratio,
                         base_stop, base_trail, *, solo=False,
                         stop_bounds=(0.10, 0.28), trail_bounds=(0.04, 0.16)):
