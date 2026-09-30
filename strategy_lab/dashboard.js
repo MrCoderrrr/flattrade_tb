@@ -64,7 +64,9 @@ function terminalPanel(session,id,spec,capital){
   for(const p of positions){const row=node('tr'),contract=p.contract||{},leg=contract.option_type||String(p.symbol||'').match(/(?:CE|PE)$/)?.[0]||'LEG',stop=premiumStop(p);const values=[leg,contract.strike??'—',p.side||'—',p.quantity??'—',money(p.entry_price),money(p.mark_price),money(p.best_mark??p.entry_price),stop.label+' '+stop.value];for(const value of values)row.append(node('td','',value));const pnl=node('td','',signed(p.unrealized_pnl));color(pnl,p.unrealized_pnl);row.append(pnl);body.append(row)}
   table.append(thead,body);positionWrap.append(table);panel.append(positionWrap);
   const footer=node('div','terminal-footer'),pnlGrid=node('div','terminal-pnl');
-  for(const [label,value] of [['REALIZED',session.realized_pnl],['UNREALIZED',session.unrealized_pnl],['NET MTM',session.net_pnl]]){const item=node('div','terminal-pnl-item');item.append(node('small','',label),node('strong','',signed(value)));color(item.lastChild,value);pnlGrid.append(item)}
+  const closedFills=closedLegs([...(Array.isArray(session.trades)?session.trades:[])].sort((a,b)=>String(a.ts||a.timestamp||'').localeCompare(String(b.ts||b.timestamp||''))));
+  const realizedNet=closedFills.length?closedFills.reduce((sum,leg)=>sum+leg.pnl,0):(Number(session.realized_pnl)||0);
+  for(const [label,value] of [['REALIZED',realizedNet],['UNREALIZED',session.unrealized_pnl],['NET MTM',session.net_pnl]]){const item=node('div','terminal-pnl-item');item.append(node('small','',label),node('strong','',signed(value)));color(item.lastChild,value);pnlGrid.append(item)}
   const returnItem=node('div','terminal-pnl-item');returnItem.append(node('small','','RETURN'),node('strong','',`(${percent(session.net_pnl,session.capital||capital)})`));pnlGrid.append(returnItem);
   const meta=node('div','terminal-meta');meta.append(node('span','',String(session.mode||'paper').toUpperCase()+' · '+(session.entries||0)+' ENTRIES'),node('span','','FEED '+age),node('span','',barTime));
   footer.append(pnlGrid,meta);panel.append(footer);
